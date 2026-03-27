@@ -23,6 +23,7 @@ _pool: asyncpg.Pool | None = None
 
 # Slug computation matching the anime-studio convention
 SLUG_EXPR = "REGEXP_REPLACE(LOWER(REPLACE(name, ' ', '_')), '[^a-z0-9_-]', '', 'g')"
+C_SLUG = "REGEXP_REPLACE(LOWER(REPLACE(c.name, ' ', '_')), '[^a-z0-9_-]', '', 'g')"
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -213,7 +214,7 @@ async def _get_character_spec(pool: asyncpg.Pool, args: dict) -> list[TextConten
 
     row = await pool.fetchrow(
         f"""
-        SELECT c.name, {SLUG_EXPR} AS slug, c.design_prompt, c.lora_path, c.lora_trigger,
+        SELECT c.name, {C_SLUG} AS slug, c.design_prompt, c.lora_path, c.lora_trigger,
                c.lora_strength, c.identity_block, c.negative_prompt,
                c.visual_prompt_template, c.checkpoint_override,
                c.entity_type, c.role, c.appearance_data,
@@ -223,7 +224,7 @@ async def _get_character_spec(pool: asyncpg.Pool, args: dict) -> list[TextConten
         FROM characters c
         JOIN projects p ON p.id = c.project_id
         LEFT JOIN generation_styles gs ON gs.style_name = p.default_style
-        WHERE c.project_id = $1 AND {SLUG_EXPR} = $2
+        WHERE c.project_id = $1 AND {C_SLUG} = $2
         """,
         project_id,
         slug,
