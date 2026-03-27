@@ -1,0 +1,30 @@
+# ai-team-sync team configuration
+# Check this file into your repo so all team members share the same settings.
+
+[server]
+# URL of the shared ai-team-sync server
+url = "http://localhost:8400"
+
+[locks]
+# "advisory" = warn on overlap, "exclusive" = block commits on overlap
+default_mode = "advisory"
+# Hours before a lock auto-expires (prevents forgotten locks)
+ttl_hours = 8
+# Show a warning when starting a session that overlaps with an existing lock
+warn_on_overlap = true
+
+[notifications]
+# Which events trigger team notifications
+events = [
+    "session.started",
+    "session.completed",
+    "lock.conflict",
+    "lock.expired",
+    "decision.logged",
+]
+
+[session]
+# Auto-detect agent type from environment (CLAUDE_CODE, CURSOR, COPILOT, etc.)
+auto_detect_agent = true
+# Auto-create scope locks when starting a session
+auto_lock = true

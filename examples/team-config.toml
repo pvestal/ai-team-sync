@@ -1,0 +1,34 @@
+# Example team configuration for ai-team-sync
+# Copy this to .ai-team-sync.toml in your repo root and check it in.
+
+[server]
+# Shared server URL — all team members point here
+url = "http://your-server:8400"
+
+[locks]
+# "advisory" = warn when someone touches your locked files
+# "exclusive" = block commits to locked files entirely
+default_mode = "advisory"
+
+# Auto-expire locks after this many hours (prevents forgotten locks)
+ttl_hours = 8
+
+# Warn when starting a session that overlaps with someone else's scope
+warn_on_overlap = true
+
+[notifications]
+# Which events trigger Slack/Telegram/VS Code notifications
+events = [
+    "session.started",     # Someone started working with an AI agent
+    "session.completed",   # Someone finished their session
+    "lock.conflict",       # Someone tried to touch locked files
+    "lock.expired",        # A lock auto-expired
+    "decision.logged",     # A design decision was recorded
+]
+
+[session]
+# Try to detect agent type from environment variables
+auto_detect_agent = true
+
+# Automatically create scope locks when starting a session
+auto_lock = true
