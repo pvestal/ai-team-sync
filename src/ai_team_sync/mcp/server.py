@@ -1,4 +1,4 @@
-"""MCP Server for ai-team-sync integration with Claude Code."""
+"""MCP Server for ai-team-sync integration with Claude Code - Complete Edition."""
 
 from __future__ import annotations
 
@@ -19,6 +19,9 @@ mcp_server = Server("ai-team-sync")
 
 # Server URL from environment
 SERVER_URL = os.environ.get("ATS_SERVER_URL", "http://localhost:8400")
+
+# Session file for persistence
+SESSION_FILE = Path.home() / ".ats_session"
 
 
 def get_git_user() -> str:
@@ -60,10 +63,56 @@ def detect_agent() -> str:
     return "unknown"
 
 
+def save_session_id(session_id: str):
+    """Save active session ID to file for persistence."""
+    SESSION_FILE.write_text(session_id)
+
+
+def load_session_id() -> str | None:
+    """Load active session ID from file."""
+    if SESSION_FILE.exists():
+        content = SESSION_FILE.read_text().strip()
+        return content if content else None
+    return None
+
+
+def clear_session_id():
+    """Clear saved session ID."""
+    if SESSION_FILE.exists():
+        SESSION_FILE.unlink()
+
+
+def format_conflict_guidance(conflicts: list[dict]) -> str:
+    """Format conflict resolution guidance."""
+    msg = "💡 **Resolution Options:**\n\n"
+
+    has_exclusive = any(c.get("lock_mode") == "exclusive" for c in conflicts)
+
+    if has_exclusive:
+        msg += "**Option 1:** Request override permission\n"
+        msg += "   Use: request_override tool with justification\n"
+        msg += "   Keywords for auto-approval: urgent, security, hotfix, critical\n\n"
+
+        msg += "**Option 2:** Coordinate with lock owner\n"
+        msg += "   Use: team_status to see who's working\n"
+        msg += "   Contact them to discuss coordination\n\n"
+
+        msg += "**Option 3:** Work on different scope\n"
+        msg += "   Adjust your scope patterns to avoid overlap\n\n"
+    else:
+        msg += "**Advisory locks detected** - you can proceed but should coordinate:\n"
+        msg += "   1. Check team_status to see who's working\n"
+        msg += "   2. Log your decisions with log_decision\n"
+        msg += "   3. Communicate with team members\n\n"
+
+    return msg
+
+
 @mcp_server.list_tools()
 async def list_tools() -> list[Tool]:
     """List available MCP tools."""
     return [
+        # Original 8 tools
         Tool(
             name="start_session",
             description="Start a new working session with scope locks. Announces your work to the team and creates locks to prevent conflicts.",
@@ -105,7 +154,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="request_override",
-            description="Request permission to work on files locked by someone else. Use when blocked by exclusive lock.",
+            description="Request permission to work on files locked by someone else. Use when blocked by exclusive lock. Keywords 'urgent', 'security', 'hotfix', 'critical' may auto-approve.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -115,7 +164,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "justification": {
                         "type": "string",
-                        "description": "Why you need access (e.g., 'Urgent security fix needed')",
+                        "description": "Why you need access. Use keywords: urgent, security, hotfix, critical for faster approval.",
                     },
                 },
                 "required": ["pattern", "justification"],
@@ -199,22 +248,126 @@ async def list_tools() -> list[Tool]:
                 "required": ["title", "chosen", "reasoning"],
             },
         ),
+
+        # NEW: Phase 1 tools (Critical)
+        Tool(
+            name="pause_session",
+            description="Pause your current session while keeping locks. Use when switching tasks temporarily.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="resume_session",
+            description="Resume a paused session. Reactivates your locks and session.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="get_session_details",
+            description="Get detailed information about your current session including locks, decisions, and commits.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="check_my_override_requests",
+            description="Check status of override requests you've made (sent TO others).",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+
+        # NEW: Phase 2 tools (High value)
+        Tool(
+            name="check_git_changes",
+            description="Check uncommitted files in your session scope. Helps verify what will be committed.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="list_all_locks",
+            description="List all active locks across the team. Shows overall coordination landscape.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+
+        # NEW: Phase 3 tools (Nice to have)
+        Tool(
+            name="get_decision_history",
+            description="Get all decisions logged during your current session.",
+            inputSchema={
+                "type": "object",
+                "properties": {},
+            },
+        ),
+        Tool(
+            name="pre_commit_check",
+            description="Check if staged files have lock conflicts before committing.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Paths to check (usually staged files)",
+                    },
+                },
+                "required": ["paths"],
+            },
+        ),
+
+        # NEW: Phase 4 tools (Polish)
+        Tool(
+            name="delete_lock",
+            description="Remove a specific lock without completing the session. Use carefully.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "lock_id": {
+                        "type": "string",
+                        "description": "The lock ID to delete",
+                    },
+                },
+                "required": ["lock_id"],
+            },
+        ),
+        Tool(
+            name="get_override_request_details",
+            description="Get detailed information about a specific override request.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "request_id": {
+                        "type": "string",
+                        "description": "The override request ID",
+                    },
+                },
+                "required": ["request_id"],
+            },
+        ),
     ]
-
-
-# Store active session ID
-_active_session_id: str | None = None
 
 
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle MCP tool calls."""
-    global _active_session_id
+    # Load active session from persistent storage
+    active_session_id = load_session_id()
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         try:
+            # Original tools
             if name == "start_session":
-                # Create session
                 scope = arguments["scope"]
                 description = arguments["description"]
                 exclusive = arguments.get("exclusive", False)
@@ -233,19 +386,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 )
 
                 if response.status_code == 409:
-                    # Conflict detected
                     error = response.json()
                     conflicts = error["detail"].get("conflicts", [])
                     msg = f"❌ Cannot start session - conflicts detected:\n\n"
                     for c in conflicts:
                         msg += f"  • Pattern '{c['new_pattern']}' conflicts with '{c['existing_pattern']}'\n"
                         msg += f"    Held by: {c['existing_developer']} ({c['lock_mode']} lock)\n\n"
-                    msg += "Use request_override tool to ask for permission."
+                    msg += format_conflict_guidance(conflicts)
                     return [TextContent(type="text", text=msg)]
 
                 response.raise_for_status()
                 data = response.json()
-                _active_session_id = data["id"]
+                save_session_id(data["id"])
 
                 msg = f"✅ Session started!\n\n"
                 msg += f"Session ID: {data['id'][:8]}...\n"
@@ -287,7 +439,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 return [TextContent(type="text", text=msg)]
 
             elif name == "request_override":
-                if not _active_session_id:
+                if not active_session_id:
                     return [TextContent(type="text", text="❌ No active session. Start a session first with start_session.")]
 
                 pattern = arguments["pattern"]
@@ -296,7 +448,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 response = await client.post(
                     f"{SERVER_URL}/api/override-requests",
                     json={
-                        "requester_session_id": _active_session_id,
+                        "requester_session_id": active_session_id,
                         "conflicting_pattern": pattern,
                         "justification": justification,
                     },
@@ -304,22 +456,38 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 response.raise_for_status()
                 data = response.json()
 
-                msg = f"✅ Override request sent!\n\n"
+                # Check for auto-approval
+                status = data.get("status", "pending")
+                auto_decided = status in ("approved", "denied") and data.get("responded_at")
+
+                if auto_decided:
+                    if status == "approved":
+                        msg = f"✅ Override request AUTO-APPROVED!\n\n"
+                        msg += f"🤖 Reason: {data.get('response_message', 'Auto-approved based on policy')}\n"
+                    else:
+                        msg = f"❌ Override request AUTO-DENIED!\n\n"
+                        msg += f"🤖 Reason: {data.get('response_message', 'Auto-denied based on policy')}\n"
+                else:
+                    msg = f"⏳ Override request sent (pending approval)...\n\n"
+
                 msg += f"Request ID: {data['id'][:8]}...\n"
                 msg += f"Pattern: {data['conflicting_pattern']}\n"
                 msg += f"Owner: {data['owner_developer']}\n"
-                msg += f"Expires: {data['expires_at']}\n\n"
-                msg += "Lock owner has been notified. Use check_pending_requests to monitor response."
+
+                if not auto_decided:
+                    msg += f"Expires: {data['expires_at']}\n\n"
+                    msg += "💡 Tip: Use keywords 'urgent', 'security', 'hotfix', 'critical' for auto-approval\n"
+                    msg += "Use check_my_override_requests to monitor response."
 
                 return [TextContent(type="text", text=msg)]
 
             elif name == "check_pending_requests":
-                if not _active_session_id:
+                if not active_session_id:
                     return [TextContent(type="text", text="❌ No active session. Start a session first.")]
 
                 response = await client.get(
                     f"{SERVER_URL}/api/override-requests",
-                    params={"session_id": _active_session_id, "status": "pending"},
+                    params={"session_id": active_session_id, "status": "pending"},
                 )
                 response.raise_for_status()
                 requests = response.json()
@@ -327,7 +495,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 if not requests:
                     return [TextContent(type="text", text="✅ No pending override requests.")]
 
-                msg = f"📬 {len(requests)} pending override request(s):\n\n"
+                msg = f"📬 {len(requests)} pending override request(s) TO YOU:\n\n"
                 for req in requests:
                     msg += f"Request ID: {req['id'][:8]}...\n"
                     msg += f"From: {req['requester_developer']}\n"
@@ -382,12 +550,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 return [TextContent(type="text", text=msg)]
 
             elif name == "complete_session":
-                if not _active_session_id:
+                if not active_session_id:
                     return [TextContent(type="text", text="❌ No active session to complete.")]
 
                 summary = arguments["summary"]
                 response = await client.patch(
-                    f"{SERVER_URL}/api/sessions/{_active_session_id}",
+                    f"{SERVER_URL}/api/sessions/{active_session_id}",
                     json={"status": "completed", "summary": summary},
                 )
                 response.raise_for_status()
@@ -396,11 +564,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 msg += f"Summary: {summary}\n\n"
                 msg += "All locks released. Team has been notified."
 
-                _active_session_id = None
+                clear_session_id()
                 return [TextContent(type="text", text=msg)]
 
             elif name == "log_decision":
-                if not _active_session_id:
+                if not active_session_id:
                     return [TextContent(type="text", text="❌ No active session. Start a session first.")]
 
                 title = arguments["title"]
@@ -411,7 +579,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 response = await client.post(
                     f"{SERVER_URL}/api/decisions",
                     json={
-                        "session_id": _active_session_id,
+                        "session_id": active_session_id,
                         "title": title,
                         "chosen": chosen,
                         "rejected": rejected,
@@ -431,11 +599,286 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
                 return [TextContent(type="text", text=msg)]
 
+            # NEW TOOLS - Phase 1 (Critical)
+
+            elif name == "pause_session":
+                if not active_session_id:
+                    return [TextContent(type="text", text="❌ No active session to pause.")]
+
+                response = await client.patch(
+                    f"{SERVER_URL}/api/sessions/{active_session_id}",
+                    json={"status": "paused"},
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                msg = f"⏸️ Session paused!\n\n"
+                msg += f"Session ID: {data['id'][:8]}...\n"
+                msg += f"Locks: {data['lock_count']} (retained)\n\n"
+                msg += "Use resume_session to continue work."
+
+                return [TextContent(type="text", text=msg)]
+
+            elif name == "resume_session":
+                if not active_session_id:
+                    return [TextContent(type="text", text="❌ No session to resume.")]
+
+                response = await client.patch(
+                    f"{SERVER_URL}/api/sessions/{active_session_id}",
+                    json={"status": "active"},
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                msg = f"▶️ Session resumed!\n\n"
+                msg += f"Session ID: {data['id'][:8]}...\n"
+                msg += f"Scope: {', '.join(data['scope'])}\n"
+                msg += f"Locks: {data['lock_count']}\n"
+
+                return [TextContent(type="text", text=msg)]
+
+            elif name == "get_session_details":
+                if not active_session_id:
+                    return [TextContent(type="text", text="❌ No active session.")]
+
+                response = await client.get(
+                    f"{SERVER_URL}/api/sessions/{active_session_id}",
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                scope = ", ".join(data["scope"]) if data["scope"] else "no scope"
+
+                msg = f"📊 Session Details\n\n"
+                msg += f"ID: {data['id'][:8]}...\n"
+                msg += f"Developer: {data['developer']}\n"
+                msg += f"Agent: {data['agent']}\n"
+                msg += f"Status: {data['status']}\n"
+                msg += f"Branch: {data['branch']}\n"
+                msg += f"Scope: {scope}\n"
+                msg += f"Description: {data['description']}\n\n"
+                msg += f"📈 Activity:\n"
+                msg += f"  Locks: {data['lock_count']}\n"
+                msg += f"  Decisions: {data['decision_count']}\n"
+                msg += f"  Commits: {data['commit_count']}\n\n"
+                msg += f"Started: {data['started_at']}\n"
+
+                if data.get("summary"):
+                    msg += f"Summary: {data['summary']}\n"
+
+                return [TextContent(type="text", text=msg)]
+
+            elif name == "check_my_override_requests":
+                if not active_session_id:
+                    return [TextContent(type="text", text="❌ No active session.")]
+
+                response = await client.get(
+                    f"{SERVER_URL}/api/override-requests",
+                    params={"session_id": active_session_id},
+                )
+                response.raise_for_status()
+                requests = response.json()
+
+                # Filter to only requests FROM this session (as requester)
+                my_requests = [r for r in requests if r["requester_session_id"] == active_session_id]
+
+                if not my_requests:
+                    return [TextContent(type="text", text="✅ No override requests sent.")]
+
+                msg = f"📤 {len(my_requests)} override request(s) you've sent:\n\n"
+                for req in my_requests:
+                    status_icon = {"pending": "⏳", "approved": "✅", "denied": "❌", "expired": "⌛"}
+                    icon = status_icon.get(req["status"], "?")
+
+                    msg += f"{icon} Request ID: {req['id'][:8]}...\n"
+                    msg += f"   To: {req['owner_developer']}\n"
+                    msg += f"   Pattern: {req['conflicting_pattern']}\n"
+                    msg += f"   Status: {req['status']}\n"
+
+                    if req.get("response_message"):
+                        msg += f"   Response: {req['response_message']}\n"
+
+                    msg += "\n"
+
+                return [TextContent(type="text", text=msg)]
+
+            # NEW TOOLS - Phase 2 (High value)
+
+            elif name == "check_git_changes":
+                if not active_session_id:
+                    return [TextContent(type="text", text="❌ No active session.")]
+
+                response = await client.get(
+                    f"{SERVER_URL}/api/git/session/{active_session_id}/changes",
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                in_scope = data.get("files_in_scope", [])
+                out_scope = data.get("files_out_of_scope", [])
+
+                if not in_scope and not out_scope:
+                    return [TextContent(type="text", text="✅ No uncommitted changes.")]
+
+                msg = ""
+
+                if in_scope:
+                    msg += f"📝 {len(in_scope)} uncommitted file(s) in your scope:\n\n"
+                    for f in in_scope[:20]:  # Limit display
+                        status = f.get("status", "modified")
+                        msg += f"  {status}: {f['path']}\n"
+
+                    if len(in_scope) > 20:
+                        msg += f"  ... and {len(in_scope) - 20} more\n"
+                    msg += "\n"
+
+                if out_scope:
+                    msg += f"⚠️ {len(out_scope)} file(s) outside your scope:\n\n"
+                    for f in out_scope[:10]:
+                        msg += f"  {f.get('status', 'modified')}: {f['path']}\n"
+
+                    if len(out_scope) > 10:
+                        msg += f"  ... and {len(out_scope) - 10} more\n"
+                    msg += "\n💡 Consider expanding scope or creating new session\n"
+
+                return [TextContent(type="text", text=msg)]
+
+            elif name == "list_all_locks":
+                response = await client.get(f"{SERVER_URL}/api/locks")
+                response.raise_for_status()
+                locks = response.json()
+
+                if not locks:
+                    return [TextContent(type="text", text="✅ No active locks.")]
+
+                msg = f"🔒 {len(locks)} active lock(s):\n\n"
+                for lock in locks:
+                    mode_icon = "⛔" if lock["mode"] == "exclusive" else "⚠️"
+                    msg += f"{mode_icon} {lock['pattern']} ({lock['mode']})\n"
+                    msg += f"   Developer: {lock.get('developer', 'unknown')}\n"
+                    msg += f"   Expires: {lock['expires_at']}\n\n"
+
+                return [TextContent(type="text", text=msg)]
+
+            # NEW TOOLS - Phase 3 (Nice to have)
+
+            elif name == "get_decision_history":
+                if not active_session_id:
+                    return [TextContent(type="text", text="❌ No active session.")]
+
+                response = await client.get(
+                    f"{SERVER_URL}/api/decisions",
+                    params={"session_id": active_session_id},
+                )
+                response.raise_for_status()
+                decisions = response.json()
+
+                if not decisions:
+                    return [TextContent(type="text", text="✅ No decisions logged yet.")]
+
+                msg = f"📚 {len(decisions)} decision(s) in this session:\n\n"
+                for d in decisions:
+                    msg += f"**{d['title']}**\n"
+                    msg += f"  Chose: {d['chosen']}\n"
+                    if d.get("rejected"):
+                        msg += f"  Rejected: {d['rejected']}\n"
+                    msg += f"  Reasoning: {d['reasoning']}\n"
+                    msg += f"  Logged: {d['created_at']}\n\n"
+
+                return [TextContent(type="text", text=msg)]
+
+            elif name == "pre_commit_check":
+                paths = arguments["paths"]
+
+                response = await client.post(
+                    f"{SERVER_URL}/api/git/pre-commit-check",
+                    json={"paths": paths},
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                blocked = data.get("blocked", [])
+                warned = data.get("warned", [])
+
+                if not blocked and not warned:
+                    return [TextContent(type="text", text="✅ All files clear for commit.")]
+
+                msg = ""
+
+                if blocked:
+                    msg += f"⛔ {len(blocked)} file(s) BLOCKED by exclusive locks:\n\n"
+                    for f in blocked:
+                        msg += f"  {f['path']}\n"
+                        msg += f"    Locked by: {f['developer']} (pattern: {f['pattern']})\n"
+                    msg += "\n❌ Commit will be blocked. Resolve conflicts first.\n\n"
+
+                if warned:
+                    msg += f"⚠️ {len(warned)} file(s) have advisory locks:\n\n"
+                    for f in warned:
+                        msg += f"  {f['path']}\n"
+                        msg += f"    Locked by: {f['developer']} (pattern: {f['pattern']})\n"
+                    msg += "\n💡 Commit allowed but coordinate with team.\n"
+
+                return [TextContent(type="text", text=msg)]
+
+            # NEW TOOLS - Phase 4 (Polish)
+
+            elif name == "delete_lock":
+                lock_id = arguments["lock_id"]
+
+                response = await client.delete(f"{SERVER_URL}/api/locks/{lock_id}")
+                response.raise_for_status()
+
+                msg = f"🗑️ Lock deleted!\n\n"
+                msg += f"Lock ID: {lock_id[:8]}...\n\n"
+                msg += "⚠️ Other team members have been notified."
+
+                return [TextContent(type="text", text=msg)]
+
+            elif name == "get_override_request_details":
+                request_id = arguments["request_id"]
+
+                response = await client.get(
+                    f"{SERVER_URL}/api/override-requests/{request_id}",
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                status_icon = {"pending": "⏳", "approved": "✅", "denied": "❌", "expired": "⌛"}
+                icon = status_icon.get(data["status"], "?")
+
+                msg = f"{icon} Override Request Details\n\n"
+                msg += f"ID: {data['id'][:8]}...\n"
+                msg += f"From: {data['requester_developer']}\n"
+                msg += f"To: {data['owner_developer']}\n"
+                msg += f"Pattern: {data['conflicting_pattern']}\n"
+                msg += f"Status: {data['status']}\n\n"
+                msg += f"Justification:\n{data['justification']}\n\n"
+                msg += f"Created: {data['created_at']}\n"
+
+                if data.get("responded_at"):
+                    msg += f"Responded: {data['responded_at']}\n"
+                    msg += f"Response: {data.get('response_message', 'No message')}\n"
+                else:
+                    msg += f"Expires: {data['expires_at']}\n"
+
+                return [TextContent(type="text", text=msg)]
+
             else:
                 return [TextContent(type="text", text=f"❌ Unknown tool: {name}")]
 
         except httpx.HTTPStatusError as e:
-            return [TextContent(type="text", text=f"❌ HTTP Error: {e.response.status_code}\n{e.response.text}")]
+            error_text = f"❌ HTTP Error: {e.response.status_code}\n{e.response.text}"
+
+            # Add helpful guidance for common errors
+            if e.response.status_code == 404:
+                error_text += "\n\n💡 Resource not found. Check IDs or session status."
+            elif e.response.status_code == 409:
+                error_text += "\n\n💡 Conflict detected. Use team_status to see active sessions."
+            elif e.response.status_code == 410:
+                error_text += "\n\n💡 Resource expired. Request has timed out."
+
+            return [TextContent(type="text", text=error_text)]
         except Exception as e:
             return [TextContent(type="text", text=f"❌ Error: {str(e)}")]
 

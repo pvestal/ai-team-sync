@@ -62,18 +62,45 @@ Copy `mcp-config.json` to your project root and Claude Code will auto-load it.
 
 ---
 
-## Available MCP Tools
+## Available MCP Tools (18 Total)
 
+### Core Session Management
 | Tool | Purpose | When to Use |
 |------|---------|-------------|
 | `start_session` | Start working session with locks | Beginning work on files |
-| `check_locks` | Check if files are locked | Before editing files |
-| `request_override` | Ask permission for locked files | When blocked by exclusive lock |
-| `check_pending_requests` | See who's asking for overrides | Periodically during session |
-| `respond_to_request` | Approve/deny override requests | When requests arrive |
-| `team_status` | See what team is working on | Check before starting work |
+| `pause_session` | Pause session (keep locks) | Switching tasks temporarily |
+| `resume_session` | Resume paused session | Returning to paused work |
+| `get_session_details` | View current session info | Check session status |
 | `complete_session` | End session and release locks | When done working |
+
+### Lock Coordination
+| Tool | Purpose | When to Use |
+|------|---------|-------------|
+| `check_locks` | Check if files are locked | Before editing files |
+| `list_all_locks` | See all active locks | Get team overview |
+| `delete_lock` | Remove specific lock | Manual lock management |
+
+### Override Requests
+| Tool | Purpose | When to Use |
+|------|---------|-------------|
+| `request_override` | Ask permission for locked files | When blocked by exclusive lock |
+| `check_pending_requests` | See requests TO you | Periodically during session |
+| `check_my_override_requests` | See requests FROM you | Monitor your request status |
+| `respond_to_request` | Approve/deny requests | When requests arrive |
+| `get_override_request_details` | Get request details | Check specific request |
+
+### Team Awareness
+| Tool | Purpose | When to Use |
+|------|---------|-------------|
+| `team_status` | See active sessions | Check before starting work |
 | `log_decision` | Record design decisions | After making architecture choices |
+| `get_decision_history` | View session decisions | Review what was decided |
+
+### Git Integration
+| Tool | Purpose | When to Use |
+|------|---------|-------------|
+| `check_git_changes` | See uncommitted files | Before committing |
+| `pre_commit_check` | Validate files for locks | Before git commit |
 
 ---
 
@@ -146,19 +173,86 @@ Summary: Refactored authentication to use JWT with refresh tokens
 All locks released. Team has been notified.
 ```
 
+### Example 5: Auto-Approval (NEW!)
+```
+You: Request override for backend/** - this is an urgent security fix
+
+Claude: *calls request_override with justification containing "urgent"*
+
+✅ Override request AUTO-APPROVED!
+🤖 Reason: Auto-approved based on justification keywords
+
+Request ID: xyz789...
+Pattern: backend/**
+Owner: alice
+
+You can now proceed with your changes immediately!
+```
+
+**Auto-approval keywords**: urgent, security, hotfix, critical
+**Auto-deny keywords**: breaking change, major refactor
+
+### Example 6: Session Pause/Resume (NEW!)
+```
+You: Need to switch branches temporarily
+
+Claude: *calls pause_session*
+
+⏸️ Session paused!
+Locks: 3 (retained)
+Use resume_session to continue work.
+
+[... work on other branch ...]
+
+You: Resume my previous session
+
+Claude: *calls resume_session*
+
+▶️ Session resumed!
+Scope: backend/auth/**
+Locks: 3
+Ready to continue where you left off.
+```
+
+### Example 7: Checking Your Changes (NEW!)
+```
+You: What files have I changed?
+
+Claude: *calls check_git_changes*
+
+📝 8 uncommitted file(s) in your scope:
+
+  modified: backend/auth/middleware.py
+  modified: backend/auth/tokens.py
+  new: backend/auth/refresh.py
+  ...
+
+✅ All changes are within your declared scope.
+```
+
 ---
 
-## Auto-Detection (Future Enhancement)
+## Enhanced Features
 
-Currently in development:
+### ✅ Session Persistence
+Sessions survive MCP server restarts - stored in `~/.ats_session`
 
-```python
-# Future: Claude Code automatically detects file modifications
-# and creates sessions without being asked
-
-# You: *open backend/auth.py in editor*
-# Claude: Detected work on backend/auth.py. Starting session...
+### ✅ Auto-Approval Policies
+Configure in `.ai-team-sync.toml`:
+```toml
+[approval]
+auto_approve_keywords = ["urgent", "security", "hotfix", "critical"]
+auto_deny_keywords = ["breaking change", "major refactor"]
 ```
+
+### ✅ Real-Time WebSocket Notifications
+Server broadcasts lock expirations and override responses in real-time
+
+### ✅ Conflict Resolution Guidance
+When conflicts occur, Claude receives contextual suggestions:
+- Request override with auto-approval keywords
+- Coordinate with lock owner
+- Adjust scope to avoid overlap
 
 ---
 
@@ -245,9 +339,10 @@ tail -f ~/.claude/logs/ats-mcp.log
 
 1. ✅ Install and configure MCP server
 2. ✅ Test with simple session
-3. ⏭️ Set up team notifications (Slack/Telegram)
-4. ⏭️ Install git hooks for pre-commit checking
-5. ⏭️ Configure auto-approval policies (coming in v0.3.0)
+3. ✅ Configure auto-approval policies
+4. ✅ Install git hooks for pre-commit checking
+5. ⏭️ Set up team notifications (Slack/Telegram)
+6. ⏭️ Set up WebSocket monitoring for real-time updates
 
 ---
 

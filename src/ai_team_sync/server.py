@@ -15,6 +15,11 @@ from ai_team_sync.routers import sessions, locks, decisions, override_requests, 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+
+    # Start background tasks
+    from ai_team_sync.background_tasks import start_background_tasks
+    await start_background_tasks()
+
     yield
 
 
