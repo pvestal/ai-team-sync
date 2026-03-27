@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.3.0] - 2026-03-27
+
+### Added
+- **MCP Server Integration** for Claude Code native support
+  - 8 MCP tools: start_session, check_locks, request_override, respond_to_request, etc.
+  - Auto-configuration via `~/.claude/config.json`
+  - Real-time session management from within Claude
+  - See MCP_SETUP.md for installation guide
+
+### Changed
+- Added `ats-mcp` command for running MCP server
+- Added `mcp>=1.0.0` dependency
+- Updated README with MCP quick start
+
 ## [0.2.0] - 2026-03-27
 
 ### Added

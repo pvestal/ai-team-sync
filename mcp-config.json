@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "ai-team-sync": {
+      "command": "ats-mcp",
+      "env": {
+        "ATS_SERVER_URL": "http://localhost:8400"
+      }
+    }
+  }
+}

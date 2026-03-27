@@ -51,6 +51,28 @@ cp .env.example .env
 ats-server
 ```
 
+### MCP Server for Claude Code (NEW!)
+
+Enable Claude Code to natively use ai-team-sync:
+
+```json
+// Add to ~/.claude/config.json
+{
+  "mcpServers": {
+    "ai-team-sync": {
+      "command": "ats-mcp",
+      "env": {
+        "ATS_SERVER_URL": "http://localhost:8400"
+      }
+    }
+  }
+}
+```
+
+Claude can now automatically check locks, request overrides, and coordinate with your team!
+
+See [MCP_SETUP.md](MCP_SETUP.md) for full instructions.
+
 ### Use the CLI
 
 ```bash
