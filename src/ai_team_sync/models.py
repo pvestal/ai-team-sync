@@ -46,6 +46,12 @@ class Session(Base):
     locks: Mapped[list[ScopeLock]] = relationship(back_populates="session", cascade="all, delete-orphan")
     decisions: Mapped[list[Decision]] = relationship(back_populates="session", cascade="all, delete-orphan")
     commits: Mapped[list[CommitRecord]] = relationship(back_populates="session", cascade="all, delete-orphan")
+    override_requests_sent: Mapped[list[OverrideRequest]] = relationship(
+        back_populates="requester_session", foreign_keys="OverrideRequest.requester_session_id"
+    )
+    override_requests_received: Mapped[list[OverrideRequest]] = relationship(
+        back_populates="owner_session", foreign_keys="OverrideRequest.owner_session_id"
+    )
 
 
 class ScopeLock(Base):
@@ -92,3 +98,30 @@ class CommitRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     session: Mapped[Session] = relationship(back_populates="commits")
+
+
+class OverrideRequest(Base):
+    """Request to override a lock conflict - enables agent-to-agent coordination."""
+
+    __tablename__ = "override_requests"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    requester_session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
+    owner_session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
+    conflicting_pattern: Mapped[str] = mapped_column(String(500))  # The pattern that conflicts
+    justification: Mapped[str] = mapped_column(Text, default="")  # Why override is needed
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|approved|denied|expired
+    response_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc) + timedelta(minutes=15)  # 15-min response window
+    )
+
+    requester_session: Mapped[Session] = relationship(
+        back_populates="override_requests_sent", foreign_keys=[requester_session_id]
+    )
+    owner_session: Mapped[Session] = relationship(
+        back_populates="override_requests_received", foreign_keys=[owner_session_id]
+    )

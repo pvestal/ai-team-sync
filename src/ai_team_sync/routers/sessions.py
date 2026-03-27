@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from fnmatch import fnmatch
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -14,6 +15,7 @@ from ai_team_sync.database import get_db
 from ai_team_sync.models import ScopeLock, Session
 from ai_team_sync.notifications.dispatcher import dispatch
 from ai_team_sync.schemas import SessionCreate, SessionResponse, SessionUpdate
+from ai_team_sync.config import settings
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -36,8 +38,86 @@ def _session_to_response(s: Session) -> SessionResponse:
     )
 
 
+async def _check_scope_conflicts(
+    db: AsyncSession,
+    new_patterns: list[str],
+    current_developer: str
+) -> list[dict]:
+    """Check if new scope patterns conflict with existing active locks."""
+    now = datetime.now(timezone.utc)
+
+    # Get all active locks from active sessions
+    result = await db.execute(
+        select(ScopeLock, Session.developer)
+        .join(Session)
+        .where(ScopeLock.expires_at > now)
+        .where(Session.status.in_(["active", "paused"]))
+    )
+    active_locks = list(result.all())
+
+    conflicts = []
+    for new_pattern in new_patterns:
+        for lock, developer in active_locks:
+            # Check if patterns overlap using bidirectional matching
+            # Pattern A matches Pattern B, or Pattern B matches Pattern A
+            if (fnmatch(new_pattern, lock.pattern) or
+                fnmatch(lock.pattern, new_pattern) or
+                new_pattern == lock.pattern):
+                conflicts.append({
+                    "new_pattern": new_pattern,
+                    "existing_pattern": lock.pattern,
+                    "existing_developer": developer,
+                    "lock_mode": lock.mode,
+                    "session_id": lock.session_id,
+                })
+
+    return conflicts
+
+
 @router.post("", response_model=SessionResponse, status_code=201)
 async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)):
+    # Check for scope conflicts BEFORE creating the session
+    if body.auto_lock and body.scope:
+        conflicts = await _check_scope_conflicts(db, body.scope, body.developer)
+
+        if conflicts:
+            # Determine lock mode for new session
+            new_lock_mode = getattr(body, 'lock_mode', settings.lock_default_mode)
+
+            # Separate exclusive vs advisory conflicts
+            exclusive_conflicts = [c for c in conflicts if c["lock_mode"] == "exclusive"]
+
+            # Block if:
+            # 1. Any existing lock is exclusive, OR
+            # 2. User is requesting exclusive mode (can't coexist with any lock)
+            if exclusive_conflicts or new_lock_mode == "exclusive":
+                conflict = exclusive_conflicts[0] if exclusive_conflicts else conflicts[0]
+                mode_msg = (
+                    f"exclusive lock '{conflict['existing_pattern']}'"
+                    if conflict["lock_mode"] == "exclusive"
+                    else f"existing lock '{conflict['existing_pattern']}' (you requested exclusive mode)"
+                )
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": "scope_conflict",
+                        "message": (
+                            f"Cannot create session: scope '{conflict['new_pattern']}' conflicts "
+                            f"with {mode_msg} held by {conflict['existing_developer']}"
+                        ),
+                        "conflicts": conflicts,
+                    }
+                )
+
+            # Advisory conflicts: warn via notification but allow
+            for conflict in conflicts:
+                await dispatch("lock.conflict", {
+                    "new_pattern": conflict["new_pattern"],
+                    "existing_pattern": conflict["existing_pattern"],
+                    "new_developer": body.developer,
+                    "existing_developer": conflict["existing_developer"],
+                })
+
     session = Session(
         developer=body.developer,
         agent=body.agent,
@@ -50,8 +130,9 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
 
     # Auto-create scope locks from scope patterns
     if body.auto_lock and body.scope:
+        lock_mode = getattr(body, 'lock_mode', settings.lock_default_mode)
         for pattern in body.scope:
-            lock = ScopeLock(session_id=session.id, pattern=pattern)
+            lock = ScopeLock(session_id=session.id, pattern=pattern, mode=lock_mode)
             db.add(lock)
 
     await db.commit()

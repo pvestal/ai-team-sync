@@ -16,6 +16,7 @@ class SessionCreate(BaseModel):
     description: str = ""
     branch: str = ""
     auto_lock: bool = True  # auto-create scope locks from scope patterns
+    lock_mode: str = "advisory"  # advisory (warn) or exclusive (block)
 
 
 class SessionUpdate(BaseModel):
@@ -117,3 +118,33 @@ class CommitResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+# --- Override Request ---
+
+class OverrideRequestCreate(BaseModel):
+    requester_session_id: str
+    conflicting_pattern: str
+    justification: str = ""
+
+
+class OverrideRequestResponse(BaseModel):
+    id: str
+    requester_session_id: str
+    owner_session_id: str
+    conflicting_pattern: str
+    justification: str
+    status: str  # pending|approved|denied|expired
+    response_message: str | None = None
+    created_at: datetime
+    responded_at: datetime | None = None
+    expires_at: datetime
+    requester_developer: str | None = None
+    owner_developer: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class OverrideRequestRespond(BaseModel):
+    approved: bool
+    message: str = ""

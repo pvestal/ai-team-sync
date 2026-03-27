@@ -82,16 +82,24 @@ def session():
 @click.option("--desc", "-d", default="", help="Description of what you're working on")
 @click.option("--agent", "-a", default=None, help="Agent name (auto-detected if omitted)")
 @click.option("--no-lock", is_flag=True, help="Don't auto-create scope locks")
-def session_start(scope, desc, agent, no_lock):
+@click.option("--exclusive", is_flag=True, help="Create exclusive locks (block overlapping sessions)")
+def session_start(scope, desc, agent, no_lock, exclusive):
     """Start a new working session and announce scope to the team."""
-    resp = _api("post", "/sessions", json={
-        "developer": _get_developer(),
-        "agent": agent or _detect_agent(),
-        "scope": list(scope),
-        "description": desc,
-        "branch": _get_branch(),
-        "auto_lock": not no_lock,
-    })
+    lock_mode = "exclusive" if exclusive else "advisory"
+
+    try:
+        resp = _api("post", "/sessions", json={
+            "developer": _get_developer(),
+            "agent": agent or _detect_agent(),
+            "scope": list(scope),
+            "description": desc,
+            "branch": _get_branch(),
+            "auto_lock": not no_lock,
+            "lock_mode": lock_mode,
+        })
+    except SystemExit:
+        # Error already printed by _api
+        raise
     data = resp.json()
     click.echo(f"Session started: {data['id']}")
     click.echo(f"  Developer: {data['developer']}")

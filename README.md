@@ -57,6 +57,9 @@ ats-server
 # Start a session — team gets notified
 ats session start -s "src/auth/**" -d "Refactoring auth to use JWT"
 
+# Start with exclusive lock (blocks all overlapping work)
+ats session start -s "src/auth/**" -d "Critical auth refactor" --exclusive
+
 # Check if a file is locked by someone else
 ats lock check src/auth/middleware.py
 
@@ -70,6 +73,26 @@ ats team
 
 # Done — release locks, notify team
 ats session complete -m "Auth now uses JWT, added refresh token rotation"
+```
+
+## Lock Modes
+
+**Advisory Mode (default)**: Warns about conflicts but allows overlapping work
+- Use for parallel work on related files
+- Team members get notifications about overlaps
+- Example: Two devs working on different auth components
+
+**Exclusive Mode**: Blocks all overlapping sessions
+- Use for critical refactoring or migrations
+- Prevents any conflicts during sensitive work
+- Example: Database schema migration, major API changes
+
+```bash
+# Advisory (default) - allows overlap with warnings
+ats session start -s "frontend/**" -d "UI updates"
+
+# Exclusive - blocks any overlapping work
+ats session start -s "backend/database/**" -d "Schema migration" --exclusive
 ```
 
 ### Install git hooks (optional)
