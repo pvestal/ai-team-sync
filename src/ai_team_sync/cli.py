@@ -294,6 +294,113 @@ def team():
         click.echo()
 
 
+# --- Hooks management ---
+
+@cli.group()
+def hooks():
+    """Manage git hooks for ai-team-sync."""
+    pass
+
+
+@hooks.command("install")
+@click.option("--force", is_flag=True, help="Overwrite existing hooks")
+def hooks_install(force):
+    """Install ai-team-sync git hooks in the current repository."""
+    import shutil
+    from pathlib import Path
+
+    # Find git hooks directory
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            capture_output=True, text=True, check=True,
+        )
+        git_dir = Path(result.stdout.strip())
+    except subprocess.CalledProcessError:
+        click.echo("Error: Not in a git repository", err=True)
+        raise SystemExit(1)
+
+    hooks_dir = git_dir / "hooks"
+    hooks_dir.mkdir(exist_ok=True)
+
+    # Find source hooks (installed with package)
+    package_dir = Path(__file__).parent
+    source_hooks_dir = package_dir / "hooks"
+
+    # Hook mapping: source file -> git hook name
+    hooks_to_install = {
+        "pre_commit.py": "pre-commit",
+        "prepare_commit_msg.py": "prepare-commit-msg",
+        "post_checkout.py": "post-checkout",
+    }
+
+    installed = []
+    skipped = []
+
+    for source_file, hook_name in hooks_to_install.items():
+        source = source_hooks_dir / source_file
+        dest = hooks_dir / hook_name
+
+        if not source.exists():
+            click.echo(f"Warning: {source_file} not found, skipping", err=True)
+            continue
+
+        if dest.exists() and not force:
+            skipped.append(hook_name)
+            continue
+
+        shutil.copy(source, dest)
+        dest.chmod(0o755)  # Make executable
+        installed.append(hook_name)
+
+    if installed:
+        click.echo(f"Installed hooks: {', '.join(installed)}")
+    if skipped:
+        click.echo(f"Skipped (already exist): {', '.join(skipped)}")
+        click.echo("Use --force to overwrite existing hooks")
+
+    if installed or skipped:
+        click.echo("\nGit hooks are now active for this repository.")
+
+
+@hooks.command("uninstall")
+def hooks_uninstall():
+    """Remove ai-team-sync git hooks from the current repository."""
+    from pathlib import Path
+
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--git-dir"],
+            capture_output=True, text=True, check=True,
+        )
+        git_dir = Path(result.stdout.strip())
+    except subprocess.CalledProcessError:
+        click.echo("Error: Not in a git repository", err=True)
+        raise SystemExit(1)
+
+    hooks_dir = git_dir / "hooks"
+    hook_names = ["pre-commit", "prepare-commit-msg", "post-checkout"]
+
+    removed = []
+    for hook_name in hook_names:
+        hook_file = hooks_dir / hook_name
+        if hook_file.exists():
+            # Check if it's our hook (contains ai-team-sync marker)
+            try:
+                with open(hook_file) as f:
+                    content = f.read()
+                if "ai-team-sync" in content:
+                    hook_file.unlink()
+                    removed.append(hook_name)
+            except Exception:
+                pass
+
+    if removed:
+        click.echo(f"Removed hooks: {', '.join(removed)}")
+    else:
+        click.echo("No ai-team-sync hooks found.")
+
+
 # --- Session file helpers ---
 
 def _session_file() -> str:

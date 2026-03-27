@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ai-team-sync"
-version = "0.3.0"
+version = "0.2.0"
 description = "Change management toolkit for teams working with AI coding agents"
 readme = "README.md"
 license = {text = "MIT"}

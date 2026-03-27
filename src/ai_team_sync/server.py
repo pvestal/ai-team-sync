@@ -9,7 +9,7 @@ from fastapi import FastAPI
 
 from ai_team_sync.database import init_db
 from ai_team_sync.config import settings
-from ai_team_sync.routers import sessions, locks, decisions, override_requests, git_status
+from ai_team_sync.routers import sessions, locks, decisions, override_requests, git_status, websocket
 
 
 @asynccontextmanager
@@ -30,6 +30,7 @@ def create_app() -> FastAPI:
     app.include_router(decisions.router, prefix="/api")
     app.include_router(override_requests.router, prefix="/api")
     app.include_router(git_status.router, prefix="/api")
+    app.include_router(websocket.router)
 
     @app.get("/health")
     async def health():

@@ -12,6 +12,8 @@ from sqlalchemy.orm import selectinload
 from ai_team_sync.database import get_db
 from ai_team_sync.models import OverrideRequest, Session
 from ai_team_sync.notifications.dispatcher import dispatch
+from ai_team_sync.events import broadcast_event
+from ai_team_sync.approval_policy import ApprovalPolicy
 from ai_team_sync.schemas import (
     OverrideRequestCreate,
     OverrideRequestResponse,
@@ -86,6 +88,18 @@ async def create_override_request(
         justification=body.justification,
     )
     db.add(request)
+    await db.flush()  # Get ID before policy check
+
+    # Check auto-approval policy
+    policy = ApprovalPolicy()
+    auto_decision = policy.should_auto_approve(request)
+
+    if auto_decision is not None:
+        # Auto-approve or auto-deny
+        request.status = "approved" if auto_decision else "denied"
+        request.response_message = policy.get_auto_response_message(auto_decision)
+        request.responded_at = datetime.now(timezone.utc)
+
     await db.commit()
 
     # Reload with relationships
@@ -99,7 +113,7 @@ async def create_override_request(
     )
     request = result.scalar_one()
 
-    # Notify lock owner
+    # Notify lock owner via webhook
     await dispatch("override.requested", {
         "request_id": request.id,
         "requester": requester_session.developer,
@@ -108,6 +122,28 @@ async def create_override_request(
         "justification": body.justification,
         "owner_session_id": owner_session_id,
     })
+
+    # Broadcast to WebSocket subscribers
+    event_data = {
+        "request_id": request.id,
+        "requester": requester_session.developer,
+        "requester_agent": requester_session.agent,
+        "pattern": body.conflicting_pattern,
+        "justification": body.justification,
+        "auto_decided": auto_decision is not None,
+        "status": request.status,
+    }
+
+    await broadcast_event(owner_session_id, "override.requested", event_data)
+
+    # If auto-decided, also notify requester immediately
+    if auto_decision is not None:
+        await broadcast_event(body.requester_session_id, "override.responded", {
+            "request_id": request.id,
+            "approved": auto_decision,
+            "response_message": request.response_message,
+            "owner": "auto-policy",
+        })
 
     return _override_to_response(request)
 
@@ -217,13 +253,21 @@ async def respond_to_override_request(
     await db.commit()
     await db.refresh(request)
 
-    # Notify requester
+    # Notify requester via webhook
     await dispatch("override.responded", {
         "request_id": request.id,
         "approved": body.approved,
         "response_message": body.message,
         "owner": request.owner_session.developer if request.owner_session else "unknown",
         "requester_session_id": request.requester_session_id,
+    })
+
+    # Broadcast to WebSocket subscribers
+    await broadcast_event(request.requester_session_id, "override.responded", {
+        "request_id": request.id,
+        "approved": body.approved,
+        "response_message": body.message,
+        "owner": request.owner_session.developer if request.owner_session else "unknown",
     })
 
     return _override_to_response(request)

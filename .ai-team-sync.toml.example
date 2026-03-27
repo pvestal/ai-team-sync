@@ -28,3 +28,13 @@ events = [
 auto_detect_agent = true
 # Auto-create scope locks when starting a session
 auto_lock = true
+
+[approval]
+# Auto-approve override requests containing these keywords
+auto_approve_keywords = ["urgent", "security", "hotfix", "critical"]
+# Auto-deny override requests containing these keywords (higher priority)
+auto_deny_keywords = ["breaking change", "major refactor"]
+# Action when override request times out: "expire" or "auto-deny"
+timeout_action = "expire"
+# Use LLM to evaluate justifications (requires API key, experimental)
+llm_evaluate = false

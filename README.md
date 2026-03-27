@@ -51,7 +51,7 @@ cp .env.example .env
 ats-server
 ```
 
-### MCP Server for Claude Code (NEW!)
+### MCP Server for Claude Code
 
 Enable Claude Code to natively use ai-team-sync:
 
