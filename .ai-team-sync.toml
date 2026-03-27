@@ -1,0 +1,11 @@
+# ai-team-sync team configuration
+# Commit this file so your team shares the same settings.
+
+[server]
+url = "http://localhost:8400"
+
+[developer]
+name = "Patrick Vestal"
+
+[locks]
+default_mode = "advisory"

@@ -2,341 +2,337 @@ import * as vscode from "vscode";
 import * as http from "http";
 import * as https from "https";
 
-interface AtsSession {
-  id: string;
+// --- Types ---
+
+interface Presence {
   developer: string;
   agent: string;
-  scope: string[];
-  description: string;
-  status: string;
-  branch: string;
-  started_at: string;
-  lock_count: number;
-  decision_count: number;
+  files: string[];
 }
 
-interface LockCheckResult {
-  path: string;
-  locked: boolean;
-  developer?: string;
-  mode?: string;
-  pattern?: string;
+// --- State ---
+
+let ws: any = null;
+let statusBar: vscode.StatusBarItem;
+let fileDecoEmitter: vscode.EventEmitter<vscode.Uri | vscode.Uri[] | undefined>;
+let sidebar: SidebarProvider;
+let teammates: Presence[] = [];
+let myName = "unknown";
+let myAgent = "vscode";
+let serverUrl = "";
+let reconnectTimer: NodeJS.Timeout | undefined;
+
+// Colors per teammate
+const PALETTE = [
+  { hex: "#f0883e", theme: "charts.orange" },
+  { hex: "#58a6ff", theme: "charts.blue" },
+  { hex: "#3fb950", theme: "charts.green" },
+  { hex: "#bc8cff", theme: "charts.purple" },
+  { hex: "#f85149", theme: "charts.red" },
+  { hex: "#d29922", theme: "charts.yellow" },
+];
+const colorMap = new Map<string, (typeof PALETTE)[0]>();
+let colorIdx = 0;
+
+function colorFor(dev: string) {
+  if (!colorMap.has(dev)) {
+    colorMap.set(dev, PALETTE[colorIdx % PALETTE.length]);
+    colorIdx++;
+  }
+  return colorMap.get(dev)!;
 }
 
-let pollTimer: NodeJS.Timeout | undefined;
-let knownSessionIds: Set<string> = new Set();
-let statusBarItem: vscode.StatusBarItem;
+function initials(name: string): string {
+  return name
+    .split(/\s+/)
+    .map((w) => w[0]?.toUpperCase() || "")
+    .join("")
+    .slice(0, 2);
+}
 
-export function activate(context: vscode.ExtensionContext) {
-  statusBarItem = vscode.window.createStatusBarItem(
-    vscode.StatusBarAlignment.Left,
-    50
-  );
-  statusBarItem.command = "aiTeamSync.showTeamStatus";
-  statusBarItem.text = "$(people) ATS";
-  statusBarItem.tooltip = "AI Team Sync — click to see team status";
-  statusBarItem.show();
-  context.subscriptions.push(statusBarItem);
+// --- Activate ---
 
-  // Register commands
+export async function activate(context: vscode.ExtensionContext) {
+  // Status bar
+  statusBar = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 50);
+  statusBar.text = "$(sync~spin) ATS";
+  statusBar.show();
+  context.subscriptions.push(statusBar);
+
+  // File decorations
+  fileDecoEmitter = new vscode.EventEmitter();
   context.subscriptions.push(
-    vscode.commands.registerCommand(
-      "aiTeamSync.showTeamStatus",
-      showTeamStatus
-    ),
-    vscode.commands.registerCommand(
-      "aiTeamSync.startSession",
-      startSession
-    ),
-    vscode.commands.registerCommand(
-      "aiTeamSync.completeSession",
-      completeSession
-    ),
-    vscode.commands.registerCommand("aiTeamSync.checkLocks", checkLocks)
-  );
-
-  // Check locks when saving files
-  context.subscriptions.push(
-    vscode.workspace.onWillSaveTextDocument(async (e) => {
-      const config = vscode.workspace.getConfiguration("aiTeamSync");
-      if (!config.get<boolean>("showLockWarnings", true)) return;
-
-      const relativePath = vscode.workspace.asRelativePath(e.document.uri);
-      const results = await apiPost<LockCheckResult[]>("/locks/check", {
-        paths: [relativePath],
-      });
-      if (!results) return;
-
-      for (const r of results) {
-        if (r.locked) {
-          const action =
-            r.mode === "exclusive" ? "is BLOCKED by" : "overlaps with";
-          vscode.window.showWarningMessage(
-            `${r.path} ${action} ${r.developer}'s lock (${r.pattern})`
-          );
+    vscode.window.registerFileDecorationProvider({
+      onDidChangeFileDecorations: fileDecoEmitter.event,
+      provideFileDecoration(uri) {
+        const rel = vscode.workspace.asRelativePath(uri, false);
+        if (rel === uri.fsPath) return undefined;
+        for (const t of teammates) {
+          if (t.files.includes(rel)) {
+            const c = colorFor(t.developer);
+            return new vscode.FileDecoration(
+              initials(t.developer),
+              `${t.developer} (${t.agent})`,
+              new vscode.ThemeColor(c.theme)
+            );
+          }
         }
-      }
+        return undefined;
+      },
     })
   );
 
-  // Start polling
-  startPolling();
-
-  // Re-start polling when config changes
+  // Sidebar panel (lives in explorer)
+  sidebar = new SidebarProvider();
   context.subscriptions.push(
-    vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("aiTeamSync")) {
-        stopPolling();
-        startPolling();
-      }
-    })
+    vscode.window.registerWebviewViewProvider("aiTeamSync.sidebar", sidebar)
   );
+
+  // Detect identity
+  myName = await getGitUser();
+  if (process.env.CLAUDE_CODE) myAgent = "claude-code";
+  else if (process.env.CURSOR_SESSION) myAgent = "cursor";
+
+  // Report open files whenever tabs change
+  context.subscriptions.push(
+    vscode.window.onDidChangeVisibleTextEditors(() => sendPresence()),
+    vscode.workspace.onDidOpenTextDocument(() => sendPresence()),
+    vscode.workspace.onDidCloseTextDocument(() => sendPresence())
+  );
+
+  // Find server and connect
+  serverUrl = await discover();
+  if (serverUrl) {
+    statusBar.text = "$(people) ATS";
+    statusBar.tooltip = `Team Sync — ${serverUrl}`;
+    connect();
+  } else {
+    statusBar.text = "$(people) ATS (no server)";
+    statusBar.tooltip = "Team Sync — server not found";
+  }
 }
 
 export function deactivate() {
-  stopPolling();
+  if (reconnectTimer) clearTimeout(reconnectTimer);
 }
 
-function startPolling() {
-  const config = vscode.workspace.getConfiguration("aiTeamSync");
-  if (!config.get<boolean>("enabled", true)) return;
+// --- WebSocket ---
 
-  const intervalSec = config.get<number>("pollIntervalSeconds", 15);
+function connect() {
+  const wsUrl = serverUrl.replace(/^http/, "ws") + "/ws/presence";
 
-  // Initial fetch to seed known sessions
-  pollForUpdates(true);
+  const WebSocket = require("ws") as typeof import("ws");
+  const socket = new WebSocket(wsUrl);
 
-  pollTimer = setInterval(() => pollForUpdates(false), intervalSec * 1000);
-}
+  socket.on("open", () => {
+    ws = socket as any;
+    sendPresence();
+  });
 
-function stopPolling() {
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = undefined;
-  }
-}
+  socket.on("message", (data: any) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (msg.type === "update") {
+        // Filter out self
+        teammates = (msg.presence as Presence[]).filter((p) => p.developer !== myName);
 
-async function pollForUpdates(initial: boolean) {
-  const sessions = await apiGet<AtsSession[]>("/sessions?status=active");
-  if (!sessions) {
-    statusBarItem.text = "$(people) ATS (offline)";
-    return;
-  }
+        // Update status bar
+        if (teammates.length > 0) {
+          const names = teammates.map((t) => t.developer.split(" ")[0]).join(", ");
+          statusBar.text = `$(people) ${names}`;
+          statusBar.backgroundColor = undefined;
+        } else {
+          statusBar.text = "$(people) ATS";
+        }
 
-  statusBarItem.text = `$(people) ATS: ${sessions.length} active`;
-
-  const currentIds = new Set(sessions.map((s) => s.id));
-
-  if (!initial) {
-    // Detect new sessions (toast notification)
-    for (const s of sessions) {
-      if (!knownSessionIds.has(s.id)) {
-        const scope = s.scope.join(", ") || "unspecified scope";
-        vscode.window.showInformationMessage(
-          `${s.developer} started working on ${scope} with ${s.agent}`,
-          "View Team Status"
-        ).then((action) => {
-          if (action) {
-            vscode.commands.executeCommand("aiTeamSync.showTeamStatus");
-          }
-        });
+        // Refresh everything
+        fileDecoEmitter.fire(undefined);
+        decorateEditors();
+        sidebar.refresh(teammates);
       }
-    }
+    } catch {}
+  });
 
-    // Detect completed sessions
-    for (const id of knownSessionIds) {
-      if (!currentIds.has(id)) {
-        // Session went away — was completed or expired
-        // We could fetch the completed session for details, but keep it simple
-      }
-    }
-  }
+  socket.on("close", () => {
+    ws = null;
+    reconnectTimer = setTimeout(connect, 5000);
+  });
 
-  knownSessionIds = currentIds;
-}
-
-async function showTeamStatus() {
-  const sessions = await apiGet<AtsSession[]>("/sessions?status=active");
-  if (!sessions || sessions.length === 0) {
-    vscode.window.showInformationMessage("No active team sessions.");
-    return;
-  }
-
-  const items: vscode.QuickPickItem[] = sessions.map((s) => ({
-    label: `$(person) ${s.developer}`,
-    description: `${s.agent} | ${s.branch}`,
-    detail: `Scope: ${s.scope.join(", ")} | Locks: ${s.lock_count} | Decisions: ${s.decision_count}`,
-  }));
-
-  vscode.window.showQuickPick(items, {
-    title: `AI Team Sync — ${sessions.length} Active Session(s)`,
-    placeHolder: "Team members currently working with AI agents",
+  socket.on("error", () => {
+    socket.close();
   });
 }
 
-async function startSession() {
-  const scope = await vscode.window.showInputBox({
-    prompt: "Scope pattern (e.g., src/auth/**)",
-    placeHolder: "src/**",
-  });
-  if (!scope) return;
+function sendPresence() {
+  if (!ws) return;
+  const files = vscode.window.visibleTextEditors
+    .map((e) => vscode.workspace.asRelativePath(e.document.uri, false))
+    .filter((p) => !p.startsWith("/"));
 
-  const desc = await vscode.window.showInputBox({
-    prompt: "What are you working on?",
-    placeHolder: "Refactoring auth middleware",
-  });
-
-  const result = await apiPost<AtsSession>("/sessions", {
-    developer:
-      vscode.workspace.getConfiguration("git").get("userName") || "unknown",
-    agent: "vscode",
-    scope: [scope],
-    description: desc || "",
-    branch: "", // Could detect from git extension
-    auto_lock: true,
-  });
-
-  if (result) {
-    vscode.window.showInformationMessage(
-      `Session started. ${result.lock_count} lock(s) created.`
+  try {
+    (ws as any).send(
+      JSON.stringify({ type: "presence", developer: myName, agent: myAgent, files })
     );
-  }
+  } catch {}
 }
 
-async function completeSession() {
-  const sessions = await apiGet<AtsSession[]>("/sessions?status=active");
-  if (!sessions || sessions.length === 0) {
-    vscode.window.showInformationMessage("No active sessions to complete.");
-    return;
-  }
+// --- Editor inline banners ---
 
-  // Find sessions by current user
-  const gitUser =
-    vscode.workspace.getConfiguration("git").get<string>("userName") ||
-    "unknown";
-  const mySessions = sessions.filter((s) => s.developer === gitUser);
+const bannerTypes = new Map<string, vscode.TextEditorDecorationType>();
 
-  if (mySessions.length === 0) {
-    vscode.window.showInformationMessage("You have no active sessions.");
-    return;
-  }
+function decorateEditors() {
+  // Clear old
+  for (const [, type] of bannerTypes) type.dispose();
+  bannerTypes.clear();
 
-  const session = mySessions[0]; // Complete the first one
+  for (const editor of vscode.window.visibleTextEditors) {
+    const rel = vscode.workspace.asRelativePath(editor.document.uri, false);
+    if (rel === editor.document.uri.fsPath) continue;
 
-  const summary = await vscode.window.showInputBox({
-    prompt: "Session summary (what did you accomplish?)",
-    placeHolder: "Refactored auth middleware to use JWT",
-  });
-
-  await apiPatch(`/sessions/${session.id}`, {
-    status: "completed",
-    summary: summary || "",
-  });
-
-  vscode.window.showInformationMessage("Session completed. Locks released.");
-}
-
-async function checkLocks() {
-  const editor = vscode.window.activeTextEditor;
-  if (!editor) {
-    vscode.window.showInformationMessage("No active editor.");
-    return;
-  }
-
-  const relativePath = vscode.workspace.asRelativePath(editor.document.uri);
-  const results = await apiPost<LockCheckResult[]>("/locks/check", {
-    paths: [relativePath],
-  });
-
-  if (!results) return;
-
-  for (const r of results) {
-    if (r.locked) {
-      vscode.window.showWarningMessage(
-        `${r.path} is locked by ${r.developer} (pattern: ${r.pattern}, mode: ${r.mode})`
-      );
-    } else {
-      vscode.window.showInformationMessage(`${r.path} — no active locks.`);
+    for (const t of teammates) {
+      if (t.files.includes(rel)) {
+        const c = colorFor(t.developer);
+        const type = vscode.window.createTextEditorDecorationType({
+          isWholeLine: true,
+          after: {
+            contentText: `  ${t.developer} (${t.agent})`,
+            color: c.hex,
+            fontStyle: "italic",
+            margin: "0 0 0 2em",
+          },
+          overviewRulerColor: c.hex,
+          overviewRulerLane: vscode.OverviewRulerLane.Full,
+        });
+        bannerTypes.set(`${rel}:${t.developer}`, type);
+        editor.setDecorations(type, [{ range: new vscode.Range(0, 0, 0, 0) }]);
+        break;
+      }
     }
   }
 }
 
-// --- HTTP helpers ---
+// --- Sidebar ---
 
-function getServerUrl(): string {
-  return vscode.workspace
+class SidebarProvider implements vscode.WebviewViewProvider {
+  private view?: vscode.WebviewView;
+
+  resolveWebviewView(v: vscode.WebviewView) {
+    this.view = v;
+    v.webview.options = { enableScripts: false };
+    this.render([]);
+  }
+
+  refresh(people: Presence[]) {
+    if (!this.view) return;
+    this.view.badge = people.length > 0
+      ? { value: people.length, tooltip: `${people.length} teammate(s)` }
+      : undefined;
+    this.render(people);
+  }
+
+  private render(people: Presence[]) {
+    if (!this.view) return;
+
+    if (people.length === 0) {
+      this.view.webview.html = `<!DOCTYPE html><html><head><style>
+        body { font-family: var(--vscode-font-family); color: var(--vscode-descriptionForeground); padding: 16px; font-size: 12px; }
+      </style></head><body>
+        <div style="text-align:center; margin-top:20px">No teammates online.<br><br>
+        <em>When someone opens files, they appear here with colored badges in your explorer.</em></div>
+      </body></html>`;
+      return;
+    }
+
+    let html = "";
+    for (const p of people) {
+      const c = colorFor(p.developer);
+      const ini = initials(p.developer);
+      const files = p.files
+        .map((f) => `<div class="f"><span class="b" style="background:${c.hex}">${esc(ini)}</span>${esc(f)}</div>`)
+        .join("");
+      html += `<div class="p" style="border-left-color:${c.hex}">
+        <div class="n" style="color:${c.hex}">${esc(p.developer)}</div>
+        <div class="a">${esc(p.agent)}</div>
+        ${files}
+      </div>`;
+    }
+
+    this.view.webview.html = `<!DOCTYPE html><html><head><style>
+      body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 8px; font-size: 12px; margin: 0; }
+      .p { border-left: 3px solid #444; padding: 8px 10px; margin-bottom: 8px;
+           background: var(--vscode-editor-background); border-radius: 3px; }
+      .n { font-weight: 600; font-size: 12px; }
+      .a { color: var(--vscode-descriptionForeground); font-size: 10px; margin-bottom: 4px; }
+      .f { font-family: var(--vscode-editor-font-family); font-size: 11px; padding: 2px 0; }
+      .b { display: inline-block; width: 20px; height: 14px; border-radius: 2px; text-align: center;
+           font-size: 9px; font-weight: 700; color: #fff; line-height: 14px; margin-right: 5px;
+           font-family: var(--vscode-font-family); }
+    </style></head><body>${html}</body></html>`;
+  }
+}
+
+function esc(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// --- Server discovery ---
+
+async function discover(): Promise<string> {
+  // Check user setting first
+  const configured = vscode.workspace
     .getConfiguration("aiTeamSync")
-    .get<string>("serverUrl", "http://localhost:8400");
+    .get<string>("serverUrl", "");
+  if (configured && configured !== "http://localhost:8400") {
+    if (await probe(configured)) return configured;
+  }
+
+  // Check .ai-team-sync.toml
+  for (const folder of vscode.workspace.workspaceFolders || []) {
+    try {
+      const toml = await vscode.workspace.fs.readFile(
+        vscode.Uri.joinPath(folder.uri, ".ai-team-sync.toml")
+      );
+      const match = Buffer.from(toml).toString().match(/url\s*=\s*"([^"]+)"/);
+      if (match && (await probe(match[1]))) return match[1];
+    } catch {}
+  }
+
+  // Try common addresses
+  for (const url of ["http://localhost:8400", "http://192.168.50.135:8400"]) {
+    if (await probe(url)) return url;
+  }
+
+  return "";
 }
 
-function apiGet<T>(path: string): Promise<T | null> {
+function probe(url: string): Promise<boolean> {
   return new Promise((resolve) => {
-    const url = `${getServerUrl()}/api${path}`;
     const client = url.startsWith("https") ? https : http;
-
-    client
-      .get(url, { timeout: 5000 }, (res) => {
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => {
-          try {
-            resolve(JSON.parse(data));
-          } catch {
-            resolve(null);
-          }
-        });
-      })
-      .on("error", () => resolve(null))
-      .on("timeout", () => resolve(null));
+    const req = client.get(`${url}/health`, { timeout: 1500 }, (res) => {
+      let data = "";
+      res.on("data", (c) => (data += c));
+      res.on("end", () => {
+        try {
+          resolve(JSON.parse(data)?.status === "ok");
+        } catch {
+          resolve(false);
+        }
+      });
+    });
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => { req.destroy(); resolve(false); });
   });
 }
 
-function apiPost<T>(path: string, body: unknown): Promise<T | null> {
-  return apiRequest<T>("POST", path, body);
-}
-
-function apiPatch<T>(path: string, body: unknown): Promise<T | null> {
-  return apiRequest<T>("PATCH", path, body);
-}
-
-function apiRequest<T>(
-  method: string,
-  path: string,
-  body: unknown
-): Promise<T | null> {
-  return new Promise((resolve) => {
-    const url = new URL(`${getServerUrl()}/api${path}`);
-    const client = url.protocol === "https:" ? https : http;
-    const payload = JSON.stringify(body);
-
-    const req = client.request(
-      {
-        hostname: url.hostname,
-        port: url.port,
-        path: url.pathname,
-        method,
-        timeout: 5000,
-        headers: {
-          "Content-Type": "application/json",
-          "Content-Length": Buffer.byteLength(payload),
-        },
-      },
-      (res) => {
-        let data = "";
-        res.on("data", (chunk) => (data += chunk));
-        res.on("end", () => {
-          try {
-            resolve(JSON.parse(data));
-          } catch {
-            resolve(null);
-          }
-        });
-      }
-    );
-
-    req.on("error", () => resolve(null));
-    req.on("timeout", () => resolve(null));
-    req.write(payload);
-    req.end();
-  });
+async function getGitUser(): Promise<string> {
+  try {
+    const { exec } = require("child_process");
+    return new Promise((resolve) => {
+      exec("git config user.name", (err: any, stdout: string) => {
+        resolve(err ? "unknown" : stdout.trim());
+      });
+    });
+  } catch {
+    return "unknown";
+  }
 }

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 
 from ai_team_sync.database import init_db
 from ai_team_sync.config import settings
-from ai_team_sync.routers import sessions, locks, decisions, override_requests, git_status, websocket
+from ai_team_sync.routers import sessions, locks, decisions, override_requests, git_status, websocket, dashboard, presence_ws
 
 
 @asynccontextmanager
@@ -36,6 +38,14 @@ def create_app() -> FastAPI:
     app.include_router(override_requests.router, prefix="/api")
     app.include_router(git_status.router, prefix="/api")
     app.include_router(websocket.router)
+    app.include_router(dashboard.router)
+    app.include_router(presence_ws.router)
+
+    # Serve extension download
+    project_root = Path(__file__).resolve().parent.parent.parent
+    vsix = project_root / "vscode-extension"
+    if vsix.exists():
+        app.mount("/ext", StaticFiles(directory=str(vsix)), name="extension")
 
     @app.get("/health")
     async def health():
