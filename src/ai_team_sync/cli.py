@@ -12,15 +12,44 @@ import httpx
 DEFAULT_SERVER = "http://localhost:8400"
 
 
+def _repo_root() -> str | None:
+    """Get git repo root, or None if not in a repo."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True, check=True
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return None
+
+
+def _load_team_config() -> dict:
+    """Load .ai-team-sync.toml from repo root if it exists."""
+    from ai_team_sync.config import load_team_config
+    root = _repo_root()
+    if root:
+        from pathlib import Path
+        return load_team_config(Path(root))
+    return {}
+
+
 def _server_url() -> str:
-    return os.environ.get("ATS_SERVER_URL", DEFAULT_SERVER)
+    env = os.environ.get("ATS_SERVER_URL")
+    if env:
+        return env
+    team = _load_team_config()
+    return team.get("server", {}).get("url", DEFAULT_SERVER)
 
 
 def _get_developer() -> str:
-    """Get developer name from git config or environment."""
+    """Get developer name from env, team config, or git config."""
     name = os.environ.get("ATS_DEVELOPER")
     if name:
         return name
+    team = _load_team_config()
+    toml_name = team.get("developer", {}).get("name")
+    if toml_name:
+        return toml_name
     try:
         result = subprocess.run(
             ["git", "config", "user.name"], capture_output=True, text=True, check=True
@@ -425,6 +454,82 @@ def _clear_active_session():
         os.remove(_session_file())
     except FileNotFoundError:
         pass
+
+
+@cli.command()
+def init():
+    """Set up ai-team-sync for this repo. Creates .ai-team-sync.toml and validates the server."""
+    root = _repo_root()
+    if not root:
+        click.echo("Not inside a git repository. Run this from your project root.", err=True)
+        raise SystemExit(1)
+
+    click.echo("ai-team-sync setup\n")
+
+    # Gather settings
+    server_url = click.prompt("Server URL", default=DEFAULT_SERVER)
+    git_name = "unknown"
+    try:
+        result = subprocess.run(
+            ["git", "config", "user.name"], capture_output=True, text=True, check=True
+        )
+        git_name = result.stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+    dev_name = click.prompt("Your name", default=git_name)
+    lock_mode = click.prompt("Default lock mode", default="advisory", type=click.Choice(["advisory", "exclusive"], case_sensitive=False))
+
+    # Write config
+    config_path = os.path.join(root, ".ai-team-sync.toml")
+    toml_content = f"""# ai-team-sync team configuration
+# Commit this file so your team shares the same settings.
+
+[server]
+url = "{server_url}"
+
+[developer]
+name = "{dev_name}"
+
+[locks]
+default_mode = "{lock_mode}"
+"""
+    with open(config_path, "w") as f:
+        f.write(toml_content)
+    click.echo(f"\nWrote {config_path}")
+
+    # Validate server connection
+    click.echo(f"\nConnecting to {server_url}...")
+    try:
+        with httpx.Client(timeout=5) as client:
+            resp = client.get(f"{server_url}/health")
+            if resp.status_code == 200:
+                click.echo("  Server is running.\n")
+            else:
+                click.echo(f"  Server returned {resp.status_code} — check the URL.\n", err=True)
+    except httpx.ConnectError:
+        click.echo("  Could not connect. Start the server with: ats-server\n", err=True)
+    except Exception as e:
+        click.echo(f"  Connection failed: {e}\n", err=True)
+
+    # Show quick start
+    click.echo("Ready! Here's how to use it:\n")
+    click.echo("  # Tell your team what you're working on")
+    click.echo("  ats session start -s 'src/auth/**' -d 'Refactoring auth module'")
+    click.echo()
+    click.echo("  # See what everyone is doing")
+    click.echo("  ats team")
+    click.echo()
+    click.echo("  # Check if a file is locked by a teammate")
+    click.echo("  ats lock check src/auth/login.py")
+    click.echo()
+    click.echo("  # Log why the AI chose a particular approach")
+    click.echo("  ats decision log 'Chose X over Y' -c 'X' -r 'Y' --reason 'because...'")
+    click.echo()
+    click.echo("  # Finish up — releases locks, notifies team")
+    click.echo("  ats session complete -m 'Done, auth refactored'")
+    click.echo()
+    click.echo(f"  # Web dashboard (if server is running)")
+    click.echo(f"  open {server_url}/dashboard")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""MCP server for ai-team-sync."""
+"""MCP server modules for ai-team-sync."""
 
 __all__ = ["create_mcp_server"]
 

@@ -15,3 +15,6 @@ venv/
 htmlcov/
 .coverage
 .ai-team-sync.toml
+node_modules/
+out/
+*.vsix

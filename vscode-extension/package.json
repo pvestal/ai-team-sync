@@ -1,73 +1,49 @@
 {
   "name": "ai-team-sync",
   "displayName": "AI Team Sync",
-  "description": "Real-time toast notifications for AI-assisted team change management",
-  "version": "0.1.0",
+  "description": "See who has what files open — colored badges in your explorer, live",
+  "version": "0.3.0",
   "publisher": "patrickv77",
   "license": "MIT",
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": [
-    "Other"
-  ],
-  "activationEvents": [
-    "onStartupFinished"
-  ],
+  "categories": ["Other"],
+  "activationEvents": ["onStartupFinished"],
   "main": "./out/extension.js",
   "contributes": {
+    "views": {
+      "explorer": [
+        {
+          "type": "webview",
+          "id": "aiTeamSync.sidebar",
+          "name": "Team Sync"
+        }
+      ]
+    },
     "configuration": {
       "title": "AI Team Sync",
       "properties": {
         "aiTeamSync.serverUrl": {
           "type": "string",
           "default": "http://localhost:8400",
-          "description": "URL of the ai-team-sync server"
-        },
-        "aiTeamSync.pollIntervalSeconds": {
-          "type": "number",
-          "default": 15,
-          "description": "How often to poll for team updates (seconds)"
-        },
-        "aiTeamSync.enabled": {
-          "type": "boolean",
-          "default": true,
-          "description": "Enable/disable notifications"
-        },
-        "aiTeamSync.showLockWarnings": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show warnings when editing locked files"
+          "description": "Server URL (auto-discovered if left default)"
         }
       }
-    },
-    "commands": [
-      {
-        "command": "aiTeamSync.showTeamStatus",
-        "title": "AI Team Sync: Show Team Status"
-      },
-      {
-        "command": "aiTeamSync.startSession",
-        "title": "AI Team Sync: Start Session"
-      },
-      {
-        "command": "aiTeamSync.completeSession",
-        "title": "AI Team Sync: Complete Session"
-      },
-      {
-        "command": "aiTeamSync.checkLocks",
-        "title": "AI Team Sync: Check File Locks"
-      }
-    ]
+    }
   },
   "scripts": {
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
-    "package": "npx @vscode/vsce package"
+    "package": "npx @vscode/vsce package --allow-missing-repository"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.0",
     "typescript": "^5.3.0",
     "@vscode/vsce": "^2.22.0"
   }

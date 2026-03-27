@@ -1,54 +1,31 @@
 # ai-team-sync
 
-Change management toolkit for teams working with AI coding agents (Claude Code, Cursor, Copilot Workspace, etc.).
+Stop AI agents from stepping on each other's work.
 
-When multiple developers each work with AI agents, changes happen faster and with larger blast radius than traditional development. **ai-team-sync** gives your team lightweight coordination: scope announcements, conflict prevention, decision logging, and real-time notifications.
+When two devs both tell their AI agents to change the same files, nobody knows until conflicting PRs appear. This gives your team instant visibility — who's working on what, and why.
 
-## The Problem
-
-- Developer A tells Claude Code to refactor the auth module
-- Developer B tells Cursor to update the auth middleware
-- Neither knows about the other until they both open PRs with conflicting changes
-- Nobody recorded *why* the AI chose approach X over Y
-
-## What This Does
-
-```
-Developer Terminal              Team Visibility
-      |                              |
-   ats CLI ────> FastAPI API ───> Slack / Telegram / VS Code
-      |               |
-  git hooks       SQLite/Postgres
-      |               |
-  GitHub Action    Sessions, Locks,
-      |            Decisions
-  PR enrichment
-```
-
-**Sessions** — Declare what you're working on before you start. Your team sees it instantly.
-
-**Scope Locks** — Advisory or exclusive locks on file patterns. Get warned (or blocked) before stepping on someone's work.
-
-**Decision Logs** — Record why your AI chose approach X over Y. Persists beyond the chat session.
-
-**Notifications** — Slack, Telegram, and VS Code toast notifications when teammates start/finish work or hit conflicts.
-
-**PR Enrichment** — GitHub Action that appends session context and decisions to PR descriptions automatically.
-
-## Quick Start
-
-### Install
+## Setup
 
 ```bash
-pip install -e ".[dev]"
+./setup.sh
 ```
 
-### Start the server
+That's it. Installs everything, starts the server, installs the VS Code extension.
 
-```bash
-cp .env.example .env
-# Edit .env with your Slack/Telegram tokens (optional)
-ats-server
+## How to use
+
+**VS Code** (primary interface):
+
+- `Ctrl+Shift+P` → **AI Team Sync: Run Demo** — see what the notifications look like
+- `Ctrl+Shift+P` → **AI Team Sync: Start Session** — tell your team what you're working on
+- `Ctrl+Shift+P` → **AI Team Sync: Complete Session** — release locks, notify team
+- Status bar (bottom-left) shows active session count — click for details
+- Save a locked file → automatic warning toast
+
+**Browser** (for remote teammates or quick glance):
+
+```
+http://YOUR_SERVER:8400/dashboard
 ```
 
 ### MCP Server for Claude Code
@@ -92,9 +69,7 @@ ats decision log "Chose JWT over sessions" \
 
 # See what the team is working on
 ats team
-
-# Done — release locks, notify team
-ats session complete -m "Auth now uses JWT, added refresh token rotation"
+ats session complete -m "Done"
 ```
 
 ## Lock Modes
@@ -117,117 +92,25 @@ ats session start -s "frontend/**" -d "UI updates"
 ats session start -s "backend/database/**" -d "Schema migration" --exclusive
 ```
 
-### Install git hooks (optional)
+## What happens
 
-```bash
-./scripts/install-hooks.sh /path/to/your/repo
-```
+1. You start a session → teammates see a toast in VS Code + dashboard updates
+2. Your file patterns are locked → teammates get warned if they try to edit those files
+3. You log decisions (why approach X over Y) → persists after the chat session ends
+4. You complete → locks release, team gets notified
 
-This installs:
-- **pre-commit**: Warns (or blocks) if you're committing to locked files
-- **post-commit**: Auto-logs commits to your active session
-- **prepare-commit-msg**: Appends session ID to commit messages for PR enrichment
+## Remote access
 
-## VS Code Extension
+The server binds to `0.0.0.0:8400`. Any machine on the network can:
+- Open the dashboard in a browser
+- Point the VS Code extension to the server URL (`aiTeamSync.serverUrl` in settings)
+- Use the CLI with `export ATS_SERVER_URL=http://SERVER_IP:8400`
 
-The `vscode-extension/` directory contains a VS Code extension that:
-- Shows a status bar item with active session count
-- Pops **toast notifications** when teammates start/complete sessions
-- Warns when you save a file that's locked by someone else
-- Provides commands: Start Session, Complete Session, Check Locks, Show Team Status
+## Optional extras
 
-### Install the extension
-
-```bash
-cd vscode-extension
-npm install
-npm run compile
-npm run package
-code --install-extension ai-team-sync-0.1.0.vsix
-```
-
-### Configure
-
-In VS Code settings:
-- `aiTeamSync.serverUrl`: Server URL (default: `http://localhost:8400`)
-- `aiTeamSync.pollIntervalSeconds`: Poll interval (default: 15s)
-- `aiTeamSync.showLockWarnings`: Warn on saving locked files (default: true)
-
-## Configuration
-
-### Team config (`.ai-team-sync.toml` — check into repo)
-
-```toml
-[server]
-url = "http://your-server:8400"
-
-[locks]
-default_mode = "advisory"   # advisory (warn) or exclusive (block)
-ttl_hours = 8               # auto-expire forgotten locks
-
-[notifications]
-events = ["session.started", "session.completed", "lock.conflict"]
-```
-
-### Environment (`.env` — do NOT check in)
-
-```bash
-DATABASE_URL=sqlite+aiosqlite:///ai_team_sync.db
-SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
-TELEGRAM_BOT_TOKEN=123456:ABC-DEF...
-TELEGRAM_CHAT_ID=-100123456789
-```
-
-## GitHub Action
-
-Add the PR enrichment workflow (`.github/workflows/pr-enrichment.yml`) to your repo. It:
-1. Scans commit messages for session IDs (added by the prepare-commit-msg hook)
-2. Fetches session details and decisions from the API
-3. Appends an "AI Session Context" section to the PR body
-
-Set `ATS_SERVER_URL` as a repository variable pointing to your server.
-
-## API Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/health` | Health check |
-| `POST` | `/api/sessions` | Create a session |
-| `GET` | `/api/sessions` | List sessions (filter: `?status=active`) |
-| `GET` | `/api/sessions/{id}` | Get session details |
-| `PATCH` | `/api/sessions/{id}` | Update/complete a session |
-| `POST` | `/api/locks` | Create a scope lock |
-| `GET` | `/api/locks` | List active locks |
-| `POST` | `/api/locks/check` | Check paths against locks |
-| `DELETE` | `/api/locks/{id}` | Delete a lock |
-| `POST` | `/api/decisions` | Log a decision |
-| `GET` | `/api/decisions` | List decisions (filter: `?session_id=...`) |
-| `GET` | `/api/decisions/{id}` | Get decision details |
-
-## Architecture
-
-- **Python 3.11+** with FastAPI and async SQLAlchemy
-- **SQLite** by default (zero infrastructure), **PostgreSQL** for shared teams
-- **Click** CLI with git integration
-- **Notification adapters** for Slack (webhook) and Telegram (Bot API)
-- **VS Code extension** (TypeScript) with polling + toast notifications
-- **GitHub Action** for PR enrichment
-
-## Development
-
-```bash
-# Install with dev dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Format
-black src/ tests/
-
-# Type check
-mypy src/
-```
+- **Git hooks**: `./scripts/install-hooks.sh /path/to/repo` — auto-warns on commits to locked files
+- **Slack/Telegram**: Edit `.env` with webhook URLs for push notifications
+- **GitHub Action**: Auto-appends session context to PR descriptions
 
 ## License
 
