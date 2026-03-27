@@ -199,7 +199,12 @@ async def respond_to_override_request(
 
     # Check if expired
     now = datetime.now(timezone.utc)
-    if request.expires_at < now:
+    # Ensure both datetimes are timezone-aware for comparison
+    expires_at = request.expires_at
+    if expires_at.tzinfo is None:
+        from datetime import timezone as tz
+        expires_at = expires_at.replace(tzinfo=tz.utc)
+    if expires_at < now:
         request.status = "expired"
         await db.commit()
         raise HTTPException(410, "Request has expired")
