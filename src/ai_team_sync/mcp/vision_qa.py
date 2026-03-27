@@ -21,6 +21,9 @@ DB_DSN = os.environ.get(
 
 _pool: asyncpg.Pool | None = None
 
+# Slug computation matching the anime-studio convention
+SLUG_EXPR = "REGEXP_REPLACE(LOWER(REPLACE(name, ' ', '_')), '[^a-z0-9_-]', '', 'g')"
+
 
 async def get_pool() -> asyncpg.Pool:
     global _pool
@@ -81,7 +84,7 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "shot_id": {"type": "integer", "description": "Shot ID"},
+                "shot_id": {"type": "string", "description": "Shot UUID"},
             },
             "required": ["shot_id"],
         },
@@ -97,12 +100,12 @@ TOOLS = [
             "properties": {
                 "project_id": {"type": "integer", "description": "Anime project ID"},
                 "character_slug": {"type": "string", "description": "Filter by character slug (optional)"},
-                "shot_id": {"type": "integer", "description": "Filter by shot ID (optional)"},
+                "shot_id": {"type": "string", "description": "Filter by shot UUID (optional)"},
                 "status": {
                     "type": "string",
-                    "enum": ["pending", "approved", "rejected", "all"],
+                    "enum": ["pending", "approved", "rejected", "unreviewed", "all"],
                     "default": "all",
-                    "description": "Filter by approval status",
+                    "description": "Filter by review_status",
                 },
                 "limit": {"type": "integer", "default": 10, "description": "Max results"},
             },
@@ -132,7 +135,7 @@ TOOLS = [
         inputSchema={
             "type": "object",
             "properties": {
-                "shot_id": {"type": "integer", "description": "Shot being reviewed"},
+                "shot_id": {"type": "string", "description": "Shot UUID being reviewed"},
                 "passed": {"type": "boolean", "description": "Whether the image passes QA"},
                 "issues": {
                     "type": "array",
@@ -177,8 +180,8 @@ async def _list_characters(pool: asyncpg.Pool, args: dict) -> list[TextContent]:
     project_id = args["project_id"]
     include_archived = args.get("include_archived", False)
 
-    query = """
-        SELECT slug, name, entity_type,
+    query = f"""
+        SELECT {SLUG_EXPR} AS slug, name, entity_type,
                lora_path IS NOT NULL AS has_lora,
                lora_trigger,
                COALESCE(archived, false) AS archived
@@ -209,18 +212,18 @@ async def _get_character_spec(pool: asyncpg.Pool, args: dict) -> list[TextConten
     slug = args["character_slug"]
 
     row = await pool.fetchrow(
-        """
-        SELECT c.name, c.slug, c.design_prompt, c.lora_path, c.lora_trigger,
+        f"""
+        SELECT c.name, {SLUG_EXPR} AS slug, c.design_prompt, c.lora_path, c.lora_trigger,
                c.lora_strength, c.identity_block, c.negative_prompt,
                c.visual_prompt_template, c.checkpoint_override,
-               c.entity_type, c.role, c.character_data,
+               c.entity_type, c.role, c.appearance_data,
                c.generation_config, c.reference_images,
                p.name AS project_name,
                gs.checkpoint_model, gs.negative_prompt_template AS project_negative
         FROM characters c
         JOIN projects p ON p.id = c.project_id
-        LEFT JOIN generation_styles gs ON gs.id = p.default_style
-        WHERE c.project_id = $1 AND c.slug = $2
+        LEFT JOIN generation_styles gs ON gs.style_name = p.default_style
+        WHERE c.project_id = $1 AND {SLUG_EXPR} = $2
         """,
         project_id,
         slug,
@@ -244,7 +247,7 @@ async def _get_character_spec(pool: asyncpg.Pool, args: dict) -> list[TextConten
         "visual_prompt_template": row["visual_prompt_template"],
         "checkpoint": row["checkpoint_override"] or row["checkpoint_model"],
         "project_negative": row["project_negative"],
-        "character_data": json.loads(row["character_data"]) if row["character_data"] else None,
+        "appearance_data": json.loads(row["appearance_data"]) if row["appearance_data"] else None,
         "generation_config": json.loads(row["generation_config"]) if row["generation_config"] else None,
         "reference_images": json.loads(row["reference_images"]) if row["reference_images"] else None,
     }
@@ -262,13 +265,13 @@ async def _get_shot_context(pool: asyncpg.Pool, args: dict) -> list[TextContent]
                sh.steps, sh.guidance_scale, sh.duration_seconds,
                sh.image_lora, sh.image_lora_strength,
                sh.content_lora_high, sh.content_lora_low,
-               sh.status, sh.keyframe_status,
+               sh.status, sh.review_status,
                sc.description AS scene_description, sc.location, sc.time_of_day, sc.mood,
                p.id AS project_id, p.name AS project_name, p.content_rating
         FROM shots sh
         JOIN scenes sc ON sc.id = sh.scene_id
         JOIN projects p ON p.id = sc.project_id
-        WHERE sh.id = $1
+        WHERE sh.id = $1::uuid
         """,
         shot_id,
     )
@@ -279,11 +282,12 @@ async def _get_shot_context(pool: asyncpg.Pool, args: dict) -> list[TextContent]
     chars_present = row["characters_present"] or []
     char_specs = []
     if chars_present:
+        # characters_present stores slugs computed from names
         char_rows = await pool.fetch(
-            """
-            SELECT slug, name, design_prompt, lora_trigger, lora_strength, negative_prompt
+            f"""
+            SELECT {SLUG_EXPR} AS slug, name, design_prompt, lora_trigger, lora_strength, negative_prompt
             FROM characters
-            WHERE project_id = $1 AND slug = ANY($2::text[])
+            WHERE project_id = $1 AND {SLUG_EXPR} = ANY($2::text[])
             """,
             row["project_id"],
             chars_present,
@@ -300,9 +304,9 @@ async def _get_shot_context(pool: asyncpg.Pool, args: dict) -> list[TextContent]
         ]
 
     ctx = {
-        "shot_id": row["id"],
+        "shot_id": str(row["id"]),
         "status": row["status"],
-        "keyframe_status": row["keyframe_status"],
+        "review_status": row["review_status"],
         "project": row["project_name"],
         "content_rating": row["content_rating"],
         "scene": {
@@ -345,7 +349,7 @@ async def _get_keyframe_paths(pool: asyncpg.Pool, args: dict) -> list[TextConten
     limit = args.get("limit", 10)
 
     query = """
-        SELECT sh.id AS shot_id, sh.source_image_path, sh.keyframe_status,
+        SELECT sh.id AS shot_id, sh.source_image_path, sh.review_status,
                sh.characters_present, sh.motion_prompt,
                sc.description AS scene_description
         FROM shots sh
@@ -357,17 +361,18 @@ async def _get_keyframe_paths(pool: asyncpg.Pool, args: dict) -> list[TextConten
     idx = 2
 
     if character_slug:
-        query += f" AND ${idx}::text = ANY(sh.characters_present)"
+        query += f" AND ${{idx}}::text = ANY(sh.characters_present)"
+        query = query.replace(f"${{idx}}", f"${idx}")
         params.append(character_slug)
         idx += 1
 
     if shot_id:
-        query += f" AND sh.id = ${idx}"
+        query += f" AND sh.id = ${idx}::uuid"
         params.append(shot_id)
         idx += 1
 
     if status != "all":
-        query += f" AND sh.keyframe_status = ${idx}"
+        query += f" AND sh.review_status = ${idx}"
         params.append(status)
         idx += 1
 
@@ -377,9 +382,9 @@ async def _get_keyframe_paths(pool: asyncpg.Pool, args: dict) -> list[TextConten
     rows = await pool.fetch(query, *params)
     results = [
         {
-            "shot_id": r["shot_id"],
+            "shot_id": str(r["shot_id"]),
             "image_path": r["source_image_path"],
-            "keyframe_status": r["keyframe_status"],
+            "review_status": r["review_status"],
             "characters": r["characters_present"],
             "motion_prompt": r["motion_prompt"],
             "scene": r["scene_description"],
@@ -395,14 +400,14 @@ async def _get_project_summary(pool: asyncpg.Pool, args: dict) -> list[TextConte
     proj = await pool.fetchrow(
         """
         SELECT p.id, p.name, p.genre, p.content_rating,
-               gs.checkpoint_model, gs.name AS style_name,
+               gs.checkpoint_model, gs.style_name AS style_name,
                (SELECT count(*) FROM characters WHERE project_id = p.id AND COALESCE(archived,false) = false) AS char_count,
                (SELECT count(*) FROM shots sh JOIN scenes sc ON sc.id = sh.scene_id WHERE sc.project_id = p.id) AS total_shots,
                (SELECT count(*) FROM shots sh JOIN scenes sc ON sc.id = sh.scene_id WHERE sc.project_id = p.id AND sh.status = 'pending') AS pending_shots,
                (SELECT count(*) FROM shots sh JOIN scenes sc ON sc.id = sh.scene_id WHERE sc.project_id = p.id AND sh.status = 'completed') AS completed_shots,
                (SELECT count(*) FROM scenes WHERE project_id = p.id) AS scene_count
         FROM projects p
-        LEFT JOIN generation_styles gs ON gs.id = p.default_style
+        LEFT JOIN generation_styles gs ON gs.style_name = p.default_style
         WHERE p.id = $1
         """,
         project_id,
@@ -438,7 +443,7 @@ async def _save_review(pool: asyncpg.Pool, args: dict) -> list[TextContent]:
     await pool.execute("""
         CREATE TABLE IF NOT EXISTS vision_qa_reviews (
             id SERIAL PRIMARY KEY,
-            shot_id INTEGER NOT NULL REFERENCES shots(id),
+            shot_id UUID NOT NULL REFERENCES shots(id),
             passed BOOLEAN NOT NULL,
             issues JSONB DEFAULT '[]',
             notes TEXT,
@@ -449,7 +454,7 @@ async def _save_review(pool: asyncpg.Pool, args: dict) -> list[TextContent]:
     review_id = await pool.fetchval(
         """
         INSERT INTO vision_qa_reviews (shot_id, passed, issues, notes)
-        VALUES ($1, $2, $3::jsonb, $4)
+        VALUES ($1::uuid, $2, $3::jsonb, $4)
         RETURNING id
         """,
         shot_id,
