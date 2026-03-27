@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "vision-qa": {
+      "type": "stdio",
+      "command": "vision-qa-mcp",
+      "env": {
+        "VQA_DATABASE_URL": "postgresql://patrick:RP78eIrW7cI2jYvL5akt1yurE@127.0.0.1:5432/anime_production"
+      }
+    }
+  }
+}
