@@ -29,7 +29,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="ai-team-sync",
         description="Change management API for AI-assisted development teams",
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
     app.include_router(sessions.router, prefix="/api")
@@ -62,7 +62,9 @@ def main():
         "ai_team_sync.server:app",
         host=settings.ats_host,
         port=settings.ats_port,
-        reload=True,
+        # reload=False: in production this server is process-managed (e.g. systemd).
+        # uvicorn's StatReload supervisor conflicts with external process tracking.
+        reload=False,
     )
 
 

@@ -72,6 +72,14 @@ ats team
 ats session complete -m "Done"
 ```
 
+### Works with any agent
+
+Each session records *which agent* created it, so `ats team` shows Claude Code
+vs Codex vs Cursor at a glance. Identity resolves from the `ATS_AGENT` env var —
+set it for any agent (`ATS_AGENT=codex`, `ATS_AGENT=ollama:qwen2.5-coder`) — and
+falls back to auto-detecting known agents. Read what other agents have decided
+with `ats decision list --all`.
+
 ## Lock Modes
 
 **Advisory Mode (default)**: Warns about conflicts but allows overlapping work
@@ -101,7 +109,10 @@ ats session start -s "backend/database/**" -d "Schema migration" --exclusive
 
 ## Remote access
 
-The server binds to `0.0.0.0:8400`. Any machine on the network can:
+By default the server binds to `127.0.0.1:8400` (localhost only) — the write API
+is **unauthenticated**, so don't expose it to untrusted networks. To share it
+across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately. Then any machine
+on that network can:
 - Open the dashboard in a browser
 - Point the VS Code extension to the server URL (`aiTeamSync.serverUrl` in settings)
 - Use the CLI with `export ATS_SERVER_URL=http://SERVER_IP:8400`

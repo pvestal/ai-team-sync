@@ -298,7 +298,7 @@ async function discover(): Promise<string> {
   }
 
   // Try common addresses
-  for (const url of ["http://localhost:8400", "http://192.168.50.135:8400"]) {
+  for (const url of ["http://localhost:8400", "http://127.0.0.1:8400"]) {
     if (await probe(url)) return url;
   }
 

@@ -72,9 +72,25 @@ def _get_branch() -> str:
 
 
 def _detect_agent() -> str:
-    """Detect which AI agent is active from environment hints."""
+    """Detect which AI agent is active from environment hints.
+
+    Resolution order:
+      1. ATS_AGENT explicit override — the reliable path for ANY agent
+         (e.g. ATS_AGENT=codex, ATS_AGENT=ollama:qwen2.5-coder). Set this in
+         the agent's environment when it lacks a stable auto-detect signature.
+      2. Known auto-detected env signatures.
+      3. "unknown".
+    """
+    explicit = os.environ.get("ATS_AGENT")
+    if explicit and explicit.strip():
+        return explicit.strip()
     if os.environ.get("CLAUDE_CODE"):
         return "claude-code"
+    # Codex CLI exports CODEX_* vars (e.g. CODEX_SANDBOX*) into the command
+    # environment it runs in. Best-effort signature; prefer ATS_AGENT=codex if
+    # this proves unreliable in a future Codex release.
+    if any(key.startswith("CODEX") for key in os.environ):
+        return "codex"
     if os.environ.get("CURSOR_SESSION"):
         return "cursor"
     if os.environ.get("COPILOT_WORKSPACE"):
@@ -265,9 +281,15 @@ def decision_log(title, chosen, rejected, reason, files):
 
 
 @decision.command("list")
-def decision_list():
-    """List recent decisions."""
-    sid = _load_active_session()
+@click.option("--all", "show_all", is_flag=True,
+              help="Show the whole team's decision log, not just the active session's")
+def decision_list(show_all):
+    """List recent decisions.
+
+    Defaults to the active session's decisions; pass --all to read the
+    team-wide log (what other agents have decided) regardless of your session.
+    """
+    sid = None if show_all else _load_active_session()
     params = {"session_id": sid} if sid else {}
     resp = _api("get", "/decisions", params=params)
     decisions = resp.json()

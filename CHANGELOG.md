@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+- **Multi-agent identity**: `ATS_AGENT` env var explicitly sets the agent for any
+  tool (e.g. `ATS_AGENT=codex`, `ATS_AGENT=ollama:<model>`); best-effort Codex
+  auto-detection via `CODEX_*` env signature.
+- **`ats decision list --all`**: read the whole team's decision log, not just the
+  active session's.
+- `AGENTS.md` contributor guide; tests for agent detection and decision listing.
+
+### Changed
+- **Security:** `ATS_HOST` now defaults to `127.0.0.1` (was `0.0.0.0`); the write
+  API is unauthenticated and should not bind all interfaces by default.
+- `uvicorn` no longer runs with `reload=True` in production (`ats-server`).
+
+### Removed
+- Dropped a bundled, environment-specific `vision-qa` MCP plugin from the public
+  package (it belonged to a private deployment).
+
 ## [0.2.0] - 2026-03-27
 
 ### Added
