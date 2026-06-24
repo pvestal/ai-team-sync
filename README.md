@@ -6,6 +6,10 @@ When two devs both tell their AI agents to change the same files, nobody knows u
 
 > Status: built as a personal multi-agent coordination tool, used daily. Small, dependency-light, MIT-licensed — useful if you run more than one coding agent against the same repo.
 
+![ai-team-sync dashboard — who's working on what, color-coded by developer, with the files each has open](docs/dashboard.png)
+
+*The live dashboard: each agent/developer's open files at a glance, color-coded — so nobody edits the same file blind.*
+
 ## Quickstart
 
 ```bash
