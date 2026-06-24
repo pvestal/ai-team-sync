@@ -61,7 +61,12 @@ class ScopeLock(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
-    pattern: Mapped[str] = mapped_column(String(500))  # glob pattern
+    pattern: Mapped[str] = mapped_column(String(500))  # glob pattern (a real path glob, NOT prose)
+    # Human/agent-readable WHY for this lock. Added 2026-06-24: agents were stuffing
+    # prose into `pattern`, which silently never fnmatch-matches a real path (the lock
+    # then protects nothing) and makes the board illegible. Prose goes here; pattern
+    # stays a glob (enforced by LockCreate validation).
+    reason: Mapped[str] = mapped_column(Text, default="")
     mode: Mapped[str] = mapped_column(String(20), default="advisory")  # advisory|exclusive
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_default_expiry)

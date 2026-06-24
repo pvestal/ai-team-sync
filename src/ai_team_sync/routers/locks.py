@@ -27,6 +27,7 @@ def _lock_to_response(lock: ScopeLock, developer: str | None = None) -> LockResp
         id=lock.id,
         session_id=lock.session_id,
         pattern=lock.pattern,
+        reason=lock.reason or "",
         mode=lock.mode,
         created_at=lock.created_at,
         expires_at=lock.expires_at,
@@ -56,7 +57,9 @@ async def create_lock(body: LockCreate, db: AsyncSession = Depends(get_db)):
     if session.status not in ("active", "paused"):
         raise HTTPException(400, "Session is not active")
 
-    lock = ScopeLock(session_id=body.session_id, pattern=body.pattern, mode=body.mode)
+    lock = ScopeLock(
+        session_id=body.session_id, pattern=body.pattern, mode=body.mode, reason=body.reason
+    )
     db.add(lock)
     await db.commit()
     await db.refresh(lock)
@@ -87,6 +90,7 @@ async def check_locks(body: LockCheckRequest, db: AsyncSession = Depends(get_db)
                     developer=developer,
                     mode=lock.mode,
                     pattern=lock.pattern,
+                    reason=lock.reason or "",
                 ))
                 matched = True
                 break

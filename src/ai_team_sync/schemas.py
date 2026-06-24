@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # --- Session ---
@@ -50,6 +50,28 @@ class LockCreate(BaseModel):
     session_id: str
     pattern: str
     mode: str = "advisory"
+    reason: str = ""  # human/agent-readable WHY; put prose HERE, never in `pattern`
+
+    @field_validator("pattern")
+    @classmethod
+    def _pattern_must_be_a_glob_not_prose(cls, v: str) -> str:
+        """A lock pattern must be a path glob, not a sentence.
+
+        Agents (incl. me) stuffed descriptions into `pattern`; a sentence never
+        fnmatch-matches a real path, so the lock silently protects nothing. Reject
+        prose early and point the caller at `reason`.
+        """
+        v = (v or "").strip()
+        if not v:
+            raise ValueError("pattern must be a non-empty path glob (e.g. 'src/**', 'pkg/foo.py')")
+        if " " in v or "\t" in v or "\n" in v:
+            raise ValueError(
+                "pattern looks like prose (contains whitespace); it must be a path glob "
+                "like 'packages/scene_generation/builder.py' or 'src/**'. Put the description in `reason`."
+            )
+        if len(v) > 200:
+            raise ValueError("pattern too long to be a glob; put the description in `reason`")
+        return v
 
 
 class LockCheckRequest(BaseModel):
@@ -64,12 +86,14 @@ class LockCheckResult(BaseModel):
     developer: str | None = None
     mode: str | None = None
     pattern: str | None = None
+    reason: str | None = None  # WHY the path is locked (surfaced so the blocker is actionable)
 
 
 class LockResponse(BaseModel):
     id: str
     session_id: str
     pattern: str
+    reason: str = ""
     mode: str
     created_at: datetime
     expires_at: datetime

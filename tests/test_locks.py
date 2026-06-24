@@ -60,6 +60,48 @@ async def test_list_locks(client):
 
 
 @pytest.mark.asyncio
+async def test_lock_reason_roundtrips_and_surfaces_in_check(client):
+    # A lock carries a human-readable reason; pattern stays a real glob.
+    sresp = await client.post("/api/sessions", json={"developer": "patrick", "auto_lock": False})
+    sid = sresp.json()["id"]
+    lresp = await client.post("/api/locks", json={
+        "session_id": sid, "pattern": "packages/scene_generation/builder.py",
+        "mode": "exclusive", "reason": "modularizing builder.py (#1512)",
+    })
+    assert lresp.status_code == 201
+    assert lresp.json()["reason"] == "modularizing builder.py (#1512)"
+
+    # check surfaces the reason so a blocked agent knows WHY
+    cresp = await client.post("/api/locks/check", json={"paths": ["packages/scene_generation/builder.py"]})
+    r = cresp.json()[0]
+    assert r["locked"] is True
+    assert r["reason"] == "modularizing builder.py (#1512)"
+
+
+@pytest.mark.asyncio
+async def test_prose_pattern_is_rejected(client):
+    # The exact anti-pattern: a sentence as the lock pattern. Must 422 (it would
+    # never fnmatch a real path -> a silent no-op lock).
+    sresp = await client.post("/api/sessions", json={"developer": "patrick", "auto_lock": False})
+    sid = sresp.json()["id"]
+    resp = await client.post("/api/locks", json={
+        "session_id": sid,
+        "pattern": "composition routing consolidation: wire total_body_count into select_keyframe_method",
+        "mode": "advisory",
+    })
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_valid_globs_accepted(client):
+    sresp = await client.post("/api/sessions", json={"developer": "patrick", "auto_lock": False})
+    sid = sresp.json()["id"]
+    for pat in ("src/**", "packages/foo/bar.py", "*.py"):
+        resp = await client.post("/api/locks", json={"session_id": sid, "pattern": pat})
+        assert resp.status_code == 201, f"{pat} should be a valid glob"
+
+
+@pytest.mark.asyncio
 async def test_delete_lock(client):
     resp = await client.post("/api/sessions", json={
         "developer": "patrick",

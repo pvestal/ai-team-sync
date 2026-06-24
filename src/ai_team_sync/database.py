@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from ai_team_sync.config import settings
+
+
+# Idempotent lightweight column additions for existing DBs (init_db uses create_all,
+# which creates missing TABLES but never alters existing ones). Each entry is applied
+# inside try/except so a re-run / already-present column is a harmless no-op. Keep
+# these append-only and backwards-compatible (new nullable/defaulted columns only).
+_COLUMN_MIGRATIONS = [
+    ("scope_locks", "reason", "TEXT DEFAULT ''"),
+]
 
 engine = create_async_engine(
     settings.database_url,
@@ -23,8 +33,13 @@ async def get_db():
 
 
 async def init_db():
-    """Create all tables."""
+    """Create all tables, then apply idempotent column additions for existing DBs."""
     from ai_team_sync.models import Base
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        for table, column, coldef in _COLUMN_MIGRATIONS:
+            try:
+                await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}"))
+            except Exception:
+                pass  # column already exists (or DB doesn't support it) — harmless
