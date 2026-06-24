@@ -172,3 +172,19 @@ class OverrideRequestResponse(BaseModel):
 class OverrideRequestRespond(BaseModel):
     approved: bool
     message: str = ""
+
+
+# --- Presence (HTTP, for hook-driven auto-emit; WS path is for the live UI) ---
+
+class PresenceUpdate(BaseModel):
+    developer: str
+    agent: str = "unknown"
+    files: list[str] = Field(default_factory=list)
+    intent: str = ""  # one-line WHAT they're doing
+
+
+class PresenceEntry(BaseModel):
+    developer: str
+    agent: str
+    files: list[str]
+    intent: str = ""

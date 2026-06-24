@@ -50,10 +50,11 @@ dev = [
 ats = "ai_team_sync.cli:cli"
 ats-server = "ai_team_sync.server:main"
 ats-mcp = "ai_team_sync.mcp.server:main"
+ats-presence-hook = "ai_team_sync.hooks.post_tool_use_presence:main"
 
 [project.urls]
-Homepage = "https://github.com/patrickv77/ai-team-sync"
-Repository = "https://github.com/patrickv77/ai-team-sync"
+Homepage = "https://github.com/pvestal/ai-team-sync"
+Repository = "https://github.com/pvestal/ai-team-sync"
 
 [tool.setuptools.packages.find]
 where = ["src"]

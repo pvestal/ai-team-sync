@@ -173,6 +173,7 @@ on that network can:
 ## Optional extras
 
 - **Git hooks**: `./scripts/install-hooks.sh /path/to/repo` — auto-warns on commits to locked files
+- **Agent edit hook** (auto-presence): wire `ats-presence-hook` as a Claude Code `PostToolUse` hook on `Edit|Write|MultiEdit` and your agent broadcasts what it's editing — and why — with zero manual steps. Set `ATS_INTENT="..."` once per session for the one-line intent. See the docstring in `src/ai_team_sync/hooks/post_tool_use_presence.py`.
 - **Slack/Telegram**: Edit `.env` with webhook URLs for push notifications
 - **GitHub Action**: Auto-appends session context to PR descriptions
 
