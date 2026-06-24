@@ -10,9 +10,23 @@ from __future__ import annotations
 from fastapi import APIRouter
 
 from ai_team_sync.presence import store
-from ai_team_sync.schemas import PresenceEntry, PresenceUpdate
+from ai_team_sync.schemas import (
+    PresenceEntry,
+    PresenceUpdate,
+    WhosEditingRequest,
+    WhosEditingResult,
+)
 
 router = APIRouter(prefix="/presence", tags=["presence"])
+
+
+def _path_matches(query: str, presence_file: str) -> bool:
+    """Match a queried path against a presence file, tolerant of absolute vs
+    repo-relative forms (e.g. '/repo/src/x.py' vs 'src/x.py')."""
+    a, b = query.strip(), presence_file.strip()
+    if not a or not b:
+        return False
+    return a == b or a.endswith("/" + b) or b.endswith("/" + a)
 
 
 @router.post("", response_model=list[PresenceEntry])
@@ -27,3 +41,24 @@ async def update_presence(body: PresenceUpdate):
 async def list_presence():
     """Who is actively editing right now (non-stale presence)."""
     return store.get_all()
+
+
+@router.post("/check", response_model=list[WhosEditingResult])
+async def whos_editing(body: WhosEditingRequest):
+    """For each path, who else is actively editing it right now (+ their intent).
+
+    The consume side of agent file-awareness (slice 3): an agent calls this BEFORE
+    editing to self-coordinate ("someone is in this file → pick another / wait").
+    Live presence only — declared scope locks are a separate check (/locks/check).
+    """
+    present = store.get_all()
+    results = []
+    for path in body.paths:
+        editors = [
+            PresenceEntry(**p)
+            for p in present
+            if p["developer"] != body.exclude_developer
+            and any(_path_matches(path, f) for f in p["files"])
+        ]
+        results.append(WhosEditingResult(path=path, editors=editors))
+    return results

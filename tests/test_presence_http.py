@@ -7,6 +7,7 @@ import pytest
 
 from ai_team_sync.hooks.post_tool_use_presence import build_presence, _display_path
 from ai_team_sync.presence import store
+from ai_team_sync.routers.presence_http import _path_matches
 
 
 @pytest.fixture(autouse=True)
@@ -98,3 +99,42 @@ def test_build_presence_developer_from_env():
     assert body["developer"] == "carol"
     assert body["agent"] == "claude-code"   # default
     assert body["files"] == ["y.py"]
+
+
+# --- whos_editing (slice 3) ---
+
+@pytest.mark.parametrize("query,pfile,expected", [
+    ("src/auth/jwt.py", "src/auth/jwt.py", True),               # exact
+    ("/repo/src/auth/jwt.py", "src/auth/jwt.py", True),          # absolute query vs rel
+    ("src/auth/jwt.py", "/repo/src/auth/jwt.py", True),          # rel query vs absolute
+    ("src/auth/jwt.py", "src/auth/middleware.py", False),        # different file
+    ("auth/jwt.py", "src/auth/jwt.py", True),                    # suffix
+    ("", "src/x.py", False),
+])
+def test_path_matches(query, pfile, expected):
+    assert _path_matches(query, pfile) is expected
+
+
+@pytest.mark.asyncio
+async def test_whos_editing_reports_other_editor(client):
+    await client.post("/api/presence", json={
+        "developer": "alice", "agent": "claude-code",
+        "files": ["src/auth/jwt.py"], "intent": "rewriting token validation"})
+
+    # bob checks the same file (excluding himself)
+    resp = await client.post("/api/presence/check", json={
+        "paths": ["src/auth/jwt.py", "src/db/orm.py"], "exclude_developer": "bob"})
+    assert resp.status_code == 200
+    by_path = {r["path"]: r for r in resp.json()}
+    assert by_path["src/auth/jwt.py"]["editors"][0]["developer"] == "alice"
+    assert by_path["src/auth/jwt.py"]["editors"][0]["intent"] == "rewriting token validation"
+    assert by_path["src/db/orm.py"]["editors"] == []   # nobody there
+
+
+@pytest.mark.asyncio
+async def test_whos_editing_excludes_self(client):
+    await client.post("/api/presence", json={
+        "developer": "alice", "agent": "claude-code", "files": ["src/auth/jwt.py"]})
+    resp = await client.post("/api/presence/check", json={
+        "paths": ["src/auth/jwt.py"], "exclude_developer": "alice"})
+    assert resp.json()[0]["editors"] == []   # alice excludes herself -> clear

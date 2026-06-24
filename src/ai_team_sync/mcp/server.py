@@ -153,6 +153,21 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="whos_editing",
+            description="Before editing, check who else is ACTIVELY editing these files right now (live presence + their intent). Use to self-coordinate: if someone is already in a file, pick another, wait, or coordinate. Distinct from check_locks (declared scope locks) — this is real-time 'who has hands on it now'.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "File paths you're about to edit (e.g., ['src/auth/jwt.py'])",
+                    },
+                },
+                "required": ["paths"],
+            },
+        ),
+        Tool(
             name="request_override",
             description="Request permission to work on files locked by someone else. Use when blocked by exclusive lock. Keywords 'urgent', 'security', 'hotfix', 'critical' may auto-approve.",
             inputSchema={
@@ -436,6 +451,32 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 else:
                     msg += "⚠️ Advisory locks - you can proceed but coordinate with team members."
 
+                return [TextContent(type="text", text=msg)]
+
+            elif name == "whos_editing":
+                paths = arguments["paths"]
+                response = await client.post(
+                    f"{SERVER_URL}/api/presence/check",
+                    json={"paths": paths, "exclude_developer": get_git_user()},
+                )
+                response.raise_for_status()
+                results = response.json()
+
+                busy = [r for r in results if r["editors"]]
+                if not busy:
+                    return [TextContent(
+                        type="text",
+                        text="✅ Nobody else is editing these files right now. Clear to go.",
+                    )]
+
+                msg = "👤 Someone else is actively editing right now:\n\n"
+                for r in busy:
+                    msg += f"📝 {r['path']}\n"
+                    for e in r["editors"]:
+                        intent = f" — {e['intent']}" if e.get("intent") else ""
+                        msg += f"   {e['developer']} ({e['agent']}){intent}\n"
+                    msg += "\n"
+                msg += "Consider editing a different file, waiting, or coordinating before you touch these."
                 return [TextContent(type="text", text=msg)]
 
             elif name == "request_override":

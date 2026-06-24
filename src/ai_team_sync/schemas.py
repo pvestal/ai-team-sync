@@ -188,3 +188,13 @@ class PresenceEntry(BaseModel):
     agent: str
     files: list[str]
     intent: str = ""
+
+
+class WhosEditingRequest(BaseModel):
+    paths: list[str]
+    exclude_developer: str = ""  # omit yourself so you only see OTHER active editors
+
+
+class WhosEditingResult(BaseModel):
+    path: str
+    editors: list[PresenceEntry] = Field(default_factory=list)  # others active on this path
