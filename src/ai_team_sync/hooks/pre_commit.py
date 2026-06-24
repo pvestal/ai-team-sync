@@ -47,16 +47,20 @@ def main():
         else:
             warned.append(r)
 
+    def _why(r):
+        reason = r.get("reason")
+        return f' — "{reason}"' if reason else ""
+
     if warned:
         print("\n[ai-team-sync] WARNING — these files overlap with active scope locks:")
         for r in warned:
-            print(f"  {r['path']} — locked by {r['developer']} (pattern: {r['pattern']})")
+            print(f"  {r['path']} — locked by {r['developer']} (pattern: {r['pattern']}){_why(r)}")
         print()
 
     if blocked:
         print("\n[ai-team-sync] BLOCKED — these files have exclusive locks:")
         for r in blocked:
-            print(f"  {r['path']} — locked by {r['developer']} (pattern: {r['pattern']})")
+            print(f"  {r['path']} — locked by {r['developer']} (pattern: {r['pattern']}){_why(r)}")
         print("\nCommit blocked. Coordinate with the lock holder or use: ats lock list")
         sys.exit(1)
 

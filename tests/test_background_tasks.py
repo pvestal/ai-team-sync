@@ -9,7 +9,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import select
 
-from ai_team_sync.background_tasks import check_expired_locks, expire_stale_override_requests
+from ai_team_sync.background_tasks import (
+    auto_complete_stale_sessions,
+    check_expired_locks,
+    expire_stale_override_requests,
+)
+from ai_team_sync.config import settings
 from ai_team_sync.models import OverrideRequest, ScopeLock, Session
 
 
@@ -67,3 +72,41 @@ async def test_expire_stale_override_requests(db_session):
     rows = (await db_session.execute(select(OverrideRequest))).scalars().all()
     by_status = sorted(r.status for r in rows)
     assert by_status == ["expired", "pending"]
+
+
+@pytest.mark.asyncio
+async def test_auto_complete_stale_session_but_keep_recent(db_session):
+    h = settings.session_inactivity_hours
+    stale = Session(developer="patrick",
+                    started_at=_utcnow() - timedelta(hours=h + 1))   # idle past window
+    recent = Session(developer="patrick",
+                     started_at=_utcnow() - timedelta(minutes=5))    # fresh
+    db_session.add_all([stale, recent])
+    await db_session.commit()
+
+    n = await auto_complete_stale_sessions(db_session)
+    assert n == 1
+
+    await db_session.refresh(stale)
+    await db_session.refresh(recent)
+    assert stale.status == "completed"
+    assert stale.completed_at is not None
+    assert "auto-completed" in (stale.summary or "")
+    assert recent.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_recent_lock_keeps_old_session_alive(db_session):
+    h = settings.session_inactivity_hours
+    sess = Session(developer="patrick",
+                   started_at=_utcnow() - timedelta(hours=h + 5))  # old start...
+    db_session.add(sess)
+    await db_session.flush()
+    # ...but a fresh lock = recent activity, so it must NOT be auto-completed
+    db_session.add(ScopeLock(session_id=sess.id, pattern="src/**",
+                             created_at=_utcnow() - timedelta(minutes=2)))
+    await db_session.commit()
+
+    assert await auto_complete_stale_sessions(db_session) == 0
+    await db_session.refresh(sess)
+    assert sess.status == "active"

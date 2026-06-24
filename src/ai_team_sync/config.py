@@ -30,6 +30,11 @@ class Settings(BaseSettings):
     lock_ttl_hours: int = 8
     lock_default_mode: str = "advisory"
 
+    # Sessions: auto-complete an 'active' session after this many hours with no
+    # activity (no new locks/commits/decisions). Stops phantom-active sessions from
+    # lingering on the board (and holding the lane) when an agent forgets to complete.
+    session_inactivity_hours: int = 12
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 
 
