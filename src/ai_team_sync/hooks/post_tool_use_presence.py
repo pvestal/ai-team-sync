@@ -29,6 +29,11 @@ import sys
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 
+# Paths that are noise, not "what I'm working on" — skip so presence stays meaningful.
+_SKIP_SUBSTR = ("/.git/", "/node_modules/", "/__pycache__/", "/.venv/", "/scratchpad/",
+                "/.claude/", "/.playwright-mcp/")
+_SKIP_PREFIX = ("/tmp/", "/var/tmp/", "/private/tmp/")
+
 
 def _developer() -> str:
     if os.environ.get("ATS_DEVELOPER"):
@@ -43,28 +48,53 @@ def _developer() -> str:
     return os.environ.get("USER", "unknown")
 
 
-def _relativize(path: str, cwd: str | None) -> str:
-    if not path:
-        return path
-    try:
-        if cwd and os.path.isabs(path):
-            return os.path.relpath(path, cwd)
-    except Exception:
-        pass
-    return path
+def _is_noise(path: str) -> bool:
+    """True for temp/scratch/vendored paths that aren't meaningful work."""
+    if any(path.startswith(p) for p in _SKIP_PREFIX):
+        return True
+    return any(s in path for s in _SKIP_SUBSTR)
+
+
+def _git_root(path: str) -> str | None:
+    """Walk up from the file's directory to the enclosing git repo root, if any."""
+    d = os.path.dirname(os.path.abspath(path))
+    while True:
+        if os.path.isdir(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _display_path(path: str, cwd: str | None) -> str:
+    """Clean, legible path: repo-relative if in a git repo, else cwd-relative if that
+    stays inside cwd, else the bare basename (never an ugly ../../ escape)."""
+    root = _git_root(path)
+    if root:
+        try:
+            return os.path.relpath(path, root)
+        except Exception:
+            pass
+    if cwd and os.path.isabs(path):
+        rel = os.path.relpath(path, cwd)
+        if not rel.startswith(".."):
+            return rel
+    return os.path.basename(path)
 
 
 def build_presence(payload: dict, env: dict) -> dict | None:
     """Pure: PostToolUse payload + env -> presence POST body, or None to skip.
 
-    Returns None for non-edit tools or payloads with no file_path (nothing to report).
+    Returns None for non-edit tools, payloads with no file_path, or noise paths
+    (temp/scratch/vendored) — so presence reflects real work, not churn.
     """
     if payload.get("tool_name") not in EDIT_TOOLS:
         return None
     file_path = (payload.get("tool_input") or {}).get("file_path")
-    if not file_path:
+    if not file_path or _is_noise(file_path):
         return None
-    rel = _relativize(file_path, payload.get("cwd") or env.get("PWD"))
+    rel = _display_path(file_path, payload.get("cwd") or env.get("PWD"))
     return {
         "developer": env.get("ATS_DEVELOPER") or _developer(),
         "agent": env.get("ATS_AGENT", "claude-code"),

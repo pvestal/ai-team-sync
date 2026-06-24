@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import pytest
 
-from ai_team_sync.hooks.post_tool_use_presence import build_presence
+from ai_team_sync.hooks.post_tool_use_presence import build_presence, _display_path
 from ai_team_sync.presence import store
 
 
@@ -60,6 +60,34 @@ def test_build_presence_skips_non_edit_tools():
 
 def test_build_presence_skips_when_no_file_path():
     assert build_presence({"tool_name": "Edit", "tool_input": {}}, {}) is None
+
+
+@pytest.mark.parametrize("path", [
+    "/tmp/claude-xyz/scratch.txt",
+    "/home/me/proj/.git/COMMIT_EDITMSG",
+    "/home/me/proj/node_modules/x/index.js",
+    "/home/me/proj/scratchpad/probe.txt",
+    "/home/me/.claude/settings.json",
+])
+def test_build_presence_skips_noise_paths(path):
+    assert build_presence({"tool_name": "Edit", "tool_input": {"file_path": path}}, {}) is None
+
+
+def test_display_path_is_repo_relative_for_in_repo_file(tmp_path):
+    # a file inside a git repo renders relative to the repo root, not ../../ junk
+    (tmp_path / ".git").mkdir()
+    f = tmp_path / "src" / "mod.py"
+    f.parent.mkdir(parents=True)
+    f.write_text("x")
+    assert _display_path(str(f), cwd="/somewhere/else") == "src/mod.py"
+
+
+def test_display_path_basename_when_outside_cwd_and_no_repo(tmp_path):
+    # no .git anywhere up-tree, and path escapes cwd -> bare basename, never ../../
+    f = tmp_path / "loose.txt"
+    f.write_text("x")
+    out = _display_path(str(f), cwd="/completely/unrelated")
+    assert out == "loose.txt"
 
 
 def test_build_presence_developer_from_env():
