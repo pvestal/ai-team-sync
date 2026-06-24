@@ -43,9 +43,12 @@ def _render(presence: list[dict]) -> str:
             f'<div class="file"><span class="badge" style="background:{c}">{initials}</span> {_esc(f)}</div>'
             for f in p["files"]
         )
+        intent = p.get("intent")
+        intent_html = f'<div class="intent">{_esc(intent)}</div>' if intent else ""
         cards += f"""<div class="card" style="border-left-color:{c}">
           <div class="dev" style="color:{c}">{_esc(p["developer"])}</div>
           <div class="agent">{_esc(p["agent"])}</div>
+          {intent_html}
           {files}
         </div>"""
 
@@ -69,6 +72,8 @@ def _render(presence: list[dict]) -> str:
            background: #161b22; border-radius: 4px; }}
   .dev {{ font-weight: 600; font-size: 0.95rem; }}
   .agent {{ color: #8b949e; font-size: 0.78rem; margin-bottom: 8px; }}
+  .intent {{ color: #c9d1d9; font-size: 0.85rem; font-style: italic; margin-bottom: 8px;
+             padding-left: 8px; border-left: 2px solid #30363d; }}
   .file {{ padding: 3px 0; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.82rem; }}
   .badge {{ display: inline-block; width: 22px; height: 16px; border-radius: 3px; text-align: center;
             font-size: 0.65rem; font-weight: 700; color: #fff; line-height: 16px; margin-right: 6px;

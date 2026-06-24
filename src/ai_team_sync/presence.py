@@ -14,6 +14,7 @@ class DevPresence:
     developer: str
     agent: str
     files: list[str] = field(default_factory=list)
+    intent: str = ""  # one-line WHAT they're doing ("rewriting token validation")
     last_seen: float = field(default_factory=time.time)
 
 
@@ -22,9 +23,9 @@ class PresenceStore:
         self._devs: dict[str, DevPresence] = {}  # keyed by developer name
         self._connections: list[asyncio.Queue] = []
 
-    def update(self, developer: str, agent: str, files: list[str]):
+    def update(self, developer: str, agent: str, files: list[str], intent: str = ""):
         self._devs[developer] = DevPresence(
-            developer=developer, agent=agent, files=files, last_seen=time.time()
+            developer=developer, agent=agent, files=files, intent=intent, last_seen=time.time()
         )
 
     def remove(self, developer: str):
@@ -33,7 +34,7 @@ class PresenceStore:
     def get_all(self) -> list[dict]:
         self._evict()
         return [
-            {"developer": d.developer, "agent": d.agent, "files": d.files}
+            {"developer": d.developer, "agent": d.agent, "files": d.files, "intent": d.intent}
             for d in self._devs.values()
             if d.files
         ]

@@ -26,7 +26,8 @@ async def presence_ws(ws: WebSocket):
                 msg = json.loads(raw)
                 if msg.get("type") == "presence":
                     developer = msg["developer"]
-                    store.update(msg["developer"], msg.get("agent", "?"), msg.get("files", []))
+                    store.update(msg["developer"], msg.get("agent", "?"),
+                                 msg.get("files", []), msg.get("intent", ""))
                     await store.broadcast()
         except (WebSocketDisconnect, Exception):
             pass
