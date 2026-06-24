@@ -941,5 +941,15 @@ async def main():
         )
 
 
-if __name__ == "__main__":
+def run() -> None:
+    """Sync console-script entry point — the `ats-mcp` script targets this.
+
+    The entry point must be sync: pointing it at the async `main` makes the wrapper
+    call it and discard the coroutine ('coroutine was never awaited', exit 1), so the
+    stdio server never starts.
+    """
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    run()
