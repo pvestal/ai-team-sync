@@ -1,8 +1,15 @@
 # ai-team-sync
 
-Stop AI agents from stepping on each other's work.
+Stop AI agents (and humans) from stepping on each other's work.
 
-When two devs both tell their AI agents to change the same files, nobody knows until conflicting PRs appear. This gives your team instant visibility — who's working on what, and why.
+When two devs both tell their AI agents to change the same files, nobody knows until conflicting PRs appear. ai-team-sync gives instant visibility — who's working on what, and why — through declared **sessions**, file **scope locks** (advisory or exclusive), and logged **decisions**. It surfaces in VS Code, a browser dashboard, a CLI, and natively in Claude Code via MCP.
+
+> Status: built as a personal multi-agent coordination tool, used daily. Small, dependency-light, MIT-licensed — useful if you run more than one coding agent against the same repo.
+
+## Requirements
+
+- Python **3.11+**
+- SQLite (bundled) for local use, or Postgres (`asyncpg`) for a shared server
 
 ## Setup
 
@@ -11,6 +18,16 @@ When two devs both tell their AI agents to change the same files, nobody knows u
 ```
 
 That's it. Installs everything, starts the server, installs the VS Code extension.
+
+### Manual install (from source)
+
+```bash
+pip install -e .            # or:  pip install -e ".[dev]"  to run the tests
+ats-server                  # starts the API + dashboard on :8400
+pytest                      # run the test suite (needs the [dev] extra)
+```
+
+Console entry points: `ats` (CLI), `ats-server` (API/dashboard), `ats-mcp` (MCP server for Claude Code).
 
 ## How to use
 
@@ -58,6 +75,9 @@ ats session start -s "src/auth/**" -d "Refactoring auth to use JWT"
 
 # Start with exclusive lock (blocks all overlapping work)
 ats session start -s "src/auth/**" -d "Critical auth refactor" --exclusive
+
+# Lock a path with a reason (the WHY is shown to anyone it blocks)
+ats lock add "src/auth/**" --mode exclusive --reason "JWT migration, #1234"
 
 # Check if a file is locked by someone else
 ats lock check src/auth/middleware.py

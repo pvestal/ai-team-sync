@@ -226,12 +226,36 @@ def lock_check(paths):
         if r["locked"]:
             any_locked = True
             icon = "BLOCKED" if r["mode"] == "exclusive" else "WARNING"
-            click.echo(f"  [{icon}] {r['path']} — locked by {r['developer']} (pattern: {r['pattern']})")
+            why = f' — "{r["reason"]}"' if r.get("reason") else ""
+            click.echo(f"  [{icon}] {r['path']} — locked by {r['developer']} (pattern: {r['pattern']}){why}")
         else:
             click.echo(f"  [ok] {r['path']}")
 
     if any_locked:
         raise SystemExit(1)
+
+
+@lock.command("add")
+@click.argument("pattern")
+@click.option("--mode", type=click.Choice(["advisory", "exclusive"]), default="advisory",
+              help="advisory (warn on overlap) or exclusive (block overlap)")
+@click.option("--reason", default="", help="Why this path is locked (shown to anyone it blocks)")
+def lock_add(pattern, mode, reason):
+    """Add a scope lock to the current session.
+
+    PATTERN must be a path glob (e.g. 'src/**', 'pkg/foo.py'), not prose — put the
+    description in --reason. The server rejects prose patterns.
+    """
+    sid = _load_active_session()
+    if not sid:
+        click.echo("No active session. Start one first with: ats session start", err=True)
+        raise SystemExit(1)
+    resp = _api("post", "/locks", json={
+        "session_id": sid, "pattern": pattern, "mode": mode, "reason": reason,
+    })
+    lock = resp.json()
+    why = f" — {reason}" if reason else ""
+    click.echo(f"Locked {lock['pattern']} ({lock['mode']}){why}")
 
 
 @lock.command("list")
@@ -245,7 +269,8 @@ def lock_list():
         return
 
     for l in locks:
-        click.echo(f"  {l['pattern']} ({l['mode']}) — {l.get('developer', '?')}  expires: {l['expires_at']}")
+        why = f"  reason: {l['reason']}" if l.get("reason") else ""
+        click.echo(f"  {l['pattern']} ({l['mode']}) — {l.get('developer', '?')}  expires: {l['expires_at']}{why}")
 
 
 # --- Decision commands ---
