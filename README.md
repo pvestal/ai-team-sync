@@ -6,6 +6,35 @@ When two devs both tell their AI agents to change the same files, nobody knows u
 
 > Status: built as a personal multi-agent coordination tool, used daily. Small, dependency-light, MIT-licensed — useful if you run more than one coding agent against the same repo.
 
+## Quickstart
+
+```bash
+# 1. install + run the server (API + dashboard on :8400)
+pip install -e .
+ats-server &
+
+# 2. announce what you're working on — teammates/agents see it instantly
+ats session start -s "src/auth/**" -d "Refactoring auth to JWT"
+
+# 3. claim a path so others get blocked/warned, with a reason they can see
+ats lock add "src/auth/**" --mode exclusive --reason "JWT migration, #1234"
+
+# 4. before you touch a file, check it's free
+ats lock check src/auth/middleware.py        # exits non-zero if locked
+
+# 5. see who's working on what
+ats team
+
+# 6. record a decision so it outlives the chat session
+ats decision log "Chose JWT over sessions" -c JWT -r "session cookies" \
+  --reason "stateless auth for horizontal scaling"
+
+# 7. wrap up — releases locks, notifies the team
+ats session complete -m "Done"
+```
+
+Dashboard: `http://localhost:8400/dashboard`. For Claude Code, wire up the [MCP server](#mcp-server-for-claude-code) so it does steps 3–4 automatically.
+
 ## Requirements
 
 - Python **3.11+**
