@@ -53,14 +53,36 @@ def get_git_branch() -> str:
 
 
 def detect_agent() -> str:
-    """Detect which AI agent is active."""
-    if os.environ.get("CLAUDE_CODE"):
+    """Detect which AI agent is active.
+
+    Honors ATS_AGENT (explicit override) first, then known env signatures.
+    NOTE: Claude Code sets CLAUDECODE (no underscore) — the old CLAUDE_CODE-only
+    check returned 'unknown', which is why concurrent sessions all showed as the
+    git user with '(unknown)' (#1556). Mirrors cli._detect_agent.
+    """
+    explicit = (os.environ.get("ATS_AGENT") or "").strip()
+    if explicit:
+        return explicit
+    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE"):
         return "claude-code"
+    if os.environ.get("CODEX_SANDBOX") or os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED"):
+        return "codex"
     if os.environ.get("CURSOR_SESSION"):
         return "cursor"
     if os.environ.get("COPILOT_WORKSPACE"):
         return "copilot-workspace"
     return "unknown"
+
+
+def session_agent_label() -> str:
+    """Per-session agent identity: base agent type + a short session token so two
+    CONCURRENT sessions of the same agent are distinguishable (#1556) instead of
+    collapsing to one 'claude-code'. Token from CLAUDE_CODE_SESSION_ID / ATS_SESSION.
+    """
+    base = detect_agent()
+    sid = (os.environ.get("CLAUDE_CODE_SESSION_ID")
+           or os.environ.get("ATS_SESSION") or "").strip()
+    return f"{base}:{sid[:8]}" if (sid and base != "unknown") else base
 
 
 def save_session_id(session_id: str):
@@ -391,7 +413,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                     f"{SERVER_URL}/api/sessions",
                     json={
                         "developer": get_git_user(),
-                        "agent": detect_agent(),
+                        "agent": session_agent_label(),
                         "scope": scope,
                         "description": description,
                         "branch": get_git_branch(),
