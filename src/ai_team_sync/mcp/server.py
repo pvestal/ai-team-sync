@@ -379,6 +379,31 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="extend_scope",
+            description=(
+                "Add file-glob patterns to your CURRENT session's scope mid-session, "
+                "without starting a new session. Updates the board scope and creates "
+                "enforceable locks for the new patterns. Use when your work grows into "
+                "files outside the scope you declared at start_session."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "patterns": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Path globs to add (e.g. ['ai-team-sync/src/**']). Globs, not prose.",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["advisory", "exclusive"],
+                        "description": "Lock mode for the new patterns (default advisory).",
+                    },
+                },
+                "required": ["patterns"],
+            },
+        ),
+        Tool(
             name="get_override_request_details",
             description="Get detailed information about a specific override request.",
             inputSchema={
@@ -896,6 +921,46 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 msg += f"Lock ID: {lock_id[:8]}...\n\n"
                 msg += "⚠️ Other team members have been notified."
 
+                return [TextContent(type="text", text=msg)]
+
+            elif name == "extend_scope":
+                if not active_session_id:
+                    return [TextContent(type="text", text="❌ No active session. Run start_session first.")]
+
+                patterns = arguments["patterns"]
+                mode = arguments.get("mode", "advisory")
+
+                # Merge into the session's declared scope (board text), de-duped.
+                sess = await client.get(f"{SERVER_URL}/api/sessions/{active_session_id}")
+                sess.raise_for_status()
+                current = sess.json().get("scope") or []
+                merged = list(dict.fromkeys([*current, *patterns]))
+                patch = await client.patch(
+                    f"{SERVER_URL}/api/sessions/{active_session_id}",
+                    json={"scope": merged},
+                )
+                patch.raise_for_status()
+
+                # Create enforceable locks for the newly-added patterns.
+                created, conflicts = [], []
+                for pat in patterns:
+                    lr = await client.post(
+                        f"{SERVER_URL}/api/locks",
+                        json={"session_id": active_session_id, "pattern": pat,
+                              "reason": "extend_scope", "mode": mode},
+                    )
+                    if lr.status_code in (200, 201):
+                        created.append(pat)
+                    elif lr.status_code == 409:
+                        conflicts.append(pat)
+                    else:
+                        lr.raise_for_status()
+
+                msg = f"✅ Scope extended (+{len(created)} {mode} lock(s)).\n\n"
+                msg += "Now covering:\n" + "\n".join(f"  • {p}" for p in merged) + "\n"
+                if conflicts:
+                    msg += ("\n⚠️ Not locked (held by another active session): "
+                            + ", ".join(conflicts) + " — coordinate or request_override.")
                 return [TextContent(type="text", text=msg)]
 
             elif name == "get_override_request_details":
