@@ -14,6 +14,7 @@ from ai_team_sync.config import settings
 # these append-only and backwards-compatible (new nullable/defaulted columns only).
 _COLUMN_MIGRATIONS = [
     ("scope_locks", "reason", "TEXT DEFAULT ''"),
+    ("sessions", "last_heartbeat", "TIMESTAMP"),  # nullable liveness signal (Gap 1)
 ]
 
 engine = create_async_engine(

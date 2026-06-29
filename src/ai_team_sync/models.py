@@ -42,6 +42,13 @@ class Session(Base):
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Liveness signal (nullable). A live client POSTs /sessions/{id}/heartbeat
+    # periodically; the reaper uses it for a FAST cleanup path so a dead Claude
+    # process's locks don't linger the full inactivity window. NULL = this session
+    # never heartbeated -> reaper falls back to the conservative session_inactivity_hours
+    # derived-activity rule, so legacy/non-heartbeating clients are unaffected. See
+    # docs/product-gaps-reaper-and-scope.md Gap 1.
+    last_heartbeat: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     locks: Mapped[list[ScopeLock]] = relationship(back_populates="session", cascade="all, delete-orphan")
     decisions: Mapped[list[Decision]] = relationship(back_populates="session", cascade="all, delete-orphan")

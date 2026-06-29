@@ -96,6 +96,55 @@ async def test_auto_complete_stale_session_but_keep_recent(db_session):
 
 
 @pytest.mark.asyncio
+async def test_stale_heartbeat_reaped_fast(db_session):
+    # A session that HEARTBEATED but went silent past the fast window is reaped
+    # well before the 12h fallback — this is the dead-process fast path.
+    m = settings.session_heartbeat_timeout_minutes
+    sess = Session(developer="patrick",
+                   started_at=_utcnow() - timedelta(minutes=m + 30),
+                   last_heartbeat=_utcnow() - timedelta(minutes=m + 5))
+    db_session.add(sess)
+    await db_session.commit()
+
+    assert await auto_complete_stale_sessions(db_session) == 1
+    await db_session.refresh(sess)
+    assert sess.status == "completed"
+    assert "heartbeat lost" in (sess.summary or "")
+
+
+@pytest.mark.asyncio
+async def test_fresh_heartbeat_keeps_session_alive(db_session):
+    # Old start, but a recent heartbeat = provably alive -> never reaped, even though
+    # it is far past the fast window's start time.
+    m = settings.session_heartbeat_timeout_minutes
+    sess = Session(developer="patrick",
+                   started_at=_utcnow() - timedelta(hours=20),
+                   last_heartbeat=_utcnow() - timedelta(minutes=max(1, m // 4)))
+    db_session.add(sess)
+    await db_session.commit()
+
+    assert await auto_complete_stale_sessions(db_session) == 0
+    await db_session.refresh(sess)
+    assert sess.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_never_heartbeated_uses_slow_window(db_session):
+    # A session that never heartbeated and is silent for longer than the FAST window
+    # but well within the 12h fallback must NOT be reaped — the fast path only applies
+    # once last_heartbeat is set, so legacy clients are unaffected (never-worse).
+    m = settings.session_heartbeat_timeout_minutes
+    sess = Session(developer="patrick",
+                   started_at=_utcnow() - timedelta(minutes=m + 30))  # no heartbeat
+    db_session.add(sess)
+    await db_session.commit()
+
+    assert await auto_complete_stale_sessions(db_session) == 0
+    await db_session.refresh(sess)
+    assert sess.status == "active"
+
+
+@pytest.mark.asyncio
 async def test_recent_lock_keeps_old_session_alive(db_session):
     h = settings.session_inactivity_hours
     sess = Session(developer="patrick",

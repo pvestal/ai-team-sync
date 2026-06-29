@@ -3,6 +3,21 @@
 ## [Unreleased]
 
 ### Added
+- **Session liveness heartbeat (reaper Gap 1)**: nullable `Session.last_heartbeat`,
+  `POST /api/sessions/{id}/heartbeat`, and a client `session_heartbeat.py` hook
+  (wire as a per-turn `Stop` hook — tool-agnostic). A session that heartbeats and
+  then goes silent for `session_heartbeat_timeout_minutes` (default 20) is reaped
+  fast and its locks released, instead of a dead Claude process holding the lane.
+  Sessions that never heartbeat keep the (now shorter) fallback window — never-worse.
+- **Explicit startup cleanup sweep**: the server runs one lock/override/session sweep
+  immediately on startup (`run_startup_cleanup`), so a restart promptly reclaims
+  sessions/locks orphaned while it was down.
+- **Override-inbox hook** (`override_inbox.py`, wire as `UserPromptSubmit`): injects
+  pending override requests targeting your locks into the turn context, so the unlock
+  handshake no longer needs polling or a human relay. Owner-only, fail-open.
+- `last_heartbeat` is now surfaced on `SessionResponse` (diagnose phantom-active rows).
+- Integration test for the `extend_scope` MCP tool (routes the MCP httpx client into
+  the in-process ASGI app — the previously-missing harness).
 - **Multi-agent identity**: `ATS_AGENT` env var explicitly sets the agent for any
   tool (e.g. `ATS_AGENT=codex`, `ATS_AGENT=ollama:<model>`); best-effort Codex
   auto-detection via `CODEX_*` env signature.
@@ -11,6 +26,8 @@
 - `AGENTS.md` contributor guide; tests for agent detection and decision listing.
 
 ### Changed
+- **Reaper fallback window** for non-heartbeating sessions cut from 12h to 4h
+  (`session_inactivity_hours`), so dead lanes don't sit parked all day.
 - **Security:** `ATS_HOST` now defaults to `127.0.0.1` (was `0.0.0.0`); the write
   API is unauthenticated and should not bind all interfaces by default.
 - `uvicorn` no longer runs with `reload=True` in production (`ats-server`).

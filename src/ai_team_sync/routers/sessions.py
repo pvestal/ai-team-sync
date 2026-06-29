@@ -31,6 +31,7 @@ def _session_to_response(s: Session) -> SessionResponse:
         branch=s.branch,
         started_at=s.started_at,
         completed_at=s.completed_at,
+        last_heartbeat=s.last_heartbeat,
         summary=s.summary,
         lock_count=len(s.locks) if s.locks else 0,
         decision_count=len(s.decisions) if s.decisions else 0,
@@ -228,4 +229,24 @@ async def update_session(session_id: str, body: SessionUpdate, db: AsyncSession 
             "session_id": session.id,
         })
 
+    return _session_to_response(session)
+
+
+@router.post("/{session_id}/heartbeat", response_model=SessionResponse)
+async def heartbeat_session(session_id: str, db: AsyncSession = Depends(get_db)):
+    """Liveness ping: bump last_heartbeat to now. Cheap, idempotent, called often
+    by a live client (e.g. a per-turn Stop hook). Gives the reaper a fast path to
+    reclaim a dead session's locks instead of waiting the full inactivity window
+    (see background_tasks.auto_complete_stale_sessions + Gap 1 doc)."""
+    result = await db.execute(
+        select(Session)
+        .where(Session.id == session_id)
+        .options(selectinload(Session.locks), selectinload(Session.decisions), selectinload(Session.commits))
+    )
+    session = result.scalar_one_or_none()
+    if not session:
+        raise HTTPException(404, "Session not found")
+    session.last_heartbeat = datetime.now(timezone.utc)
+    await db.commit()
+    await db.refresh(session)
     return _session_to_response(session)

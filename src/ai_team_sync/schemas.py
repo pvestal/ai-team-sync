@@ -36,6 +36,7 @@ class SessionResponse(BaseModel):
     branch: str
     started_at: datetime
     completed_at: datetime | None = None
+    last_heartbeat: datetime | None = None  # NULL = never heartbeated (see Gap 1)
     summary: str | None = None
     lock_count: int = 0
     decision_count: int = 0

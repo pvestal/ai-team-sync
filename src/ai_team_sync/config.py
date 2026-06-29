@@ -30,10 +30,23 @@ class Settings(BaseSettings):
     lock_ttl_hours: int = 8
     lock_default_mode: str = "advisory"
 
-    # Sessions: auto-complete an 'active' session after this many hours with no
-    # activity (no new locks/commits/decisions). Stops phantom-active sessions from
-    # lingering on the board (and holding the lane) when an agent forgets to complete.
-    session_inactivity_hours: int = 12
+    # Sessions: FALLBACK auto-complete window for sessions that never heartbeat
+    # (legacy clients / MCP-only flows). After this many hours with no derived
+    # activity (no new locks/commits/decisions) the session is completed so it stops
+    # holding its lane. Heartbeating sessions use the much faster path below; this is
+    # only the safety net. 4h trades a slightly higher chance of reaping a genuinely
+    # idle-but-live non-heartbeating session for not leaving dead lanes parked all
+    # day — wire the heartbeat hook and the fast path makes this moot.
+    session_inactivity_hours: int = 4
+
+    # Fast reaper path for sessions that emit a liveness heartbeat. A session that
+    # has EVER heartbeated and then goes silent (process died) for this many minutes
+    # with no newer lock/commit/decision is auto-completed well before the
+    # session_inactivity_hours fallback. Only applies once last_heartbeat is set, so
+    # non-heartbeating clients are unaffected. Keep comfortably above the client
+    # heartbeat cadence (a per-turn Stop hook) so a slow-but-live session is never
+    # falsely reaped.
+    session_heartbeat_timeout_minutes: int = 20
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
 

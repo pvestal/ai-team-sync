@@ -90,3 +90,28 @@ async def test_complete_session_releases_locks(client):
 async def test_get_session_not_found(client):
     resp = await client.get("/api/sessions/nonexistent")
     assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_sets_last_heartbeat(client):
+    resp = await client.post("/api/sessions", json={
+        "developer": "patrick",
+        "scope": ["src/"],
+        "auto_lock": False,
+    })
+    session_id = resp.json()["id"]
+    assert resp.json()["last_heartbeat"] is None  # never heartbeated yet
+
+    hb = await client.post(f"/api/sessions/{session_id}/heartbeat")
+    assert hb.status_code == 200
+    assert hb.json()["last_heartbeat"] is not None
+
+    # Persisted and surfaced on subsequent reads
+    got = await client.get(f"/api/sessions/{session_id}")
+    assert got.json()["last_heartbeat"] is not None
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_unknown_session_404(client):
+    resp = await client.post("/api/sessions/nonexistent/heartbeat")
+    assert resp.status_code == 404

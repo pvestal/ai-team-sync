@@ -184,6 +184,24 @@ on that network can:
         "command": "<ats-venv>/bin/python <repo>/src/ai_team_sync/hooks/pre_tool_use_lockcheck.py" } ] }
   ]
   ```
+- **Liveness heartbeat hook** (fast dead-session cleanup): wire `session_heartbeat.py` as a Claude Code `Stop` (and optionally `UserPromptSubmit`) hook. It fires once per turn — tool-agnostic, so read/bash-only turns still count as alive — and POSTs `/api/sessions/{id}/heartbeat`. A session that heartbeats and then goes silent for `session_heartbeat_timeout_minutes` (default 20) is auto-completed and its locks released, instead of lingering the `session_inactivity_hours` fallback (default 4h). Sessions that never heartbeat are unaffected (never-worse). Fail-open. Which session: `ATS_SESSION_ID`/`ATS_SESSION` env, else `~/.ats_session`.
+
+  ```jsonc
+  // ~/.claude/settings.json
+  "Stop": [
+    { "hooks": [ { "type": "command",
+      "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.session_heartbeat" } ] }
+  ]
+  ```
+- **Override-inbox hook** (surfaces unlock requests without polling): wire `override_inbox.py` as a Claude Code `UserPromptSubmit` hook. Each turn it injects a one-line "N override request(s) awaiting YOUR response" — with requester, pattern, and request IDs — when another session has asked to work in a path *you* locked. Closes the one coordination step that otherwise needs active polling (`check_pending_requests`) or a human relay. Owner-only, fail-open, exit 0.
+
+  ```jsonc
+  // ~/.claude/settings.json
+  "UserPromptSubmit": [
+    { "hooks": [ { "type": "command",
+      "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.override_inbox" } ] }
+  ]
+  ```
 - **Slack/Telegram**: Edit `.env` with webhook URLs for push notifications
 - **GitHub Action**: Auto-appends session context to PR descriptions
 

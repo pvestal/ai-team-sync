@@ -69,20 +69,27 @@ async def expire_stale_override_requests(db: AsyncSession) -> int:
 
 
 async def auto_complete_stale_sessions(db: AsyncSession) -> int:
-    """Auto-complete 'active' sessions with no activity for session_inactivity_hours.
+    """Auto-complete 'active' sessions that have gone silent, so their locks don't
+    linger and hold the lane after the agent's process is gone.
 
-    Activity = the most recent of: session.started_at, its newest lock/commit/decision.
-    No new schema needed — activity is derived from existing timestamps. Conservative
-    window (default 12h) so genuinely-active work is never closed; this only clears
-    phantom-active sessions an agent forgot to complete (the failure mode where stale
-    sessions linger on the board and hold their lane).
+    Activity = the most recent of: session.started_at, its newest lock/commit/decision,
+    and last_heartbeat. Two windows:
+
+    * FAST path — only for sessions that have EVER heartbeated (last_heartbeat set):
+      if silent for > session_heartbeat_timeout_minutes (default 20), complete. A live
+      client heartbeats every turn, so silence this long means the process is gone.
+    * FALLBACK — sessions that never heartbeated (legacy/other clients): the
+      session_inactivity_hours window (default 4h). So adding heartbeats is strictly
+      never-worse: heartbeating sessions get fast cleanup, everything else behaves as
+      a (shorter) version of before. See docs/product-gaps-reaper-and-scope.md Gap 1.
     """
     def _aware(dt):
         # SQLite returns tz-naive datetimes even for timezone=True columns; assume UTC.
         return dt.replace(tzinfo=timezone.utc) if dt and dt.tzinfo is None else dt
 
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=settings.session_inactivity_hours)
+    slow_cutoff = now - timedelta(hours=settings.session_inactivity_hours)
+    fast_cutoff = now - timedelta(minutes=settings.session_heartbeat_timeout_minutes)
     result = await db.execute(select(Session).where(Session.status == "active"))
     completed = 0
     for sess in result.scalars().all():
@@ -93,18 +100,50 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
         last_decision = await db.scalar(
             select(func.max(Decision.created_at)).where(Decision.session_id == sess.id))
         last_activity = max(
-            _aware(t) for t in (sess.started_at, last_lock, last_commit, last_decision) if t)
+            _aware(t) for t in
+            (sess.started_at, last_lock, last_commit, last_decision, sess.last_heartbeat) if t)
+
+        heartbeated = sess.last_heartbeat is not None
+        cutoff = fast_cutoff if heartbeated else slow_cutoff
         if last_activity < cutoff:
             sess.status = "completed"
             sess.completed_at = now
-            note = f"[auto-completed: inactive >{settings.session_inactivity_hours}h]"
+            reason = (f"silent >{settings.session_heartbeat_timeout_minutes}m (heartbeat lost)"
+                      if heartbeated else
+                      f"inactive >{settings.session_inactivity_hours}h")
+            note = f"[auto-completed: {reason}]"
             sess.summary = f"{sess.summary} {note}".strip() if sess.summary else note
             await broadcast_event(sess.id, "session.auto_completed", {
-                "session_id": sess.id, "last_activity": last_activity.isoformat()})
+                "session_id": sess.id, "last_activity": last_activity.isoformat(),
+                "reason": reason})
             completed += 1
     if completed:
         await db.commit()
     return completed
+
+
+async def run_cleanup_once(db: AsyncSession) -> dict[str, int]:
+    """One sweep: expired locks + stale override-requests + stale sessions.
+
+    Shared by the periodic loop AND the explicit startup sweep so a server restart
+    immediately reclaims sessions/locks orphaned while it was down (a crashed server
+    leaves every session 'active' in the DB; live clients re-heartbeat within a turn,
+    dead ones are caught here on the way up instead of lingering)."""
+    return {
+        "locks_expired": await check_expired_locks(db),
+        "override_requests_expired": await expire_stale_override_requests(db),
+        "sessions_completed": await auto_complete_stale_sessions(db),
+    }
+
+
+async def run_startup_cleanup() -> dict[str, int]:
+    """Explicit one-shot sweep at server startup (see run_cleanup_once)."""
+    async for db in get_db():
+        result = await run_cleanup_once(db)
+        if any(result.values()):
+            print(f"[ats] startup cleanup: {result}")
+        return result
+    return {}
 
 
 async def cleanup_task_loop():
@@ -112,9 +151,7 @@ async def cleanup_task_loop():
     while True:
         try:
             async for db in get_db():
-                await check_expired_locks(db)
-                await expire_stale_override_requests(db)
-                await auto_complete_stale_sessions(db)
+                await run_cleanup_once(db)
         except Exception as e:
             print(f"Error in cleanup task: {e}")
 
@@ -123,6 +160,6 @@ async def cleanup_task_loop():
 
 
 async def start_background_tasks():
-    """Start all background tasks."""
-    # Start cleanup loop in background
+    """Run an immediate startup sweep, then start the periodic cleanup loop."""
+    await run_startup_cleanup()
     asyncio.create_task(cleanup_task_loop())
