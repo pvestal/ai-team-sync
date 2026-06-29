@@ -40,16 +40,43 @@ of every assistant turn regardless of tools used — exactly the liveness signal
 and `POST /api/locks`. Now has an integration test (`tests/test_mcp_extend_scope.py`)
 that routes the MCP httpx client into the in-process ASGI app.
 
-## Gap 3 — `~/.ats_session` is a single global file (OPEN)
+## Gap 0 — no auto-registration: a session that never called start_session was invisible — SHIPPED (2026-06-29)
 
-The MCP server persists "the active session id" to one file in `$HOME`. Two
-concurrent Claude sessions on the same machine clobber each other's pointer — the
-last `start_session` wins — so MCP verbs that read it (`complete_session`,
-`log_decision`, `request_override`, and the heartbeat hook's fallback) may act on
-the wrong session. Per-session identity (#1556) fixed the *board labels* but not
-this pointer. Mitigation today: set `ATS_SESSION_ID` per session (the heartbeat
-hook honors it first). Real fix (deferred): key the pointer by Claude session id,
-or have the MCP server resolve the session from the agent label.
+**Was:** the presence/heartbeat/lock-guard hooks only MAINTAIN a session that was
+created manually with `start_session`. The Stop heartbeat exits early ("no active
+ATS session — nothing to heartbeat") when no pointer exists, and the PostToolUse
+presence store evicts after 30s. So a live session that never called
+`start_session` held no DB row, was absent from `team_status`, and held no
+advisory locks — observed in the wild: a session edited the shared composition
+layer for 2.5h while `team_status` reported an empty team. Tests were green
+because they exercise the registered-session path; the failure was in the un-tested
+seam (does a real session actually *issue* start_session — it's opt-in).
+
+**Fix (shipped):** `hooks/session_autostart.py`, wired as a SessionStart hook (no
+matcher → fires on startup/resume/compact). It creates a lightweight, **scope-less**
+session row automatically (announces presence, claims no locks) and records the
+per-session pointer (Gap 3). Idempotent: re-fires reuse the existing active session
+via the pointer + a server status check; fail-open. Manual `start_session` /
+`extend_scope` still layer real scope + locks on top. Covered by
+`tests/test_session_autostart.py`.
+
+## Gap 3 — `~/.ats_session` is a single global file — SHIPPED (2026-06-29)
+
+**Was:** the MCP server persisted "the active session id" to one file in `$HOME`.
+Two concurrent Claude sessions clobbered each other's pointer — last
+`start_session` wins — so MCP verbs that read it (`complete_session`,
+`log_decision`, `request_override`, and the heartbeat hook's fallback) could act
+on the wrong session. Per-session identity (#1556) fixed the *board labels* but
+not this pointer.
+
+**Fix (shipped):** `session_pointer.py` keys the pointer by
+`$CLAUDE_CODE_SESSION_ID` (present in every hook + the stdio MCP subprocess).
+`save_pointer` writes both `~/.ats_session_<cid8>` (authoritative) and the legacy
+global file (back-compat); `resolve_pointer` resolves `$ATS_SESSION_ID` → per-session
+file → global. The MCP server's `save_session_id`/`load_session_id` and the
+heartbeat hook all route through it, so concurrent sessions no longer cross-bump.
+Covered by `tests/test_session_autostart.py` (per-session-beats-global-clobber +
+env-override-wins).
 
 ## Gap 4 — `POST /api/locks` has no conflict check (OPEN)
 

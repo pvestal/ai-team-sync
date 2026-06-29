@@ -86,12 +86,27 @@ def session_agent_label() -> str:
 
 
 def save_session_id(session_id: str):
-    """Save active session ID to file for persistence."""
+    """Save active session ID for persistence. Writes the legacy global file AND a
+    per-session pointer keyed by CLAUDE_CODE_SESSION_ID so concurrent sessions
+    don't clobber each other's pointer (Gap 3)."""
     SESSION_FILE.write_text(session_id)
+    try:
+        from ai_team_sync import session_pointer as sp
+        sp.save_pointer(session_id)
+    except Exception:
+        pass  # back-compat: global file alone still works for a single session
 
 
 def load_session_id() -> str | None:
-    """Load active session ID from file."""
+    """Load THIS session's active ID. Prefers the per-session pointer (Gap 3) and
+    falls back to the legacy global file."""
+    try:
+        from ai_team_sync import session_pointer as sp
+        sid = sp.resolve_pointer()
+        if sid:
+            return sid
+    except Exception:
+        pass
     if SESSION_FILE.exists():
         content = SESSION_FILE.read_text().strip()
         return content if content else None

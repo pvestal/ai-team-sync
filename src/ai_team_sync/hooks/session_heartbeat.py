@@ -37,14 +37,21 @@ SESSION_FILE = Path.home() / ".ats_session"
 
 
 def _resolve_session_id() -> str | None:
-    sid = (os.environ.get("ATS_SESSION_ID") or os.environ.get("ATS_SESSION") or "").strip()
-    if sid:
-        return sid
+    # Per-session pointer (keyed by CLAUDE_CODE_SESSION_ID) bumps THIS session even
+    # when a concurrent session clobbered the legacy global file (Gap 3). Resolution
+    # order — $ATS_SESSION_ID, per-session file, global file — lives in one place.
     try:
-        content = SESSION_FILE.read_text().strip()
-        return content or None
+        from ai_team_sync import session_pointer as sp
+        return sp.resolve_pointer()
     except Exception:
-        return None
+        # Fail-open fallback to the legacy behavior if the module can't import.
+        sid = (os.environ.get("ATS_SESSION_ID") or os.environ.get("ATS_SESSION") or "").strip()
+        if sid:
+            return sid
+        try:
+            return SESSION_FILE.read_text().strip() or None
+        except Exception:
+            return None
 
 
 def main() -> None:
