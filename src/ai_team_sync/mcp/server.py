@@ -504,7 +504,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 paths = arguments["paths"]
                 response = await client.post(
                     f"{SERVER_URL}/api/presence/check",
-                    json={"paths": paths, "exclude_developer": get_git_user()},
+                    json={"paths": paths, "exclude_developer": get_git_user(),
+                          "exclude_agent": session_agent_label()},
                 )
                 response.raise_for_status()
                 results = response.json()
@@ -878,15 +879,20 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             elif name == "pre_commit_check":
                 paths = arguments["paths"]
 
+                # NOTE: the endpoint field is `staged_files` (NOT `paths`) and it
+                # returns `blocking_locks`/`advisory_locks` with a `file` key. The old
+                # code sent `paths` and read `blocked`/`warned`, so the argument was
+                # silently dropped (server auto-detected staged files from ITS OWN cwd)
+                # and the response never parsed — the tool always said "clear". Fixed.
                 response = await client.post(
                     f"{SERVER_URL}/api/git/pre-commit-check",
-                    json={"paths": paths},
+                    json={"staged_files": paths},
                 )
                 response.raise_for_status()
                 data = response.json()
 
-                blocked = data.get("blocked", [])
-                warned = data.get("warned", [])
+                blocked = data.get("blocking_locks", [])
+                warned = data.get("advisory_locks", [])
 
                 if not blocked and not warned:
                     return [TextContent(type="text", text="✅ All files clear for commit.")]
@@ -896,14 +902,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 if blocked:
                     msg += f"⛔ {len(blocked)} file(s) BLOCKED by exclusive locks:\n\n"
                     for f in blocked:
-                        msg += f"  {f['path']}\n"
+                        msg += f"  {f['file']}\n"
                         msg += f"    Locked by: {f['developer']} (pattern: {f['pattern']})\n"
                     msg += "\n❌ Commit will be blocked. Resolve conflicts first.\n\n"
 
                 if warned:
                     msg += f"⚠️ {len(warned)} file(s) have advisory locks:\n\n"
                     for f in warned:
-                        msg += f"  {f['path']}\n"
+                        msg += f"  {f['file']}\n"
                         msg += f"    Locked by: {f['developer']} (pattern: {f['pattern']})\n"
                     msg += "\n💡 Commit allowed but coordinate with team.\n"
 

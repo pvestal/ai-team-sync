@@ -138,3 +138,51 @@ async def test_whos_editing_excludes_self(client):
     resp = await client.post("/api/presence/check", json={
         "paths": ["src/auth/jwt.py"], "exclude_developer": "alice"})
     assert resp.json()[0]["editors"] == []   # alice excludes herself -> clear
+
+
+# --- per-session presence (concurrent same-developer sessions) ---
+
+@pytest.mark.asyncio
+async def test_concurrent_same_developer_sessions_coexist(client):
+    # Two claude sessions, same git user, different per-session agent labels.
+    await client.post("/api/presence", json={
+        "developer": "pat", "agent": "claude-code:aaaaaaaa", "files": ["a.py"]})
+    await client.post("/api/presence", json={
+        "developer": "pat", "agent": "claude-code:bbbbbbbb", "files": ["b.py"]})
+    listed = (await client.get("/api/presence")).json()
+    # keyed by (developer, agent) -> both survive instead of clobbering
+    assert len(listed) == 2
+    assert {e["agent"] for e in listed} == {"claude-code:aaaaaaaa", "claude-code:bbbbbbbb"}
+
+
+@pytest.mark.asyncio
+async def test_whos_editing_excludes_only_my_session_not_developer(client):
+    # session aaa is editing jwt.py; session bbb (SAME developer) checks it.
+    await client.post("/api/presence", json={
+        "developer": "pat", "agent": "claude-code:aaaaaaaa",
+        "files": ["src/auth/jwt.py"], "intent": "session aaa work"})
+
+    # bbb excludes only itself -> must still SEE aaa (the old developer-keyed code
+    # would have hidden it because both are 'pat').
+    resp = await client.post("/api/presence/check", json={
+        "paths": ["src/auth/jwt.py"],
+        "exclude_developer": "pat", "exclude_agent": "claude-code:bbbbbbbb"})
+    editors = resp.json()[0]["editors"]
+    assert len(editors) == 1 and editors[0]["agent"] == "claude-code:aaaaaaaa"
+
+    # aaa excludes itself -> clear (don't self-report).
+    resp = await client.post("/api/presence/check", json={
+        "paths": ["src/auth/jwt.py"],
+        "exclude_developer": "pat", "exclude_agent": "claude-code:aaaaaaaa"})
+    assert resp.json()[0]["editors"] == []
+
+
+def test_build_presence_agent_is_per_session():
+    # session_id from the payload becomes the agent token, matching the MCP's
+    # session_agent_label so whos_editing.exclude_agent omits exactly this session.
+    body = build_presence(
+        {"tool_name": "Edit", "tool_input": {"file_path": "z.py"},
+         "session_id": "abcdef12-3456-7890"},
+        {"ATS_AGENT": "claude-code"},
+    )
+    assert body["agent"] == "claude-code:abcdef12"

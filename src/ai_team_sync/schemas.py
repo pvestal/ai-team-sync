@@ -193,7 +193,10 @@ class PresenceEntry(BaseModel):
 
 class WhosEditingRequest(BaseModel):
     paths: list[str]
-    exclude_developer: str = ""  # omit yourself so you only see OTHER active editors
+    exclude_developer: str = ""  # legacy: omit yourself by developer name
+    exclude_agent: str = ""  # preferred: omit only YOUR session (per-session agent
+    # label), so a concurrent same-developer session is still reported. Falls back to
+    # exclude_developer when empty.
 
 
 class WhosEditingResult(BaseModel):

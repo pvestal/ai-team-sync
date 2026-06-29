@@ -97,10 +97,21 @@ def build_presence(payload: dict, env: dict) -> dict | None:
     rel = _display_path(file_path, payload.get("cwd") or env.get("PWD"))
     return {
         "developer": env.get("ATS_DEVELOPER") or _developer(),
-        "agent": env.get("ATS_AGENT", "claude-code"),
+        "agent": _agent_label(payload, env),
         "files": [rel],
         "intent": env.get("ATS_INTENT", ""),
     }
+
+
+def _agent_label(payload: dict, env: dict) -> str:
+    """Per-session agent label so two sessions of the same developer stay distinct in
+    presence (mirrors mcp.server.session_agent_label). Session token comes from the
+    PostToolUse payload's session_id (always present), so whos_editing's exclude_agent
+    can omit exactly my session and still surface a parallel same-developer session."""
+    base = (env.get("ATS_AGENT") or "claude-code").strip()
+    sid = (payload.get("session_id") or env.get("CLAUDE_CODE_SESSION_ID")
+           or env.get("ATS_SESSION") or "").strip()
+    return f"{base}:{sid[:8]}" if sid else base
 
 
 def main() -> None:

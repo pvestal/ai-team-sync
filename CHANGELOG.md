@@ -25,6 +25,19 @@
   active session's.
 - `AGENTS.md` contributor guide; tests for agent detection and decision listing.
 
+### Fixed
+- **`pre_commit_check` MCP tool was a silent no-op**: it sent `{"paths": ...}` while
+  the endpoint reads `staged_files`, and parsed `blocked`/`warned` while the endpoint
+  returns `blocking_locks`/`advisory_locks`. The argument was dropped (server
+  auto-detected staged files from its own cwd) and the response never matched, so it
+  always reported "clear". Now wired correctly and tested end-to-end.
+- **`whos_editing` was blind to a concurrent same-developer session**: presence was
+  keyed by developer name (so two sessions of one git user clobbered each other) and
+  exclusion was by developer. Presence is now keyed by `(developer, agent)`,
+  `whos_editing` excludes by session via `exclude_agent`, and the presence hook emits
+  a per-session agent label (from the PostToolUse `session_id`). A parallel session of
+  the same person is now visible.
+
 ### Changed
 - **Reaper fallback window** for non-heartbeating sessions cut from 12h to 4h
   (`session_inactivity_hours`), so dead lanes don't sit parked all day.

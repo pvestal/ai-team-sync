@@ -20,16 +20,26 @@ class DevPresence:
 
 class PresenceStore:
     def __init__(self):
-        self._devs: dict[str, DevPresence] = {}  # keyed by developer name
+        # Keyed by (developer, agent), NOT developer alone: one operator runs several
+        # agent sessions under the same git user (agent = per-session label like
+        # 'claude-code:ab12cd34'). Keying by developer made concurrent same-developer
+        # sessions clobber each other's presence, so whos_editing went blind to a
+        # parallel session of the same person. The composite key keeps them distinct.
+        self._devs: dict[tuple[str, str], DevPresence] = {}
         self._connections: list[asyncio.Queue] = []
 
     def update(self, developer: str, agent: str, files: list[str], intent: str = ""):
-        self._devs[developer] = DevPresence(
+        self._devs[(developer, agent)] = DevPresence(
             developer=developer, agent=agent, files=files, intent=intent, last_seen=time.time()
         )
 
-    def remove(self, developer: str):
-        self._devs.pop(developer, None)
+    def remove(self, developer: str, agent: str | None = None):
+        """Remove one session's presence, or all of a developer's if agent is None
+        (WS disconnect knows only the developer)."""
+        if agent is None:
+            self._devs = {k: v for k, v in self._devs.items() if k[0] != developer}
+        else:
+            self._devs.pop((developer, agent), None)
 
     def get_all(self) -> list[dict]:
         self._evict()

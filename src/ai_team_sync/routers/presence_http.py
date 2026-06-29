@@ -52,12 +52,21 @@ async def whos_editing(body: WhosEditingRequest):
     Live presence only — declared scope locks are a separate check (/locks/check).
     """
     present = store.get_all()
+    ex_agent = (body.exclude_agent or "").strip()
+
+    def _is_me(p: dict) -> bool:
+        # Prefer excluding by session (agent label) so a concurrent same-developer
+        # session is still surfaced; fall back to developer for legacy callers.
+        if ex_agent:
+            return p["agent"] == ex_agent
+        return p["developer"] == body.exclude_developer
+
     results = []
     for path in body.paths:
         editors = [
             PresenceEntry(**p)
             for p in present
-            if p["developer"] != body.exclude_developer
+            if not _is_me(p)
             and any(_path_matches(path, f) for f in p["files"])
         ]
         results.append(WhosEditingResult(path=path, editors=editors))
