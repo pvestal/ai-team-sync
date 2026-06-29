@@ -57,6 +57,10 @@ async def test_list_locks(client):
     assert resp.status_code == 200
     locks = resp.json()
     assert len(locks) == 2
+    # Every lock must carry its id so a stale/ghost lock is reapable via
+    # delete_lock(lock_id) — list_all_locks surfaces this id to agents.
+    # (ats-reap-stale-locks-needs-lock-ids-p01)
+    assert all(lock.get("id") for lock in locks)
 
 
 @pytest.mark.asyncio
@@ -76,6 +80,8 @@ async def test_lock_reason_roundtrips_and_surfaces_in_check(client):
     r = cresp.json()[0]
     assert r["locked"] is True
     assert r["reason"] == "modularizing builder.py (#1512)"
+    # check_locks must surface lock_id so a blocked agent can reap a stale lock.
+    assert r["lock_id"]
 
 
 @pytest.mark.asyncio

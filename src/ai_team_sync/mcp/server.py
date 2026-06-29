@@ -490,7 +490,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                     msg += f"{icon} {r['path']}\n"
                     msg += f"   Locked by: {r['developer']}\n"
                     msg += f"   Pattern: {r['pattern']}\n"
-                    msg += f"   Mode: {r['mode']}\n\n"
+                    msg += f"   Mode: {r['mode']}\n"
+                    # Lock id makes a stale conflict reapable via delete_lock(lock_id).
+                    msg += f"   Lock ID: {r.get('lock_id', '?')}  (reap: delete_lock)\n\n"
 
                 exclusive = [r for r in locked if r["mode"] == "exclusive"]
                 if exclusive:
@@ -845,6 +847,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                     mode_icon = "⛔" if lock["mode"] == "exclusive" else "⚠️"
                     msg += f"{mode_icon} {lock['pattern']} ({lock['mode']})\n"
                     msg += f"   Developer: {lock.get('developer', 'unknown')}\n"
+                    # Surface the lock id so a stale/ghost lock is reapable via
+                    # delete_lock(lock_id) without completing its (dead) session.
+                    msg += f"   Lock ID: {lock['id']}  (reap: delete_lock)\n"
                     msg += f"   Expires: {lock['expires_at']}\n\n"
 
                 return [TextContent(type="text", text=msg)]
