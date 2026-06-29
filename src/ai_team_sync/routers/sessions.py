@@ -20,7 +20,35 @@ from ai_team_sync.config import settings
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
 
+def _session_liveness(s: Session) -> tuple[float | None, bool]:
+    """Idle seconds since the session's most recent activity, and whether it is
+    'stale' — silent past the heartbeat window (session_heartbeat_timeout_minutes,
+    default 20m). Stale flags a suspected ghost in team_status WELL BEFORE the
+    reaper auto-completes it (which is session_inactivity_hours, default 4h, for
+    never-heartbeated clients), so its scope stops reading as a live blocker.
+
+    Activity = newest of started_at, last_heartbeat, and its newest
+    lock/decision/commit — the same signal the reaper uses
+    (background_tasks.auto_complete_stale_sessions). Requires the locks/decisions/
+    commits relationships to be loaded (list_sessions selectinloads them).
+    """
+    def _aware(dt):
+        return dt.replace(tzinfo=timezone.utc) if dt and dt.tzinfo is None else dt
+
+    times = [s.started_at, s.last_heartbeat]
+    times += [x.created_at for x in (s.locks or [])]
+    times += [x.created_at for x in (s.decisions or [])]
+    times += [x.created_at for x in (s.commits or [])]
+    aware = [_aware(t) for t in times if t]
+    if not aware:
+        return None, False
+    idle = (datetime.now(timezone.utc) - max(aware)).total_seconds()
+    is_stale = s.status == "active" and idle > settings.session_heartbeat_timeout_minutes * 60
+    return idle, is_stale
+
+
 def _session_to_response(s: Session) -> SessionResponse:
+    idle_seconds, is_stale = _session_liveness(s)
     return SessionResponse(
         id=s.id,
         developer=s.developer,
@@ -36,6 +64,8 @@ def _session_to_response(s: Session) -> SessionResponse:
         lock_count=len(s.locks) if s.locks else 0,
         decision_count=len(s.decisions) if s.decisions else 0,
         commit_count=len(s.commits) if s.commits else 0,
+        idle_seconds=idle_seconds,
+        is_stale=is_stale,
     )
 
 

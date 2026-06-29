@@ -45,6 +45,33 @@ async def test_list_sessions(client):
 
 
 @pytest.mark.asyncio
+async def test_session_idle_and_stale(client, db_session):
+    """team_status liveness: a fresh session reports low idle / not stale; a
+    session silent past the heartbeat window reports is_stale=True so its scope
+    isn't treated as a live blocker. (ats-ghost-session-liveness-reap-p01)"""
+    from datetime import datetime, timezone, timedelta
+    from sqlalchemy import select
+    from ai_team_sync.models import Session
+
+    resp = await client.post("/api/sessions", json={
+        "developer": "patrick", "scope": ["src/"], "auto_lock": False})
+    sid = resp.json()["id"]
+
+    fresh = next(s for s in (await client.get("/api/sessions")).json() if s["id"] == sid)
+    assert fresh["is_stale"] is False
+    assert fresh["idle_seconds"] is not None and fresh["idle_seconds"] < 60
+
+    # Backdate started_at past the 20-min heartbeat window, no heartbeat -> stale.
+    row = await db_session.scalar(select(Session).where(Session.id == sid))
+    row.started_at = datetime.now(timezone.utc) - timedelta(hours=1)
+    await db_session.commit()
+
+    ghost = next(s for s in (await client.get("/api/sessions")).json() if s["id"] == sid)
+    assert ghost["is_stale"] is True
+    assert ghost["idle_seconds"] > 20 * 60
+
+
+@pytest.mark.asyncio
 async def test_list_sessions_filter_by_status(client):
     resp = await client.post("/api/sessions", json={
         "developer": "patrick",

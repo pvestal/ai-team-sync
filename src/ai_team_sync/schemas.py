@@ -41,6 +41,12 @@ class SessionResponse(BaseModel):
     lock_count: int = 0
     decision_count: int = 0
     commit_count: int = 0
+    # Liveness: seconds since the session's most recent activity, and whether it
+    # has gone silent past the heartbeat window (a suspected ghost). Lets
+    # team_status flag idle/ghost sessions so their scope isn't treated as a live
+    # blocker. (ats-ghost-session-liveness-reap-p01)
+    idle_seconds: float | None = None
+    is_stale: bool = False
 
     model_config = {"from_attributes": True}
 

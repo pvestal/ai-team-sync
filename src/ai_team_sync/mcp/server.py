@@ -629,10 +629,22 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 if not sessions:
                     return [TextContent(type="text", text="✅ No active sessions. Team is available.")]
 
-                msg = f"👥 {len(sessions)} active session(s):\n\n"
+                stale_n = sum(1 for s in sessions if s.get("is_stale"))
+                header = f"👥 {len(sessions)} active session(s)"
+                if stale_n:
+                    header += f" — ⚠ {stale_n} look STALE (idle/ghost; their scope is NOT a live blocker)"
+                msg = header + ":\n\n"
                 for s in sessions:
                     scope = ", ".join(s["scope"]) if s["scope"] else "no scope"
-                    msg += f"• {s['developer']} ({s['agent']})\n"
+                    idle = s.get("idle_seconds")
+                    idle_txt = f"{int(idle // 60)}m" if isinstance(idle, (int, float)) else "?"
+                    if s.get("is_stale"):
+                        tag = (f"  ⚠ STALE (idle {idle_txt} — likely a ghost; treat its scope as "
+                               f"non-blocking. Reap its locks via delete_lock(lock_id), or it "
+                               f"auto-completes on the reaper's next sweep)")
+                    else:
+                        tag = f"  (active, idle {idle_txt})"
+                    msg += f"• {s['developer']} ({s['agent']}){tag}\n"
                     msg += f"  Scope: {scope}\n"
                     msg += f"  Branch: {s['branch']}\n"
                     msg += f"  Description: {s['description']}\n"
