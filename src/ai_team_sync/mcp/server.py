@@ -442,6 +442,17 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     active_session_id = load_session_id()
 
     async with httpx.AsyncClient(timeout=10.0) as client:
+        # Liveness on ANY tool use (ats-sessionstart-orphan-adoption-p01): a
+        # session that only ever talks through tools previously never
+        # heartbeated, so live sessions looked orphaned on the board.
+        # Fire-and-forget; a failed beat must never break the actual call.
+        if active_session_id:
+            try:
+                await client.post(
+                    f"{SERVER_URL}/api/sessions/{active_session_id}/heartbeat")
+            except Exception:
+                pass
+
         try:
             # Original tools
             if name == "start_session":
@@ -476,7 +487,33 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 data = response.json()
                 save_session_id(data["id"])
 
+                # Adopt-or-complete the SessionStart auto-registration
+                # (ats-sessionstart-orphan-adoption-p01): the hook registers a
+                # placeholder session per agent; without this, start_session
+                # creates a sibling and the placeholder lingers 'active'
+                # forever (orphan class observed 2x on 2026-07-02).
+                adopted = 0
+                try:
+                    sess_resp = await client.get(f"{SERVER_URL}/api/sessions")
+                    sess_resp.raise_for_status()
+                    my_label = session_agent_label()
+                    for s in sess_resp.json():
+                        if (s.get("status") == "active"
+                                and s.get("id") != data["id"]
+                                and s.get("agent") == my_label
+                                and s.get("description") == "auto-registered on SessionStart"
+                                and not s.get("lock_count")):
+                            await client.patch(
+                                f"{SERVER_URL}/api/sessions/{s['id']}",
+                                json={"status": "completed",
+                                      "summary": f"adopted by {data['id'][:8]} (start_session)"})
+                            adopted += 1
+                except Exception:
+                    pass  # adoption is best-effort; never block session start
+
                 msg = f"✅ Session started!\n\n"
+                if adopted:
+                    msg += f"(auto-registered placeholder session completed: {adopted})\n"
                 msg += f"Session ID: {data['id'][:8]}...\n"
                 msg += f"Scope: {', '.join(data['scope'])}\n"
                 msg += f"Branch: {data['branch']}\n"
@@ -971,11 +1008,23 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 # Merge into the session's declared scope (board text), de-duped.
                 sess = await client.get(f"{SERVER_URL}/api/sessions/{active_session_id}")
                 sess.raise_for_status()
-                current = sess.json().get("scope") or []
+                sess_data = sess.json()
+                current = sess_data.get("scope") or []
                 merged = list(dict.fromkeys([*current, *patterns]))
+                patch_body: dict[str, Any] = {"scope": merged}
+                # Adoption variant (ats-sessionstart-orphan-adoption-p01): a
+                # session taking real locks must not keep the placeholder
+                # description — a working session with 'auto-registered on
+                # SessionStart' reads as an orphan on the board (observed
+                # 2026-07-02, agent 4f5c927a). Derive a minimal honest one.
+                if sess_data.get("description") == "auto-registered on SessionStart":
+                    patch_body["description"] = (
+                        "auto-registered; working scope: " + ", ".join(merged[:4])
+                        + ("…" if len(merged) > 4 else "")
+                        + " (describe via start_session for a real summary)")
                 patch = await client.patch(
                     f"{SERVER_URL}/api/sessions/{active_session_id}",
-                    json={"scope": merged},
+                    json=patch_body,
                 )
                 patch.raise_for_status()
 
