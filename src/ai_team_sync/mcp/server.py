@@ -435,8 +435,75 @@ async def list_tools() -> list[Tool]:
     ]
 
 
+# Tools that already surface the override inbox themselves — appending the
+# piggyback nudge to these would just duplicate their own output.
+_OVERRIDE_NUDGE_SKIP = {"check_pending_requests", "respond_to_request",
+                        "get_override_request_details"}
+
+
+def format_override_nudge(requests: list, session_id: str) -> str | None:
+    """One-line-per-request nudge when OTHER sessions are waiting on YOUR lock.
+
+    Pure (unit-testable). Owner-side pending requests only; full ids so the
+    holder can paste straight into respond_to_request. Returns None when quiet.
+    """
+    incoming = [
+        r for r in (requests or [])
+        if r.get("owner_session_id") == session_id
+        and str(r.get("status", "")).lower() == "pending"
+    ]
+    if not incoming:
+        return None
+    lines = [f"⚠️ {len(incoming)} pending override request(s) awaiting YOUR response:"]
+    for r in incoming:
+        who = r.get("requester_developer") or "unknown"
+        lines.append(
+            f"  • {r.get('id')} — {who} wants '{r.get('conflicting_pattern', '?')}'"
+        )
+    lines.append("Respond with respond_to_request (approve/deny) — requests expire "
+                 "after 15 minutes and the requester is stalled until you answer.")
+    return "\n".join(lines)
+
+
+async def _incoming_override_nudge(client: httpx.AsyncClient, tool_name: str,
+                                   session_id: str | None) -> str | None:
+    """Piggyback layer (ats-override-push-p01): any ATS tool touch surfaces
+    override requests pending ON this session, so a busy autonomous session
+    hears about them without the operator relaying. Best-effort — never
+    breaks the actual tool call."""
+    if not session_id or tool_name in _OVERRIDE_NUDGE_SKIP:
+        return None
+    try:
+        response = await client.get(
+            f"{SERVER_URL}/api/override-requests",
+            params={"session_id": session_id, "status": "pending"},
+            timeout=2.0,
+        )
+        response.raise_for_status()
+        requests = response.json()
+    except Exception:
+        return None
+    return format_override_nudge(
+        requests if isinstance(requests, list) else [], session_id)
+
+
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    """Handle MCP tool calls, then piggyback the override-request inbox."""
+    result = await _call_tool_impl(name, arguments)
+    try:
+        session_id = load_session_id()
+        if session_id:
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                nudge = await _incoming_override_nudge(client, name, session_id)
+            if nudge:
+                result = list(result) + [TextContent(type="text", text=nudge)]
+    except Exception:
+        pass  # the nudge is advisory; the tool result must always go through
+    return result
+
+
+async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle MCP tool calls."""
     # Load active session from persistent storage
     active_session_id = load_session_id()
@@ -613,14 +680,17 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 else:
                     msg = f"⏳ Override request sent (pending approval)...\n\n"
 
-                msg += f"Request ID: {data['id'][:8]}...\n"
+                msg += f"Request ID: {data['id']}\n"
                 msg += f"Pattern: {data['conflicting_pattern']}\n"
                 msg += f"Owner: {data['owner_developer']}\n"
 
                 if not auto_decided:
                     msg += f"Expires: {data['expires_at']}\n\n"
                     msg += "💡 Tip: Use keywords 'urgent', 'security', 'hotfix', 'critical' for auto-approval\n"
-                    msg += "Use check_my_override_requests to monitor response."
+                    msg += "Use check_my_override_requests to monitor response.\n"
+                    msg += ("If it EXPIRES unanswered and the lock is ADVISORY: proceed with a "
+                            "tightly-scoped change + log_decision (visible to the holder); "
+                            "escalate to the operator only as a last resort.")
 
                 return [TextContent(type="text", text=msg)]
 
@@ -635,12 +705,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 response.raise_for_status()
                 requests = response.json()
 
+                # The API returns rows where this session is requester OR owner;
+                # 'pending requests TO YOU' means owner-side only (the requester
+                # view is check_my_override_requests).
+                requests = [r for r in requests
+                            if r.get("owner_session_id") == active_session_id]
+
                 if not requests:
                     return [TextContent(type="text", text="✅ No pending override requests.")]
 
                 msg = f"📬 {len(requests)} pending override request(s) TO YOU:\n\n"
                 for req in requests:
-                    msg += f"Request ID: {req['id'][:8]}...\n"
+                    msg += f"Request ID: {req['id']}\n"
                     msg += f"From: {req['requester_developer']}\n"
                     msg += f"Pattern: {req['conflicting_pattern']}\n"
                     msg += f"Justification: {req['justification']}\n"
@@ -663,7 +739,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
                 status = "✅ APPROVED" if approved else "❌ DENIED"
                 msg = f"{status} Override request response sent!\n\n"
-                msg += f"Request ID: {data['id'][:8]}...\n"
+                msg += f"Request ID: {data['id']}\n"
                 msg += f"Requester: {data['requester_developer']}\n"
                 msg += f"Your message: {message}\n\n"
                 msg += "Requester has been notified."
@@ -845,13 +921,18 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                     status_icon = {"pending": "⏳", "approved": "✅", "denied": "❌", "expired": "⌛"}
                     icon = status_icon.get(req["status"], "?")
 
-                    msg += f"{icon} Request ID: {req['id'][:8]}...\n"
+                    msg += f"{icon} Request ID: {req['id']}\n"
                     msg += f"   To: {req['owner_developer']}\n"
                     msg += f"   Pattern: {req['conflicting_pattern']}\n"
                     msg += f"   Status: {req['status']}\n"
 
                     if req.get("response_message"):
                         msg += f"   Response: {req['response_message']}\n"
+
+                    if req["status"] == "expired":
+                        msg += ("   ⌛ Expired unanswered. If the lock is ADVISORY: proceed with a "
+                                "tightly-scoped change + log_decision; or re-file request_override "
+                                "if the holder is now active. Operator escalation = last resort.\n")
 
                     msg += "\n"
 
@@ -1063,7 +1144,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
                 icon = status_icon.get(data["status"], "?")
 
                 msg = f"{icon} Override Request Details\n\n"
-                msg += f"ID: {data['id'][:8]}...\n"
+                msg += f"ID: {data['id']}\n"
                 msg += f"From: {data['requester_developer']}\n"
                 msg += f"To: {data['owner_developer']}\n"
                 msg += f"Pattern: {data['conflicting_pattern']}\n"

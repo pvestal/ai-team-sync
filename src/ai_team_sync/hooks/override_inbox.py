@@ -53,7 +53,7 @@ def format_inbox(requests: list, session_id: str) -> str | None:
     lines = [f"ATS: {len(incoming)} override request(s) awaiting YOUR response "
              f"(another session wants to work in a path you locked):"]
     for r in incoming:
-        rid = str(r.get("id", ""))[:8]
+        rid = str(r.get("id", ""))  # full id — paste-ready for respond_to_request
         who = r.get("requester_developer") or "unknown"
         pat = r.get("conflicting_pattern", "?")
         why = (r.get("justification") or "").strip()

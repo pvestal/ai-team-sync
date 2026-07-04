@@ -23,6 +23,43 @@ from ai_team_sync.schemas import (
 router = APIRouter(prefix="/override-requests", tags=["override-requests"])
 
 
+async def _load_request_by_id_or_prefix(
+    db: AsyncSession, request_id: str
+) -> OverrideRequest:
+    """Resolve a request by exact id, else by unique prefix (>= 8 chars).
+
+    MCP displays historically truncated ids to 8 chars ('3745bd63...'), and
+    agents pasted the truncated form back into respond_to_request and 404'd
+    (ats-override-push-p01). Exact match wins; a prefix must be unambiguous.
+    """
+    opts = (
+        selectinload(OverrideRequest.requester_session),
+        selectinload(OverrideRequest.owner_session),
+    )
+    result = await db.execute(
+        select(OverrideRequest).where(OverrideRequest.id == request_id).options(*opts)
+    )
+    request = result.scalar_one_or_none()
+    if request:
+        return request
+
+    prefix = request_id.rstrip(".")  # tolerate a pasted '3745bd63...'
+    if len(prefix) >= 8:
+        result = await db.execute(
+            select(OverrideRequest)
+            .where(OverrideRequest.id.like(f"{prefix}%"))
+            .options(*opts)
+            .limit(2)
+        )
+        matches = result.scalars().all()
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise HTTPException(409, f"Ambiguous request id prefix '{prefix}'")
+
+    raise HTTPException(404, "Override request not found")
+
+
 def _override_to_response(req: OverrideRequest) -> OverrideRequestResponse:
     return OverrideRequestResponse(
         id=req.id,
@@ -198,18 +235,8 @@ async def list_override_requests(
 
 @router.get("/{request_id}", response_model=OverrideRequestResponse)
 async def get_override_request(request_id: str, db: AsyncSession = Depends(get_db)):
-    """Get a specific override request."""
-    result = await db.execute(
-        select(OverrideRequest)
-        .where(OverrideRequest.id == request_id)
-        .options(
-            selectinload(OverrideRequest.requester_session),
-            selectinload(OverrideRequest.owner_session),
-        )
-    )
-    request = result.scalar_one_or_none()
-    if not request:
-        raise HTTPException(404, "Override request not found")
+    """Get a specific override request (exact id or unique >=8-char prefix)."""
+    request = await _load_request_by_id_or_prefix(db, request_id)
     return _override_to_response(request)
 
 
@@ -217,18 +244,11 @@ async def get_override_request(request_id: str, db: AsyncSession = Depends(get_d
 async def respond_to_override_request(
     request_id: str, body: OverrideRequestRespond, db: AsyncSession = Depends(get_db)
 ):
-    """Approve or deny an override request (called by lock owner)."""
-    result = await db.execute(
-        select(OverrideRequest)
-        .where(OverrideRequest.id == request_id)
-        .options(
-            selectinload(OverrideRequest.requester_session),
-            selectinload(OverrideRequest.owner_session),
-        )
-    )
-    request = result.scalar_one_or_none()
-    if not request:
-        raise HTTPException(404, "Override request not found")
+    """Approve or deny an override request (called by lock owner).
+
+    Accepts the exact request id or a unique >=8-char prefix.
+    """
+    request = await _load_request_by_id_or_prefix(db, request_id)
 
     if request.status != "pending":
         raise HTTPException(400, f"Request already {request.status}")
