@@ -71,6 +71,10 @@ async def ensure_session(server_url: str, client) -> str | None:
             pass  # fall through to create a fresh row
 
     try:
+        # repo_root deliberately NOT sent: on multi-repo boxes the Claude cwd
+        # (~/Documents) is not the repo the session will lock, and a wrong
+        # anchor turns enforcement OFF for that repo (false negative — worse
+        # than the false positive). Anchoring is opt-in via start_session.
         r = await client.post(f"{server_url}/api/sessions", json={
             "developer": _developer(),
             "agent": _agent_label(cid),

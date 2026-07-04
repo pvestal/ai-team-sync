@@ -17,6 +17,9 @@ class SessionCreate(BaseModel):
     branch: str = ""
     auto_lock: bool = True  # auto-create scope locks from scope patterns
     lock_mode: str = "advisory"  # advisory (warn) or exclusive (block)
+    # Absolute git root the session works in; anchors its repo-relative scope
+    # patterns so they don't collide across repos. '' = unanchored (legacy).
+    repo_root: str = ""
 
 
 class SessionUpdate(BaseModel):
@@ -34,6 +37,7 @@ class SessionResponse(BaseModel):
     description: str
     status: str
     branch: str
+    repo_root: str = ""  # '' = unanchored (legacy session)
     started_at: datetime
     completed_at: datetime | None = None
     last_heartbeat: datetime | None = None  # NULL = never heartbeated (see Gap 1)
@@ -83,6 +87,10 @@ class LockCreate(BaseModel):
 
 class LockCheckRequest(BaseModel):
     paths: list[str]
+    # Caller's git root: locks held by sessions anchored to a DIFFERENT repo are
+    # skipped (their patterns are relative to that repo, not this one). '' or
+    # omitted = legacy behavior (all locks considered).
+    repo_root: str = ""
 
 
 class LockCheckResult(BaseModel):

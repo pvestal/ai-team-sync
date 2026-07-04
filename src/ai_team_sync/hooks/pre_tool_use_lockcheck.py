@@ -73,10 +73,17 @@ def scope_matches(rel: str, pattern: str) -> bool:
     return fnmatch.fnmatch(rel, pat)
 
 
-def find_conflicts(rel: str, sessions: list, my_session_id: str) -> list:
+def find_conflicts(rel: str, sessions: list, my_session_id: str,
+                   file_repo_root: str = "") -> list:
     """OTHER active sessions whose scope covers `rel`. Excludes my own session
-    (matched by the session-id prefix the server appends to the agent id)."""
+    (matched by the session-id prefix the server appends to the agent id).
+
+    Repo anchoring (ats-lockcheck-repo-anchoring-p01): scope patterns are
+    repo-RELATIVE, so a session anchored to a DIFFERENT repo_root than the
+    target file's git root cannot conflict — its 'tests/**' means ITS tests/.
+    Either side unanchored ('') falls back to legacy match-everywhere."""
     mine = (my_session_id or "")[:8]
+    froot = (file_repo_root or "").rstrip("/")
     out = []
     for s in sessions or []:
         if str(s.get("status", "")).lower() != "active":
@@ -84,6 +91,9 @@ def find_conflicts(rel: str, sessions: list, my_session_id: str) -> list:
         agent = str(s.get("agent", ""))
         if mine and mine in agent:          # my own session — never self-block
             continue
+        sroot = str(s.get("repo_root") or "").rstrip("/")
+        if froot and sroot and froot != sroot:
+            continue                        # anchored to a different repo
         scope = s.get("scope") or s.get("files") or []
         if isinstance(scope, str):
             scope = [scope]
@@ -115,7 +125,8 @@ def main() -> None:
         sys.exit(0)  # server down / network — fail open
     sessions = data if isinstance(data, list) else data.get("sessions", data.get("data", []))
 
-    conflicts = find_conflicts(rel, sessions, payload.get("session_id", ""))
+    conflicts = find_conflicts(rel, sessions, payload.get("session_id", ""),
+                               file_repo_root=_git_root(fp) or "")
     if not conflicts:
         sys.exit(0)
 

@@ -39,6 +39,11 @@ class Session(Base):
     description: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(20), default="active")  # active|paused|completed
     branch: Mapped[str] = mapped_column(String(255), default="")
+    # Repo anchoring (ats-lockcheck-repo-anchoring-p01): scope patterns are
+    # repo-RELATIVE globs ('tests/**'), so without knowing WHICH repo a session
+    # works in, 'tests/**' held for /opt/anime-studio false-blocks edits to
+    # ~/code/ai-team-sync/tests/. '' = unanchored (legacy) -> enforced everywhere.
+    repo_root: Mapped[str] = mapped_column(String(1024), default="")
     started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     summary: Mapped[str | None] = mapped_column(Text, nullable=True)

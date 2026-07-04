@@ -73,6 +73,9 @@ class PreCommitCheckRequest(BaseModel):
     """Request to check if staged files conflict with active locks."""
 
     staged_files: list[str] | None = None  # If None, auto-detect from git
+    # Caller's git root — anchors the check so locks held for a DIFFERENT repo
+    # (repo-relative patterns) don't flag this repo's files. '' = legacy.
+    repo_root: str = ""
 
 
 class PreCommitCheckResponse(BaseModel):
@@ -95,7 +98,7 @@ async def pre_commit_check(
     """
     from ai_team_sync.git_utils import get_staged_files
     from ai_team_sync.models import ScopeLock
-    from ai_team_sync.routers.locks import _get_active_locks
+    from ai_team_sync.routers.locks import _cross_repo, _get_active_locks
 
     # Get staged files
     if body.staged_files is None:
@@ -103,6 +106,7 @@ async def pre_commit_check(
         staged_files = get_staged_files(repo_root)
     else:
         staged_files = body.staged_files
+    caller_repo_root = body.repo_root or (get_repo_root() if body.staged_files is None else "")
 
     if not staged_files:
         return PreCommitCheckResponse(
@@ -117,9 +121,11 @@ async def pre_commit_check(
     warnings = []
 
     for file in staged_files:
-        for lock, developer in active_locks:
+        for lock, developer, lock_repo_root in active_locks:
             from fnmatch import fnmatch
 
+            if _cross_repo(caller_repo_root, lock_repo_root):
+                continue  # lock belongs to a different repo — not this commit's concern
             if fnmatch(file, lock.pattern):
                 lock_info = {
                     "file": file,

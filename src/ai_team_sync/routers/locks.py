@@ -35,16 +35,27 @@ def _lock_to_response(lock: ScopeLock, developer: str | None = None) -> LockResp
     )
 
 
-async def _get_active_locks(db: AsyncSession) -> list[tuple[ScopeLock, str]]:
-    """Return all non-expired locks with their developer names."""
+async def _get_active_locks(db: AsyncSession) -> list[tuple[ScopeLock, str, str]]:
+    """Return all non-expired locks with their developer names and the owning
+    session's repo_root ('' = unanchored legacy session)."""
     now = datetime.now(timezone.utc)
     result = await db.execute(
-        select(ScopeLock, Session.developer)
+        select(ScopeLock, Session.developer, Session.repo_root)
         .join(Session)
         .where(ScopeLock.expires_at > now)
         .where(Session.status.in_(["active", "paused"]))
     )
     return list(result.all())
+
+
+def _cross_repo(caller_repo_root: str, lock_repo_root: str) -> bool:
+    """A lock's repo-relative pattern only means something inside its own repo.
+    Skip the lock when BOTH sides are anchored and to different repos; if either
+    side is unanchored (''), fall back to legacy match-everywhere behavior
+    (conservative — never lose protection during the transition)."""
+    a = (caller_repo_root or "").rstrip("/")
+    b = (lock_repo_root or "").rstrip("/")
+    return bool(a) and bool(b) and a != b
 
 
 @router.post("", response_model=LockResponse, status_code=201)
@@ -69,7 +80,7 @@ async def create_lock(body: LockCreate, db: AsyncSession = Depends(get_db)):
 @router.get("", response_model=list[LockResponse])
 async def list_locks(db: AsyncSession = Depends(get_db)):
     locks = await _get_active_locks(db)
-    return [_lock_to_response(lock, developer=dev) for lock, dev in locks]
+    return [_lock_to_response(lock, developer=dev) for lock, dev, _root in locks]
 
 
 @router.post("/check", response_model=list[LockCheckResult])
@@ -80,7 +91,9 @@ async def check_locks(body: LockCheckRequest, db: AsyncSession = Depends(get_db)
 
     for path in body.paths:
         matched = False
-        for lock, developer in active_locks:
+        for lock, developer, lock_repo_root in active_locks:
+            if _cross_repo(body.repo_root, lock_repo_root):
+                continue  # pattern belongs to a different repo — not a conflict here
             if fnmatch(path, lock.pattern):
                 results.append(LockCheckResult(
                     path=path,

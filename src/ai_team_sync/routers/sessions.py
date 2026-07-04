@@ -57,6 +57,7 @@ def _session_to_response(s: Session) -> SessionResponse:
         description=s.description,
         status=s.status,
         branch=s.branch,
+        repo_root=getattr(s, "repo_root", "") or "",
         started_at=s.started_at,
         completed_at=s.completed_at,
         last_heartbeat=s.last_heartbeat,
@@ -72,14 +73,22 @@ def _session_to_response(s: Session) -> SessionResponse:
 async def _check_scope_conflicts(
     db: AsyncSession,
     new_patterns: list[str],
-    current_developer: str
+    current_developer: str,
+    repo_root: str = "",
 ) -> list[dict]:
-    """Check if new scope patterns conflict with existing active locks."""
+    """Check if new scope patterns conflict with existing active locks.
+
+    `repo_root` anchors the check: locks held by sessions anchored to a
+    DIFFERENT repo use patterns relative to that repo, so they cannot conflict
+    with this session's patterns ('' on either side = legacy match-everywhere).
+    """
+    from ai_team_sync.routers.locks import _cross_repo
+
     now = datetime.now(timezone.utc)
 
     # Get all active locks from active sessions
     result = await db.execute(
-        select(ScopeLock, Session.developer)
+        select(ScopeLock, Session.developer, Session.repo_root)
         .join(Session)
         .where(ScopeLock.expires_at > now)
         .where(Session.status.in_(["active", "paused"]))
@@ -88,7 +97,9 @@ async def _check_scope_conflicts(
 
     conflicts = []
     for new_pattern in new_patterns:
-        for lock, developer in active_locks:
+        for lock, developer, lock_repo_root in active_locks:
+            if _cross_repo(repo_root, lock_repo_root):
+                continue  # other repo's patterns can't collide with ours
             # Check if patterns overlap using bidirectional matching
             # Pattern A matches Pattern B, or Pattern B matches Pattern A
             if (fnmatch(new_pattern, lock.pattern) or
@@ -109,7 +120,8 @@ async def _check_scope_conflicts(
 async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)):
     # Check for scope conflicts BEFORE creating the session
     if body.auto_lock and body.scope:
-        conflicts = await _check_scope_conflicts(db, body.scope, body.developer)
+        conflicts = await _check_scope_conflicts(
+            db, body.scope, body.developer, repo_root=body.repo_root)
 
         if conflicts:
             # Determine lock mode for new session
@@ -155,6 +167,7 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
         scope=json.dumps(body.scope),
         description=body.description,
         branch=body.branch,
+        repo_root=body.repo_root,
     )
     db.add(session)
     await db.flush()  # Ensure session.id is populated

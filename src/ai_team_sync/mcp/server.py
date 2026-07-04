@@ -52,6 +52,13 @@ def get_git_branch() -> str:
         return ""
 
 
+# Repo anchoring (ats-lockcheck-repo-anchoring-p01) is OPT-IN via the explicit
+# repo_root tool argument. Deliberately NO cwd-derived default: on multi-repo
+# boxes the MCP process cwd (~/Documents) is not the repo being locked, and a
+# wrong anchor silently disables enforcement for the real repo (false negative
+# — strictly worse than the cross-repo false positive this feature fixes).
+
+
 def detect_agent() -> str:
     """Detect which AI agent is active.
 
@@ -170,6 +177,15 @@ async def list_tools() -> list[Tool]:
                         "description": "If true, blocks all overlapping work (use for critical changes)",
                         "default": False,
                     },
+                    "repo_root": {
+                        "type": "string",
+                        "description": "Absolute git root your scope patterns are relative to "
+                                       "(e.g., '/opt/anime-studio'). PASS THIS when working a "
+                                       "specific repo: it anchors your locks so identical "
+                                       "patterns in OTHER repos don't false-block anyone. "
+                                       "Omit only for cross-repo/unscoped work (legacy "
+                                       "match-everywhere).",
+                    },
                 },
                 "required": ["scope", "description"],
             },
@@ -184,6 +200,12 @@ async def list_tools() -> list[Tool]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "File paths to check (e.g., ['src/main.py', 'backend/auth.py'])",
+                    },
+                    "repo_root": {
+                        "type": "string",
+                        "description": "Absolute git root the paths belong to. When given, locks "
+                                       "anchored to a DIFFERENT repo are ignored (their patterns "
+                                       "are relative to that repo). Omit = consider all locks.",
                     },
                 },
                 "required": ["paths"],
@@ -373,6 +395,12 @@ async def list_tools() -> list[Tool]:
                         "items": {"type": "string"},
                         "description": "Paths to check (usually staged files)",
                     },
+                    "repo_root": {
+                        "type": "string",
+                        "description": "Absolute git root of the repo being committed. When "
+                                       "given, locks anchored to a DIFFERENT repo are ignored. "
+                                       "Omit = consider all locks.",
+                    },
                 },
                 "required": ["paths"],
             },
@@ -535,6 +563,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         "scope": scope,
                         "description": description,
                         "branch": get_git_branch(),
+                        "repo_root": arguments.get("repo_root", ""),
                         "auto_lock": True,
                         "lock_mode": "exclusive" if exclusive else "advisory",
                     },
@@ -594,7 +623,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 paths = arguments["paths"]
                 response = await client.post(
                     f"{SERVER_URL}/api/locks/check",
-                    json={"paths": paths},
+                    json={"paths": paths,
+                          "repo_root": arguments.get("repo_root", "")},
                 )
                 response.raise_for_status()
                 results = response.json()
@@ -1036,7 +1066,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # and the response never parsed — the tool always said "clear". Fixed.
                 response = await client.post(
                     f"{SERVER_URL}/api/git/pre-commit-check",
-                    json={"staged_files": paths},
+                    json={"staged_files": paths,
+                          "repo_root": arguments.get("repo_root", "")},
                 )
                 response.raise_for_status()
                 data = response.json()

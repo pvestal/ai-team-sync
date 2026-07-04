@@ -15,6 +15,7 @@ from ai_team_sync.config import settings
 _COLUMN_MIGRATIONS = [
     ("scope_locks", "reason", "TEXT DEFAULT ''"),
     ("sessions", "last_heartbeat", "TIMESTAMP"),  # nullable liveness signal (Gap 1)
+    ("sessions", "repo_root", "TEXT DEFAULT ''"),  # repo anchoring (ats-lockcheck-repo-anchoring-p01)
 ]
 
 engine = create_async_engine(
