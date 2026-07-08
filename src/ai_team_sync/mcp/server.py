@@ -806,7 +806,12 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     msg += f"  Scope: {scope}\n"
                     msg += f"  Branch: {s['branch']}\n"
                     msg += f"  Description: {s['description']}\n"
-                    msg += f"  Locks: {s['lock_count']}  Decisions: {s['decision_count']}\n\n"
+                    msg += f"  Locks: {s['lock_count']}  Decisions: {s['decision_count']}\n"
+                    unc = s.get("uncommitted_in_scope") or []
+                    if unc:
+                        shown = ", ".join(unc[:5]) + ("…" if len(unc) > 5 else "")
+                        msg += f"  ✎ Uncommitted in scope ({len(unc)}): {shown}\n"
+                    msg += "\n"
 
                 return [TextContent(type="text", text=msg)]
 

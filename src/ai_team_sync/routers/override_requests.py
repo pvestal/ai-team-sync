@@ -109,9 +109,13 @@ async def create_override_request(
     active_locks = list(result.all())
 
     owner_session_id = None
+    owner_lock = None
+    owner_session = None
     for lock, session in active_locks:
         if lock.pattern == body.conflicting_pattern:
             owner_session_id = session.id
+            owner_lock = lock
+            owner_session = session
             break
 
     if not owner_session_id:
@@ -127,9 +131,27 @@ async def create_override_request(
     db.add(request)
     await db.flush()  # Get ID before policy check
 
-    # Check auto-approval policy
+    # Check auto-approval policy — with lock context so the advisory-idle
+    # rule can approve without the operator relaying (targeted fix,
+    # ats-git-diff-merge-workflow-p01). Owner idle = newest of started_at /
+    # last_heartbeat / this lock's creation (same signal as team_status
+    # staleness), so a just-registered session is never auto-overridden.
+    def _aware(dt):
+        return dt.replace(tzinfo=timezone.utc) if dt and dt.tzinfo is None else dt
+
+    _activity = [_aware(t) for t in
+                 (owner_session.started_at, owner_session.last_heartbeat,
+                  owner_lock.created_at) if t]
+    owner_idle_seconds = (
+        (datetime.now(timezone.utc) - max(_activity)).total_seconds()
+        if _activity else None
+    )
     policy = ApprovalPolicy()
-    auto_decision = policy.should_auto_approve(request)
+    auto_decision = policy.should_auto_approve(
+        request,
+        lock_mode=owner_lock.mode,
+        owner_idle_seconds=owner_idle_seconds,
+    )
 
     if auto_decision is not None:
         # Auto-approve or auto-deny

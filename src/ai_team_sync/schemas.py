@@ -45,6 +45,10 @@ class SessionResponse(BaseModel):
     lock_count: int = 0
     decision_count: int = 0
     commit_count: int = 0
+    # Diff visibility (ats-git-diff-merge-workflow-p01): the session's
+    # uncommitted files that fall inside its scope (capped) — overlap between
+    # sessions reads as diffs on the board, not just lock patterns.
+    uncommitted_in_scope: list[str] = []
     # Liveness: seconds since the session's most recent activity, and whether it
     # has gone silent past the heartbeat window (a suspected ghost). Lets
     # team_status flag idle/ghost sessions so their scope isn't treated as a live

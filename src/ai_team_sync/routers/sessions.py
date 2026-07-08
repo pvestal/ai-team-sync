@@ -11,8 +11,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from pathlib import Path
+
 from ai_team_sync.database import get_db
 from ai_team_sync.models import ScopeLock, Session
+from ai_team_sync.git_utils import files_match_patterns, get_uncommitted_files
 from ai_team_sync.notifications.dispatcher import dispatch
 from ai_team_sync.schemas import SessionCreate, SessionResponse, SessionUpdate
 from ai_team_sync.config import settings
@@ -47,7 +50,34 @@ def _session_liveness(s: Session) -> tuple[float | None, bool]:
     return idle, is_stale
 
 
-def _session_to_response(s: Session) -> SessionResponse:
+
+# Diff visibility (ats-git-diff-merge-workflow-p01): cap the per-session list so
+# a huge dirty tree can't bloat the sessions payload.
+_UNCOMMITTED_CAP = 20
+
+
+def _uncommitted_in_scope(s: Session, cache: dict[str, list[str]] | None) -> list[str]:
+    """Active session's uncommitted files that fall inside its scope.
+
+    `cache` memoizes the git call per repo_root within one request — sessions
+    frequently share a repo. Unanchored/legacy sessions ('' repo_root) return [].
+    """
+    if s.status != "active" or not (getattr(s, "repo_root", "") or ""):
+        return []
+    if cache is None:
+        cache = {}
+    root = s.repo_root
+    if root not in cache:
+        cache[root] = get_uncommitted_files(Path(root))
+    files = cache[root]
+    if not files:
+        return []
+    scope = json.loads(s.scope) if s.scope else []
+    matched = sorted({f for fl in files_match_patterns(files, scope).values() for f in fl})
+    return matched[:_UNCOMMITTED_CAP]
+
+
+def _session_to_response(s: Session, uncommitted_cache: dict[str, list[str]] | None = None) -> SessionResponse:
     idle_seconds, is_stale = _session_liveness(s)
     return SessionResponse(
         id=s.id,
@@ -67,6 +97,7 @@ def _session_to_response(s: Session) -> SessionResponse:
         commit_count=len(s.commits) if s.commits else 0,
         idle_seconds=idle_seconds,
         is_stale=is_stale,
+        uncommitted_in_scope=_uncommitted_in_scope(s, uncommitted_cache),
     )
 
 
@@ -219,7 +250,8 @@ async def list_sessions(
     query = query.order_by(Session.started_at.desc())
 
     result = await db.execute(query)
-    return [_session_to_response(s) for s in result.scalars().all()]
+    uncommitted_cache: dict[str, list[str]] = {}
+    return [_session_to_response(s, uncommitted_cache) for s in result.scalars().all()]
 
 
 @router.get("/{session_id}", response_model=SessionResponse)
