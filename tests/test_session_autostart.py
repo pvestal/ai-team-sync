@@ -89,3 +89,36 @@ def test_explicit_env_override_wins(_isolated_state, monkeypatch):
     sp.save_pointer("from-file")
     monkeypatch.setenv("ATS_SESSION_ID", "from-env")
     assert sp.resolve_pointer() == "from-env"
+
+
+@pytest.mark.asyncio
+async def test_autostart_does_not_adopt_another_sessions_global_pointer(client, tmp_path):
+    """A NEW Claude session must never inherit a previous session's active row.
+
+    Live failure 2026-07-24: session 5876a02c had no per-session pointer yet, so
+    resolve_pointer fell through to the legacy ~/.ats_session, found an older
+    session's still-active row (agent claude-code:afb53dd3) and reused it —
+    inheriting that row's agent label, scope and description. The PreToolUse
+    lock guard self-excludes by the payload session id, which never matches the
+    inherited agent label, so the session hard-blocked its OWN edits.
+    """
+    # An OLDER session registers and leaves the global pointer behind.
+    import os
+    os.environ["CLAUDE_CODE_SESSION_ID"] = "aaaaaaaa-0000-0000-0000-000000000000"
+    old_sid = await autostart.ensure_session("http://test", client)
+    assert old_sid
+    old_row = [s for s in await _active_sessions(client) if s["id"] == old_sid][0]
+
+    # Global pointer now points at the OLD row; the new session has no pointer.
+    (tmp_path / ".ats_session").write_text(old_sid)
+    os.environ["CLAUDE_CODE_SESSION_ID"] = "bbbbbbbb-0000-0000-0000-000000000000"
+    assert not (tmp_path / ".ats_session_bbbbbbbb").exists()
+
+    new_sid = await autostart.ensure_session("http://test", client)
+
+    assert new_sid != old_sid, "new session adopted the previous session's ATS row"
+    rows = {s["id"]: s for s in await _active_sessions(client)}
+    assert new_sid in rows
+    assert rows[new_sid]["agent"] != old_row["agent"], \
+        "inherited agent label is what makes the lock guard block the session against itself"
+    assert rows[new_sid]["agent"] == "claude-code:bbbbbbbb"

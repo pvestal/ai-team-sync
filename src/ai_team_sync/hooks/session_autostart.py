@@ -60,7 +60,9 @@ async def ensure_session(server_url: str, client) -> str | None:
         return None  # no stable key → can't dedupe a pointer; leave to manual flow
 
     # Idempotent reuse: a pointer we still recognize as active on the server.
-    existing = sp.resolve_pointer(cid)
+    # allow_global=False: the legacy shared pointer names the last session to
+    # write it, so reusing it makes THIS session inherit that row's identity.
+    existing = sp.resolve_pointer(cid, allow_global=False)
     if existing:
         try:
             r = await client.get(f"{server_url}/api/sessions/{existing}")

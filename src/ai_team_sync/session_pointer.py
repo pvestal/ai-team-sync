@@ -68,8 +68,14 @@ def save_pointer(session_id: str, cid: str | None = None) -> None:
             pass
 
 
-def resolve_pointer(cid: str | None = None) -> str | None:
-    """Resolve THIS session's ATS session id. See module docstring for order."""
+def resolve_pointer(cid: str | None = None, allow_global: bool = True) -> str | None:
+    """Resolve THIS session's ATS session id. See module docstring for order.
+
+    allow_global=False drops step 3 (the legacy shared file). Callers that
+    ADOPT the resolved row must pass False: the global file names whichever
+    session wrote it last, so a new session would inherit that row's agent
+    label, scope and description.
+    """
     env = (os.environ.get("ATS_SESSION_ID") or "").strip()
     if env:
         return env
@@ -81,6 +87,8 @@ def resolve_pointer(cid: str | None = None) -> str | None:
                 return content
         except Exception:
             pass
+    if not allow_global:
+        return None
     try:
         content = global_pointer_path().read_text().strip()
         return content or None
