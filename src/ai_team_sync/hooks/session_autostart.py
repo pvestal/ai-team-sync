@@ -55,9 +55,17 @@ async def ensure_session(server_url: str, client) -> str | None:
     """Create-or-reuse this Claude session's ATS row. Returns the ATS session id,
     or None if it can't (no session id / server unreachable) so the caller fails
     open. `client` is an httpx.AsyncClient (real, or ASGI-routed in tests)."""
-    cid = sp.claude_session_id()
+    # env_ not claude_: this hook is the PUBLISHER of the live cid, and it is
+    # respawned on /clear, so its environment is the authority. Reading through
+    # claude_session_id() would hand back the pre-/clear value it published last
+    # time and the rotation would never propagate (#2003).
+    cid = sp.env_claude_session_id()
     if not cid:
         return None  # no stable key → can't dedupe a pointer; leave to manual flow
+
+    # Hand the live cid to this Claude process's stdio MCP server, whose own
+    # CLAUDE_CODE_SESSION_ID froze at spawn time and cannot see the rotation.
+    sp.publish_live_cid(cid)
 
     # Idempotent reuse: a pointer we still recognize as active on the server.
     # allow_global=False: the legacy shared pointer names the last session to

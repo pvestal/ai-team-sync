@@ -85,10 +85,18 @@ def session_agent_label() -> str:
     """Per-session agent identity: base agent type + a short session token so two
     CONCURRENT sessions of the same agent are distinguishable (#1556) instead of
     collapsing to one 'claude-code'. Token from CLAUDE_CODE_SESSION_ID / ATS_SESSION.
+
+    This server is spawned once per Claude process, so its own
+    CLAUDE_CODE_SESSION_ID goes stale at the first /clear while every hook sees
+    the rotated value. The lock guard self-excludes by string-matching the live
+    hook cid against this label, so reading the environment directly made a
+    session block its own edits (#2003). session_pointer.claude_session_id()
+    prefers the cid the SessionStart hook published for this Claude process.
     """
+    from ai_team_sync import session_pointer as sp
+
     base = detect_agent()
-    sid = (os.environ.get("CLAUDE_CODE_SESSION_ID")
-           or os.environ.get("ATS_SESSION") or "").strip()
+    sid = (sp.claude_session_id() or "").strip()
     return f"{base}:{sid[:8]}" if (sid and base != "unknown") else base
 
 
