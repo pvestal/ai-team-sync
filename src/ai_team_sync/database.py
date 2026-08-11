@@ -16,6 +16,10 @@ _COLUMN_MIGRATIONS = [
     ("scope_locks", "reason", "TEXT DEFAULT ''"),
     ("sessions", "last_heartbeat", "TIMESTAMP"),  # nullable liveness signal (Gap 1)
     ("sessions", "repo_root", "TEXT DEFAULT ''"),  # repo anchoring (ats-lockcheck-repo-anchoring-p01)
+    # Reaper-vs-operator completion. Existing rows backfill to 0 (= operator),
+    # which is the conservative direction: a historical auto-completion will not
+    # resurrect, it just behaves as it does today.
+    ("sessions", "auto_completed", "BOOLEAN DEFAULT 0"),
 ]
 
 engine = create_async_engine(

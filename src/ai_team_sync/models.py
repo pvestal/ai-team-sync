@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import DateTime, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from ai_team_sync.config import settings
@@ -54,6 +54,15 @@ class Session(Base):
     # derived-activity rule, so legacy/non-heartbeating clients are unaffected. See
     # docs/product-gaps-reaper-and-scope.md Gap 1.
     last_heartbeat: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # TRUE when the REAPER completed this session, not the operator. The two are
+    # not interchangeable: a heartbeat arriving after an auto-completion is proof
+    # the reaper guessed wrong and the process is alive, so the session is
+    # resurrected; a heartbeat after an OPERATOR completion is a late hook from a
+    # process shutting down and must not reopen work the operator called done.
+    # Before this flag the only marker was a substring in `summary`, which is not
+    # something a security-relevant branch should read.
+    auto_completed: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default="0")
 
     locks: Mapped[list[ScopeLock]] = relationship(back_populates="session", cascade="all, delete-orphan")
     decisions: Mapped[list[Decision]] = relationship(back_populates="session", cascade="all, delete-orphan")

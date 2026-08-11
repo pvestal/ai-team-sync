@@ -55,6 +55,10 @@ class SessionResponse(BaseModel):
     # blocker. (ats-ghost-session-liveness-reap-p01)
     idle_seconds: float | None = None
     is_stale: bool = False
+    # True when the REAPER completed this session rather than its owner. Surfaced
+    # so a client can tell "I was reaped" (recoverable — heartbeat resurrects it)
+    # from "I finished" (terminal), instead of both reading as plain 'completed'.
+    auto_completed: bool = False
 
     model_config = {"from_attributes": True}
 

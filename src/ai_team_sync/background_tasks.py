@@ -108,6 +108,10 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
         if last_activity < cutoff:
             sess.status = "completed"
             sess.completed_at = now
+            # Mark WHO completed it. A later heartbeat on a reaper-completed
+            # session is proof this decision was wrong and resurrects it; the
+            # same heartbeat on an operator-completed session must not.
+            sess.auto_completed = True
             reason = (f"silent >{settings.session_heartbeat_timeout_minutes}m (heartbeat lost)"
                       if heartbeated else
                       f"inactive >{settings.session_inactivity_hours}h")

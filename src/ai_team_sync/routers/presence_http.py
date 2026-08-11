@@ -7,8 +7,11 @@ each edit acts as a heartbeat: "actively editing right now"; it ages out when ed
 """
 from __future__ import annotations
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from ai_team_sync.database import get_db
+from ai_team_sync.liveness import touch_session_liveness
 from ai_team_sync.presence import store
 from ai_team_sync.schemas import (
     PresenceEntry,
@@ -30,9 +33,17 @@ def _path_matches(query: str, presence_file: str) -> bool:
 
 
 @router.post("", response_model=list[PresenceEntry])
-async def update_presence(body: PresenceUpdate):
-    """Set/refresh a developer's live presence (files + one-line intent)."""
+async def update_presence(body: PresenceUpdate, db: AsyncSession = Depends(get_db)):
+    """Set/refresh a developer's live presence (files + one-line intent).
+
+    Also refreshes that agent's session liveness: the PostToolUse presence hook
+    already identifies the session by `agent`, so an edit is proof of life and
+    the reaper should count it. Before this, presence and liveness were separate
+    signals and a session could be broadcasting edits while being reaped for
+    silence.
+    """
     store.update(body.developer, body.agent, body.files, body.intent)
+    await touch_session_liveness(db, agent=body.agent)
     await store.broadcast()
     return store.get_all()
 

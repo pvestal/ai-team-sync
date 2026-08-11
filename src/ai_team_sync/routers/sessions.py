@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 
@@ -19,6 +20,8 @@ from ai_team_sync.git_utils import files_match_patterns, get_uncommitted_files
 from ai_team_sync.notifications.dispatcher import dispatch
 from ai_team_sync.schemas import SessionCreate, SessionResponse, SessionUpdate
 from ai_team_sync.config import settings
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
 
@@ -97,6 +100,7 @@ def _session_to_response(s: Session, uncommitted_cache: dict[str, list[str]] | N
         commit_count=len(s.commits) if s.commits else 0,
         idle_seconds=idle_seconds,
         is_stale=is_stale,
+        auto_completed=bool(getattr(s, "auto_completed", False)),
         uncommitted_in_scope=_uncommitted_in_scope(s, uncommitted_cache),
     )
 
@@ -321,6 +325,41 @@ async def heartbeat_session(session_id: str, db: AsyncSession = Depends(get_db))
     session = result.scalar_one_or_none()
     if not session:
         raise HTTPException(404, "Session not found")
+
+    # A heartbeat for a COMPLETED session is the highest-signal event this server
+    # can receive, and it used to be written to the corpse and forgotten.
+    # Observed live 2026-08-10: bc62c5e9 completed 03:39:55, heartbeated 03:43:49;
+    # 3436c282 heartbeated 2h19m after completion. Two different meanings:
+    #
+    #   auto_completed  -> the REAPER guessed, and this ping disproves it. The
+    #                      process is alive, so bring the session back with its
+    #                      locks rather than forcing a new id that severs
+    #                      continuity with the work already claimed against it.
+    #   operator-completed -> the operator said done. A late hook from a dying
+    #                      process must not reopen it; refuse and do NOT stamp,
+    #                      so a corpse never looks alive.
+    if session.status == "completed":
+        if not getattr(session, "auto_completed", False):
+            raise HTTPException(
+                409,
+                "Session was completed by its owner; heartbeat refused. "
+                "Start a new session rather than reopening finished work.",
+            )
+        note = "[resurrected: heartbeat proved the reap wrong]"
+        session.status = "active"
+        session.completed_at = None
+        session.auto_completed = False
+        session.summary = f"{session.summary} {note}".strip() if session.summary else note
+        logger.warning(
+            "session %s resurrected: it was auto-completed as silent but is alive",
+            session.id,
+        )
+        await dispatch("session.resurrected", {
+            "session_id": session.id,
+            "developer": session.developer,
+            "agent": session.agent,
+        })
+
     session.last_heartbeat = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(session)

@@ -9,8 +9,11 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from fastapi import Depends
+
 from ai_team_sync.database import init_db
 from ai_team_sync.config import settings
+from ai_team_sync.liveness import liveness_from_request
 from ai_team_sync.routers import sessions, locks, decisions, override_requests, git_status, websocket, dashboard, presence_ws, presence_http
 
 
@@ -31,6 +34,10 @@ def create_app() -> FastAPI:
         description="Change management API for AI-assisted development teams",
         version="0.2.0",
         lifespan=lifespan,
+        # Any request carrying a session header proves that session is alive, so
+        # read-heavy work (Read/Bash/queries) is no longer invisible to the
+        # reaper. See liveness.py for the incident this closes.
+        dependencies=[Depends(liveness_from_request)],
     )
     app.include_router(sessions.router, prefix="/api")
     app.include_router(locks.router, prefix="/api")
