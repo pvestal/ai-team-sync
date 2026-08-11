@@ -104,6 +104,37 @@ async def test_presence_update_counts_as_liveness_for_that_agent(client):
 
 
 @pytest.mark.asyncio
+async def test_agent_liveness_refreshes_every_session_that_agent_holds(client):
+    """One process, several repos, several sessions — all of them are alive.
+
+    Regression for a real reap: agent claude-code:15b5b559 held 956401fb (7
+    locks, /opt/anime-studio) and 832684d4 (ai-team-sync). Liveness resolved
+    by-agent to the NEWEST session only, so 956401fb starved and the reaper took
+    it — with its locks — while the process was demonstrably working.
+    """
+    agent = "claude-code:multi"
+    first = (await client.post("/api/sessions", json={
+        "developer": "patrick", "agent": agent,
+        "scope": ["repo_a/**"], "description": "repo A",
+    })).json()["id"]
+    second = (await client.post("/api/sessions", json={
+        "developer": "patrick", "agent": agent,
+        "scope": ["repo_b/**"], "description": "repo B",
+    })).json()["id"]
+    assert first != second
+
+    r = await client.post("/api/presence", json={
+        "developer": "patrick", "agent": agent,
+        "files": ["repo_b/x.py"], "intent": "editing",
+    })
+    assert r.status_code == 200
+
+    for sid, label in ((first, "older"), (second, "newer")):
+        got = (await client.get(f"/api/sessions/{sid}")).json()
+        assert got["last_heartbeat"] is not None, f"{label} session was left to starve"
+
+
+@pytest.mark.asyncio
 async def test_unknown_session_header_is_ignored_not_an_error(client):
     """Liveness must never wedge a request — a bad/stale header is a no-op."""
     r = await client.get("/api/sessions", headers={"X-ATS-Session-Id": "no-such-session"})

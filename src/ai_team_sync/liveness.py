@@ -54,7 +54,16 @@ async def touch_session_liveness(
 ) -> bool:
     """Refresh last_heartbeat for the matching ACTIVE session. True if bumped.
 
-    Resolution order: exact session id, then newest active session for `agent`.
+    Resolution: exact session id, else EVERY active session for `agent`.
+
+    All of them, not the newest — one agent process routinely holds several
+    sessions at once (one per repo it is working in), and they are all alive
+    exactly when the process is. A first version took only the newest and was
+    caught doing the damage it was written to prevent: on 2026-08-11 agent
+    claude-code:15b5b559 held 956401fb (7 locks, /opt/anime-studio) and
+    832684d4 (ai-team-sync); every liveness ping refreshed the newer one and
+    956401fb starved and was reaped at 04:25:20 with its locks.
+
     An unknown id/agent is a no-op, not an error — a stale pointer is normal
     after a reap and must not fail the caller's real request.
     """
@@ -65,11 +74,13 @@ async def touch_session_liveness(
         if session_id:
             stmt = stmt.where(Session.id == session_id)
         else:
-            stmt = stmt.where(Session.agent == agent).order_by(Session.started_at.desc())
-        session = (await db.execute(stmt.limit(1))).scalar_one_or_none()
-        if session is None:
+            stmt = stmt.where(Session.agent == agent)
+        sessions = (await db.execute(stmt)).scalars().all()
+        if not sessions:
             return False
-        session.last_heartbeat = datetime.now(timezone.utc)
+        now = datetime.now(timezone.utc)
+        for session in sessions:
+            session.last_heartbeat = now
         await db.commit()
         return True
     except Exception:  # noqa: BLE001 — liveness must never break a request
