@@ -54,10 +54,38 @@ def _resolve_session_id() -> str | None:
             return None
 
 
+def _throttled(session_id: str) -> bool:
+    """True when a beat went out recently enough to skip this one.
+
+    Wiring this hook at PostToolUse (2026-08-17) is what keeps a LONG turn
+    alive — the reaper's ~20m timeout is shorter than a heavy render/review
+    turn, and Stop only fires at turn END, so sessions were being reaped
+    mid-turn with their locks silently released. Per-tool-call beats need a
+    throttle: mtime of a tiny state file, one beat per interval, so a
+    tool-dense turn does not hammer the server."""
+    try:
+        interval = int(os.environ.get("ATS_HEARTBEAT_MIN_INTERVAL_S", "60"))
+    except ValueError:
+        interval = 60
+    if interval <= 0:
+        return False
+    marker = Path(os.environ.get("ATS_STATE_DIR") or Path.home()) / f".ats_hb_{session_id[:8]}"
+    try:
+        import time
+        if marker.exists() and (time.time() - marker.stat().st_mtime) < interval:
+            return True
+        marker.touch()
+    except Exception:
+        pass  # throttle bookkeeping must never stop a beat
+    return False
+
+
 def main() -> None:
     session_id = _resolve_session_id()
     if not session_id:
         sys.exit(0)  # no active ATS session — nothing to heartbeat
+    if _throttled(session_id):
+        sys.exit(0)
     server = os.environ.get("ATS_SERVER_URL", "http://localhost:8400")
     try:
         import httpx

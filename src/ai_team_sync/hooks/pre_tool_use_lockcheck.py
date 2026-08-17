@@ -104,6 +104,67 @@ def find_conflicts(rel: str, sessions: list, my_session_id: str,
     return out
 
 
+def _coordinated_roots() -> list[str]:
+    raw = os.environ.get("ATS_COORDINATED_REPOS",
+                         "/opt/anime-studio:/opt/tower-echo-brain")
+    return [r.rstrip("/") for r in raw.split(":") if r.strip()]
+
+
+def claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,
+                sessions: list, locks: list) -> tuple[bool, str]:
+    """(ok, reason) — do *I* hold a live claim covering `rel`? The CLAIM half
+    of coordination (2026-08-17). find_conflicts asks "is someone ELSE here?";
+    nothing asked "is my own session alive and does it claim this file?" — so
+    a session reaped mid-turn (Stop-only heartbeats vs a 25-minute render
+    turn) kept editing coordinated repos lock-less all day with zero warning.
+
+    My session resolves pointer-first (concurrency-safe, Gap 3), falling back
+    to agent-match on the hook payload's Claude session id. A claim is a LOCK
+    whose pattern covers `rel` (locks are the primary claim primitive) or a
+    session SCOPE pattern covering it, either anchored to this repo or
+    unanchored. Pure function of its inputs, for tests."""
+    def _mine(s) -> bool:
+        if my_sid and str(s.get("id", "")) == my_sid:
+            return True
+        return bool(my_cid8) and my_cid8 in str(s.get("agent", ""))
+
+    mine_active = [s for s in sessions or []
+                   if _mine(s) and str(s.get("status", "")).lower() == "active"]
+    if not mine_active:
+        mine_any = [s for s in sessions or [] if _mine(s)]
+        if mine_any:
+            return False, ("your ATS session was completed/reaped — its locks are "
+                           "gone. Heartbeat/re-register (ats session start or POST "
+                           "/api/sessions/<id>/heartbeat) and re-take locks before "
+                           "editing this repo.")
+        return False, ("no ATS session found for this agent — SessionStart "
+                       "autostart did not register one. Run `ats session start` "
+                       "with scope before editing this repo.")
+
+    my_ids = {str(s.get("id", "")) for s in mine_active}
+    for lk in locks or []:
+        if str(lk.get("session_id", "")) not in my_ids:
+            continue
+        lroot = str(lk.get("repo_root") or "").rstrip("/")
+        if lroot and froot and lroot != froot:
+            continue
+        if scope_matches(rel, str(lk.get("pattern", ""))):
+            return True, ""
+    for s in mine_active:
+        sroot = str(s.get("repo_root") or "").rstrip("/")
+        if sroot and froot and sroot != froot:
+            continue
+        scope = s.get("scope") or []
+        if isinstance(scope, str):
+            scope = [scope]
+        for pat in scope:
+            if scope_matches(rel, str(pat)):
+                return True, ""
+    return False, (f"your active ATS session holds no lock or scope covering "
+                   f"'{rel}'. Take a lock first (ats lock / POST /api/locks) — "
+                   f"claims are what stop two sessions clobbering one file.")
+
+
 def main() -> None:
     try:
         payload = json.load(sys.stdin)
@@ -125,8 +186,36 @@ def main() -> None:
         sys.exit(0)  # server down / network — fail open
     sessions = data if isinstance(data, list) else data.get("sessions", data.get("data", []))
 
+    froot = (_git_root(fp) or "").rstrip("/")
     conflicts = find_conflicts(rel, sessions, payload.get("session_id", ""),
-                               file_repo_root=_git_root(fp) or "")
+                               file_repo_root=froot)
+
+    # Claim guard — only inside coordinated repos, and only when the server
+    # ANSWERED (the fail-open above already exited on server errors): being
+    # unclaimed there is exactly the silent-clobber hole, so it fails CLOSED.
+    # ATS_CLAIMCHECK=0 downgrades to warn-only.
+    if not conflicts and froot in _coordinated_roots():
+        try:
+            import httpx
+            with httpx.Client(timeout=2) as client:
+                locks = client.get(f"{server}/api/locks").json()
+            if not isinstance(locks, list):
+                locks = locks.get("locks", locks.get("data", []))
+        except Exception:
+            sys.exit(0)  # locks endpoint unreachable — fail open
+        my_sid = None
+        try:
+            from ai_team_sync import session_pointer as sp
+            my_sid = sp.resolve_pointer()
+        except Exception:
+            pass
+        my_cid8 = str(payload.get("session_id", ""))[:8]
+        ok, reason = claim_check(rel, froot, my_sid, my_cid8, sessions, locks)
+        if ok:
+            sys.exit(0)
+        print(f"ATS CLAIM GUARD: {reason}", file=sys.stderr)
+        sys.exit(2 if os.environ.get("ATS_CLAIMCHECK", "1") != "0" else 0)
+
     if not conflicts:
         sys.exit(0)
 
