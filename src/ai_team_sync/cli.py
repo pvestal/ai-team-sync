@@ -81,21 +81,11 @@ def _detect_agent() -> str:
       2. Known auto-detected env signatures.
       3. "unknown".
     """
-    explicit = os.environ.get("ATS_AGENT")
-    if explicit and explicit.strip():
-        return explicit.strip()
-    if os.environ.get("CLAUDE_CODE"):
-        return "claude-code"
-    # Codex CLI exports CODEX_* vars (e.g. CODEX_SANDBOX*) into the command
-    # environment it runs in. Best-effort signature; prefer ATS_AGENT=codex if
-    # this proves unreliable in a future Codex release.
-    if any(key.startswith("CODEX") for key in os.environ):
-        return "codex"
-    if os.environ.get("CURSOR_SESSION"):
-        return "cursor"
-    if os.environ.get("COPILOT_WORKSPACE"):
-        return "copilot-workspace"
-    return "unknown"
+    # #2517: this was a rotted copy — it missed CLAUDECODE (no underscore),
+    # so `ats session start` from a Claude Code shell registered 'unknown'.
+    # One detection now lives in session_pointer; keep this name for callers.
+    from ai_team_sync import session_pointer as sp
+    return sp.detect_agent()
 
 
 def _api(method: str, path: str, **kwargs) -> httpx.Response:
@@ -133,9 +123,14 @@ def session_start(scope, desc, agent, no_lock, exclusive):
     lock_mode = "exclusive" if exclusive else "advisory"
 
     try:
+        # #2517: the label MUST carry the live Claude session token — the lock
+        # guard attributes sessions by matching the hook cid against it. A bare
+        # label here created rows the guard read as "another ACTIVE session",
+        # self-blocking the caller and worsening on every re-register.
+        from ai_team_sync import session_pointer as sp
         resp = _api("post", "/sessions", json={
             "developer": _get_developer(),
-            "agent": agent or _detect_agent(),
+            "agent": sp.agent_label(agent) if agent else sp.agent_label(),
             "scope": list(scope),
             "description": desc,
             "branch": _get_branch(),
@@ -486,9 +481,25 @@ def _session_file() -> str:
 def _save_active_session(session_id: str):
     with open(_session_file(), "w") as f:
         f.write(session_id)
+    # #2517: the global file names whichever session wrote it last, so with two
+    # concurrent sessions `ats status` flapped between "no active session" and
+    # someone else's id. The per-cid pointer (session_pointer) is authoritative
+    # when a Claude session id is known; the global file stays for hookless use.
+    try:
+        from ai_team_sync import session_pointer as sp
+        sp.save_pointer(session_id)
+    except Exception:
+        pass
 
 
 def _load_active_session() -> str | None:
+    try:
+        from ai_team_sync import session_pointer as sp
+        sid = sp.resolve_pointer()
+        if sid:
+            return sid
+    except Exception:
+        pass
     try:
         with open(_session_file()) as f:
             return f.read().strip() or None

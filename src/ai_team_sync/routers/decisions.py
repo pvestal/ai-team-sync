@@ -29,6 +29,27 @@ def _decision_to_response(d: Decision) -> DecisionResponse:
     )
 
 
+class DecisionBody(DecisionCreate):
+    # Nested alias carries the session in the PATH; make the body's copy
+    # optional so {"title": ...} alone is a valid nested payload (#2517).
+    session_id: str | None = None  # type: ignore[assignment]
+
+
+session_scoped = APIRouter(prefix="/sessions", tags=["decisions"])
+
+
+@session_scoped.post("/{session_id}/decisions", response_model=DecisionResponse,
+                     status_code=201)
+async def create_decision_alias(
+    session_id: str, body: DecisionBody, db: AsyncSession = Depends(get_db),
+):
+    """Alias for POST /api/decisions with session_id in the path (#2517
+    failure 2) — the shape agents guess. Delegates to create_decision."""
+    return await create_decision(
+        DecisionCreate(**{**body.model_dump(exclude_none=True),
+                          "session_id": session_id}), db)
+
+
 @router.post("", response_model=DecisionResponse, status_code=201)
 async def create_decision(body: DecisionCreate, db: AsyncSession = Depends(get_db)):
     # Verify session exists

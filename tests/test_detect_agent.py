@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from ai_team_sync.cli import _detect_agent
 
-_RELEVANT = ("ATS_AGENT", "CLAUDE_CODE", "CURSOR_SESSION", "COPILOT_WORKSPACE")
+_RELEVANT = ("ATS_AGENT", "CLAUDE_CODE", "CLAUDECODE", "CURSOR_SESSION", "COPILOT_WORKSPACE")
 
 
 def _run(env_overrides):
@@ -47,6 +47,10 @@ def test_codex_autodetect():
 
 def test_known_signatures():
     assert _run({"CLAUDE_CODE": "1"}) == "claude-code"
+    # 2517: Claude Code actually sets CLAUDECODE (no underscore); the CLI copy
+    # missed it (#1556 fixed only the MCP copy) so `ats session start` from a
+    # Claude Code shell registered as 'unknown'.
+    assert _run({"CLAUDECODE": "1"}) == "claude-code"
     assert _run({"CURSOR_SESSION": "x"}) == "cursor"
     assert _run({"COPILOT_WORKSPACE": "x"}) == "copilot-workspace"
 

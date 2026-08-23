@@ -141,6 +141,49 @@ def claude_session_id() -> str | None:
     return live_claude_session_id() or env_claude_session_id()
 
 
+def detect_agent() -> str:
+    """Detect which AI agent is active. The ONE detection (#2517).
+
+    Honors ATS_AGENT (explicit override) first, then known env signatures.
+    NOTE: Claude Code sets CLAUDECODE (no underscore) — the old
+    CLAUDE_CODE-only check returned 'unknown' (#1556). cli._detect_agent and
+    mcp.server.detect_agent delegate here; before #2517 the CLI carried a
+    rotted copy that still missed CLAUDECODE, so `ats session start` from a
+    Claude Code shell registered as 'unknown'.
+    """
+    explicit = (os.environ.get("ATS_AGENT") or "").strip()
+    if explicit:
+        return explicit
+    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE"):
+        return "claude-code"
+    if any(key.startswith("CODEX") for key in os.environ):
+        return "codex"
+    if os.environ.get("CURSOR_SESSION"):
+        return "cursor"
+    if os.environ.get("COPILOT_WORKSPACE"):
+        return "copilot-workspace"
+    return "unknown"
+
+
+def agent_label(base: str | None = None, cid: str | None = None) -> str:
+    """Per-session agent identity: '<base>:<cid8>' (#1556/#2003/#2517).
+
+    THE label the lock guard attributes sessions by: it string-matches the
+    hook payload's live cid against this. Every registrar (SessionStart
+    autostart, the stdio MCP, the CLI) must build it HERE — a registrar that
+    writes a bare base label creates a session its own creator can never be
+    matched to, so the guard names the caller's scope as "another ACTIVE
+    session's scope" and every re-register adds another blocker (#2517).
+
+    base defaults to detect_agent(); cid defaults to claude_session_id().
+    Falls back to the bare base when no cid is known ('unknown' never gets a
+    suffix — a token on an unidentified agent reads as identity it isn't).
+    """
+    base = (base or detect_agent()).strip() or "unknown"
+    cid = (cid if cid is not None else (claude_session_id() or "")).strip()
+    return f"{base}:{cid[:8]}" if (cid and base != "unknown") else base
+
+
 def global_pointer_path() -> Path:
     return _state_dir() / GLOBAL_FILE_NAME
 

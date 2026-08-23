@@ -311,6 +311,23 @@ async def update_session(session_id: str, body: SessionUpdate, db: AsyncSession 
     return _session_to_response(session)
 
 
+@router.post("/{session_id}/complete", response_model=SessionResponse)
+async def complete_session_alias(
+    session_id: str, body: SessionUpdate | None = None,
+    db: AsyncSession = Depends(get_db),
+):
+    """Alias for PATCH {status:'completed'} (#2517 failure 2).
+
+    Agents guess this RESTful-looking path, got {"detail":"Not Found"}, and
+    concluded ATS was down — then proceeded uncoordinated. Delegates to
+    update_session so completion semantics (lock release, completed_at,
+    session.completed dispatch) stay single-sourced.
+    """
+    patch = SessionUpdate(status="completed",
+                          summary=(body.summary if body else None))
+    return await update_session(session_id, patch, db)
+
+
 @router.post("/{session_id}/heartbeat", response_model=SessionResponse)
 async def heartbeat_session(session_id: str, db: AsyncSession = Depends(get_db)):
     """Liveness ping: bump last_heartbeat to now. Cheap, idempotent, called often

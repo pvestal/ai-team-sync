@@ -67,18 +67,8 @@ def detect_agent() -> str:
     check returned 'unknown', which is why concurrent sessions all showed as the
     git user with '(unknown)' (#1556). Mirrors cli._detect_agent.
     """
-    explicit = (os.environ.get("ATS_AGENT") or "").strip()
-    if explicit:
-        return explicit
-    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE"):
-        return "claude-code"
-    if os.environ.get("CODEX_SANDBOX") or os.environ.get("CODEX_SANDBOX_NETWORK_DISABLED"):
-        return "codex"
-    if os.environ.get("CURSOR_SESSION"):
-        return "cursor"
-    if os.environ.get("COPILOT_WORKSPACE"):
-        return "copilot-workspace"
-    return "unknown"
+    from ai_team_sync import session_pointer as sp
+    return sp.detect_agent()  # one detection (#2517)
 
 
 def session_agent_label() -> str:
@@ -95,9 +85,7 @@ def session_agent_label() -> str:
     """
     from ai_team_sync import session_pointer as sp
 
-    base = detect_agent()
-    sid = (sp.claude_session_id() or "").strip()
-    return f"{base}:{sid[:8]}" if (sid and base != "unknown") else base
+    return sp.agent_label(detect_agent())  # one label (#2517)
 
 
 def save_session_id(session_id: str):

@@ -46,9 +46,9 @@ def _developer() -> str:
 
 
 def _agent_label(cid: str) -> str:
-    # Mirrors mcp.server.session_agent_label so auto- and manual-registered rows
-    # carry the same identity for a given session.
-    return f"claude-code:{cid[:8]}"
+    # One label for every registrar (#2517). cid passed EXPLICITLY: this hook is
+    # the publisher of the live cid and its environment is the authority (#2003).
+    return sp.agent_label("claude-code", cid)
 
 
 async def ensure_session(server_url: str, client) -> str | None:
@@ -89,7 +89,8 @@ async def ensure_session(server_url: str, client) -> str | None:
             "developer": _developer(),
             "agent": _agent_label(cid),
             "scope": [],
-            "description": "auto-registered on SessionStart",
+            "description": ("auto-registered on SessionStart (UNSCOPED — claims "
+                            "nothing; extend scope / take locks to claim files)"),
             "auto_lock": False,
         })
         if r.status_code in (200, 201):

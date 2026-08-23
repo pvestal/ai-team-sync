@@ -21,8 +21,16 @@ def _run(fn, env):
         for k in list(os.environ):
             if k.startswith("CODEX"):
                 os.environ.pop(k, None)
-        os.environ.update(env)
-        return fn()
+        # #2517 flake fix: claude_session_id() PREFERS the live-cid file a real
+        # Claude session's hook published for this process tree (#2003), which
+        # leaked the developer's actual session id into these env-only tests
+        # whenever they ran inside a Claude session. Point the state dir at an
+        # empty tmpdir so only the env this test sets is visible.
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            os.environ["ATS_STATE_DIR"] = td
+            os.environ.update(env)
+            return fn()
     finally:
         os.environ.clear()
         os.environ.update(saved)

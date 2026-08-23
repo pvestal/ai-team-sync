@@ -42,6 +42,7 @@ def create_app() -> FastAPI:
     app.include_router(sessions.router, prefix="/api")
     app.include_router(locks.router, prefix="/api")
     app.include_router(decisions.router, prefix="/api")
+    app.include_router(decisions.session_scoped, prefix="/api")  # nested alias (#2517)
     app.include_router(override_requests.router, prefix="/api")
     app.include_router(git_status.router, prefix="/api")
     app.include_router(websocket.router)
