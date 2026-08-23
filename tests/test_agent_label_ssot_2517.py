@@ -103,3 +103,17 @@ def test_cli_pointer_prefers_per_session_file(monkeypatch, tmp_path):
     (tmp_path / sp.GLOBAL_FILE_NAME).write_text("theirs-9999")
     # ...but this session still resolves its own row.
     assert cli._load_active_session() == "mine-1234"
+
+
+def test_cli_clear_drops_the_per_session_pointer(monkeypatch, tmp_path):
+    # In production cli._session_file() IS sp.global_pointer_path() (~/.ats_session
+    # with ATS_STATE_DIR unset) — mirror that, or the test invents a split that
+    # cannot happen and fails on resolve_pointer's global fallback.
+    monkeypatch.setattr(sp, "_state_dir", lambda: tmp_path)
+    monkeypatch.setattr(cli, "_session_file",
+                        lambda: str(tmp_path / sp.GLOBAL_FILE_NAME))
+    monkeypatch.setattr(sp, "claude_session_id", lambda: CID)
+    monkeypatch.delenv("ATS_SESSION_ID", raising=False)
+    cli._save_active_session("mine-1234")
+    cli._clear_active_session()
+    assert cli._load_active_session() is None

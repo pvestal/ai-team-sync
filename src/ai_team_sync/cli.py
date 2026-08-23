@@ -512,6 +512,14 @@ def _clear_active_session():
         os.remove(_session_file())
     except FileNotFoundError:
         pass
+    # #2517: also drop the per-cid pointer, or `ats status` keeps resolving the
+    # session that was just completed (the pointer outliving the row is the
+    # same stale-identity class the save/load wiring fixed).
+    try:
+        from ai_team_sync import session_pointer as sp
+        sp.clear_pointer()
+    except Exception:
+        pass
 
 
 @cli.command()
