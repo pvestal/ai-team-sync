@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
@@ -14,6 +15,37 @@ from ai_team_sync.database import get_db
 from ai_team_sync.git_utils import uncommitted_for_scope
 from ai_team_sync.models import CommitRecord, Decision, OverrideRequest, ScopeLock, Session
 from ai_team_sync.events import broadcast_event
+
+# Lifecycle bookkeeping the reaper/resurrect pair writes into `summary`. Matched so a
+# NEW marker can REPLACE the previous one instead of appending to it (#2445).
+#
+# WHY REPLACE RATHER THAN APPEND. A long-running interactive session is routinely silent
+# for longer than the heartbeat window (the operator is reading, or one tool call is
+# slow), so reap -> heartbeat -> resurrect is the NORMAL cycle, not an edge. Each half
+# used to append, so N cycles left N markers: measured 2026-08-14 over 1116 live rows,
+# 16 sessions carried thrash, 55 resurrect events, worst single session 10 cycles, one
+# with 281 characters of machine chatter before any handoff was written. `summary` is
+# where a human writes the wrap note, and it was being consumed by bookkeeping.
+#
+# NOT SILENCED, DE-DUPLICATED: exactly one current marker survives, so #2554's contract
+# that a reaped session SAYS SO still holds and its ABSENCE on a clean session still
+# means something. The full history is already available as dispatched events
+# (session.auto_completed / session.resurrected), which is the event log to read for
+# per-cycle detail — a dedicated column would duplicate it.
+#
+# STRANDED is matched too because it is re-derived on every reap: the new note carries a
+# fresh file list, so a stale one must not linger beside it.
+_LIFECYCLE_MARKER_RE = re.compile(
+    r"\s*\[(?:auto-completed|resurrected|STRANDED)\b[^\]]*\]")
+
+
+def replace_lifecycle_marker(summary: str | None, note: str) -> str:
+    """Return `summary` with prior lifecycle markers dropped and `note` appended.
+
+    Operator narrative is preserved verbatim; only the machine markers are rewritten.
+    """
+    base = _LIFECYCLE_MARKER_RE.sub("", summary or "").strip()
+    return f"{base} {note}".strip() if base else note
 
 
 async def check_expired_locks(db: AsyncSession) -> int:
@@ -147,7 +179,7 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
             if stranded:
                 note += (f" [STRANDED {len(stranded)} uncommitted file(s) in scope: "
                          + ", ".join(stranded) + "]")
-            sess.summary = f"{sess.summary} {note}".strip() if sess.summary else note
+            sess.summary = replace_lifecycle_marker(sess.summary, note)
             await broadcast_event(sess.id, "session.auto_completed", {
                 "session_id": sess.id, "last_activity": last_activity.isoformat(),
                 "reason": reason, "uncommitted_in_scope": stranded})

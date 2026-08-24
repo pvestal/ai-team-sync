@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from ai_team_sync.database import get_db
+from ai_team_sync.background_tasks import replace_lifecycle_marker
 from ai_team_sync.models import ScopeLock, Session
 from ai_team_sync.git_utils import uncommitted_for_scope
 from ai_team_sync.notifications.dispatcher import dispatch
@@ -363,7 +364,7 @@ async def heartbeat_session(session_id: str, db: AsyncSession = Depends(get_db))
         session.status = "active"
         session.completed_at = None
         session.auto_completed = False
-        session.summary = f"{session.summary} {note}".strip() if session.summary else note
+        session.summary = replace_lifecycle_marker(session.summary, note)
         logger.warning(
             "session %s resurrected: it was auto-completed as silent but is alive",
             session.id,
