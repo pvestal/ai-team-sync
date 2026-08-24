@@ -271,6 +271,67 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="record_restart",
+            description=(
+                "Record that you restarted a SHARED service (comfyui, comfyui-rocm, "
+                "anime-studio, tower-echo-brain, ollama, ...). Call this right after "
+                "`systemctl restart`. A restart drops queued prompts, kills in-flight "
+                "renders and deploys whatever is on disk, and it is invisible to every "
+                "other session unless it is recorded here — team_status shows only a "
+                "decision COUNT, never the content. Capture before/after numbers when "
+                "you have them so 'did it help' is answerable later."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "unit": {
+                        "type": "string",
+                        "description": "systemd unit, e.g. 'comfyui' ('.service' and case are normalized)",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "WHY it was bounced, and who authorized it",
+                    },
+                    "outcome": {
+                        "type": "string",
+                        "enum": ["completed", "failed", "in_progress"],
+                        "description": "'completed' by default; 'failed' if it did not come back",
+                        "default": "completed",
+                    },
+                    "old_pid": {"type": "integer", "description": "PID before the restart"},
+                    "new_pid": {"type": "integer", "description": "PID after the restart"},
+                    "before": {
+                        "type": "object",
+                        "description": "Measurements taken BEFORE (e.g. {'queue_depth': 0, 'ram_avail_gb': 22.7})",
+                    },
+                    "after": {
+                        "type": "object",
+                        "description": "Measurements taken AFTER, if already known",
+                    },
+                },
+                "required": ["unit", "reason"],
+            },
+        ),
+        Tool(
+            name="recent_restarts",
+            description=(
+                "When was a shared service last bounced, by whom, and did it help? "
+                "Check this BEFORE debugging a vanished prompt, a dead render or "
+                "surprising code behaviour — a peer session may have just restarted "
+                "the thing you are standing on."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "unit": {
+                        "type": "string",
+                        "description": "Optional: limit to one unit, e.g. 'comfyui'",
+                    },
+                    "limit": {"type": "integer", "description": "Max rows (default 20)"},
+                },
+            },
+        ),
+        Tool(
             name="team_status",
             description="See what team members are currently working on. Shows active sessions and their scope.",
             inputSchema={
@@ -487,6 +548,63 @@ def format_override_nudge(requests: list, session_id: str) -> str | None:
     lines.append("Respond with respond_to_request (approve/deny) — requests expire "
                  "after 15 minutes and the requester is stalled until you answer.")
     return "\n".join(lines)
+
+
+def _fmt_age(seconds: float) -> str:
+    """Compact age for display: '3m ago', '2h ago'."""
+    seconds = max(0.0, float(seconds or 0))
+    if seconds < 90:
+        return f"{int(seconds)}s ago"
+    if seconds < 5400:
+        return f"{int(seconds // 60)}m ago"
+    if seconds < 172800:
+        return f"{int(seconds // 3600)}h ago"
+    return f"{int(seconds // 86400)}d ago"
+
+
+#: How far back team_status looks for restarts. A bounce matters to a peer session
+#: while its effects are still in play -- a vanished prompt, a reloaded deploy --
+#: not forever, and an all-time list would bury today's under history.
+RESTART_WINDOW_SECONDS = 6 * 3600
+
+
+async def _recent_restarts_block(client: httpx.AsyncClient) -> str:
+    """Render recent shared-service restarts for team_status (#2559).
+
+    This is the half that makes recording worth anything. team_status prints only
+    `Decisions: N` -- a count -- so a restart logged as a generic decision was
+    invisible to every other session. "comfyui was bounced 3 minutes ago" is exactly
+    what a session needs before it starts debugging why its prompt disappeared.
+
+    Fails SILENT and empty: an older ats-server without /api/restarts must not break
+    team_status, which is the tool sessions rely on to see each other at all.
+    """
+    try:
+        resp = await client.get(f"{SERVER_URL}/api/restarts", params={"limit": 10})
+        if resp.status_code != 200:
+            return ""
+        restarts = resp.json()
+    except Exception:
+        return ""
+
+    recent = [r for r in restarts if (r.get("age_seconds") or 0) <= RESTART_WINDOW_SECONDS]
+    if not recent:
+        return ""
+
+    out = "\n\U0001f501 Shared services restarted recently:\n"
+    for r in recent:
+        who = r.get("developer") or "unknown"
+        line = f"• {r['unit']} — {_fmt_age(r.get('age_seconds'))} by {who}"
+        if r.get("outcome") == "failed":
+            line += "  \u274c FAILED"
+        elif r.get("outcome") == "in_progress":
+            line += "  \u23f3 IN PROGRESS"
+        out += line + "\n"
+        if r.get("reason"):
+            out += f"  {r['reason'][:150]}\n"
+    out += ("  (a restart drops queued prompts, kills in-flight renders, and deploys "
+            "whatever is on disk)\n")
+    return out
 
 
 async def _incoming_override_nudge(client: httpx.AsyncClient, tool_name: str,
@@ -772,6 +890,78 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
                 return [TextContent(type="text", text=msg)]
 
+            elif name == "record_restart":
+                payload = {
+                    "unit": arguments["unit"],
+                    "reason": arguments.get("reason", ""),
+                    "outcome": arguments.get("outcome", "completed"),
+                    "before": arguments.get("before") or {},
+                    "after": arguments.get("after") or {},
+                }
+                for key in ("old_pid", "new_pid"):
+                    if arguments.get(key) is not None:
+                        payload[key] = arguments[key]
+                # Attribute to this session when there is one, but a restart with no
+                # session is still worth recording -- an out-of-band bounce is exactly
+                # the kind that leaves everyone else confused.
+                if active_session_id:
+                    payload["session_id"] = active_session_id
+                else:
+                    payload["developer"] = get_git_user()
+
+                response = await client.post(f"{SERVER_URL}/api/restarts", json=payload)
+                if response.status_code == 404 and active_session_id:
+                    # Stale pointer (reaped session) must not silently lose the record.
+                    payload.pop("session_id", None)
+                    payload["developer"] = get_git_user()
+                    response = await client.post(f"{SERVER_URL}/api/restarts", json=payload)
+                response.raise_for_status()
+                rec = response.json()
+
+                msg = f"\U0001f501 Recorded restart of {rec['unit']}\n\n"
+                msg += f"Outcome: {rec['outcome']}\n"
+                if rec.get("old_pid") or rec.get("new_pid"):
+                    msg += f"PID: {rec.get('old_pid') or '?'} -> {rec.get('new_pid') or '?'}\n"
+                if rec.get("reason"):
+                    msg += f"Reason: {rec['reason']}\n"
+                msg += "\nVisible to every other session via team_status."
+                if not rec.get("after"):
+                    msg += ("\nMeasure the effect once it settles and PATCH "
+                            f"/api/restarts/{rec['id']} with `after` to answer 'did it help'.")
+                return [TextContent(type="text", text=msg)]
+
+            elif name == "recent_restarts":
+                params: dict[str, Any] = {"limit": arguments.get("limit", 20)}
+                if arguments.get("unit"):
+                    params["unit"] = arguments["unit"]
+                response = await client.get(f"{SERVER_URL}/api/restarts", params=params)
+                response.raise_for_status()
+                rows = response.json()
+
+                if not rows:
+                    scope = f" of {arguments['unit']}" if arguments.get("unit") else ""
+                    return [TextContent(type="text", text=(
+                        f"No recorded restarts{scope}.\n\n"
+                        "NOTE: this means none were RECORDED, which is not the same as "
+                        "none having happened -- restarts done outside ATS leave no trace."
+                    ))]
+
+                msg = f"\U0001f501 {len(rows)} recorded restart(s), newest first:\n\n"
+                for r in rows:
+                    msg += f"• {r['unit']} — {_fmt_age(r.get('age_seconds'))}"
+                    msg += f" by {r.get('developer') or 'unknown'}"
+                    if r.get("outcome") != "completed":
+                        msg += f"  [{r['outcome']}]"
+                    msg += "\n"
+                    if r.get("old_pid") or r.get("new_pid"):
+                        msg += f"  PID {r.get('old_pid') or '?'} -> {r.get('new_pid') or '?'}\n"
+                    if r.get("reason"):
+                        msg += f"  {r['reason'][:200]}\n"
+                    if r.get("before") or r.get("after"):
+                        msg += f"  before={r.get('before')} after={r.get('after')}\n"
+                    msg += "\n"
+                return [TextContent(type="text", text=msg)]
+
             elif name == "team_status":
                 response = await client.get(
                     f"{SERVER_URL}/api/sessions",
@@ -809,6 +999,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         msg += f"  ✎ Uncommitted in scope ({len(unc)}): {shown}\n"
                     msg += "\n"
 
+                msg += await _recent_restarts_block(client)
                 return [TextContent(type="text", text=msg)]
 
             elif name == "complete_session":

@@ -234,3 +234,98 @@ class WhosEditingRequest(BaseModel):
 class WhosEditingResult(BaseModel):
     path: str
     editors: list[PresenceEntry] = Field(default_factory=list)  # others active on this path
+
+
+# --- Service restart (#2559) ---
+
+#: Recorded outcomes. Closed vocabulary, enforced where the write happens -- the
+#: cheapest place to make a bad value impossible rather than merely rare.
+#: 'in_progress' exists so a caller may record INTENT before bouncing a unit and
+#: PATCH the result afterwards; it is optional, never required.
+RESTART_OUTCOMES = ("completed", "failed", "in_progress")
+
+
+def normalize_unit(unit: str) -> str:
+    """Collapse the spellings of one systemd unit into a single queryable name.
+
+    'comfyui.service', 'ComfyUI' and '  comfyui  ' are the same service, and if they
+    land as three distinct strings then "when was comfyui last bounced" -- the whole
+    question this record exists to answer -- silently returns a partial history.
+
+    Normalizing at the PRODUCER is the lesson from shots.composition_method, which
+    accumulated ~19 alias strings because each writer invented its own spelling and
+    every reader was then expected to know them all.
+    """
+    return (unit or "").strip().lower().removesuffix(".service").strip()
+
+
+class RestartCreate(BaseModel):
+    unit: str
+    session_id: str | None = None  # absent for an operator's out-of-band restart
+    developer: str = ""
+    reason: str = ""
+    outcome: str = "completed"
+    old_pid: int | None = None
+    new_pid: int | None = None
+    before: dict = Field(default_factory=dict)
+    after: dict = Field(default_factory=dict)
+
+    @field_validator("unit")
+    @classmethod
+    def _normalize(cls, v: str) -> str:
+        v = normalize_unit(v)
+        if not v:
+            raise ValueError("unit must be a systemd unit name, e.g. 'comfyui'")
+        return v
+
+    @field_validator("outcome")
+    @classmethod
+    def _known_outcome(cls, v: str) -> str:
+        v = (v or "").strip().lower()
+        if v not in RESTART_OUTCOMES:
+            raise ValueError(f"outcome must be one of {', '.join(RESTART_OUTCOMES)}")
+        return v
+
+
+class RestartUpdate(BaseModel):
+    """Enrich a recorded restart after the fact.
+
+    `after` is separate from `before` because "did it help" can only be measured
+    once the unit has settled -- recycling ComfyUI-NVIDIA moved RAM 22.7 -> 47.7 GB,
+    a number that does not exist at the moment the restart is issued.
+    """
+
+    outcome: str | None = None
+    after: dict | None = None
+    reason: str | None = None
+    new_pid: int | None = None
+
+    @field_validator("outcome")
+    @classmethod
+    def _known_outcome(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip().lower()
+        if v not in RESTART_OUTCOMES:
+            raise ValueError(f"outcome must be one of {', '.join(RESTART_OUTCOMES)}")
+        return v
+
+
+class RestartResponse(BaseModel):
+    id: str
+    unit: str
+    session_id: str | None = None
+    developer: str = ""
+    reason: str = ""
+    outcome: str
+    old_pid: int | None = None
+    new_pid: int | None = None
+    before: dict = Field(default_factory=dict)
+    after: dict = Field(default_factory=dict)
+    created_at: datetime
+    #: Age computed SERVER-side, mirroring SessionResponse.idle_seconds. SQLite
+    #: stores no UTC offset, so created_at serializes naive ('...T23:42:27') even
+    #: though the column is DateTime(timezone=True); a client that parsed it and
+    #: compared against an aware now() would raise TypeError. "bounced 3 minutes
+    #: ago" is the whole point, so the arithmetic belongs where the tzinfo is known.
+    age_seconds: float = 0.0

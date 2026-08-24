@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from ai_team_sync.config import settings
@@ -124,6 +124,56 @@ class CommitRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     session: Mapped[Session] = relationship(back_populates="commits")
+
+
+class ServiceRestart(Base):
+    """A restart of a SHARED service, recorded so other sessions can see it (#2559).
+
+    ATS claims FILES (scope_locks) and WORK (tower tasks) but claimed nothing for
+    shared services, even though bouncing comfyui / anime-studio / tower-echo-brain
+    is among the highest-blast-radius actions on this box: it drops queued prompts,
+    kills in-flight renders, and deploys whatever happens to be on disk.
+
+    Before this, a restart could only be logged as a generic Decision -- and
+    team_status renders only `Decisions: N`, a count, so it was invisible to every
+    other session. The one such record in the live DB carries "old PID 1969400 ->
+    2415302" as prose inside `reasoning`, which no query can reach.
+
+    NOT a ScopeLock. A unit name passes LockCreate's glob validator yet can never
+    fnmatch a real path, so a service claim borrowed from that table would be an
+    inert lock that silently protects nothing -- the same class of bug the `reason`
+    column was added to fix, in a shape the validator cannot detect.
+
+    This table RECORDS; it does not gate. Refusing a restart against a claimed unit
+    is a separate decision precisely because a guard that makes an emergency recycle
+    harder than going out-of-band is worse than no guard at all.
+    """
+
+    __tablename__ = "service_restarts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    # Normalized at the writer (see schemas.RestartCreate): 'comfyui.service',
+    # 'ComfyUI' and ' comfyui ' all land as 'comfyui'. Alias drift is prevented at
+    # the producer rather than taught to every reader.
+    unit: Mapped[str] = mapped_column(String(100), index=True)
+    # Nullable and SET NULL, never CASCADE: the restart OUTLIVES the session that
+    # did it. Sessions are reaped routinely, and "who bounced comfyui an hour ago"
+    # must survive that. NULL also covers the most important case -- the operator
+    # restarting something by hand, with no session at all.
+    session_id: Mapped[str | None] = mapped_column(
+        ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True)
+    developer: Mapped[str] = mapped_column(String(255), default="")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    outcome: Mapped[str] = mapped_column(String(20), default="completed")
+    old_pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    new_pid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # JSON objects as Text, matching how Session.scope stores its list. Free-form
+    # on purpose: the metric that proves a restart helped differs per unit (queue
+    # depth and VRAM for comfyui, commits-behind for anime-studio), and a fixed
+    # column set would force every caller into the wrong shape.
+    before_state: Mapped[str] = mapped_column(Text, default="{}")
+    after_state: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class OverrideRequest(Base):
