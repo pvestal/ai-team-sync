@@ -12,11 +12,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from pathlib import Path
-
 from ai_team_sync.database import get_db
 from ai_team_sync.models import ScopeLock, Session
-from ai_team_sync.git_utils import files_match_patterns, get_uncommitted_files
+from ai_team_sync.git_utils import uncommitted_for_scope
 from ai_team_sync.notifications.dispatcher import dispatch
 from ai_team_sync.schemas import SessionCreate, SessionResponse, SessionUpdate
 from ai_team_sync.config import settings
@@ -54,30 +52,23 @@ def _session_liveness(s: Session) -> tuple[float | None, bool]:
 
 
 
-# Diff visibility (ats-git-diff-merge-workflow-p01): cap the per-session list so
-# a huge dirty tree can't bloat the sessions payload.
-_UNCOMMITTED_CAP = 20
-
-
 def _uncommitted_in_scope(s: Session, cache: dict[str, list[str]] | None) -> list[str]:
-    """Active session's uncommitted files that fall inside its scope.
+    """ACTIVE session's uncommitted files that fall inside its scope.
+
+    The active-only policy lives here rather than in the computation (#2554):
+    reporting a live `git status` against a session completed hours ago would
+    attribute whoever is dirty in that repo now to that session. What a
+    completed session stranded is recorded at reap time instead — see
+    background_tasks.auto_complete_stale_sessions — because it can only be
+    known before the status flips.
 
     `cache` memoizes the git call per repo_root within one request — sessions
     frequently share a repo. Unanchored/legacy sessions ('' repo_root) return [].
     """
-    if s.status != "active" or not (getattr(s, "repo_root", "") or ""):
-        return []
-    if cache is None:
-        cache = {}
-    root = s.repo_root
-    if root not in cache:
-        cache[root] = get_uncommitted_files(Path(root))
-    files = cache[root]
-    if not files:
+    if s.status != "active":
         return []
     scope = json.loads(s.scope) if s.scope else []
-    matched = sorted({f for fl in files_match_patterns(files, scope).values() for f in fl})
-    return matched[:_UNCOMMITTED_CAP]
+    return uncommitted_for_scope(getattr(s, "repo_root", "") or "", scope, cache)
 
 
 def _session_to_response(s: Session, uncommitted_cache: dict[str, list[str]] | None = None) -> SessionResponse:
@@ -295,6 +286,12 @@ async def update_session(session_id: str, body: SessionUpdate, db: AsyncSession 
         session.scope = json.dumps(body.scope)
     if body.description is not None:
         session.description = body.description
+    if body.repo_root is not None:
+        # Anchor (or re-anchor) the session. Stored rstrip'd because
+        # find_conflicts and the repo-anchoring comparisons are string equality
+        # on this value — '/opt/anime-studio/' and '/opt/anime-studio' must not
+        # read as two different repos.
+        session.repo_root = body.repo_root.rstrip("/")
 
     await db.commit()
     await db.refresh(session)

@@ -85,6 +85,39 @@ def files_match_patterns(files: list[str], patterns: list[str]) -> dict[str, lis
     return matches
 
 
+# Cap the per-session list so a huge dirty tree cannot bloat a payload or a
+# reaper summary (ats-git-diff-merge-workflow-p01).
+UNCOMMITTED_CAP = 20
+
+
+def uncommitted_for_scope(repo_root: str | None, scope: list[str],
+                          cache: dict[str, list[str]] | None = None) -> list[str]:
+    """Uncommitted files under `repo_root` that fall inside `scope`.
+
+    STATUS-AGNOSTIC ON PURPOSE (#2554). The session-list view only wants this
+    for ACTIVE sessions — recomputing it for a session completed hours ago
+    would report whoever is dirty in that repo NOW as if it were that session's
+    stranded work. But the reaper needs the same answer for a session it is
+    about to complete, and asking after the status flip is too late. So the
+    status decision belongs to each caller, and the computation lives here.
+
+    `cache` memoizes the git call per repo_root across one sweep/request —
+    sessions frequently share a repo.
+    """
+    root = (repo_root or "").strip()
+    if not root:
+        return []
+    if cache is None:
+        cache = {}
+    if root not in cache:
+        cache[root] = get_uncommitted_files(Path(root))
+    files = cache[root]
+    if not files:
+        return []
+    matched = {f for fl in files_match_patterns(files, scope or []).values() for f in fl}
+    return sorted(matched)[:UNCOMMITTED_CAP]
+
+
 def get_current_branch(repo_path: Path | None = None) -> str:
     """Get current git branch name."""
     if repo_path is None:

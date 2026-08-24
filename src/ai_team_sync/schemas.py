@@ -27,6 +27,16 @@ class SessionUpdate(BaseModel):
     summary: str | None = None
     scope: list[str] | None = None
     description: str | None = None
+    # ANCHORING AFTER THE FACT (#2554). Every session now begins auto-registered
+    # by the SessionStart hook with repo_root='' (Gap 0), and start_session — the
+    # only other writer of repo_root — cannot help, because by then the session
+    # already exists. Without this field there was NO API PATH from the default
+    # state to an anchored session: PATCH accepted repo_root, Pydantic dropped
+    # it as an extra key, and the caller got a 200 describing a change that
+    # never happened. Anchoring is not cosmetic — _uncommitted_in_scope returns
+    # [] for an unanchored session, so an agent's dirty files stayed invisible
+    # to the whole team, and the reaper completed it without ever surfacing them.
+    repo_root: str | None = None
 
 
 class SessionResponse(BaseModel):

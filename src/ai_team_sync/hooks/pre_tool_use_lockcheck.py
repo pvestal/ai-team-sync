@@ -58,10 +58,37 @@ def _rel(path: str) -> str:
     return os.path.basename(path)
 
 
-def scope_matches(rel: str, pattern: str) -> bool:
-    """True if repo-relative `rel` falls under a scope `pattern`. Supports the
-    '**' = any-depth convention ATS scopes use (e.g. 'packages/scene_generation/**')."""
+def normalize_pattern(pattern: str, repo_root: str = "") -> str:
+    """A scope pattern as a repo-RELATIVE pattern.
+
+    ATS scope is repo-relative, but nothing said so at the point of writing and
+    nothing caught it afterwards, so an ABSOLUTE pattern
+    ('/opt/anime-studio/packages/x.py') silently matched nothing: the guard
+    compares against a rel built by _rel(), and
+    fnmatch('packages/x.py', '/opt/anime-studio/packages/x.py') is False. The
+    agent then reads "no lock or scope covering X" and takes a lock instead of
+    fixing the scope — the exact loop observed 2026-08-23 (#2554).
+
+    An absolute pattern under this repo is rewritten to its relative form. One
+    that is absolute but NOT under this repo is left alone: it genuinely cannot
+    describe a file here, and quietly re-rooting it would invent a claim.
+    """
     pat = (pattern or "").strip().rstrip("/")
+    if not pat.startswith("/"):
+        return pat
+    root = (repo_root or "").rstrip("/")
+    if root and (pat == root or pat.startswith(root + "/")):
+        return pat[len(root):].lstrip("/")
+    return pat
+
+
+def scope_matches(rel: str, pattern: str, repo_root: str = "") -> bool:
+    """True if repo-relative `rel` falls under a scope `pattern`. Supports the
+    '**' = any-depth convention ATS scopes use (e.g. 'packages/scene_generation/**').
+
+    `repo_root` lets an absolute pattern be read as the relative one it meant;
+    omitted, behaviour is exactly as before for relative patterns."""
+    pat = normalize_pattern(pattern, repo_root)
     if not pat:
         return False
     if pat.endswith("/**"):
@@ -98,7 +125,7 @@ def find_conflicts(rel: str, sessions: list, my_session_id: str,
         if isinstance(scope, str):
             scope = [scope]
         for pat in scope:
-            if scope_matches(rel, str(pat)):
+            if scope_matches(rel, str(pat), froot):
                 out.append((agent, str(s.get("description", ""))[:90], str(pat)))
                 break
     return out
@@ -148,7 +175,7 @@ def claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,
         lroot = str(lk.get("repo_root") or "").rstrip("/")
         if lroot and froot and lroot != froot:
             continue
-        if scope_matches(rel, str(lk.get("pattern", ""))):
+        if scope_matches(rel, str(lk.get("pattern", "")), froot):
             return True, ""
     for s in mine_active:
         sroot = str(s.get("repo_root") or "").rstrip("/")
@@ -158,11 +185,33 @@ def claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,
         if isinstance(scope, str):
             scope = [scope]
         for pat in scope:
-            if scope_matches(rel, str(pat)):
+            if scope_matches(rel, str(pat), froot):
                 return True, ""
+
+    # Say WHY, not just no. An absolute pattern that would have matched once
+    # read as repo-relative is the single most common way this guard fires on
+    # someone who believed they had declared scope, so name it and give the
+    # exact replacement instead of sending them to take a lock (#2554).
+    near = []
+    for s in mine_active:
+        scope = s.get("scope") or []
+        if isinstance(scope, str):
+            scope = [scope]
+        for pat in scope:
+            pat = str(pat)
+            if pat.startswith("/") and normalize_pattern(pat, froot) != pat:
+                near.append((pat, normalize_pattern(pat, froot)))
+    if near:
+        abs_pat, rel_pat = near[0]
+        return False, (
+            f"your ATS scope pattern '{abs_pat}' is ABSOLUTE, but ATS scope is "
+            f"repo-relative — it matches nothing. Re-declare it as '{rel_pat}' "
+            f"(ats scope / PATCH /api/sessions/<id>), or take a lock on "
+            f"'{rel}'.")
     return False, (f"your active ATS session holds no lock or scope covering "
                    f"'{rel}'. Take a lock first (ats lock / POST /api/locks) — "
-                   f"claims are what stop two sessions clobbering one file.")
+                   f"claims are what stop two sessions clobbering one file. "
+                   f"Patterns are repo-relative, not absolute.")
 
 
 def main() -> None:

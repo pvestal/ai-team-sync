@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
@@ -10,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_team_sync.config import settings
 from ai_team_sync.database import get_db
+from ai_team_sync.git_utils import uncommitted_for_scope
 from ai_team_sync.models import CommitRecord, Decision, OverrideRequest, ScopeLock, Session
 from ai_team_sync.events import broadcast_event
 
@@ -92,6 +94,9 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
     fast_cutoff = now - timedelta(minutes=settings.session_heartbeat_timeout_minutes)
     result = await db.execute(select(Session).where(Session.status == "active"))
     completed = 0
+    # One `git status` per repo_root across the whole sweep, not per session —
+    # sessions cluster on the same few repos.
+    uncommitted_cache: dict[str, list[str]] = {}
     for sess in result.scalars().all():
         last_lock = await db.scalar(
             select(func.max(ScopeLock.created_at)).where(ScopeLock.session_id == sess.id))
@@ -106,6 +111,29 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
         heartbeated = sess.last_heartbeat is not None
         cutoff = fast_cutoff if heartbeated else slow_cutoff
         if last_activity < cutoff:
+            # LOOK BEFORE COMPLETING (#2554). Reaping drops the session's locks,
+            # and anything it left dirty in a shared repo becomes unattributed:
+            # the next session's `git add -A` sweeps it into an unrelated commit,
+            # or a checkout destroys it. Measured 2026-08-23 on /opt/anime-studio
+            # — four reaped sessions had left 10 uncommitted files (four real
+            # fixes plus their passing tests) and NOTHING surfaced them.
+            #
+            # This has to happen BEFORE the status flip, because the answer is
+            # unknowable afterwards: a live `git status` on a session completed
+            # hours ago reports whoever is dirty in that repo NOW.
+            #
+            # We still reap. Holding a dead session's locks is worse than
+            # reaping it — the lane stays blocked for everyone. What changes is
+            # that the stranded work is NAMED, in the summary (durable) and on
+            # the event (live), instead of vanishing silently.
+            stranded: list[str] = []
+            try:
+                scope = json.loads(sess.scope) if sess.scope else []
+                stranded = uncommitted_for_scope(
+                    getattr(sess, "repo_root", "") or "", scope, uncommitted_cache)
+            except Exception:  # noqa: BLE001 — never let the sweep die on a git call
+                stranded = []
+
             sess.status = "completed"
             sess.completed_at = now
             # Mark WHO completed it. A later heartbeat on a reaper-completed
@@ -116,10 +144,13 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
                       if heartbeated else
                       f"inactive >{settings.session_inactivity_hours}h")
             note = f"[auto-completed: {reason}]"
+            if stranded:
+                note += (f" [STRANDED {len(stranded)} uncommitted file(s) in scope: "
+                         + ", ".join(stranded) + "]")
             sess.summary = f"{sess.summary} {note}".strip() if sess.summary else note
             await broadcast_event(sess.id, "session.auto_completed", {
                 "session_id": sess.id, "last_activity": last_activity.isoformat(),
-                "reason": reason})
+                "reason": reason, "uncommitted_in_scope": stranded})
             completed += 1
     if completed:
         await db.commit()
