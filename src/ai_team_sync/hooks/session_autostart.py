@@ -30,6 +30,7 @@ import subprocess
 import sys
 
 from ai_team_sync import session_pointer as sp
+from ai_team_sync.session_marker import AUTOREG_DESCRIPTION
 
 
 def _developer() -> str:
@@ -89,8 +90,7 @@ async def ensure_session(server_url: str, client) -> str | None:
             "developer": _developer(),
             "agent": _agent_label(cid),
             "scope": [],
-            "description": ("auto-registered on SessionStart (UNSCOPED — claims "
-                            "nothing; extend scope / take locks to claim files)"),
+            "description": AUTOREG_DESCRIPTION,
             "auto_lock": False,
         })
         if r.status_code in (200, 201):

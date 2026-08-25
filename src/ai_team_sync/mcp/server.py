@@ -13,6 +13,12 @@ import httpx
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 
+from ai_team_sync.session_marker import (
+    adopted_summary,
+    derived_working_description,
+    is_autoregistered,
+)
+
 
 # MCP Server instance
 mcp_server = Server("ai-team-sync")
@@ -708,15 +714,22 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     sess_resp.raise_for_status()
                     my_label = session_agent_label()
                     for s in sess_resp.json():
+                        # Prefix match via the SSOT predicate, NOT string equality.
+                        # The old `== "auto-registered on SessionStart"` could never
+                        # be true — the hook writes a guidance tail after that
+                        # prefix — so adoption never fired and every agent
+                        # accumulated a permanent ghost row alongside its real
+                        # session (observed 2026-08-24: agent claude-code:7bb1e161
+                        # active as both cf21607b and 4215bbc3).
                         if (s.get("status") == "active"
                                 and s.get("id") != data["id"]
                                 and s.get("agent") == my_label
-                                and s.get("description") == "auto-registered on SessionStart"
+                                and is_autoregistered(s.get("description"))
                                 and not s.get("lock_count")):
                             await client.patch(
                                 f"{SERVER_URL}/api/sessions/{s['id']}",
                                 json={"status": "completed",
-                                      "summary": f"adopted by {data['id'][:8]} (start_session)"})
+                                      "summary": adopted_summary(data["id"])})
                             adopted += 1
                 except Exception:
                     pass  # adoption is best-effort; never block session start
@@ -1321,11 +1334,11 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # description — a working session with 'auto-registered on
                 # SessionStart' reads as an orphan on the board (observed
                 # 2026-07-02, agent 4f5c927a). Derive a minimal honest one.
-                if sess_data.get("description") == "auto-registered on SessionStart":
-                    patch_body["description"] = (
-                        "auto-registered; working scope: " + ", ".join(merged[:4])
-                        + ("…" if len(merged) > 4 else "")
-                        + " (describe via start_session for a real summary)")
+                # Same dead-equality bug as the adoption path above: this compared
+                # against a bare prefix the hook never writes, so a session that
+                # took real locks kept reading as an unclaimed orphan forever.
+                if is_autoregistered(sess_data.get("description")):
+                    patch_body["description"] = derived_working_description(merged)
                 patch = await client.patch(
                     f"{SERVER_URL}/api/sessions/{active_session_id}",
                     json=patch_body,

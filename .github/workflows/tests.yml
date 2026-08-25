@@ -1,0 +1,74 @@
+name: tests
+
+# WHY THIS EXISTS
+# ---------------
+# 2026-08-24: a fleet-wide outage. `mcp>=1.0.0` had no upper bound, a deploy
+# pulled mcp 2.1.0, and the MCP entrypoint died at import — so ZERO ATS tools
+# reached ANY Claude Code session. No session could declare scope, take locks, or
+# log a decision. It went unnoticed for hours.
+#
+# Seven test files already imported ai_team_sync.mcp and would have caught it.
+# NONE of them ran: this repo had no test workflow, and the deploy path
+# (`pipx install --force`) runs no tests. The guard existed; nothing invoked it.
+#
+# It also hid behind a divergent environment: the dev venv held mcp 1.28.0 while
+# the deployed pipx venv resolved 2.1.0. Local tests were green throughout.
+# That is why the gating job below installs from pyproject with RESOLVED
+# dependencies — the same way deployment does — rather than reusing a pinned dev
+# environment. A test suite that runs against different dependency versions than
+# production cannot see production's failures.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # GATING. This job must stay green. It reproduces the outage conditions:
+  # resolve deps from pyproject exactly as a deploy would, then assert the MCP
+  # entrypoint imports AND actually offers tools. An incompatible mcp major bump
+  # fails here, loudly, instead of silently at every Claude session start.
+  mcp-entrypoint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install the way deployment installs (resolve, do not pin)
+        run: |
+          python -m pip install --upgrade pip
+          pip install .
+          pip install pytest pytest-asyncio
+
+      - name: Report the resolved mcp version
+        run: python -c "import importlib.metadata as m; print('resolved mcp ==', m.version('mcp'))"
+
+      - name: MCP entrypoint imports and exposes tools
+        run: pytest tests/test_mcp_entrypoint_smoke.py -q
+
+      - name: Auto-registration marker writer and readers agree
+        run: pytest tests/test_autoreg_marker_ssot.py -q
+
+  # REPORTING. Runs everything. Expected RED until the pre-existing
+  # test_presence_http.py failures are fixed — they fail at clean HEAD and are
+  # unrelated to the outage work. Deliberately NOT skipped or excluded: silencing
+  # a known failure to get a green badge is how the unsatisfiable guards above
+  # survived shipping in the first place.
+  full-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install with dev extras
+        run: |
+          python -m pip install --upgrade pip
+          pip install ".[dev]"
+
+      - name: Full test suite
+        run: pytest -q
