@@ -31,7 +31,21 @@ dependencies = [
     "click>=8.1.0",
     "httpx>=0.26.0",
     "tomli>=2.0.0;python_version<'3.11'",
-    "mcp>=1.0.0",
+    # UPPER BOUND IS LOAD-BEARING. mcp 2.x removed the low-level decorator API
+    # (@Server.list_tools / @Server.call_tool) and dropped mcp.server.fastmcp
+    # entirely. src/ai_team_sync/mcp/server.py is built on those decorators, so an
+    # unbounded ">=1.0.0" lets a --force-reinstall pull 2.x and the MCP entrypoint
+    # then dies at IMPORT time:
+    #   server.py:151 @mcp_server.list_tools()
+    #   -> AttributeError: 'Server' object has no attribute 'list_tools'
+    # The failure is silent to operators: SessionStart health checks report
+    # "ok ai-team-sync (stdio)" because that check only resolves the binary, never
+    # loads its tools. Result was a fleet-wide outage in which ZERO ATS tools were
+    # exposed to ANY Claude session, so no session could declare scope, take locks,
+    # or record decisions — while the `ats` CLI and the :8400 server kept working,
+    # making the board look merely under-used rather than broken.
+    # Raise this bound only together with a port of mcp/server.py to the 2.x API.
+    "mcp>=1.0.0,<2",
     "asyncpg>=0.29.0",
 ]
 
