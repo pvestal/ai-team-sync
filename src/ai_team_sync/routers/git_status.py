@@ -15,6 +15,7 @@ from ai_team_sync.git_utils import (
     files_match_patterns,
     get_repo_root,
     get_uncommitted_files,
+    uncommitted_for_scope,
 )
 from ai_team_sync.models import Session
 
@@ -50,15 +51,21 @@ async def get_session_changes(session_id: str, db: AsyncSession = Depends(get_db
             total_files=0,
         )
 
-    # Get uncommitted files from git
-    repo_root = get_repo_root()
-    uncommitted = get_uncommitted_files(repo_root)
-
-    # Match files against session scope
-    files_by_pattern = files_match_patterns(uncommitted, scope_patterns)
-
-    # Flatten to get all matching files
-    all_matching = list({f for files in files_by_pattern.values() for f in files})
+    # Anchor to the SESSION's repo, not the ATS server's cwd. get_repo_root()
+    # with no argument resolves from Path.cwd() -- wherever ats-server happened
+    # to be launched -- so a session working in any other repo was answered
+    # about the wrong tree, which reads as a false all-clear. session.repo_root
+    # was loaded above and never read; #2554 added it and uncommitted_for_scope
+    # for the reaper, and this endpoint is the same question.
+    if (session.repo_root or "").strip():
+        all_matching = uncommitted_for_scope(session.repo_root, scope_patterns)
+        files_by_pattern = files_match_patterns(all_matching, scope_patterns)
+    else:
+        # Legacy session with no repo_root: keep the cwd behaviour rather than
+        # returning silence to a caller that may well be in the right repo.
+        uncommitted = get_uncommitted_files(get_repo_root())
+        files_by_pattern = files_match_patterns(uncommitted, scope_patterns)
+        all_matching = list({f for files in files_by_pattern.values() for f in files})
 
     return SessionChangesResponse(
         session_id=session_id,

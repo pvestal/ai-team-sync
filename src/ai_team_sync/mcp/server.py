@@ -1185,32 +1185,27 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 response.raise_for_status()
                 data = response.json()
 
-                in_scope = data.get("files_in_scope", [])
-                out_scope = data.get("files_out_of_scope", [])
+                # SessionChangesResponse returns uncommitted_files/
+                # files_by_pattern/total_files. This read files_in_scope and
+                # files_out_of_scope, which the endpoint has never sent, so
+                # both were always [] and the tool always said "no changes" --
+                # the same wiring mismatch already fixed once for
+                # pre_commit_check (tests/test_mcp_pre_commit_check.py).
+                # The endpoint filters BY scope, so there is no out-of-scope
+                # list to render; the branch that claimed to show one is gone
+                # rather than left reading a key nobody sends.
+                in_scope = data.get("uncommitted_files", [])
 
-                if not in_scope and not out_scope:
+                if not in_scope:
                     return [TextContent(type="text", text="✅ No uncommitted changes.")]
 
-                msg = ""
+                msg = f"📝 {len(in_scope)} uncommitted file(s) in your scope:\n\n"
+                for path in in_scope[:20]:  # Limit display
+                    msg += f"  {path}\n"
 
-                if in_scope:
-                    msg += f"📝 {len(in_scope)} uncommitted file(s) in your scope:\n\n"
-                    for f in in_scope[:20]:  # Limit display
-                        status = f.get("status", "modified")
-                        msg += f"  {status}: {f['path']}\n"
-
-                    if len(in_scope) > 20:
-                        msg += f"  ... and {len(in_scope) - 20} more\n"
-                    msg += "\n"
-
-                if out_scope:
-                    msg += f"⚠️ {len(out_scope)} file(s) outside your scope:\n\n"
-                    for f in out_scope[:10]:
-                        msg += f"  {f.get('status', 'modified')}: {f['path']}\n"
-
-                    if len(out_scope) > 10:
-                        msg += f"  ... and {len(out_scope) - 10} more\n"
-                    msg += "\n💡 Consider expanding scope or creating new session\n"
+                if len(in_scope) > 20:
+                    msg += f"  ... and {len(in_scope) - 20} more\n"
+                msg += "\n💡 Commit or stash before your session is reaped.\n"
 
                 return [TextContent(type="text", text=msg)]
 
