@@ -788,14 +788,62 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 response.raise_for_status()
                 results = response.json()
 
+                # ALSO consult declared scope locks before claiming clearance.
+                # /presence/check answers "who has hands on it in the last few
+                # minutes" and NOTHING else -- its own docstring says "Live
+                # presence only -- declared scope locks are a separate check".
+                # Saying "Clear to go" off that alone is a false all-clear, and
+                # it fired for real: on 2026-08-25 this returned clear for
+                # scene_generation_ops_routes_regenerate.py while session
+                # 0fd3a304 held an advisory lock on that exact path, and the
+                # caller shipped the file's uncommitted contents in a restart.
+                # A second session got the same clear for clip_depth_transfer.py
+                # against two live locks. The presence store was [] both times.
+                #
+                # Presence is the weaker signal and can be empty for reasons the
+                # caller cannot see (the hook not firing, a session that never
+                # opened the file). Locks are DECLARED and durable. A tool whose
+                # answer gates an edit has to consult the durable one.
+                locked_rows: list[dict] = []
+                try:
+                    lock_resp = await client.post(
+                        f"{SERVER_URL}/api/locks/check", json={"paths": paths})
+                    lock_resp.raise_for_status()
+                    locked_rows = [r for r in lock_resp.json() if r.get("locked")]
+                except Exception as _lk_err:  # noqa: BLE001
+                    # Never let a lock-check failure turn into a silent clear:
+                    # degrade to a NAMED unknown, not to "Clear to go".
+                    return [TextContent(type="text", text=(
+                        "⚠️ Live presence checked, but the scope-lock check "
+                        f"failed ({_lk_err}). Cannot confirm this path is free "
+                        "— run check_locks before editing."))]
+
                 busy = [r for r in results if r["editors"]]
-                if not busy:
+                if not busy and not locked_rows:
                     return [TextContent(
                         type="text",
-                        text="✅ Nobody else is editing these files right now. Clear to go.",
+                        text="✅ Nobody else is editing these files right now, "
+                             "and no scope lock covers them. Clear to go.",
                     )]
 
-                msg = "👤 Someone else is actively editing right now:\n\n"
+                if locked_rows:
+                    msg = "🔒 Declared scope lock(s) cover these paths:\n\n"
+                    for r in locked_rows:
+                        who = r.get("developer") or "unknown"
+                        sess = str(r.get("session_id") or "")[:8]
+                        msg += (f"   {r['path']}\n      {r.get('mode','advisory')}"
+                                f" lock held by {who} (session {sess})"
+                                f" via pattern {r.get('pattern')}\n")
+                    if not busy:
+                        msg += ("\nNobody has LIVE presence on them — a lock with "
+                                "no presence still means an owner. Ask before "
+                                "editing; do not read the quiet as free.\n")
+                        return [TextContent(type="text", text=msg)]
+                    msg += "\n"
+                else:
+                    msg = ""
+
+                msg += "👤 Someone else is actively editing right now:\n\n"
                 for r in busy:
                     msg += f"📝 {r['path']}\n"
                     for e in r["editors"]:
