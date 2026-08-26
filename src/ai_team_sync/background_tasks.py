@@ -168,6 +168,17 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
 
             sess.status = "completed"
             sess.completed_at = now
+            # RELEASE THE LANE -- what the comment above has always claimed.
+            # update_session deletes these on completion; the reaper sets
+            # status directly on the model and so never did, which meant a
+            # REAPED session (the common case for a dead agent, and exactly
+            # when the lane matters) kept its locks for the full lock_ttl_hours
+            # -- 8h by default. Observed 2026-08-25: session 9d4793db, reaped
+            # 4.4h earlier, still held two advisory locks due to expire 9h out.
+            released = (await db.execute(
+                select(ScopeLock).where(ScopeLock.session_id == sess.id))).scalars().all()
+            for lock in released:
+                await db.delete(lock)
             # Mark WHO completed it. A later heartbeat on a reaper-completed
             # session is proof this decision was wrong and resurrects it; the
             # same heartbeat on an operator-completed session must not.
@@ -182,7 +193,8 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
             sess.summary = replace_lifecycle_marker(sess.summary, note)
             await broadcast_event(sess.id, "session.auto_completed", {
                 "session_id": sess.id, "last_activity": last_activity.isoformat(),
-                "reason": reason, "uncommitted_in_scope": stranded})
+                "reason": reason, "uncommitted_in_scope": stranded,
+                "locks_released": len(released)})
             completed += 1
     if completed:
         await db.commit()
