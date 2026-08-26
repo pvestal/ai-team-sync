@@ -1,0 +1,17 @@
+[Unit]
+Description=AI Team Sync - session coordination server
+After=network.target
+
+[Service]
+Type=simple
+User=patrick
+Group=patrick
+WorkingDirectory=/home/patrick/code/ai-team-sync
+ExecStart=/home/patrick/code/ai-team-sync/.venv/bin/uvicorn ai_team_sync.server:app --host 0.0.0.0 --port 8400
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

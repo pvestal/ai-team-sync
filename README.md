@@ -62,6 +62,18 @@ pytest                      # run the test suite (needs the [dev] extra)
 
 Console entry points: `ats` (CLI), `ats-server` (API/dashboard), `ats-mcp` (MCP server for Claude Code).
 
+### Run as a service
+
+`setup.sh` starts the server as a plain background process — it won't survive a reboot or crash. To keep it up persistently, install the systemd unit instead:
+
+```bash
+sudo cp deploy/ai-team-sync.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now ai-team-sync
+```
+
+Edit the `User`/`WorkingDirectory`/`ExecStart` paths in `deploy/ai-team-sync.service` first if your install location differs from `/home/patrick/code/ai-team-sync`.
+
 ## How to use
 
 **VS Code** (primary interface):
