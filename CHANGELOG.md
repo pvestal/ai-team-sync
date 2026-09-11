@@ -26,6 +26,10 @@
 - `AGENTS.md` contributor guide; tests for agent detection and decision listing.
 
 ### Fixed
+- Checked-in service and setup paths now preserve the localhost-only ATS default
+  instead of reintroducing `0.0.0.0` on reinstall.
+- Stale agent/MCP gap docs now reflect the current Claude Code hook/MCP coverage
+  and the remaining Codex/other-agent enforcement gap.
 - **`pre_commit_check` MCP tool was a silent no-op**: it sent `{"paths": ...}` while
   the endpoint reads `staged_files`, and parsed `blocked`/`warned` while the endpoint
   returns `blocking_locks`/`advisory_locks`. The argument was dropped (server
