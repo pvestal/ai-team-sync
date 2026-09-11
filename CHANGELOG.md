@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Added
+- **Worker capability + authority registry** (`workers.py`, `GET /api/workers`,
+  `my_authority` MCP tool, example at `deploy/workers.toml`). A worker is a
+  CLASS with declared capabilities (what it is good at, for routing) and
+  declared authority (what it may do, enforced on claim) — two separate
+  questions, because a local model can be capable of proposing a patch and have
+  no authority to commit one. Labels resolve by stripping one ':'-segment at a
+  time, so 'claude-code:fb0bb6bf' and 'local:qwen3-30b' both find their class.
+  Enforced SERVER-side in `create_session`: a worker with edit authority 'none'
+  is refused when it claims scope (403) and may register unscoped, and a worker
+  class with a concurrency cap is refused a session beyond it (409). That
+  placement is the point — the scope guard Claude Code runs is a PreToolUse
+  hook, Codex has no hook mechanism and a local worker has no client, so a
+  client-side rule would bind exactly one of the three. It is a guardrail, not
+  access control: the API is unauthenticated by design, so this stops a worker
+  exceeding its role by accident, not by intent.
+  An UNREGISTERED label keeps pre-registry rights and is logged by name, so
+  adding the registry cannot break a client that predates it (the VS Code
+  extension and older CLI builds post agent="unknown"). `ATS_STRICT_WORKERS=1`
+  drops unregistered workers to read-only once the fleet is registered.
+
 ### Fixed
 - **Hooks were blind inside git worktrees**: both `pre_tool_use_lockcheck` and
   `post_tool_use_presence` found the repo root by walking up for a `.git`

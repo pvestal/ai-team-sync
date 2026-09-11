@@ -18,6 +18,7 @@ from ai_team_sync.models import ScopeLock, Session
 from ai_team_sync.git_utils import uncommitted_for_scope
 from ai_team_sync.notifications.dispatcher import dispatch
 from ai_team_sync.schemas import SessionCreate, SessionResponse, SessionUpdate
+from ai_team_sync.workers import registry
 from ai_team_sync.config import settings
 
 logger = logging.getLogger(__name__)
@@ -143,8 +144,70 @@ async def _check_scope_conflicts(
     return conflicts
 
 
+
+
+async def _active_sessions_for_worker(db: AsyncSession, worker_name: str) -> int:
+    """Active sessions governed by this worker class.
+
+    Counted by RESOLVING each label, not by string match: 'claude-code:a1b2' and
+    'claude-code:c3d4' are two sessions of one worker, and 'local:qwen3-30b' and
+    'local:gpt-oss-20b' both draw on the same local budget.
+    """
+    rows = await db.execute(select(Session.agent).where(Session.status == "active"))
+    return sum(1 for (label,) in rows.all() if registry().resolve(label).name == worker_name)
+
+
+def _authority_gate(body: SessionCreate, active_for_worker: int) -> None:
+    """Refuse a claim the worker has no authority to make. HTTPException or None.
+
+    This is the half of coordination that cannot live in a client. The scope
+    guard Claude Code runs is a PreToolUse hook; Codex has no hooks and a local
+    worker has no client, so a client-side rule binds exactly one of the three.
+    It is a guardrail, not access control — the API is unauthenticated, so this
+    stops a worker exceeding its role by accident, not by intent.
+    """
+    worker = registry().resolve(body.agent)
+
+    if body.scope and not worker.may_claim_scope:
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "worker_authority",
+                "message": (
+                    f"worker '{worker.name}' has edit authority 'none', so it cannot claim "
+                    f"scope {body.scope}. Register unscoped and attach findings to the task "
+                    f"instead — reading, triaging and proposing need no claim."
+                ),
+                "worker": worker.as_dict(),
+            },
+        )
+
+    if worker.concurrency is not None and active_for_worker >= worker.concurrency:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "worker_concurrency",
+                "message": (
+                    f"worker '{worker.name}' already has {active_for_worker} active "
+                    f"session(s) and is capped at {worker.concurrency}"
+                ),
+                "limit": worker.concurrency,
+                "worker": worker.as_dict(),
+            },
+        )
+
+
 @router.post("", response_model=SessionResponse, status_code=201)
 async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)):
+    # Authority BEFORE conflicts: whether this worker may claim at all precedes
+    # whether the claim collides with someone else's.
+    worker = registry().resolve(body.agent)
+    active_for_worker = (
+        await _active_sessions_for_worker(db, worker.name)
+        if worker.concurrency is not None else 0
+    )
+    _authority_gate(body, active_for_worker)
+
     # Check for scope conflicts BEFORE creating the session
     if body.auto_lock and body.scope:
         conflicts = await _check_scope_conflicts(

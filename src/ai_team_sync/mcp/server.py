@@ -338,6 +338,25 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="my_authority",
+            description=(
+                "What THIS worker may do: its capabilities, its edit/commit/close "
+                "authority, and its concurrency cap. Ask before claiming scope or "
+                "offering to close work — authority is declared server-side and is "
+                "the same answer for every client. Pass `worker` to look up another "
+                "worker instead (e.g. to decide who to hand a job to)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "worker": {
+                        "type": "string",
+                        "description": "Worker or session label to look up. Omit for yourself.",
+                    },
+                },
+            },
+        ),
+        Tool(
             name="team_status",
             description="See what team members are currently working on. Shows active sessions and their scope.",
             inputSchema={
@@ -1022,6 +1041,33 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         msg += f"  before={r.get('before')} after={r.get('after')}\n"
                     msg += "\n"
                 return [TextContent(type="text", text=msg)]
+
+            elif name == "my_authority":
+                label = (arguments or {}).get("worker") or detect_agent()
+                response = await client.get(f"{SERVER_URL}/api/workers/{label}")
+                response.raise_for_status()
+                w = response.json()
+                auth = w["authority"]
+                edit = {"none": "NO — read-only", "claimed_scope": "yes, inside a claimed scope"}.get(
+                    auth["edit"], auth["edit"])
+                close = {"no": "NO", "yes": "yes",
+                         "conditional": "only against satisfied acceptance evidence"}.get(
+                    auth["task_close"], auth["task_close"])
+                cap = w["concurrency"]
+                lines = [
+                    f"🪪 {label}  →  worker '{w['worker']}'  ({w['cost_class']})",
+                    "",
+                    f"  edit files : {edit}",
+                    f"  commit     : {'yes' if auth['commit'] else 'NO'}",
+                    f"  close work : {close}",
+                    f"  concurrency: {cap if cap is not None else 'uncapped'}",
+                    "",
+                    "  capabilities: " + ", ".join(w["capabilities"]),
+                ]
+                if auth["edit"] == "none":
+                    lines += ["", ("  A read-only worker registers UNSCOPED and attaches findings. "
+                                   "Claiming scope is refused by the server, not by your client.")]
+                return [TextContent(type="text", text="\n".join(lines))]
 
             elif name == "team_status":
                 response = await client.get(

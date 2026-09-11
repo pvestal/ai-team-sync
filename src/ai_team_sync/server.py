@@ -14,7 +14,7 @@ from fastapi import Depends
 from ai_team_sync.database import init_db
 from ai_team_sync.config import settings
 from ai_team_sync.liveness import liveness_from_request
-from ai_team_sync.routers import sessions, locks, decisions, override_requests, git_status, websocket, dashboard, presence_ws, presence_http, restarts
+from ai_team_sync.routers import sessions, locks, decisions, override_requests, git_status, websocket, dashboard, presence_ws, presence_http, restarts, workers
 
 
 @asynccontextmanager
@@ -46,6 +46,7 @@ def create_app() -> FastAPI:
     app.include_router(override_requests.router, prefix="/api")
     app.include_router(git_status.router, prefix="/api")
     app.include_router(restarts.router, prefix="/api")  # shared-service restarts (#2559)
+    app.include_router(workers.router, prefix="/api")  # worker capability/authority registry
     app.include_router(websocket.router)
     app.include_router(dashboard.router)
     app.include_router(presence_ws.router)

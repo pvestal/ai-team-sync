@@ -1,0 +1,55 @@
+# Worker capability + authority registry — copy to ~/.config/ai-team-sync/workers.toml
+# (or point ATS_WORKERS_CONFIG at it) to override or extend the builtins.
+#
+# Two separate questions, deliberately not one:
+#   capabilities — what this worker is GOOD AT, used to route work to it
+#   authority    — what it is ALLOWED to do, enforced server-side on claim
+# A local model can be entirely capable of proposing a patch and have no
+# authority to commit one.
+#
+# authority.edit       "none" | "claimed_scope"
+# authority.commit     true | false
+# authority.task_close "no" | "conditional" | "yes"
+#                      conditional = closes only against satisfied acceptance
+#                      evidence, never on its own say-so.
+# concurrency          max simultaneous ACTIVE sessions for this worker class,
+#                      omit for uncapped.
+#
+# The server reads this at startup; restart ats-server after editing.
+
+[workers.claude-code]
+capabilities = ["repo_read", "multi_file_edit", "architecture", "debugging", "tests"]
+cost_class = "cloud"
+[workers.claude-code.authority]
+edit = "claimed_scope"
+commit = true
+task_close = "conditional"
+
+[workers.codex]
+capabilities = ["repo_read", "bounded_edit", "tests", "code_review"]
+cost_class = "cloud"
+[workers.codex.authority]
+edit = "claimed_scope"
+commit = true
+task_close = "no"
+
+# Family entry: 'local:qwen3-30b', 'local:gpt-oss-20b' and friends all resolve
+# here unless registered individually below. Findings yes, verdicts no.
+[workers.local]
+capabilities = ["repo_read", "log_triage", "classify", "summarize",
+                "failure_cluster", "plan_review", "retrieval"]
+cost_class = "local"
+concurrency = 1
+[workers.local.authority]
+edit = "none"
+commit = false
+task_close = "no"
+
+# Register a specific model when it needs different limits from its family.
+# The RAM floor and residency policy are infrastructure constraints, not
+# per-worker ones: a worker does not get to override them by asking.
+# [workers.'local:qwen3-30b']
+# capabilities = ["repo_read", "failure_cluster", "plan_review"]
+# concurrency = 1
+# [workers.'local:qwen3-30b'.authority]
+# edit = "none"
