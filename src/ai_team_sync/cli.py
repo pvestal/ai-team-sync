@@ -693,8 +693,11 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
                      ATS_DELEGATION=d["id"], ATS_SESSION=child_id)
     click.echo(f"launching {worker} ({mode}, lease {lease_minutes}m)...", err=True)
     try:
+        # stdin closed: the child is not interactive, and left open the harness
+        # waits on it before starting.
         proc = subprocess.run(argv, capture_output=True, text=True,
-                              timeout=lease_minutes * 60, env=child_env)
+                              timeout=lease_minutes * 60, env=child_env,
+                              stdin=subprocess.DEVNULL)
         output, failure = proc.stdout.strip(), (proc.returncode != 0)
     except subprocess.TimeoutExpired:
         output, failure = "", True

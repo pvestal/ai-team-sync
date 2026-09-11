@@ -78,5 +78,9 @@ def child_launch_argv(mode: str) -> list[str]:
     """
     if mode == IMPLEMENT:
         return []
+    # Tool names must match the harness's own registry: an unknown name is
+    # reported as "matches no known tool" and silently denies NOTHING, which is
+    # the worst outcome for a rule whose whole job is to deny. 'MultiEdit' was
+    # in the first draft and does not exist in this Claude Code build.
     return ["--permission-mode", "plan",
-            "--disallowedTools", "Edit", "Write", "MultiEdit", "NotebookEdit"]
+            "--disallowedTools", "Edit", "Write", "NotebookEdit"]
