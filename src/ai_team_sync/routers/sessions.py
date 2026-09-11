@@ -225,7 +225,7 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
                 detail={
                     "error": "delegation_authority",
                     "message": (
-                        f"delegation {delegation.id[:8]} is {delegation.mode}, so this "
+                        f"delegation {delegation.id} is {delegation.mode}, so this "
                         f"child cannot claim scope {body.scope}. Register unscoped, "
                         f"investigate, and return evidence to the parent."
                     ),

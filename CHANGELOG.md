@@ -2,6 +2,32 @@
 
 ## [Unreleased]
 
+### Added
+- **Build identity and MCP catalog parity** (`build_info.py`, `GET /api/version`,
+  `ats_version` MCP tool, `scripts/deploy.sh`, `scripts/check_mcp_parity.py`).
+  A stdio MCP server is spawned once per client session and holds its tool
+  catalog for that session's whole life, so `pipx install --force` updates REST
+  (restarted) and leaves every running client on the old catalog. Observed
+  2026-09-11: an independent Codex session whose MCP started 13:45:39 reported
+  that delegation "was not testable — the catalog exposes no delegation
+  operations" while REST had served `/api/delegations` since 14:01:58. Neither
+  surface could state its own revision, so staleness was indistinguishable from
+  a missing feature.
+  Both surfaces now report commit, version, package path, pid and process start.
+  `ats_version` fetches both and names a SKEW explicitly, telling the caller to
+  restart its session rather than conclude a feature is absent. `deploy.sh`
+  stamps the commit into the package before install, so the installed copy
+  carries the revision it was built from. `check_mcp_parity.py` spawns the
+  INSTALLED entrypoint and fails when its catalog is missing a tool this
+  checkout registers, or when installed MCP and running REST disagree on commit.
+
+### Fixed
+- **Machine-facing MCP output no longer truncates ids.** `start_session`,
+  `pause_session`, `resume_session`, `get_session_details`, lock creation,
+  `reconcile_delegation` and the mutation-guard refusals returned 8-character
+  prefixes, so recovering a canonical id meant scraping the database. Full ids
+  now; CLI terminal display still abbreviates, which is display, not interface.
+
 ### Fixed
 - **Cross-agent session identity: one agent could redirect another's mutations**
   through the shared `~/.ats_session` pointer. Proven live 2026-09-11: a Codex

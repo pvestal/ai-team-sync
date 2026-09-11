@@ -145,7 +145,7 @@ def mutation_refusal(session_id: str | None, source: str,
     if source == "global":
         return ("Refusing to mutate: this session id came from the SHARED "
                 f"pointer file, which names whichever session wrote it last "
-                f"({session_id[:8]}), not necessarily yours. Start a session in "
+                f"({session_id}), not necessarily yours. Start a session in "
                 "this process, or set ATS_SESSION_ID explicitly.")
 
     if source in ("in_process", "explicit"):
@@ -157,11 +157,11 @@ def mutation_refusal(session_id: str | None, source: str,
     # (or inherit) an id naming another worker's row. Binding is by exact id;
     # this check only rejects a row that is plainly not ours.
     if row is None:
-        return (f"Refusing to mutate: session {session_id[:8]} was not found on "
+        return (f"Refusing to mutate: session {session_id} was not found on "
                 "the server, so ownership cannot be established.")
     agent = str(row.get("agent") or "")
     if agent and my_label and agent != my_label:
-        return (f"Refusing to mutate: session {session_id[:8]} belongs to "
+        return (f"Refusing to mutate: session {session_id} belongs to "
                 f"{agent}, not to {my_label}.")
     return None
 
@@ -485,6 +485,19 @@ async def list_tools() -> list[Tool]:
                 },
                 "required": ["objective"],
             },
+        ),
+        Tool(
+            name="ats_version",
+            description=(
+                "Build identity of the ATS surfaces you are talking to: the commit "
+                "this MCP process is running, the commit the REST service is running, "
+                "and whether they MATCH. Call this before a contract test. An MCP "
+                "server is spawned once per client session and keeps its tool catalog "
+                "for that whole session, so a deploy made after your session started "
+                "is invisible to you — which reads as 'the feature does not exist' "
+                "rather than 'your process is old'."
+            ),
+            inputSchema={"type": "object", "properties": {}},
         ),
         Tool(
             name="my_authority",
@@ -920,7 +933,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 msg = f"✅ Session started!\n\n"
                 if adopted:
                     msg += f"(auto-registered placeholder session completed: {adopted})\n"
-                msg += f"Session ID: {data['id'][:8]}...\n"
+                msg += f"Session ID: {data['id']}\n"
                 msg += f"Scope: {', '.join(data['scope'])}\n"
                 msg += f"Branch: {data['branch']}\n"
                 msg += f"Locks created: {data['lock_count']}\n"
@@ -1032,7 +1045,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     msg = "🔒 Declared scope lock(s) cover these paths:\n\n"
                     for r in locked_rows:
                         who = r.get("developer") or "unknown"
-                        sess = str(r.get("session_id") or "")[:8]
+                        sess = str(r.get("session_id") or "")
                         msg += (f"   {r['path']}\n      {r.get('mode','advisory')}"
                                 f" lock held by {who} (session {sess})"
                                 f" via pattern {r.get('pattern')}\n")
@@ -1236,9 +1249,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     return [TextContent(type="text", text=f"Refused: {response.text}")]
                 d = response.json()
                 return [TextContent(type="text", text=(
-                    f"Delegation {d['id'][:8]} {d['state'].upper()}.\n"
+                    f"Delegation {d['id']} {d['state'].upper()}.\n"
                     f"Your verdict: {d['verdict']}\n"
-                    f"Parent owner unchanged: {d['parent_owner_session_id'][:8]} (you)."))]
+                    f"Parent owner unchanged: {d['parent_owner_session_id']} (you)."))]
 
             elif name == "delegate":
                 import subprocess as _sp
@@ -1289,6 +1302,31 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 )
                 response.raise_for_status()
                 return [TextContent(type="text", text=response.json()["rendered"])]
+
+            elif name == "ats_version":
+                from ai_team_sync.build_info import identity, summary_line
+                mine = identity("ats-mcp")
+                rest: dict | None = None
+                try:
+                    r = await client.get(f"{SERVER_URL}/api/version", timeout=5)
+                    rest = r.json() if r.status_code == 200 else None
+                except Exception:
+                    rest = None
+
+                lines = ["🏷  ATS build identity", "", "  " + summary_line(mine)]
+                if rest:
+                    lines.append("  " + summary_line(rest))
+                    if rest.get("commit") != mine.get("commit"):
+                        lines += ["", ("  ⚠ SKEW: this MCP process and the REST service are on "
+                                       "DIFFERENT commits. Your tool catalog was fixed when this "
+                                       "session started; restart your client session to pick up a "
+                                       "newer deploy. Do not conclude a feature is missing.")]
+                    else:
+                        lines.append("\n  MCP and REST agree.")
+                else:
+                    lines.append("  ats-rest: unreachable (could not compare)")
+                lines += ["", "  tools in this catalog: " + str(len(await list_tools()))]
+                return [TextContent(type="text", text="\n".join(lines))]
 
             elif name == "my_authority":
                 label = (arguments or {}).get("worker") or detect_agent()
@@ -1428,7 +1466,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 data = response.json()
 
                 msg = f"⏸️ Session paused!\n\n"
-                msg += f"Session ID: {data['id'][:8]}...\n"
+                msg += f"Session ID: {data['id']}\n"
                 msg += f"Locks: {data['lock_count']} (retained)\n\n"
                 msg += "Use resume_session to continue work."
 
@@ -1449,7 +1487,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 data = response.json()
 
                 msg = f"▶️ Session resumed!\n\n"
-                msg += f"Session ID: {data['id'][:8]}...\n"
+                msg += f"Session ID: {data['id']}\n"
                 msg += f"Scope: {', '.join(data['scope'])}\n"
                 msg += f"Locks: {data['lock_count']}\n"
 
@@ -1468,7 +1506,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 scope = ", ".join(data["scope"]) if data["scope"] else "no scope"
 
                 msg = f"📊 Session Details\n\n"
-                msg += f"ID: {data['id'][:8]}...\n"
+                msg += f"ID: {data['id']}\n"
                 msg += f"Developer: {data['developer']}\n"
                 msg += f"Agent: {data['agent']}\n"
                 msg += f"Status: {data['status']}\n"
@@ -1657,7 +1695,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 response.raise_for_status()
 
                 msg = f"🗑️ Lock deleted!\n\n"
-                msg += f"Lock ID: {lock_id[:8]}...\n\n"
+                msg += f"Lock ID: {lock_id}\n\n"
                 msg += "⚠️ Other team members have been notified."
 
                 return [TextContent(type="text", text=msg)]
