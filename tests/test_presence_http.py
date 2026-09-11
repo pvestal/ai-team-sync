@@ -77,6 +77,7 @@ def test_build_presence_skips_noise_paths(path):
 def test_display_path_is_repo_relative_for_in_repo_file(tmp_path):
     # a file inside a git repo renders relative to the repo root, not ../../ junk
     (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     f = tmp_path / "src" / "mod.py"
     f.parent.mkdir(parents=True)
     f.write_text("x")

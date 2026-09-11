@@ -202,7 +202,10 @@ def resolve_repo_roots(path: str | Path) -> tuple[str | None, str | None]:
     d = os.path.dirname(os.path.abspath(os.fspath(path)))
     while True:
         dot_git = os.path.join(d, ".git")
-        if os.path.isdir(dot_git):
+        # HEAD is what makes it a repo. `~/Documents/.git` on this box is a
+        # directory holding only `info/`; git says "not a git repository", but
+        # an isdir() check accepts it and captures every path underneath.
+        if os.path.isfile(os.path.join(dot_git, "HEAD")):
             return d, d
         if os.path.isfile(dot_git):
             return d, _shared_root_from_gitfile(dot_git, d)

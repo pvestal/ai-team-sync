@@ -15,7 +15,10 @@
   `git_utils.resolve_repo_roots`, which returns the worktree root (paths stay
   repo-relative, one key per file in every checkout) and the SHARED repo root
   (locks and coordinated-repo gating bind across a project's worktrees).
-  Submodules, whose `.git` file is also a pointer, anchor to themselves.
+  Submodules, whose `.git` file is also a pointer, anchor to themselves. A
+  `.git` DIRECTORY now has to contain HEAD to count: `~/Documents/.git` on
+  this box holds only `info/`, so git calls it "not a git repository" while
+  an isdir() check captured every loose file underneath it.
 
 ### Added
 - **Session liveness heartbeat (reaper Gap 1)**: nullable `Session.last_heartbeat`,

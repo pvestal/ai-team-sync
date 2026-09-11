@@ -18,9 +18,11 @@ def _make_worktree(tmp_path):
     """outer repo > main repo + linked worktree — mirrors ~/Documents on this box."""
     outer = tmp_path / "outer"
     (outer / ".git").mkdir(parents=True)
+    (outer / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
 
     main = outer / "code" / "proj"
     (main / ".git" / "worktrees" / "wt-feature").mkdir(parents=True)
+    (main / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     (main / "src").mkdir(parents=True)
     (main / "src" / "x.py").write_text("x")
 
@@ -48,6 +50,7 @@ def test_linked_worktree_resolves_to_itself_and_its_shared_repo(tmp_path):
 def test_submodule_gitfile_anchors_to_the_submodule(tmp_path):
     outer = tmp_path / "outer"
     (outer / ".git" / "modules" / "sub").mkdir(parents=True)
+    (outer / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     sub = outer / "sub"
     (sub / "src").mkdir(parents=True)
     (sub / ".git").write_text("gitdir: ../.git/modules/sub\n")
@@ -98,3 +101,28 @@ def test_a_lock_taken_in_the_main_checkout_blocks_the_same_file_in_a_worktree(tm
     conflicts = find_conflicts(rel, sessions, "mine", file_repo_root=froot)
 
     assert conflicts, "worktree edit must see the main checkout's lock"
+
+
+def test_a_git_directory_without_head_is_not_a_repo(tmp_path):
+    """`~/Documents/.git` on this box is a directory holding only `info/`.
+
+    git rejects it ('fatal: not a git repository'), but an isdir() check accepts
+    it and every loose file beneath it then anchors to a repo that does not
+    exist. A real git directory always has HEAD, bare ones included.
+    """
+    stray = tmp_path / "documents"
+    (stray / ".git" / "info").mkdir(parents=True)
+    (stray / "notes").mkdir()
+
+    assert resolve_repo_roots(stray / "notes" / "a.txt") == (None, None)
+
+
+def test_a_real_repo_below_a_stray_git_directory_still_resolves(tmp_path):
+    stray = tmp_path / "documents"
+    (stray / ".git" / "info").mkdir(parents=True)
+    real = stray / "proj"
+    (real / ".git").mkdir(parents=True)
+    (real / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (real / "src").mkdir()
+
+    assert resolve_repo_roots(real / "src" / "x.py") == (str(real), str(real))
