@@ -172,6 +172,11 @@ def _memory_citation(result: dict[str, Any]) -> str:
     two hits and can be searched for verbatim.
     """
     payload = result.get("payload") or {}
+    # A memory that states its own citation outranks anything derived. Clerk
+    # rows carry 'project_facts/<id> · ats:session/<id>', which is the whole
+    # provenance chain; falling through to a content digest threw that away.
+    if payload.get("citation"):
+        return str(payload["citation"])
     for key in ("file_path", "path", "url", "source_file"):
         if payload.get(key):
             return f"echo:{payload[key]}"

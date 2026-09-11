@@ -159,3 +159,18 @@ async def test_decisions_from_another_repo_do_not_leak_into_the_brief(client, mo
 
     titles = " ".join(i["text"] for i in brief.json()["decisions"])
     assert "Unrelated choice" not in titles
+
+
+def test_a_memory_that_states_its_citation_keeps_it():
+    """Clerk rows carry the whole provenance chain in the payload.
+
+    Falling through to a content digest threw that away and handed the reader
+    'echo:sha1/6bcd622d' instead of the fact id and the session it came from.
+    """
+    from ai_team_sync.briefs import _memory_citation
+
+    cite = _memory_citation({"payload": {"citation": "project_facts/43 · ats:session/4df033bf",
+                                         "file_path": "/tmp/irrelevant.md"},
+                             "content": "x"})
+
+    assert cite == "project_facts/43 · ats:session/4df033bf"
