@@ -3,6 +3,28 @@
 ## [Unreleased]
 
 ### Added
+- **Task-claim context packet** (`briefs.py`, `POST /api/brief`, `task_brief` MCP
+  tool, and returned automatically by `start_session`). The claim is the trigger:
+  a worker starts with live blockers, prior ATS decisions, prior work in its
+  scope, and Echo Brain recall, instead of re-deriving them or re-running a lane
+  already known to fail. Three rules the tests hold. Provenance is CARRIED, not
+  flattened — OBSERVATION / INFERRED / VERIFIED / OPERATOR_DECISION, read from
+  Echo's own `payload.trust` rather than guessed, and nothing is promoted here,
+  because promotion needs an artifact. Every line carries a citation the reader
+  can check (an `ats:decision/<id>`, a memory's file path); the first live run
+  cited `echo:mem/qdrant/echo_memory` on every line, which is present, uniform
+  and useless, so the digest fallback exists. Recall is best-effort: Echo Brain
+  or ollama being down degrades the packet, never the claim.
+  Ranking is a local embedding pass (`nomic-embed-text`, the resident model)
+  across every section, because filtering decisions by repo is not relevance —
+  before it, a two-body-contact objective surfaced an OAuth decision and a
+  watchdog timer; after it, the top four are the contact canary that located the
+  failure at identity binding. Compression is deterministic dedup, authority
+  ordering and a character budget: a generative summariser would be a second
+  place for a model to invent a fact, and would load a model the residency
+  policy keeps evicted.
+
+### Added
 - **Worker capability + authority registry** (`workers.py`, `GET /api/workers`,
   `my_authority` MCP tool, example at `deploy/workers.toml`). A worker is a
   CLASS with declared capabilities (what it is good at, for routing) and

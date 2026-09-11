@@ -338,6 +338,31 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="task_brief",
+            description=(
+                "The context packet for a piece of work: live blockers, prior ATS "
+                "decisions, prior work in this scope, and Echo Brain recall, each "
+                "line carrying its provenance (OBSERVATION / INFERRED / VERIFIED / "
+                "OPERATOR_DECISION) and a citation you can check. Ask BEFORE "
+                "investigating or spending a canary — it is how you find out a lane "
+                "is already known to fail. start_session returns one automatically."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "objective": {"type": "string",
+                                  "description": "What you are about to do, in a sentence."},
+                    "repo_root": {"type": "string",
+                                  "description": "Absolute git root, to scope decisions to this repo."},
+                    "scope": {"type": "array", "items": {"type": "string"},
+                              "description": "Path globs you expect to touch."},
+                    "recall": {"type": "boolean",
+                               "description": "Consult Echo Brain (default true)."},
+                },
+                "required": ["objective"],
+            },
+        ),
+        Tool(
             name="my_authority",
             description=(
                 "What THIS worker may do: its capabilities, its edit/commit/close "
@@ -763,6 +788,25 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 msg += f"Mode: {'EXCLUSIVE (blocks all overlaps)' if exclusive else 'Advisory (warns on overlaps)'}\n\n"
                 msg += "Team has been notified. Use complete_session when done."
 
+                # The claim IS the trigger for context (brief-on-claim). A worker
+                # that starts with prior decisions, live blockers and recall is a
+                # worker that does not re-derive them or re-run a lane already
+                # known to fail. Best-effort: a missing brief never fails a claim.
+                try:
+                    brief_resp = await client.post(
+                        f"{SERVER_URL}/api/brief",
+                        json={"objective": description,
+                              "repo_root": arguments.get("repo_root", ""),
+                              "scope": scope, "limit": 6},
+                        timeout=25,
+                    )
+                    brief_resp.raise_for_status()
+                    rendered = (brief_resp.json() or {}).get("rendered", "")
+                    if rendered:
+                        msg += "\n\n" + "-" * 60 + "\n" + rendered
+                except Exception as exc:  # noqa: BLE001
+                    msg += f"\n\n(no task brief: {type(exc).__name__})"
+
                 return [TextContent(type="text", text=msg)]
 
             elif name == "check_locks":
@@ -1041,6 +1085,20 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         msg += f"  before={r.get('before')} after={r.get('after')}\n"
                     msg += "\n"
                 return [TextContent(type="text", text=msg)]
+
+            elif name == "task_brief":
+                response = await client.post(
+                    f"{SERVER_URL}/api/brief",
+                    json={
+                        "objective": arguments["objective"],
+                        "repo_root": arguments.get("repo_root", ""),
+                        "scope": arguments.get("scope", []),
+                        "recall": arguments.get("recall", True),
+                    },
+                    timeout=30,
+                )
+                response.raise_for_status()
+                return [TextContent(type="text", text=response.json()["rendered"])]
 
             elif name == "my_authority":
                 label = (arguments or {}).get("worker") or detect_agent()
