@@ -64,15 +64,21 @@ Console entry points: `ats` (CLI), `ats-server` (API/dashboard), `ats-mcp` (MCP 
 
 ### Run as a service
 
-`setup.sh` starts the server as a plain background process — it won't survive a reboot or crash. To keep it up persistently, install the systemd unit instead:
+Install the **user** unit — the server holds one developer's coordination state, needs no root, and must outlive the terminal that started it:
 
 ```bash
-sudo cp deploy/ai-team-sync.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now ai-team-sync
+pipx install --force .                  # deploys server + MCP + CLI + hooks together
+cp deploy/ats-server.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now ats-server
+sudo loginctl enable-linger "$USER"     # survive logout / start at boot
 ```
 
-Edit the `User`/`WorkingDirectory`/`ExecStart` paths in `deploy/ai-team-sync.service` first if your install location differs from `/home/patrick/code/ai-team-sync`.
+Two things the unit pins deliberately, both of which have bitten this box:
+
+- **`DATABASE_URL` is absolute.** The default sqlite URL is relative, so it resolves against the process CWD — a launcher started elsewhere opens a different database and every session, lock and decision silently disappears.
+- **`ATS_HOST` is loopback.** The write API is unauthenticated. Expose it to a LAN only deliberately.
+
+Do not also install this as a system unit: two servers fight over 8400, and the second one is the one with the wrong database. Edit the paths if your install location differs from `/home/patrick`.
 
 ## How to use
 

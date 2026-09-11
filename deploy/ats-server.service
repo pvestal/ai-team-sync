@@ -1,0 +1,36 @@
+# ai-team-sync coordination server.
+#
+# Install as a USER unit — the server holds one developer's coordination state,
+# needs no root, and must outlive the terminal that started it:
+#
+#   cp deploy/ats-server.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now ats-server
+#   sudo loginctl enable-linger "$USER"     # survive logout / start at boot
+#
+# Do NOT also install this as a system unit: two servers would fight over 8400,
+# and a system unit's WorkingDirectory silently opens a DIFFERENT database.
+[Unit]
+Description=ai-team-sync coordination server (ats-server) — agent change-management API
+Documentation=https://github.com/patrickv77/ai-team-sync
+After=network.target
+
+[Service]
+Type=simple
+# Bind localhost only — the write API is unauthenticated; do NOT expose to LAN.
+# If you later run Codex/agents on another host, change to 0.0.0.0 deliberately.
+Environment=ATS_HOST=127.0.0.1
+Environment=ATS_PORT=8400
+# Absolute DB path so state is stable regardless of process CWD (and out of the
+# repo). A relative sqlite URL resolves against CWD, so a launcher started
+# somewhere else opens an empty/stale database and every session and lock
+# silently disappears.
+Environment=DATABASE_URL=sqlite+aiosqlite:////home/patrick/.local/share/ai-team-sync/ats.db
+WorkingDirectory=/home/patrick/.local/share/ai-team-sync
+# The pipx-installed entry point: `pipx install --force <repo>` is the one
+# deploy action for the server, the MCP, the CLI and the hooks together.
+ExecStart=/home/patrick/.local/bin/ats-server
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

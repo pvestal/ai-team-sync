@@ -32,12 +32,19 @@ for cmd in code codium code-insiders; do
     fi
 done
 
-# Start server (kill old one if running)
-fuser -k 8400/tcp 2>/dev/null || true
-sleep 1
-cd "$DIR"
-ATS_HOST="${ATS_HOST:-127.0.0.1}"
-nohup .venv/bin/uvicorn ai_team_sync.server:app --host "$ATS_HOST" --port 8400 &>/tmp/ats-server.log &
+# Start server. If the systemd user unit is installed it OWNS the server and its
+# database path — killing :8400 and relaunching here would swap the live database
+# for whatever a relative sqlite URL resolves to under this CWD.
+if systemctl --user list-unit-files ats-server.service &>/dev/null \
+   && systemctl --user is-enabled ats-server &>/dev/null; then
+    systemctl --user restart ats-server
+else
+    fuser -k 8400/tcp 2>/dev/null || true
+    sleep 1
+    cd "$DIR"
+    ATS_HOST="${ATS_HOST:-127.0.0.1}"
+    nohup .venv/bin/uvicorn ai_team_sync.server:app --host "$ATS_HOST" --port 8400 &>/tmp/ats-server.log &
+fi
 sleep 2
 
 # Get IP for optional trusted-network access
