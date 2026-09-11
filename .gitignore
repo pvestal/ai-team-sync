@@ -20,4 +20,4 @@ out/
 *.vsix
 
 # Build output: the commit stamped into the package at deploy time.
-src/ai_team_sync/_build_stamp.json
+src/ai_team_sync/_build_stamp.py

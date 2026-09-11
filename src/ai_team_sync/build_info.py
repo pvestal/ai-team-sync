@@ -15,7 +15,6 @@ inferring from process paths or file timestamps.
 
 from __future__ import annotations
 
-import json
 import os
 import subprocess
 import time
@@ -25,22 +24,25 @@ from typing import Any
 _PKG = Path(__file__).resolve().parent
 # Written into the package at deploy time (scripts/deploy.sh), so the COPY that
 # pipx installs carries the commit it was built from. Gitignored: it is build
-# output, not source.
-_STAMP = _PKG / "_build_stamp.json"
+# output, not source. A .py module rather than a data file because setuptools
+# packages modules automatically — a JSON file needs package-data config and
+# silently did not ship, which is how the first deploy reported commit
+# "unknown" while claiming success.
 
 _PROCESS_STARTED = time.time()
 
 
 def _from_stamp() -> dict[str, Any] | None:
     try:
-        with open(_STAMP, encoding="utf-8") as fh:
-            data = json.load(fh)
-        if data.get("commit"):
-            data["revision_source"] = "stamp"
-            return data
-    except Exception:  # noqa: BLE001
-        pass
-    return None
+        from ai_team_sync import _build_stamp as stamp  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 — absent in a plain checkout
+        return None
+    commit = getattr(stamp, "COMMIT", "")
+    if not commit:
+        return None
+    return {"commit": commit, "dirty": getattr(stamp, "DIRTY", None),
+            "built_at": getattr(stamp, "BUILT_AT", None),
+            "revision_source": "stamp"}
 
 
 def _from_git() -> dict[str, Any] | None:

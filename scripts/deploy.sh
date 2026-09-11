@@ -10,9 +10,12 @@ cd "$(dirname "$0")/.."
 
 COMMIT="$(git rev-parse --short HEAD)"
 DIRTY=false; [ -n "$(git status --porcelain)" ] && DIRTY=true
-cat > src/ai_team_sync/_build_stamp.json <<JSON
-{"commit": "${COMMIT}", "dirty": ${DIRTY}, "built_at": "$(date -Is)"}
-JSON
+cat > src/ai_team_sync/_build_stamp.py <<PY
+"""Generated at deploy time. Not source; see .gitignore."""
+COMMIT = "${COMMIT}"
+DIRTY = ${DIRTY^}
+BUILT_AT = "$(date -Is)"
+PY
 echo "stamped ${COMMIT} (dirty=${DIRTY})"
 
 pipx install --force . >/dev/null
@@ -23,4 +26,4 @@ curl -s http://localhost:8400/api/version | python3 -m json.tool
 echo
 echo "NOTE: a running client's stdio MCP keeps the catalog it started with."
 echo "Restart Codex / Claude Code sessions to pick this up."
-scripts/check_mcp_parity.py
+.venv/bin/python scripts/check_mcp_parity.py
