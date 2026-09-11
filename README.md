@@ -174,10 +174,10 @@ ats session start -s "backend/database/**" -d "Schema migration" --exclusive
 
 ## Remote access
 
-By default the server binds to `127.0.0.1:8400` (localhost only) — the write API
-is **unauthenticated**, so don't expose it to untrusted networks. To share it
-across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately. Then any machine
-on that network can:
+By default the server binds to `127.0.0.1:8400` (localhost only). The write API
+is **unauthenticated**, so do not expose it to untrusted networks. To share it
+across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately before starting
+`ats-server` or running `setup.sh`. Then any machine on that network can:
 - Open the dashboard in a browser
 - Point the VS Code extension to the server URL (`aiTeamSync.serverUrl` in settings)
 - Use the CLI with `export ATS_SERVER_URL=http://SERVER_IP:8400`

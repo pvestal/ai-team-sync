@@ -36,10 +36,11 @@ done
 fuser -k 8400/tcp 2>/dev/null || true
 sleep 1
 cd "$DIR"
-nohup .venv/bin/uvicorn ai_team_sync.server:app --host 0.0.0.0 --port 8400 &>/tmp/ats-server.log &
+ATS_HOST="${ATS_HOST:-127.0.0.1}"
+nohup .venv/bin/uvicorn ai_team_sync.server:app --host "$ATS_HOST" --port 8400 &>/tmp/ats-server.log &
 sleep 2
 
-# Get IP for remote access
+# Get IP for optional trusted-network access
 IP=$(hostname -I 2>/dev/null | awk '{print $1}')
 
 # Verify
@@ -51,7 +52,9 @@ if curl -s http://localhost:8400/health | grep -q ok; then
     echo "            Ctrl+Shift+P → 'AI Team Sync: Start Session' to begin"
     echo ""
     echo "  Browser:  http://localhost:8400/dashboard"
-    [ -n "$IP" ] && echo "  Remote:   http://${IP}:8400/dashboard"
+    if [ "$ATS_HOST" = "0.0.0.0" ] && [ -n "$IP" ]; then
+        echo "  Remote:   http://${IP}:8400/dashboard"
+    fi
     echo ""
 else
     echo "  Server failed to start. Check /tmp/ats-server.log"

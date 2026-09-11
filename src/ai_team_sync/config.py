@@ -6,7 +6,6 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from pydantic import Field
 from pydantic_settings import BaseSettings
 
 
@@ -16,7 +15,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite+aiosqlite:///ai_team_sync.db"
 
     # Server
-    ats_host: str = "0.0.0.0"
+    ats_host: str = "127.0.0.1"
     ats_port: int = 8400
 
     # Slack
