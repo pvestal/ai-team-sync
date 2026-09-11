@@ -367,6 +367,27 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="reconcile_delegation",
+            description=(
+                "Close the loop on a child delegation you own: ACCEPT it only after "
+                "you have independently checked its claims against the acceptance "
+                "criteria, or REJECT it. You cannot complete your own session while a "
+                "child is unreconciled — you still own the task. Accepting is your "
+                "judgement, not the child's report of success."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "delegation_id": {"type": "string"},
+                    "state": {"type": "string", "enum": ["closed", "rejected"],
+                              "description": "'closed' = accepted, 'rejected' = not satisfied."},
+                    "verdict": {"type": "string",
+                                "description": "What YOU verified, and how. Not a restatement of the child's claim."},
+                },
+                "required": ["delegation_id", "state", "verdict"],
+            },
+        ),
+        Tool(
             name="task_brief",
             description=(
                 "The context packet for a piece of work: live blockers, prior ATS "
@@ -1114,6 +1135,18 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         msg += f"  before={r.get('before')} after={r.get('after')}\n"
                     msg += "\n"
                 return [TextContent(type="text", text=msg)]
+
+            elif name == "reconcile_delegation":
+                response = await client.post(
+                    f"{SERVER_URL}/api/delegations/{arguments['delegation_id']}/close",
+                    json={"state": arguments["state"], "verdict": arguments["verdict"]})
+                if response.status_code >= 400:
+                    return [TextContent(type="text", text=f"Refused: {response.text}")]
+                d = response.json()
+                return [TextContent(type="text", text=(
+                    f"Delegation {d['id'][:8]} {d['state'].upper()}.\n"
+                    f"Your verdict: {d['verdict']}\n"
+                    f"Parent owner unchanged: {d['parent_owner_session_id'][:8]} (you)."))]
 
             elif name == "delegate":
                 import subprocess as _sp
