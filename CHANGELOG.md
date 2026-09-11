@@ -3,6 +3,30 @@
 ## [Unreleased]
 
 ### Added
+- **Delegation-authority hardening.** `GET /api/authority/{session_id}` and a
+  delegation-aware `my_authority` report `base_authority`, the delegation
+  `mode`, and the `effective_authority` intersection separately — reporting only
+  the base is how a READ_ONLY child was told it could edit and commit.
+  `delegation_status` gives the whole lifecycle (full delegation/parent/child
+  ids, state, mode, child effective authority, timestamps, per-session status
+  and lock counts) so a delegation can be verified without reading the database.
+  `docs/authority-model.md` writes down the policy for every mutation surface.
+
+### Fixed
+- **A delegated child could not act on its own row.** `agent_label` appended a
+  cid suffix, so a child whose ATS row says `claude-code:delegate` computed
+  `claude-code:delegate:<cid8>` and failed the ownership check on itself. Under
+  a delegation the label takes no suffix, and the mutation guard now accepts an
+  exact delegation binding (this session IS that delegation's child) as
+  authority in its own right, rather than comparing names.
+- **Explicit-id surfaces had no authorization.** `reconcile_delegation` is now
+  owner-bound (only the parent, and an unidentified actor is refused), returning
+  a result is child-bound, `delete_lock` refuses a lock held by a live
+  heartbeating session while keeping the ghost-reap path open, and
+  `respond_to_request` only accepts the session the request is addressed to.
+  `record_restart` stays intentionally global and session-optional.
+
+### Added
 - **Build identity and MCP catalog parity** (`build_info.py`, `GET /api/version`,
   `ats_version` MCP tool, `scripts/deploy.sh`, `scripts/check_mcp_parity.py`).
   A stdio MCP server is spawned once per client session and holds its tool

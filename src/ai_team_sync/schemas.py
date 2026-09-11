@@ -208,6 +208,9 @@ class OverrideRequestResponse(BaseModel):
 class OverrideRequestRespond(BaseModel):
     approved: bool
     message: str = ""
+    # The lock OWNER answers. An override is permission to cross someone's
+    # claim, so the only session that can grant it is the one holding it.
+    actor_session_id: str = ""
 
 
 # --- Presence (HTTP, for hook-driven auto-emit; WS path is for the live UI) ---

@@ -109,16 +109,24 @@ async def test_valid_globs_accepted(client):
 
 @pytest.mark.asyncio
 async def test_delete_lock(client):
+    """The holder releases its own lock.
+
+    Owner-bound since the explicit-ID authority audit: a live claim is not
+    something another session may drop. See
+    test_a_live_lock_is_not_reapable_by_a_stranger for the other half.
+    """
     resp = await client.post("/api/sessions", json={
         "developer": "patrick",
         "scope": ["src/auth/**"],
         "auto_lock": True,
     })
+    session_id = resp.json()["id"]
 
     locks_resp = await client.get("/api/locks")
     lock_id = locks_resp.json()[0]["id"]
 
-    resp = await client.delete(f"/api/locks/{lock_id}")
+    resp = await client.delete(f"/api/locks/{lock_id}",
+                               params={"actor_session_id": session_id})
     assert resp.status_code == 204
 
     locks_resp = await client.get("/api/locks")

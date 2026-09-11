@@ -711,6 +711,7 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         ret = c.post(f"{server}/api/delegations/{d['id']}/return", json={
             "result_summary": output[:20000],
             "evidence": {"exit_ok": not failure, "child_session_id": child_id},
+            "actor_session_id": child_id,
         })
         c.patch(f"{server}/api/sessions/{child_id}",
                 json={"status": "completed",

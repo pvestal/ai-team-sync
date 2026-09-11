@@ -14,7 +14,7 @@ from fastapi import Depends
 from ai_team_sync.database import init_db
 from ai_team_sync.config import settings
 from ai_team_sync.liveness import liveness_from_request
-from ai_team_sync.routers import sessions, locks, decisions, override_requests, git_status, websocket, dashboard, presence_ws, presence_http, restarts, workers, briefs, delegations, version
+from ai_team_sync.routers import sessions, locks, decisions, override_requests, git_status, websocket, dashboard, presence_ws, presence_http, restarts, workers, briefs, delegations, version, authority
 
 
 @asynccontextmanager
@@ -50,6 +50,7 @@ def create_app() -> FastAPI:
     app.include_router(briefs.router, prefix="/api")   # task-claim context packet
     app.include_router(delegations.router, prefix="/api")  # bounded worker-to-worker delegation
     app.include_router(version.router, prefix="/api")      # build identity (REST vs MCP skew)
+    app.include_router(authority.router, prefix="/api")    # base vs delegation-narrowed authority
     app.include_router(websocket.router)
     app.include_router(dashboard.router)
     app.include_router(presence_ws.router)

@@ -275,6 +275,19 @@ async def respond_to_override_request(
     if request.status != "pending":
         raise HTTPException(400, f"Request already {request.status}")
 
+    # Owner-bound. Granting an override is the holder's decision about their own
+    # claim; a third party approving it would make the lock advisory to anyone
+    # who asks. An unidentified caller is refused rather than assumed to be the
+    # owner.
+    if body.actor_session_id and body.actor_session_id != request.owner_session_id:
+        raise HTTPException(
+            403,
+            detail={"error": "not_the_lock_owner",
+                    "message": (f"override request {request.id} is addressed to "
+                                f"session {request.owner_session_id}; "
+                                f"{body.actor_session_id} cannot answer it"),
+                    "owner_session_id": request.owner_session_id})
+
     # Check if expired
     now = datetime.now(timezone.utc)
     # Ensure both datetimes are timezone-aware for comparison

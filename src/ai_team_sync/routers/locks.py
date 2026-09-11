@@ -122,11 +122,54 @@ async def check_locks(body: LockCheckRequest, db: AsyncSession = Depends(get_db)
     return results
 
 
+def _owner_is_stale(owner: Session) -> bool:
+    """A GHOST still marked active — silent past the heartbeat window.
+
+    Completing a session releases its locks, so a lock whose owner is properly
+    finished is already gone. The lock that actually needs reaping belongs to a
+    session that LOOKS active and is not, which is what list_all_locks surfaces
+    lock ids for. Keep that path open; a genuinely live session heartbeats.
+    """
+    from datetime import datetime, timezone
+    from ai_team_sync.config import settings
+
+    def _aware(dt):
+        return dt.replace(tzinfo=timezone.utc) if dt and dt.tzinfo is None else dt
+
+    last = _aware(owner.last_heartbeat) or _aware(owner.started_at)
+    if last is None:
+        return False
+    idle = (datetime.now(timezone.utc) - last).total_seconds()
+    return idle > settings.session_heartbeat_timeout_minutes * 60
+
+
 @router.delete("/{lock_id}", status_code=204)
-async def delete_lock(lock_id: str, db: AsyncSession = Depends(get_db)):
+async def delete_lock(lock_id: str, actor_session_id: str = "",
+                      db: AsyncSession = Depends(get_db)):
+    """Owner-bound, with the reap path kept open.
+
+    A lock held by a LIVE session is that session's claim and nobody else's to
+    drop. A lock left behind by a session that is no longer active is exactly
+    what delete_lock exists to clear, so that stays allowed — reaping a corpse's
+    lane is the documented use. An actor that does not identify itself can still
+    reap a dead lock and still cannot touch a live one.
+    """
     result = await db.execute(select(ScopeLock).where(ScopeLock.id == lock_id))
     lock = result.scalar_one_or_none()
     if not lock:
         raise HTTPException(404, "Lock not found")
+
+    owner = await db.get(Session, lock.session_id)
+    if owner is not None and owner.status == "active" and not _owner_is_stale(owner) \
+            and actor_session_id != lock.session_id:
+        raise HTTPException(
+            403,
+            detail={
+                "error": "lock_not_yours",
+                "message": (f"lock {lock.id} is held by ACTIVE session "
+                            f"{lock.session_id} ({owner.agent}). Coordinate or "
+                            f"request_override; a live claim is not reapable."),
+                "owner_session_id": lock.session_id,
+            })
     await db.delete(lock)
     await db.commit()

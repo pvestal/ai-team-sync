@@ -180,6 +180,17 @@ def agent_label(base: str | None = None, cid: str | None = None) -> str:
     suffix — a token on an unidentified agent reads as identity it isn't).
     """
     base = (base or detect_agent()).strip() or "unknown"
+
+    # A DELEGATED child takes no cid suffix. The wrapper creates its row as
+    # '<worker>:delegate' before the process exists, so appending a cid here
+    # would produce '<worker>:delegate:<cid8>' and the child would fail the
+    # ownership check on its OWN row (observed by an independent Codex run:
+    # process reported claude-code while the row said claude-code:delegate).
+    # Its identity is the delegation binding, which is exact; the cid adds
+    # nothing a delegation id does not already pin down.
+    if (os.environ.get("ATS_DELEGATION") or "").strip():
+        return base
+
     cid = (cid if cid is not None else (claude_session_id() or "")).strip()
     return f"{base}:{cid[:8]}" if (cid and base != "unknown") else base
 

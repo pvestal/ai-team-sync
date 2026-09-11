@@ -487,6 +487,22 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="delegation_status",
+            description=(
+                "Read-only lifecycle view of one delegation: full delegation, parent "
+                "and child session ids, mode, state, the child's EFFECTIVE authority, "
+                "timestamps, and each session's status and lock count. Enough to "
+                "verify a delegation without reading the database."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "delegation_id": {"type": "string", "description": "Full delegation id."},
+                },
+                "required": ["delegation_id"],
+            },
+        ),
+        Tool(
             name="ats_version",
             description=(
                 "Build identity of the ATS surfaces you are talking to: the commit "
@@ -513,7 +529,13 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "worker": {
                         "type": "string",
-                        "description": "Worker or session label to look up. Omit for yourself.",
+                        "description": ("Worker NAME to look up (base authority only). "
+                                        "Omit for yourself."),
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": ("Full session id. Answers with EFFECTIVE authority, "
+                                        "i.e. base narrowed by any delegation mode."),
                     },
                 },
             },
@@ -840,6 +862,19 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
     async def deny_mutation(client) -> str | None:
         """Refusal text for a session-mutating call, or None to proceed."""
+        # A delegated child's authority is its DELEGATION BINDING, not its name.
+        # If the delegation ATS created names this exact session as its child,
+        # that is proof no label comparison can improve on.
+        deleg_id = (os.environ.get("ATS_DELEGATION") or "").strip()
+        if deleg_id and active_session_id:
+            try:
+                r = await client.get(f"{SERVER_URL}/api/delegations/{deleg_id}")
+                if r.status_code == 200 and \
+                        r.json().get("child_session_id") == active_session_id:
+                    return None
+            except Exception:
+                pass  # fall through to the normal checks
+
         row = None
         if active_session_id and identity_source in ("env", "per_session"):
             try:
@@ -1244,7 +1279,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
             elif name == "reconcile_delegation":
                 response = await client.post(
                     f"{SERVER_URL}/api/delegations/{arguments['delegation_id']}/close",
-                    json={"state": arguments["state"], "verdict": arguments["verdict"]})
+                    json={"state": arguments["state"], "verdict": arguments["verdict"],
+                          "actor_session_id": active_session_id or ""})
                 if response.status_code >= 400:
                     return [TextContent(type="text", text=f"Refused: {response.text}")]
                 d = response.json()
@@ -1303,6 +1339,55 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 response.raise_for_status()
                 return [TextContent(type="text", text=response.json()["rendered"])]
 
+            elif name == "delegation_status":
+                did = arguments["delegation_id"]
+                r = await client.get(f"{SERVER_URL}/api/delegations/{did}")
+                if r.status_code != 200:
+                    return [TextContent(type="text", text=f"❌ {r.text}")]
+                d = r.json()
+
+                async def _session(sid):
+                    if not sid:
+                        return None
+                    sr = await client.get(f"{SERVER_URL}/api/sessions/{sid}")
+                    return sr.json() if sr.status_code == 200 else None
+
+                parent = await _session(d["parent_owner_session_id"])
+                child = await _session(d.get("child_session_id"))
+                eff = None
+                if d.get("child_session_id"):
+                    ar = await client.get(
+                        f"{SERVER_URL}/api/authority/{d['child_session_id']}")
+                    eff = ar.json() if ar.status_code == 200 else None
+
+                def _line(label, sess):
+                    if not sess:
+                        return f"  {label}: (not found)"
+                    return (f"  {label}: {sess['id']}\n"
+                            f"      agent {sess['agent']}  status {sess['status']}  "
+                            f"locks {sess.get('lock_count', '?')}")
+
+                lines = [f"🔗 delegation {d['id']}",
+                         f"   mode {d['mode']}   state {d['state']}",
+                         f"   created {d['created_at']}   closed {d['closed_at'] or '-'}",
+                         f"   lease expires {d['lease_expires_at']}", "",
+                         _line("parent OWNER", parent),
+                         _line("child       ", child)]
+                if eff:
+                    e, b = eff["effective_authority"], eff["base_authority"]
+                    lines += ["", f"  child base authority     : edit={b['edit']} "
+                                  f"commit={b['commit']} close={b['task_close']}",
+                              f"  child EFFECTIVE authority: edit={e['edit']} "
+                              f"commit={e['commit']} close={e['task_close']}"]
+                    if eff.get("prohibitions"):
+                        lines.append("  child may not: " + ", ".join(eff["prohibitions"]))
+                if d.get("result_summary"):
+                    lines += ["", "  result: " + d["result_summary"][:400]]
+                if d.get("verdict"):
+                    lines += ["", "  owner verdict: " + d["verdict"][:400]]
+                lines += ["", "  Ownership never moved: the parent above owns the task."]
+                return [TextContent(type="text", text="\n".join(lines))]
+
             elif name == "ats_version":
                 from ai_team_sync.build_info import identity, summary_line
                 mine = identity("ats-mcp")
@@ -1329,7 +1414,42 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 return [TextContent(type="text", text="\n".join(lines))]
 
             elif name == "my_authority":
-                label = (arguments or {}).get("worker") or detect_agent()
+                args = arguments or {}
+                sid = (args.get("session_id") or "").strip()
+                label = (args.get("worker") or "").strip()
+                if not sid and not label:
+                    sid = active_session_id or ""
+
+                # A session id can be answered with EFFECTIVE authority, because
+                # the server knows whether that session is a delegated child.
+                # A bare worker name can only be answered with base authority.
+                if sid:
+                    resp = await client.get(f"{SERVER_URL}/api/authority/{sid}")
+                    if resp.status_code == 200:
+                        a = resp.json()
+                        base, eff = a["base_authority"], a["effective_authority"]
+                        d = a.get("delegation")
+                        lines = [f"🪪 session {a['session_id']}",
+                                 f"   agent {a['agent']}  →  worker '{a['worker']}'", ""]
+                        if d:
+                            lines += [f"  delegation : {d['delegation_id']}",
+                                      f"  mode       : {d['mode']} ({d['state']})",
+                                      f"  parent owner: {d['parent_owner_session_id']}", ""]
+                        def _fmt(x):
+                            return (f"edit={x['edit']} commit={x['commit']} "
+                                    f"close={x['task_close']}")
+                        lines += [f"  base authority     : {_fmt(base)}",
+                                  f"  EFFECTIVE authority: {_fmt(eff)}"]
+                        if a.get("narrowed"):
+                            lines += ["", "  ⚠ NARROWED by the delegation mode. The effective "
+                                          "row is what applies; base is what this worker could "
+                                          "do outside this delegation."]
+                        if a.get("prohibitions"):
+                            lines += ["", "  you may not: " + ", ".join(a["prohibitions"])]
+                        lines += ["", "  capabilities: " + ", ".join(a["capabilities"])]
+                        return [TextContent(type="text", text="\n".join(lines))]
+
+                label = label or detect_agent()
                 response = await client.get(f"{SERVER_URL}/api/workers/{label}")
                 response.raise_for_status()
                 w = response.json()

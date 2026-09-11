@@ -37,11 +37,17 @@ class DelegationCreate(BaseModel):
 class DelegationReturn(BaseModel):
     result_summary: str = ""
     evidence: dict = Field(default_factory=dict)
+    # The CHILD submits its result. Exact id, not a worker name.
+    actor_session_id: str = ""
 
 
 class DelegationClose(BaseModel):
     state: str = "closed"          # closed | rejected
     verdict: str = ""
+    # Only the PARENT OWNER reconciles. Accepting a result is the owner's
+    # judgement of evidence against acceptance criteria; a child that could
+    # close its own delegation would be marking its own homework.
+    actor_session_id: str = ""
 
 
 def _aware(dt: datetime) -> datetime:
@@ -161,6 +167,14 @@ async def return_delegation(delegation_id: str, body: DelegationReturn,
         raise HTTPException(404, detail={"error": "no_such_delegation"})
     if d.state != "open":
         raise HTTPException(409, detail={"error": "not_open", "state": d.state})
+    if d.child_session_id and body.actor_session_id \
+            and body.actor_session_id != d.child_session_id:
+        raise HTTPException(
+            403,
+            detail={"error": "not_the_child",
+                    "message": (f"only the delegated child ({d.child_session_id}) "
+                                f"submits this result"),
+                    "child_session_id": d.child_session_id})
     if _aware(d.lease_expires_at) <= datetime.now(timezone.utc):
         d.state = "expired"
         await db.commit()
@@ -188,6 +202,20 @@ async def close_delegation(delegation_id: str, body: DelegationClose,
         raise HTTPException(404, detail={"error": "no_such_delegation"})
     if body.state not in ("closed", "rejected"):
         raise HTTPException(422, detail={"error": "bad_state"})
+    if not body.actor_session_id:
+        raise HTTPException(
+            403,
+            detail={"error": "no_actor",
+                    "message": ("reconciling is an ownership act; identify the "
+                                "session doing it (actor_session_id)")})
+    if body.actor_session_id != d.parent_session_id:
+        raise HTTPException(
+            403,
+            detail={"error": "not_the_owner",
+                    "message": (f"delegation {d.id} is owned by session "
+                                f"{d.parent_session_id}; {body.actor_session_id} "
+                                f"cannot reconcile it"),
+                    "parent_owner_session_id": d.parent_session_id})
 
     d.state = body.state
     d.verdict = body.verdict
