@@ -19,6 +19,8 @@ from ai_team_sync.git_utils import uncommitted_for_scope
 from ai_team_sync.notifications.dispatcher import dispatch
 from ai_team_sync.schemas import SessionCreate, SessionResponse, SessionUpdate
 from ai_team_sync.workers import registry
+from ai_team_sync.delegation import effective_authority
+from ai_team_sync.models import Delegation
 from ai_team_sync.config import settings
 
 logger = logging.getLogger(__name__)
@@ -208,6 +210,30 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
     )
     _authority_gate(body, active_for_worker)
 
+    # A delegated child is narrowed by its mode on top of its worker class.
+    # READ_ONLY that only decorated the record would be a note attached to a
+    # worker which can still edit six files.
+    delegation = None
+    if body.delegation_id:
+        delegation = await db.get(Delegation, body.delegation_id)
+        if delegation is None:
+            raise HTTPException(404, detail={"error": "no_such_delegation"})
+        auth = effective_authority(worker, delegation.mode)
+        if body.scope and auth.edit == "none":
+            raise HTTPException(
+                status_code=403,
+                detail={
+                    "error": "delegation_authority",
+                    "message": (
+                        f"delegation {delegation.id[:8]} is {delegation.mode}, so this "
+                        f"child cannot claim scope {body.scope}. Register unscoped, "
+                        f"investigate, and return evidence to the parent."
+                    ),
+                    "mode": delegation.mode,
+                    "prohibitions": json.loads(delegation.prohibitions or "[]"),
+                },
+            )
+
     # Check for scope conflicts BEFORE creating the session
     if body.auto_lock and body.scope:
         conflicts = await _check_scope_conflicts(
@@ -261,6 +287,8 @@ async def create_session(body: SessionCreate, db: AsyncSession = Depends(get_db)
     )
     db.add(session)
     await db.flush()  # Ensure session.id is populated
+    if delegation is not None:
+        delegation.child_session_id = session.id
 
     # Auto-create scope locks from scope patterns
     if body.auto_lock and body.scope:
@@ -336,6 +364,26 @@ async def update_session(session_id: str, body: SessionUpdate, db: AsyncSession 
     session = result.scalar_one_or_none()
     if not session:
         raise HTTPException(404, "Session not found")
+
+    if body.status == "completed":
+        # Ownership cannot be dropped while a child is still out. Completing
+        # here would strand the child and leave the task owned by nobody —
+        # the failure the delegation-is-not-handoff rule exists to prevent.
+        from ai_team_sync.routers.delegations import open_delegations_for
+        outstanding = await open_delegations_for(db, session.id)
+        if outstanding:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "open_delegations",
+                    "message": (
+                        f"{len(outstanding)} child delegation(s) still open or awaiting "
+                        f"reconciliation; close or reject them before releasing this "
+                        f"session — you still own the task."
+                    ),
+                    "delegations": [d.id for d in outstanding],
+                },
+            )
 
     if body.status is not None:
         session.status = body.status

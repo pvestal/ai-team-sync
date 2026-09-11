@@ -201,3 +201,41 @@ class OverrideRequest(Base):
     owner_session: Mapped[Session] = relationship(
         back_populates="override_requests_received", foreign_keys=[owner_session_id]
     )
+
+
+class Delegation(Base):
+    """A bounded subproblem handed from one worker to another.
+
+    Deliberately NOT a handoff: `parent_session_id` keeps owning the work for
+    the whole life of the child, and nothing in the child's lifecycle writes to
+    the parent. `mode` is enforced (see delegation.effective_authority and
+    child_launch_argv), not merely recorded.
+    """
+
+    __tablename__ = "delegations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    # The parent keeps ownership. Named for the invariant so a reader of this
+    # row cannot mistake a returned child for a transfer.
+    parent_session_id: Mapped[str] = mapped_column(
+        ForeignKey("sessions.id", ondelete="CASCADE"))
+    parent_task: Mapped[str] = mapped_column(String(120), default="")
+    delegating_worker: Mapped[str] = mapped_column(String(100), default="")
+    delegated_worker: Mapped[str] = mapped_column(String(100), default="")
+    mode: Mapped[str] = mapped_column(String(20), default="READ_ONLY")
+    repo_root: Mapped[str] = mapped_column(String(1024), default="")
+    scope: Mapped[str] = mapped_column(Text, default="[]")        # JSON list
+    objective: Mapped[str] = mapped_column(Text, default="")
+    acceptance: Mapped[str] = mapped_column(Text, default="")
+    prohibitions: Mapped[str] = mapped_column(Text, default="[]")  # JSON list
+    child_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
+                                                       default=_utcnow)
+    # open -> returned -> closed | rejected | expired
+    state: Mapped[str] = mapped_column(String(20), default="open")
+    result_summary: Mapped[str] = mapped_column(Text, default="")
+    evidence: Mapped[str] = mapped_column(Text, default="{}")      # JSON object
+    verdict: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True),
+                                                       nullable=True)

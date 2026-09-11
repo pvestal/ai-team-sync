@@ -598,5 +598,128 @@ default_mode = "{lock_mode}"
     click.echo(f"  open {server_url}/dashboard")
 
 
+# ---------------------------------------------------------------------------
+# delegate — bounded worker-to-worker work, through ATS rather than a raw shell
+# ---------------------------------------------------------------------------
+
+@cli.command("delegate")
+@click.option("--task", "parent_task", default="", help="Parent task id this serves, e.g. 2654")
+@click.option("--parent-session", default="", help="Delegating session id (default: your current one)")
+@click.option("--worker", default="claude-code", help="Worker to delegate to")
+@click.option("--mode", type=click.Choice(["READ_ONLY", "IMPLEMENT", "VERIFY"]),
+              default="READ_ONLY", help="Authority envelope granted to the child")
+@click.option("--scope", "-s", multiple=True, help="Scope glob (repeatable); IMPLEMENT only")
+@click.option("--repo", default="", help="Absolute repo root")
+@click.option("--objective", "-o", required=True, help="The ONE question or change")
+@click.option("--acceptance", "-a", required=True, help="What a satisfactory answer must contain")
+@click.option("--lease-minutes", default=30, show_default=True)
+@click.option("--dry-run", is_flag=True, help="Create the record and print the child packet; launch nothing")
+def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
+             acceptance, lease_minutes, dry_run):
+    """Delegate a bounded subproblem to another worker.
+
+    The delegating worker keeps ownership throughout: this creates a CHILD
+    record, never a handoff. The child is launched with the mode's own harness
+    restrictions and receives a freshly built packet — the parent's conversation
+    is deliberately NOT inherited, so one worker's intermediate reasoning cannot
+    contaminate the next, and the exchange stays reproducible from the record.
+    """
+    import sys
+    from ai_team_sync.delegation import child_launch_argv
+
+    server = _server_url()
+    parent_session = parent_session or (_load_active_session() or "")
+    if not parent_session:
+        click.echo("No parent session. Run `ats session start` first.", err=True)
+        sys.exit(1)
+    repo = repo or (_repo_root() or "")
+
+    with httpx.Client(timeout=30) as c:
+        resp = c.post(f"{server}/api/delegations", json={
+            "parent_session_id": parent_session, "parent_task": parent_task,
+            "delegated_worker": worker, "mode": mode, "repo_root": repo,
+            "scope": list(scope), "objective": objective, "acceptance": acceptance,
+            "lease_minutes": lease_minutes,
+        })
+        if resp.status_code >= 400:
+            click.echo(f"delegation refused: {resp.text}", err=True)
+            sys.exit(2)
+        d = resp.json()
+
+        child = c.post(f"{server}/api/sessions", json={
+            "developer": _get_developer(), "agent": f"{worker}:delegate",
+            # A READ_ONLY/VERIFY child claims nothing; the server refuses it anyway.
+            "scope": list(scope) if mode == "IMPLEMENT" else [],
+            "description": f"delegated {mode} for task {parent_task or '-'}: {objective}",
+            "repo_root": repo, "delegation_id": d["id"],
+        })
+        if child.status_code >= 400:
+            click.echo(f"child session refused: {child.text}", err=True)
+            sys.exit(2)
+        child_id = child.json()["id"]
+
+        brief = ""
+        try:
+            b = c.post(f"{server}/api/brief", json={
+                "objective": objective, "repo_root": repo,
+                "scope": list(scope), "limit": 6}, timeout=40)
+            brief = (b.json() or {}).get("rendered", "")
+        except Exception as exc:  # noqa: BLE001
+            brief = f"(no brief: {type(exc).__name__})"
+
+    packet = "\n".join([
+        f"DELEGATED TASK — mode {mode}",
+        f"delegation: {d['id']}",
+        f"parent task: {parent_task or '(none)'} — owned by {d['delegating_worker']}, NOT by you.",
+        "",
+        "OBJECTIVE", f"  {objective}",
+        "", "ACCEPTANCE — your answer is judged against this", f"  {acceptance}",
+        "", "SCOPE", "  " + (", ".join(scope) if scope else "(none — claim nothing)"),
+        "", "YOU MAY NOT", *[f"  - {p}" for p in d["prohibitions"]],
+        "", "Return findings with file:line citations. Do not report success you "
+        "have not demonstrated; the parent verifies your claims independently.",
+        "", "-" * 60, brief,
+    ])
+
+    if dry_run:
+        click.echo(json.dumps({"delegation": d, "child_session": child_id,
+                               "packet": packet}, indent=2))
+        return
+
+    argv = ["claude", "-p", packet, *child_launch_argv(mode)]
+    # Identity is stated, not inferred: without this the child inherits the
+    # delegating process's agent signature and registers as its parent.
+    child_env = dict(os.environ, ATS_AGENT=f"{worker}:delegate",
+                     ATS_DELEGATION=d["id"], ATS_SESSION=child_id)
+    click.echo(f"launching {worker} ({mode}, lease {lease_minutes}m)...", err=True)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=lease_minutes * 60, env=child_env)
+        output, failure = proc.stdout.strip(), (proc.returncode != 0)
+    except subprocess.TimeoutExpired:
+        output, failure = "", True
+        click.echo("child exceeded its lease", err=True)
+
+    with httpx.Client(timeout=30) as c:
+        ret = c.post(f"{server}/api/delegations/{d['id']}/return", json={
+            "result_summary": output[:20000],
+            "evidence": {"exit_ok": not failure, "child_session_id": child_id},
+        })
+        c.patch(f"{server}/api/sessions/{child_id}",
+                json={"status": "completed",
+                      "summary": f"delegated {mode}: {objective[:120]}"})
+
+    click.echo(json.dumps({
+        "delegation_id": d["id"],
+        "state": (ret.json().get("state") if ret.status_code < 400 else "return_refused"),
+        "mode": mode,
+        "parent_still_owns": d["parent_owner_session_id"],
+        "child_session_id": child_id,
+        "result": output,
+        "verify_before_accepting": d["acceptance"],
+    }, indent=2))
+
+
+
 if __name__ == "__main__":
     cli()

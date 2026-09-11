@@ -338,6 +338,35 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="delegate",
+            description=(
+                "Hand a BOUNDED subproblem to another worker through ATS. You keep "
+                "ownership of the parent task the whole time — this creates a child "
+                "record, never a handoff, and you must reconcile what comes back "
+                "before accepting it. mode is enforced, not advisory: READ_ONLY and "
+                "VERIFY children cannot write files, commit, restart services, submit "
+                "GPU work, or delegate onward. Requires acceptance criteria: without "
+                "them you cannot judge the result and 'it worked' becomes the test."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "objective": {"type": "string", "description": "The ONE question or change."},
+                    "acceptance": {"type": "string",
+                                   "description": "What a satisfactory answer must contain."},
+                    "mode": {"type": "string", "enum": ["READ_ONLY", "IMPLEMENT", "VERIFY"],
+                             "description": "Authority envelope for the child. Start READ_ONLY."},
+                    "task": {"type": "string", "description": "Parent task id, e.g. '2654'."},
+                    "repo": {"type": "string", "description": "Absolute repo root."},
+                    "scope": {"type": "array", "items": {"type": "string"},
+                              "description": "Globs the child may edit. IMPLEMENT only."},
+                    "worker": {"type": "string", "description": "Delegated worker (default claude-code)."},
+                    "lease_minutes": {"type": "integer", "description": "Cap on the child's run."},
+                },
+                "required": ["objective", "acceptance"],
+            },
+        ),
+        Tool(
             name="task_brief",
             description=(
                 "The context packet for a piece of work: live blockers, prior ATS "
@@ -1085,6 +1114,42 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         msg += f"  before={r.get('before')} after={r.get('after')}\n"
                     msg += "\n"
                 return [TextContent(type="text", text=msg)]
+
+            elif name == "delegate":
+                import subprocess as _sp
+                import sys as _sys
+                from pathlib import Path as _Path
+
+                ats_bin = str(_Path(_sys.executable).parent / "ats")
+                argv = [ats_bin, "delegate",
+                        "--objective", arguments["objective"],
+                        "--acceptance", arguments["acceptance"],
+                        "--mode", arguments.get("mode", "READ_ONLY"),
+                        "--worker", arguments.get("worker", "claude-code"),
+                        "--lease-minutes", str(arguments.get("lease_minutes", 30))]
+                if arguments.get("task"):
+                    argv += ["--task", str(arguments["task"])]
+                if arguments.get("repo"):
+                    argv += ["--repo", arguments["repo"]]
+                for pat in arguments.get("scope", []) or []:
+                    argv += ["--scope", pat]
+
+                lease = int(arguments.get("lease_minutes", 30))
+                try:
+                    proc = _sp.run(argv, capture_output=True, text=True,
+                                   timeout=lease * 60 + 120)
+                except _sp.TimeoutExpired:
+                    return [TextContent(type="text",
+                                        text="Delegation exceeded its lease and was abandoned. "
+                                             "The child record stays open for you to reconcile.")]
+                if proc.returncode != 0:
+                    return [TextContent(type="text",
+                                        text=f"Delegation refused:\n{proc.stderr.strip()}")]
+                return [TextContent(
+                    type="text",
+                    text=(proc.stdout.strip() +
+                          "\n\nYou still own the parent task. Verify the claims above "
+                          "against the acceptance criteria before accepting them."))]
 
             elif name == "task_brief":
                 response = await client.post(

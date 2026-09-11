@@ -3,6 +3,32 @@
 ## [Unreleased]
 
 ### Added
+- **Delegation as a first-class ATS object** (`delegation.py`, `models.Delegation`,
+  `/api/delegations`, `ats delegate`, `delegate` MCP tool). One invariant:
+  DELEGATION IS NOT HANDOFF. The parent keeps ownership for the whole life of the
+  child, nothing in the child's lifecycle writes to the parent, and a parent with
+  open children cannot be completed (409) — completing there would strand the
+  child and leave the task owned by nobody.
+  A mode is a SAFETY PROPERTY, not an audit label. READ_ONLY and VERIFY children
+  cannot write files, commit, restart services, submit GPU work, mutate task
+  state, or delegate onward; IMPLEMENT writes only inside its declared scope and
+  still cannot close the parent's task. Enforced in three places: authority is
+  the INTERSECTION of worker registry and mode (a mode can never grant what the
+  worker lacks, or delegation becomes the escalation path around the registry),
+  the server refuses a scope claim from a read-only child, and the launcher
+  applies the harness's own restrictions (`--permission-mode plan`,
+  `--disallowedTools`) so it is not honour-system.
+  Recursive delegation is refused at depth 1: a chain of workers collaborating
+  on one bug is a chain in which nobody owns it. Acceptance criteria are
+  required, because without them the parent cannot reconcile what comes back.
+  Leases expire, and an expired lease stops accepting evidence rather than
+  taking work of unknown age.
+  The child receives a freshly built packet (contract + prohibitions +
+  brief-on-claim), never the parent's conversation — one worker's intermediate
+  reasoning must not contaminate the next, and the exchange stays reproducible
+  from the record alone.
+
+### Added
 - **Task-claim context packet** (`briefs.py`, `POST /api/brief`, `task_brief` MCP
   tool, and returned automatically by `start_session`). The claim is the trigger:
   a worker starts with live blockers, prior ATS decisions, prior work in its

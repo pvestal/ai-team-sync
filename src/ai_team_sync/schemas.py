@@ -20,6 +20,9 @@ class SessionCreate(BaseModel):
     # Absolute git root the session works in; anchors its repo-relative scope
     # patterns so they don't collide across repos. '' = unanchored (legacy).
     repo_root: str = ""
+    # Set when this session IS a delegated child. Its authority is then the
+    # intersection of its worker's and the delegation mode's — never the union.
+    delegation_id: str = ""
 
 
 class SessionUpdate(BaseModel):
