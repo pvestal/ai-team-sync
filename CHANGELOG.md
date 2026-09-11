@@ -2,6 +2,21 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Hooks were blind inside git worktrees**: both `pre_tool_use_lockcheck` and
+  `post_tool_use_presence` found the repo root by walking up for a `.git`
+  DIRECTORY. A linked worktree's `.git` is a FILE, so the walk sailed past the
+  worktree root to the nearest ancestor that had one (on this box, the
+  operator's `~/Documents`, itself a repo). Every edit from a worktree reported
+  a path prefixed with the worktree's directory name and anchored to an
+  unrelated repo, so `find_conflicts` saw no owner and the claim guard's
+  coordinated-root gate never fired — the guards failed open for exactly the
+  isolated-workspace flow the worktree skills encourage. Both now share
+  `git_utils.resolve_repo_roots`, which returns the worktree root (paths stay
+  repo-relative, one key per file in every checkout) and the SHARED repo root
+  (locks and coordinated-repo gating bind across a project's worktrees).
+  Submodules, whose `.git` file is also a pointer, anchor to themselves.
+
 ### Added
 - **Session liveness heartbeat (reaper Gap 1)**: nullable `Session.last_heartbeat`,
   `POST /api/sessions/{id}/heartbeat`, and a client `session_heartbeat.py` hook

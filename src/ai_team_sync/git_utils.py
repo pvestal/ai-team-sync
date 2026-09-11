@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 from fnmatch import fnmatch
@@ -152,3 +153,60 @@ def get_repo_root(path: Path | None = None) -> Path | None:
         return Path(result.stdout.strip())
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
+
+
+def _shared_root_from_gitfile(gitfile: str, worktree_root: str) -> str:
+    """The repo a LINKED WORKTREE belongs to; `worktree_root` for anything else.
+
+    A `.git` file also appears in submodules ('gitdir: ../.git/modules/<name>'),
+    which are their own project — only the '/.git/worktrees/' form is a second
+    checkout of one repo.
+    """
+    try:
+        with open(gitfile, encoding="utf-8", errors="replace") as fh:
+            text = fh.read(4096)
+    except OSError:
+        return worktree_root
+
+    gitdir = ""
+    for line in text.splitlines():
+        if line.strip().startswith("gitdir:"):
+            gitdir = line.split(":", 1)[1].strip()
+            break
+    if not gitdir:
+        return worktree_root
+
+    if not os.path.isabs(gitdir):
+        gitdir = os.path.join(worktree_root, gitdir)
+    gitdir = os.path.normpath(gitdir)
+
+    marker = f"{os.sep}.git{os.sep}worktrees{os.sep}"
+    idx = gitdir.find(marker)
+    return gitdir[:idx] if idx > 0 else worktree_root
+
+
+def resolve_repo_roots(path: str | Path) -> tuple[str | None, str | None]:
+    """(worktree_root, repo_root) for `path` — worktree-aware, no subprocess.
+
+    A linked worktree's `.git` is a FILE, not a directory, so walking up for a
+    `.git` DIRECTORY sails past the worktree root to the nearest ancestor that
+    has one. Edits made from a worktree then reported paths prefixed with the
+    worktree's directory name and anchored to an unrelated repo, so the lock
+    guard found no owner and the claim guard never fired (observed 2026-09-11).
+
+    `worktree_root` is what paths are made relative to, so one file has one key
+    in every checkout. `repo_root` is the SHARED root, so locks and the
+    coordinated-repo gate bind across a project's worktrees. Pure path work —
+    this runs in a PreToolUse hook on every edit.
+    """
+    d = os.path.dirname(os.path.abspath(os.fspath(path)))
+    while True:
+        dot_git = os.path.join(d, ".git")
+        if os.path.isdir(dot_git):
+            return d, d
+        if os.path.isfile(dot_git):
+            return d, _shared_root_from_gitfile(dot_git, d)
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None, None
+        d = parent

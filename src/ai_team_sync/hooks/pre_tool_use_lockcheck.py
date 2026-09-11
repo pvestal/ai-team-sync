@@ -16,7 +16,7 @@ ATS_LOCKCHECK_BLOCK=0 to downgrade from block to warn-only.
 Wire (~/.claude/settings.json):
   "PreToolUse": [{ "matcher": "Edit|Write|MultiEdit|NotebookEdit",
     "hooks": [{ "type": "command",
-      "command": "<ats-venv>/bin/python <this-file>" }] }]
+      "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.pre_tool_use_lockcheck" }] }]
 """
 from __future__ import annotations
 
@@ -24,6 +24,8 @@ import fnmatch
 import json
 import os
 import sys
+
+from ai_team_sync.git_utils import resolve_repo_roots as _roots
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 _SKIP_SUBSTR = ("/.git/", "/node_modules/", "/__pycache__/", "/.venv/",
@@ -37,19 +39,8 @@ def _is_noise(path: str) -> bool:
     return any(s in path for s in _SKIP_SUBSTR)
 
 
-def _git_root(path: str) -> str | None:
-    d = os.path.dirname(os.path.abspath(path))
-    while True:
-        if os.path.isdir(os.path.join(d, ".git")):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None
-        d = parent
-
-
-def _rel(path: str) -> str:
-    root = _git_root(path)
+def _rel(path: str, worktree_root: str | None = None) -> str:
+    root = worktree_root if worktree_root is not None else _roots(path)[0]
     if root:
         try:
             return os.path.relpath(path, root)
@@ -224,7 +215,8 @@ def main() -> None:
     fp = (payload.get("tool_input") or {}).get("file_path")
     if not fp or _is_noise(fp):
         sys.exit(0)
-    rel = _rel(fp)
+    wt_root, repo_root = _roots(fp)
+    rel = _rel(fp, wt_root)
 
     server = os.environ.get("ATS_SERVER_URL", "http://localhost:8400")
     try:
@@ -235,7 +227,7 @@ def main() -> None:
         sys.exit(0)  # server down / network — fail open
     sessions = data if isinstance(data, list) else data.get("sessions", data.get("data", []))
 
-    froot = (_git_root(fp) or "").rstrip("/")
+    froot = (repo_root or "").rstrip("/")
     conflicts = find_conflicts(rel, sessions, payload.get("session_id", ""),
                                file_repo_root=froot)
 

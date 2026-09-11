@@ -27,6 +27,8 @@ import os
 import subprocess
 import sys
 
+from ai_team_sync.git_utils import resolve_repo_roots as _roots
+
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 
 # Paths that are noise, not "what I'm working on" — skip so presence stays meaningful.
@@ -55,22 +57,10 @@ def _is_noise(path: str) -> bool:
     return any(s in path for s in _SKIP_SUBSTR)
 
 
-def _git_root(path: str) -> str | None:
-    """Walk up from the file's directory to the enclosing git repo root, if any."""
-    d = os.path.dirname(os.path.abspath(path))
-    while True:
-        if os.path.isdir(os.path.join(d, ".git")):
-            return d
-        parent = os.path.dirname(d)
-        if parent == d:
-            return None
-        d = parent
-
-
 def _display_path(path: str, cwd: str | None) -> str:
     """Clean, legible path: repo-relative if in a git repo, else cwd-relative if that
     stays inside cwd, else the bare basename (never an ugly ../../ escape)."""
-    root = _git_root(path)
+    root = _roots(path)[0]
     if root:
         try:
             return os.path.relpath(path, root)
