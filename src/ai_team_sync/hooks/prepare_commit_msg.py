@@ -6,7 +6,15 @@ from __future__ import annotations
 import os
 import sys
 
-SESSION_FILE = os.path.expanduser("~/.ats_session")
+# Resolved through session_pointer so $ATS_STATE_DIR isolates a process
+# that was launched with its own state directory (a delegated child). A
+# hardcoded ~ path would reach into the parent's pointers regardless.
+def _session_file() -> str:
+    try:
+        from ai_team_sync import session_pointer as sp
+        return str(sp.global_pointer_path())
+    except Exception:
+        return os.path.expanduser("~/.ats_session")
 
 
 def main():
@@ -20,9 +28,9 @@ def main():
         sys.exit(0)
 
     # Check for active session
-    if not os.path.exists(SESSION_FILE):
+    if not os.path.exists(_session_file()):
         sys.exit(0)
-    with open(SESSION_FILE) as f:
+    with open(_session_file()) as f:
         session_id = f.read().strip()
     if not session_id:
         sys.exit(0)

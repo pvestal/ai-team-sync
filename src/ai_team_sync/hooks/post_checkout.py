@@ -11,7 +11,15 @@ from pathlib import Path
 import httpx
 
 SERVER = os.environ.get("ATS_SERVER_URL", "http://localhost:8400")
-SESSION_FILE = os.path.expanduser("~/.ats_session")
+# Resolved through session_pointer so $ATS_STATE_DIR isolates a process
+# that was launched with its own state directory (a delegated child). A
+# hardcoded ~ path would reach into the parent's pointers regardless.
+def _session_file() -> str:
+    try:
+        from ai_team_sync import session_pointer as sp
+        return str(sp.global_pointer_path())
+    except Exception:
+        return os.path.expanduser("~/.ats_session")
 
 
 def load_config() -> dict:
@@ -66,11 +74,11 @@ def detect_agent() -> str:
 
 def has_active_session() -> bool:
     """Check if there's already an active session."""
-    if not os.path.exists(SESSION_FILE):
+    if not os.path.exists(_session_file()):
         return False
 
     try:
-        with open(SESSION_FILE) as f:
+        with open(_session_file()) as f:
             session_id = f.read().strip()
 
         # Verify session is still active on server
@@ -116,7 +124,7 @@ def auto_start_session(branch: str, config: dict):
             if resp.status_code == 201:
                 data = resp.json()
                 # Save session ID
-                with open(SESSION_FILE, "w") as f:
+                with open(_session_file(), "w") as f:
                     f.write(data["id"])
 
                 print(f"\n[ai-team-sync] Auto-started session for branch '{branch}'")

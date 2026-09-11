@@ -27,7 +27,15 @@ import os
 import sys
 from pathlib import Path
 
-SESSION_FILE = Path.home() / ".ats_session"
+# Resolved through session_pointer so $ATS_STATE_DIR isolates a process
+# that was launched with its own state directory (a delegated child). A
+# hardcoded ~ path would reach into the parent's pointers regardless.
+def _session_file() -> Path:
+    try:
+        from ai_team_sync import session_pointer as sp
+        return sp.global_pointer_path()
+    except Exception:
+        return Path.home() / ".ats_session"
 
 
 def _resolve_session_id() -> str | None:
@@ -35,7 +43,7 @@ def _resolve_session_id() -> str | None:
     if sid:
         return sid
     try:
-        return SESSION_FILE.read_text().strip() or None
+        return _session_file().read_text().strip() or None
     except Exception:
         return None
 

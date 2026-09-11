@@ -475,7 +475,12 @@ def hooks_uninstall():
 # --- Session file helpers ---
 
 def _session_file() -> str:
-    return os.path.join(os.path.expanduser("~"), ".ats_session")
+    # Through session_pointer so $ATS_STATE_DIR isolates a delegated child.
+    try:
+        from ai_team_sync import session_pointer as sp
+        return str(sp.global_pointer_path())
+    except Exception:
+        return os.path.join(os.path.expanduser("~"), ".ats_session")
 
 
 def _save_active_session(session_id: str):
@@ -687,16 +692,15 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         return
 
     argv = ["claude", "-p", packet, *child_launch_argv(mode)]
-    # Identity is stated, not inferred: without this the child inherits the
-    # delegating process's agent signature and registers as its parent.
-    child_env = dict(os.environ, ATS_AGENT=f"{worker}:delegate",
-                     ATS_DELEGATION=d["id"], ATS_SESSION=child_id)
+    from ai_team_sync.delegation import child_env as _child_env
+    env = _child_env(dict(os.environ), delegation_id=d["id"],
+                     child_session_id=child_id, worker=worker)
     click.echo(f"launching {worker} ({mode}, lease {lease_minutes}m)...", err=True)
     try:
         # stdin closed: the child is not interactive, and left open the harness
         # waits on it before starting.
         proc = subprocess.run(argv, capture_output=True, text=True,
-                              timeout=lease_minutes * 60, env=child_env,
+                              timeout=lease_minutes * 60, env=env,
                               stdin=subprocess.DEVNULL)
         output, failure = proc.stdout.strip(), (proc.returncode != 0)
     except subprocess.TimeoutExpired:

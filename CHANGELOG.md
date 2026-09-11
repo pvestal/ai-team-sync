@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### Fixed
+- **Cross-agent session identity: one agent could redirect another's mutations**
+  through the shared `~/.ats_session` pointer. Proven live 2026-09-11: a Codex
+  parent delegated a READ_ONLY subtask; the delegated Claude's SessionStart wrote
+  the shared pointer; the Codex parent has no CLAUDE_CODE_SESSION_ID and so no
+  per-session pointer, resolved through the shared file, and its
+  `complete_session` completed the CHILD's row — reporting "All locks released"
+  while the parent stayed active holding its lock.
+  Three changes. (1) `session_pointer.resolve_pointer_source()` returns WHERE an
+  id came from, and `mcp.mutation_refusal()` refuses any session-mutating call
+  whose identity resolved through the shared file, fails closed when identity is
+  absent, and refuses an explicit binding that names another worker's row.
+  (2) The MCP remembers the session THIS process started in memory, which is the
+  one identity no other agent can write. (3) A delegated child is launched with
+  its own `ATS_STATE_DIR` and with `ATS_SESSION_ID` set to the child row ATS
+  already created, so it adopts that exact session and registers no second
+  placeholder. Every hardcoded `~/.ats_session` path now resolves through
+  `session_pointer`, so that isolation is real rather than nominal.
+  The global pointer is still written and still read for back-compat; it is no
+  longer accepted as proof of identity for a mutation. `record_restart` stays
+  ungated deliberately: it creates a new row and is session-optional, and #2559
+  has a test that a stale pointer must not lose the record.
+
 ### Added
 - **Delegation as a first-class ATS object** (`delegation.py`, `models.Delegation`,
   `/api/delegations`, `ats delegate`, `delegate` MCP tool). One invariant:

@@ -27,7 +27,11 @@ mcp_server = Server("ai-team-sync")
 SERVER_URL = os.environ.get("ATS_SERVER_URL", "http://localhost:8400")
 
 # Session file for persistence
-SESSION_FILE = Path.home() / ".ats_session"
+# Honors $ATS_STATE_DIR, so a delegated child launched with its own state
+# directory cannot read or write its parent's pointers.
+def _session_file() -> Path:
+    from ai_team_sync import session_pointer as sp
+    return sp.global_pointer_path()
 
 
 def get_git_user() -> str:
@@ -94,11 +98,79 @@ def session_agent_label() -> str:
     return sp.agent_label(detect_agent())  # one label (#2517)
 
 
+# Identity of the session THIS MCP process started. A stdio MCP server is
+# spawned once per agent session and lives as long as it, so in-process memory
+# is the one identity no other agent can write — the property every file-based
+# pointer lacks. Codex in particular has no CLAUDE_CODE_SESSION_ID and so no
+# per-session pointer file; without this it could only fall back to the shared
+# global file, which is exactly how it completed a delegated child's row on
+# 2026-09-11 while reporting that its own session had completed.
+_IN_PROCESS_SESSION_ID: str | None = None
+
+
+def resolve_identity() -> tuple[str | None, str]:
+    """(session id, provenance) for this process.
+
+    Goes through load_session_id() so the established injection seam still
+    works, then asks the pointer layer WHERE that id lives. An id that matches
+    no pointer file we can see did not come from shared state, so it is
+    'explicit' — a caller handed it to us directly.
+    """
+    if _IN_PROCESS_SESSION_ID:
+        return _IN_PROCESS_SESSION_ID, "in_process"
+
+    sid = load_session_id()
+    if not sid:
+        return None, "none"
+    try:
+        from ai_team_sync import session_pointer as sp
+        found, source = sp.resolve_pointer_source()
+    except Exception:
+        return sid, "explicit"
+    return sid, (source if found == sid else "explicit")
+
+
+def mutation_refusal(session_id: str | None, source: str,
+                     row: dict | None, my_label: str) -> str | None:
+    """Why this mutation must NOT proceed, or None to allow it.
+
+    Pure, so the rule is testable without a server. Fails CLOSED: anything it
+    cannot prove is refused rather than attempted against a row that may belong
+    to somebody else.
+    """
+    if not session_id:
+        return ("No active session for this process. Start one (start_session) "
+                "or set ATS_SESSION_ID; refusing to guess which session to mutate.")
+
+    if source == "global":
+        return ("Refusing to mutate: this session id came from the SHARED "
+                f"pointer file, which names whichever session wrote it last "
+                f"({session_id[:8]}), not necessarily yours. Start a session in "
+                "this process, or set ATS_SESSION_ID explicitly.")
+
+    if source in ("in_process", "explicit"):
+        # in_process: this process started it, nothing else can have written it.
+        # explicit: it came from the caller, not from a file another agent shares.
+        return None
+
+    # env / per_session: the id is process-local, but a process can be handed
+    # (or inherit) an id naming another worker's row. Binding is by exact id;
+    # this check only rejects a row that is plainly not ours.
+    if row is None:
+        return (f"Refusing to mutate: session {session_id[:8]} was not found on "
+                "the server, so ownership cannot be established.")
+    agent = str(row.get("agent") or "")
+    if agent and my_label and agent != my_label:
+        return (f"Refusing to mutate: session {session_id[:8]} belongs to "
+                f"{agent}, not to {my_label}.")
+    return None
+
+
 def save_session_id(session_id: str):
     """Save active session ID for persistence. Writes the legacy global file AND a
     per-session pointer keyed by CLAUDE_CODE_SESSION_ID so concurrent sessions
     don't clobber each other's pointer (Gap 3)."""
-    SESSION_FILE.write_text(session_id)
+    _session_file().write_text(session_id)
     try:
         from ai_team_sync import session_pointer as sp
         sp.save_pointer(session_id)
@@ -116,16 +188,18 @@ def load_session_id() -> str | None:
             return sid
     except Exception:
         pass
-    if SESSION_FILE.exists():
-        content = SESSION_FILE.read_text().strip()
+    f = _session_file()
+    if f.exists():
+        content = f.read_text().strip()
         return content if content else None
     return None
 
 
 def clear_session_id():
     """Clear saved session ID."""
-    if SESSION_FILE.exists():
-        SESSION_FILE.unlink()
+    f = _session_file()
+    if f.exists():
+        f.unlink()
 
 
 def format_conflict_guidance(conflicts: list[dict]) -> str:
@@ -747,8 +821,21 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
 
 async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle MCP tool calls."""
-    # Load active session from persistent storage
-    active_session_id = load_session_id()
+    # Identity AND where it came from. A read may use any of it; a mutation may
+    # not use the shared pointer (see mutation_refusal).
+    active_session_id, identity_source = resolve_identity()
+
+    async def deny_mutation(client) -> str | None:
+        """Refusal text for a session-mutating call, or None to proceed."""
+        row = None
+        if active_session_id and identity_source in ("env", "per_session"):
+            try:
+                r = await client.get(f"{SERVER_URL}/api/sessions/{active_session_id}")
+                row = r.json() if r.status_code == 200 else None
+            except Exception:
+                row = None
+        return mutation_refusal(active_session_id, identity_source, row,
+                                session_agent_label())
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         # Liveness on ANY tool use (ats-sessionstart-orphan-adoption-p01): a
@@ -796,6 +883,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 response.raise_for_status()
                 data = response.json()
                 save_session_id(data["id"])
+                global _IN_PROCESS_SESSION_ID
+                _IN_PROCESS_SESSION_ID = data["id"]
 
                 # Adopt-or-complete the SessionStart auto-registration
                 # (ats-sessionstart-orphan-adoption-p01): the hook registers a
@@ -967,6 +1056,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 return [TextContent(type="text", text=msg)]
 
             elif name == "request_override":
+                refusal = await deny_mutation(client)
+                if refusal:
+                    return [TextContent(type="text", text=f"❌ {refusal}")]
                 if not active_session_id:
                     return [TextContent(type="text", text="❌ No active session. Start a session first with start_session.")]
 
@@ -1266,8 +1358,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 return [TextContent(type="text", text=msg)]
 
             elif name == "complete_session":
-                if not active_session_id:
-                    return [TextContent(type="text", text="❌ No active session to complete.")]
+                refusal = await deny_mutation(client)
+                if refusal:
+                    return [TextContent(type="text", text=f"❌ {refusal}")]
 
                 summary = arguments["summary"]
                 response = await client.patch(
@@ -1284,6 +1377,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 return [TextContent(type="text", text=msg)]
 
             elif name == "log_decision":
+                refusal = await deny_mutation(client)
+                if refusal:
+                    return [TextContent(type="text", text=f"❌ {refusal}")]
                 if not active_session_id:
                     return [TextContent(type="text", text="❌ No active session. Start a session first.")]
 
@@ -1318,6 +1414,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
             # NEW TOOLS - Phase 1 (Critical)
 
             elif name == "pause_session":
+                refusal = await deny_mutation(client)
+                if refusal:
+                    return [TextContent(type="text", text=f"❌ {refusal}")]
                 if not active_session_id:
                     return [TextContent(type="text", text="❌ No active session to pause.")]
 
@@ -1336,6 +1435,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 return [TextContent(type="text", text=msg)]
 
             elif name == "resume_session":
+                refusal = await deny_mutation(client)
+                if refusal:
+                    return [TextContent(type="text", text=f"❌ {refusal}")]
                 if not active_session_id:
                     return [TextContent(type="text", text="❌ No session to resume.")]
 
@@ -1561,6 +1663,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 return [TextContent(type="text", text=msg)]
 
             elif name == "extend_scope":
+                refusal = await deny_mutation(client)
+                if refusal:
+                    return [TextContent(type="text", text=f"❌ {refusal}")]
                 if not active_session_id:
                     return [TextContent(type="text", text="❌ No active session. Run start_session first.")]
 

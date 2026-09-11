@@ -241,6 +241,45 @@ def resolve_pointer(cid: str | None = None, allow_global: bool = True) -> str | 
         return None
 
 
+def resolve_pointer_source(cid: str | None = None) -> tuple[str | None, str]:
+    """(session_id, WHERE it came from) — the provenance a mutation must check.
+
+    resolve_pointer() answers "which session", which is enough for a read. A
+    mutation also needs "can this id have been written by somebody else", and
+    the three sources differ:
+
+      env          $ATS_SESSION_ID — set by whoever launched this process.
+      per_session  ~/.ats_session_<cid8> — keyed to THIS Claude session.
+      global       ~/.ats_session — SHARED. Names whichever session wrote it
+                   last, across every agent on the box.
+
+    Proven live 2026-09-11: a delegated Claude's SessionStart overwrote the
+    global file, a Codex parent (no cid, so no per-session pointer) resolved
+    through it, and its complete_session completed the child's row while
+    reporting success. Mutations must refuse 'global'.
+    """
+    env = (os.environ.get("ATS_SESSION_ID") or "").strip()
+    if env:
+        return env, "env"
+
+    cid = cid or claude_session_id()
+    if cid:
+        try:
+            content = session_pointer_path(cid).read_text().strip()
+            if content:
+                return content, "per_session"
+        except Exception:
+            pass
+
+    try:
+        content = global_pointer_path().read_text().strip()
+        if content:
+            return content, "global"
+    except Exception:
+        pass
+    return None, "none"
+
+
 def clear_pointer(cid: str | None = None) -> None:
     """Drop this session's per-session pointer (on complete_session). Leaves the
     global file alone — another session may legitimately own it."""
