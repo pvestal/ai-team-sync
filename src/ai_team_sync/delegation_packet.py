@@ -51,7 +51,8 @@ def build_child_packet(*, mode: str, delegation: Mapping[str, Any],
                        objective: str, acceptance: str,
                        scope: Sequence[str] = (),
                        task_envelope_text: str = "",
-                       brief: str = "") -> str:
+                       brief: str = "",
+                       verify_env_text: str = "") -> str:
     """The full packet text for a delegated child.
 
     Worker-independent by construction: nothing here branches on who will run
@@ -77,6 +78,14 @@ def build_child_packet(*, mode: str, delegation: Mapping[str, Any],
             task_envelope_text,
             "=" * 60,
         ]
+
+    if verify_env_text:
+        # WHERE the child is working and WHAT it is looking at, before the
+        # objective. A VERIFY child that starts reviewing without knowing it is
+        # in a disposable worktree cannot tell an escaped write from a normal
+        # one, and cannot tell a faithful reproduction from a stale checkout.
+        # The manifest carries a per-file hash comparison so this is checkable.
+        lines += ["", verify_env_text.rstrip()]
 
     lines += [
         "",

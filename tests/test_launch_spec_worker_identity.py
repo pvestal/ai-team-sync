@@ -87,16 +87,34 @@ def test_registry_workers_without_a_launcher_fail_closed():
 
 # ── 2. Claude enforcement must not regress ───────────────────────────────────
 
-def test_claude_verify_enforcement_is_unchanged_from_before_this_module():
-    """The pre-existing harness flags, unchanged and in the same order.
+def test_claude_verify_gets_a_shell_and_an_os_sandbox_not_plan_mode():
+    """VERIFY moved off plan mode too (operator ruling 2026-09-12, second tranche).
 
-    VERIFY is the mode this tranche deliberately did not touch: it must run
-    tests, so it needs a shell, and it therefore keeps plan mode.
+    Plan mode was worse for VERIFY than for READ_ONLY: it blocked the coordination
+    reads AND, measured across three runs, the child declined to run the
+    unmodified CI command because pytest writes __pycache__. So the mode that
+    exists to RUN things could not run them, and its filesystem guarantee was the
+    model's own compliance.
+
+    VERIFY now gets Bash, and containment is the OS sandbox plus a disposable
+    worktree. Full coverage in tests/test_verify_mode_capability.py.
     """
     argv = build_launch("claude-code", VERIFY, PACKET, repo=REPO, which=FOUND_BOTH).argv
     assert argv[:3] == ["/usr/local/bin/claude", "-p", PACKET]
-    assert argv[3:] == ["--permission-mode", "plan",
-                        "--disallowedTools", "Edit", "Write", "NotebookEdit"]
+
+    tail = argv[3:]
+    assert "--permission-mode" not in tail, "plan mode was the defect"
+    assert tail[tail.index("--tools") + 1] == "Read,Grep,Glob,Bash"
+    assert tail[tail.index("--permission-prompts") + 1] == "none"
+    # The sandbox, and the hard gate that stops a missing backend from silently
+    # running the shell unconfined.
+    settings = tail[tail.index("--settings") + 1]
+    assert '"enabled":true' in settings
+    assert '"failIfUnavailable":true' in settings
+    assert '"allowUnsandboxedCommands":false' in settings
+    # Still not an implementer.
+    for writer in ("Edit", "Write", "NotebookEdit"):
+        assert writer in tail
 
 
 def test_claude_read_only_is_at_least_as_strong_as_plan_mode_was():

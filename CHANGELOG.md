@@ -56,6 +56,48 @@
   handler after the new one was deployed.
 
 ### Changed
+- **VERIFY is verification-capable, non-authoritative, non-implementation.**
+  Operator ruling 2026-09-12, second coordination tranche. `d685142` repaired
+  READ_ONLY and deliberately left VERIFY on plan mode as a named gap. Measuring it
+  found the gap was worse than recorded: plan mode refused every ATS and Echo Brain
+  call as expected, AND across **three** independent runs the child declined the
+  shell writes *itself* rather than the harness denying them — it even declined to
+  run the unmodified CI command `python3 -m pytest -q`, because pytest writes
+  `__pycache__`. So the mode whose purpose is to RUN verification could not run it,
+  and the filesystem guarantee it appeared to give was the model's own compliance.
+  Plan mode also left `Task`/`Agent` available, so the subagent escape was open.
+  VERIFY now gets a real shell, and containment is environmental because a shell
+  can write files and no tool list can honestly say otherwise. Two existing
+  mechanisms, neither invented here: Claude Code's own Bash sandbox (bubblewrap +
+  seccomp) declared with `failIfUnavailable` so a host without a backend REFUSES
+  rather than running unconfined and `allowUnsandboxedCommands: false` so the
+  per-call escape hatch is rejected; plus a disposable linked git worktree as the
+  writable working directory. Measured: a write aimed at the lead tree fails at the
+  kernel with `Read-only file system`. VERIFY's coordination reads and denial list
+  are IDENTICAL to READ_ONLY's — one answer to "what may a delegated child read",
+  asserted as set algebra so the only difference is `Bash`.
+  The sandbox's writable set is the working directory plus the system temp root,
+  and that edge is not hypothetical: the first containment measurement put the
+  fixture lead repo in the temp root alongside the worktree and the child wrote
+  into it with exit 0. The supervisor now REFUSES to launch when the lead
+  repository is inside the temp root, rather than launching something contained
+  only in appearance.
+  READ_ONLY is unchanged, pinned as the exact token sequence `d685142` shipped.
+  Codex READ_ONLY and Codex VERIFY are untouched: their containment is Codex's own
+  `--sandbox read-only` runtime, so they get no Claude settings and no worktree.
+- **A VERIFY child reviews the lead's ACTUAL result, and can prove it.** The lead's
+  result is usually still uncommitted when review happens, so `git worktree add
+  <rev>` alone would reproduce the commit and silently drop the work under review.
+  The supervisor replays the tracked diff, copies untracked files, and writes a
+  manifest carrying the base commit, the diff hash and a per-file sha256 comparison
+  against the lead — placed in the child's packet ahead of the objective, so the
+  child can check the claim instead of trusting it. A diff that does not apply
+  cleanly is a refusal, because a partially reproduced result makes an invalid
+  review look valid. The worktree is DETACHED, so a commit in it advances no
+  branch, and teardown prunes it to unreachable; `git push` needs a network the
+  sandbox denies. Teardown joins session finalization as the supervisor's duty on
+  every terminal outcome, including a refused environment and a spawn that never
+  ran.
 - **READ_ONLY bounds the work product, not the coordination plane.** Operator
   ruling 2026-09-12, after a Codex-led canary. Claude READ_ONLY was
   `--permission-mode plan`, which refuses EVERY MCP call including pure reads —

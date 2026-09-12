@@ -193,15 +193,60 @@ _CLAUDE_READ_ONLY = (
     "--disallowedTools", *_READ_ONLY_DENIED,
 )
 
-# VERIFY is DELIBERATELY left on the pre-ruling flags. It is the one mode that
-# must run tests, so it needs a shell, and the READ_ONLY allow-list above has no
-# Bash by design -- a Bash command-prefix allow-list is pattern matching on a
-# composable shell, which is not a boundary a safety property should rest on.
-# VERIFY therefore still carries plan mode and still cannot make coordination
-# reads. That is a KNOWN remaining gap, named here rather than silently widened:
-# the operator scoped this repair to READ_ONLY.
-_CLAUDE_VERIFY = ("--permission-mode", "plan",
-                  "--disallowedTools", "Edit", "Write", "NotebookEdit")
+# ---------------------------------------------------------------------------
+# Claude VERIFY: verification-capable, non-authoritative, non-implementation
+# ---------------------------------------------------------------------------
+# VERIFY is the mode that must actually RUN things: the test suite, `git diff`,
+# a linter. So unlike READ_ONLY it gets a shell, and that changes what
+# containment can honestly claim. A shell can write files, so no tool allow-list
+# makes VERIFY filesystem-read-only, and saying otherwise would be inventing
+# fake read-only shell semantics.
+#
+# WHAT PLAN MODE ACTUALLY DID HERE, measured 2026-09-12 rather than assumed:
+#   * it refused all 179 ATS and Echo Brain calls, verbatim "Cannot call
+#     mcp__ai-team-sync__my_authority while in plan mode" -- the same defect
+#     READ_ONLY had;
+#   * and it did not contain the shell either. Across THREE independent runs the
+#     child declined the writes itself ("I_REFUSED"), including declining to run
+#     the unmodified CI command `python3 -m pytest -q` because pytest writes
+#     __pycache__. So plan mode's filesystem guarantee was the model's own
+#     compliance, and its cost was that VERIFY could not run its core workload.
+#
+# Containment is therefore ENVIRONMENTAL, and it is two mechanisms that already
+# existed, cooperating (see verify_worktree.__doc__):
+#   1. Claude Code's Bash sandbox (bubblewrap + seccomp), declared below.
+#      Measured: a write outside the working directory fails at the KERNEL with
+#      "Read-only file system" -- not at a prompt, not at the model's discretion.
+#   2. A disposable linked worktree, supplied as the child's cwd by cli.delegate,
+#      holding the lead's exact result. It is the writable side of that boundary.
+#
+# failIfUnavailable is the load-bearing flag: without it a host with no sandbox
+# backend would run the shell UNCONFINED, which is precisely the silent decay
+# this mode system exists to prevent. A VERIFY delegation on such a host is
+# refused instead.
+_VERIFY_BUILTINS = "Read,Grep,Glob,Bash"
+
+_VERIFY_SANDBOX = ('{"sandbox":{"enabled":true,"failIfUnavailable":true,'
+                   '"allowUnsandboxedCommands":false}}')
+
+_CLAUDE_VERIFY = (
+    # Read + search + a real shell. Still no Edit/Write/NotebookEdit and no
+    # Task/Agent: VERIFY reviews an implementation, it does not produce one, and
+    # it does not delegate onward.
+    "--tools", _VERIFY_BUILTINS,
+    "--permission-prompts", "none",
+    # OS-level containment, and a hard gate if the backend is missing.
+    "--settings", _VERIFY_SANDBOX,
+    # Bash is GRANTED; the sandbox is what bounds it. The coordination reads are
+    # identical to READ_ONLY's -- deliberately the same list, so there is one
+    # answer to "what may a delegated child read" rather than two that drift.
+    "--allowedTools", "Bash", *_READ_ONLY_COORDINATION_READS,
+    # Identical denials to READ_ONLY: no Tower mutation, no gate change, no
+    # session or scope mutation, no reconciling its own delegation, no onward
+    # delegation. Commit is reachable only inside the disposable worktree, where
+    # it is detached and discarded; push needs a network the sandbox denies.
+    "--disallowedTools", *_READ_ONLY_DENIED,
+)
 
 # `-c approval_policy=never` is not a convenience: without it `codex exec`
 # waits on an approval prompt, and an automated parent never answers one.

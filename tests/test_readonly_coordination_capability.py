@@ -254,19 +254,23 @@ def test_11_codex_read_only_behaviour_is_unchanged():
         assert flag not in argv
 
 
-def test_claude_verify_keeps_its_previous_enforcement_untouched():
-    """VERIFY is the one mode that must run tests, so it needs a shell, and the
-    READ_ONLY allow-list has none. The operator scoped this repair to READ_ONLY,
-    so VERIFY keeps plan mode -- and keeps the same coordination limitation.
-    That is a KNOWN remaining gap, frozen here so it cannot be forgotten or
-    silently widened.
-    """
-    p = claude(VERIFY)
+def test_verify_is_a_superset_of_read_only_by_exactly_one_capability():
+    """The known gap this file used to freeze is now closed, and the relationship
+    between the two modes is pinned instead.
 
-    assert p.permission_mode == "plan"
-    assert p.builtin_allowlist is None
-    for tool in ("Edit", "Write", "NotebookEdit"):
-        assert tool in p.denied
+    VERIFY differs from READ_ONLY by adding a shell, and by NOTHING else in the
+    authority dimension: identical coordination reads, identical denials. Written
+    as set algebra so a future widening of VERIFY has to break this test rather
+    than slip in as an extra allow-list entry.
+    """
+    ro, ve = claude(READ_ONLY), claude(VERIFY)
+
+    assert ro.allowed == ve.allowed - {"Bash"}, "the read allow-lists must match"
+    assert ro.denied == ve.denied, "the denial lists must match"
+    assert set(ve.builtin_allowlist.split(",")) - set(ro.builtin_allowlist.split(",")) == {"Bash"}
+    assert ro.fails_closed and ve.fails_closed
+    # And neither is on plan mode any more.
+    assert ro.permission_mode is None and ve.permission_mode is None
 
 
 def test_claude_implement_still_writes_inside_its_claimed_scope():

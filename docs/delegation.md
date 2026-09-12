@@ -32,7 +32,7 @@ noted.
 |---|---|---|
 | `READ_ONLY` | read, investigate, report, **read ATS coordination state** | write files, commit, restart services, submit expensive jobs, mutate task state, delegate onward |
 | `IMPLEMENT` | write inside the declared scope, commit, run tests | restart services, submit expensive jobs, close the parent's task, delegate onward |
-| `VERIFY` | read, run tests | write files, commit, restart services, close the parent's task, delegate onward |
+| `VERIFY` | read, run tests **in a disposable worktree**, **read ATS coordination state** | write to the lead tree, commit anything authoritative, push, deploy, restart services, close the parent's task, delegate onward |
 
 Three things hold a mode in place. The server refuses a scope claim from a child
 whose mode grants no edit authority. The launcher applies **that worker's own**
@@ -42,7 +42,8 @@ reader can check what was and was not permitted.
 
 Enforcement is per worker, not one flag set for everybody. Codex is launched with
 `--sandbox read-only`, which its own runtime enforces; Claude READ_ONLY with a
-built-in allow-list and a per-tool MCP policy (below). Handing Claude's flags to
+built-in allow-list and a per-tool MCP policy, and Claude VERIFY with that policy
+plus a shell, an OS sandbox and a disposable worktree (both below). Handing Claude's flags to
 Codex would mean nothing to it, so READ_ONLY would quietly decay from a
 restriction into a request. A worker/mode pair with no enforcement mapping
 **fails closed before anything is spawned** — it is refused, not run
@@ -92,10 +93,74 @@ are POSTs whose handlers issue no write at all. `delegate` issues no HTTP
 whatsoever and shells out to `ats delegate`, which is recursive delegation — a
 name-based or verb-based allow-list would have let that through.
 
-`VERIFY` still carries plan mode. It is the one mode that must run tests, so it
-needs a shell, and a Bash command-prefix allow-list is pattern matching on a
-composable shell rather than a boundary. VERIFY therefore keeps the same
-coordination limitation; that is a known remaining gap, not an oversight.
+`VERIFY` is covered in its own section below: it needs a shell, so its
+containment is environmental rather than a tool list.
+
+## VERIFY is verification-capable, non-authoritative, non-implementation
+
+Operator ruling 2026-09-12, second coordination tranche. VERIFY had the same
+plan-mode defect READ_ONLY had, and one more besides.
+
+What plan mode actually did to VERIFY, measured rather than assumed:
+
+- it refused every ATS and Echo Brain call, the same categorical refusal;
+- and across **three** independent runs the child declined the shell writes
+  *itself* rather than the harness denying them. It even declined to run the
+  unmodified CI command `python3 -m pytest -q`, because pytest writes
+  `__pycache__`.
+
+So the mode whose entire purpose is to *run* verification could not run it, and
+the filesystem guarantee it appeared to give was the model's own compliance. Plan
+mode also left `Task`/`Agent` available, so the subagent escape was open.
+
+### The honest model
+
+VERIFY gets a **real shell**. A shell can write files, so no tool list makes
+VERIFY filesystem-read-only, and this document does not claim otherwise. What
+bounds it is two mechanisms that already existed:
+
+| Layer | What it guarantees |
+|---|---|
+| Claude Code's Bash sandbox (bubblewrap + seccomp) | everything outside the working directory is read-only **at the kernel**. Measured: a write aimed at the lead tree fails with `Read-only file system`, not at a prompt and not at the model's discretion. Declared with `failIfUnavailable` so a host with no sandbox backend **refuses** rather than running the shell unconfined, and `allowUnsandboxedCommands: false` so the per-call escape hatch is rejected. |
+| A disposable linked git worktree | the writable working directory, holding the lead's exact result. Side effects land there and die with it. |
+
+VERIFY's coordination reads and its denial list are **identical** to READ_ONLY's,
+deliberately: one answer to "what may a delegated child read", not two that drift.
+The only capability VERIFY adds is `Bash`. A test asserts exactly that difference
+as set algebra.
+
+`Task`/`Agent` stay unavailable, so a VERIFY child cannot spawn a worker with a
+different policy.
+
+### The sandbox's writable set, and the arrangement it requires
+
+Measured: the working directory and the **system temp root** are writable;
+everything else, `$HOME` included, is read-only.
+
+That has a sharp edge, and it is not hypothetical. The first containment
+measurement put the fixture lead repository inside the temp root alongside the
+worktree, and the child wrote into the lead with exit 0 and no sandbox violation,
+because temp is on the writable side. So the supervisor **refuses** to launch when
+the lead repository is inside the temp root, rather than launching something
+contained only in appearance.
+
+### Reviewing the actual result, provably
+
+The lead's result is usually still uncommitted when review happens, so
+`git worktree add <rev>` alone would reproduce the commit and silently drop the
+work under review. The supervisor replays the tracked diff and copies untracked
+files, and writes a manifest into the worktree carrying the base commit, the diff
+hash, and a **per-file sha256 comparison** against the lead. That manifest is
+placed in the child's packet ahead of the objective, so "you are reviewing the
+lead's actual result" is something the child can check rather than trust. A diff
+that does not apply cleanly is a refusal, because a partially reproduced result
+would make an invalid review look valid.
+
+### No VERIFY commit becomes authoritative
+
+The worktree is checked out **detached**, so a commit in it advances no branch.
+Teardown runs `git worktree remove --force` and prunes, leaving the commit
+unreachable from any ref. `git push` needs a network the sandbox denies.
 
 ## The supervisor finalizes the child session
 
@@ -105,8 +170,10 @@ remembering to call `complete_session` — and under READ_ONLY it cannot, becaus
 that call is a coordination mutation the launch spec denies.
 
 After the child process reaches any terminal outcome — clean exit, non-zero exit,
-lease expiry, or a spawn that never ran — the supervisor submits the result on the
-child's behalf and completes **that exact child session**. Both steps are
+lease expiry, a spawn that never ran, or a verification environment that was
+refused — the supervisor submits the result on the child's behalf, completes
+**that exact child session**, and removes the verification worktree if it built
+one. Both steps are
 unconditional, and the session close does not depend on the result submission
 succeeding. A child that failed to start cannot clean up after itself, and a
 supervisor that dies with its child leaves the orphan the contract exists to

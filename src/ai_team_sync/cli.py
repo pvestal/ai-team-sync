@@ -639,6 +639,15 @@ default_mode = "{lock_mode}"
 # delegate — bounded worker-to-worker work, through ATS rather than a raw shell
 # ---------------------------------------------------------------------------
 
+class _SpawnRefused(RuntimeError):
+    """The child must not be spawned, but its records already exist.
+
+    Raised inside the spawn block so one finalization path serves every
+    terminal outcome: a refused spawn leaves no orphan for the same reason a
+    crashed one does not.
+    """
+
+
 @cli.command("delegate")
 @click.option("--task", "parent_task", default="", help="Parent task id this serves, e.g. 2654")
 @click.option("--parent-session", default="", help="Delegating session id (default: your current one)")
@@ -741,9 +750,32 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         except Exception as exc:  # noqa: BLE001
             brief = f"(no brief: {type(exc).__name__})"
 
+    # A Claude VERIFY child gets a SHELL, so its containment cannot be a tool
+    # list. It runs in a disposable linked worktree holding the lead's exact
+    # result, with everything outside that worktree read-only to its shell at the
+    # kernel level (see verify_worktree.__doc__ and _CLAUDE_VERIFY).
+    #
+    # Codex VERIFY deliberately gets NO worktree: its containment is its own
+    # `--sandbox read-only` runtime, which already denies writes, and this repair
+    # is not allowed to change Codex behaviour.
+    verify_env = None
+    verify_error = ""
+    if worker == "claude-code" and mode == "VERIFY":
+        from ai_team_sync import verify_worktree as _vw
+        try:
+            verify_env = _vw.create(repo, d["id"])
+            click.echo(verify_env.manifest_text, err=True)
+        except _vw.VerifyEnvironmentError as exc:
+            # Fail closed. An uncontained VERIFY child, or one reviewing a
+            # partially reproduced result, yields a verdict nobody should rely
+            # on — worse than a refused delegation.
+            verify_error = f"verification environment refused: {exc}"
+            click.echo(verify_error, err=True)
+
     packet = build_child_packet(
         mode=mode, delegation=d, objective=objective, acceptance=acceptance,
-        scope=list(scope), task_envelope_text=task_envelope_text, brief=brief)
+        scope=list(scope), task_envelope_text=task_envelope_text, brief=brief,
+        verify_env_text=(verify_env.manifest_text if verify_env else ""))
 
     if dry_run:
         click.echo(json.dumps({"delegation": d, "child_session": child_id,
@@ -768,14 +800,23 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
     argv = launch.argv
     click.echo(f"launching {worker} via {launch.resolved_binary} "
                f"({mode}, lease {lease_minutes}m)...", err=True)
-    launch_error = ""
+    launch_error = verify_error
+    output, failure = "", True
     try:
+        if verify_error:
+            raise _SpawnRefused(verify_error)
         # stdin closed: the child is not interactive, and left open the harness
         # waits on it before starting.
+        # cwd is the verification worktree for a Claude VERIFY child, and the
+        # parent's cwd otherwise. It is what makes the sandbox's writable root
+        # the disposable tree rather than the lead's.
         proc = subprocess.run(argv, capture_output=True, text=True,
                               timeout=lease_minutes * 60, env=env,
-                              stdin=subprocess.DEVNULL)
+                              stdin=subprocess.DEVNULL,
+                              cwd=(str(verify_env.path) if verify_env else None))
         output, failure = proc.stdout.strip(), (proc.returncode != 0)
+    except _SpawnRefused:
+        pass                      # already reported; records still get finalized
     except subprocess.TimeoutExpired:
         output, failure = "", True
         launch_error = "lease expired"
@@ -821,6 +862,18 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
                        f"inactivity rather than closed by its supervisor.",
                        err=True)
 
+    # Teardown belongs to the supervisor for the same reason finalization does:
+    # it must happen on every terminal outcome, including the ones where the
+    # child never ran. A commit made in the worktree was detached, so removing it
+    # leaves nothing reachable from any ref.
+    verify_removed = None
+    if verify_env is not None:
+        from ai_team_sync import verify_worktree as _vw
+        verify_removed = _vw.remove(verify_env.repo_root, verify_env.path)
+        click.echo(f"verification worktree "
+                   f"{'removed' if verify_removed else 'NOT REMOVED'}: "
+                   f"{verify_env.path}", err=True)
+
     click.echo(json.dumps({
         "delegation_id": d["id"],
         "state": return_state,
@@ -832,6 +885,11 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         "launch_spec_version": launch.spec_version,
         "parent_still_owns": d["parent_owner_session_id"],
         "child_session_id": child_id,
+        # What the VERIFY child actually reviewed, and whether its scratch tree
+        # is gone. Reported rather than assumed, so a reader can check both.
+        "verify_worktree": (str(verify_env.path) if verify_env else None),
+        "verify_base_commit": (verify_env.base_commit if verify_env else None),
+        "verify_worktree_removed": verify_removed,
         "result": output,
         "verify_before_accepting": d["acceptance"],
     }, indent=2))
