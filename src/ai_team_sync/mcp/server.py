@@ -907,6 +907,24 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     return result
 
 
+async def _delegation_child(client) -> str | None:
+    """The child session this process is bound to, or None.
+
+    A delegated child's authority over its OWN row is the delegation binding,
+    not its label: ATS created that row for this delegation, which is exact
+    where a name comparison is not (child_env writes the label, so comparing
+    labels would compare the parent's own text with itself).
+    """
+    deleg_id = (os.environ.get("ATS_DELEGATION") or "").strip()
+    if not deleg_id:
+        return None
+    try:
+        r = await client.get(f"{SERVER_URL}/api/delegations/{deleg_id}")
+        return r.json().get("child_session_id") if r.status_code == 200 else None
+    except Exception:  # noqa: BLE001 — no binding proven; caller falls back to label
+        return None
+
+
 async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle MCP tool calls."""
     # Identity AND where it came from. A read may use any of it; a mutation may
@@ -1665,48 +1683,66 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # — guessing which of two live sessions was meant is exactly the
                 # 2026-09-11 wrong-session completion.
                 pointer_id, pointer_source = resolve_identity()
-                live = None
-                if explicit_id and pointer_id and pointer_id != explicit_id:
+
+                # ORDER MATTERS, and a live canary is what taught us so. The
+                # pointer-conflict rule used to run first, so naming a
+                # nonexistent id, or another worker's id, was refused with a
+                # CONFLICT message whose remedy reads "clear/point the pointer at
+                # <that id> and retry" — advice that is wrong for a missing
+                # session and actively dangerous for someone else's, since
+                # following it would enable the very completion we forbid.
+                # Existence and ownership are the more fundamental facts, so they
+                # are settled first and the conflict rule speaks only about a row
+                # the caller could legitimately complete.
+                if explicit_id:
                     try:
-                        pr = await client.get(f"{SERVER_URL}/api/sessions/{pointer_id}")
-                        live = (pr.status_code == 200
-                                and pr.json().get("status") == "active")
-                    except Exception:  # noqa: BLE001 — unknown stays LIVE, fail closed
-                        live = None
+                        rr = await client.get(f"{SERVER_URL}/api/sessions/{explicit_id}")
+                        row = rr.json() if rr.status_code == 200 else None
+                    except Exception:  # noqa: BLE001
+                        row = None
 
-                target = resolve_completion_target(
-                    explicit_id=explicit_id or None, pointer_id=pointer_id,
-                    pointer_source=pointer_source, pointer_names_live_session=live)
-                if not target.ok:
-                    return [TextContent(type="text", text=f"❌ {target.refusal}")]
+                    deleg_child = await _delegation_child(client)
+                    refusal = ownership_refusal(explicit_id, row,
+                                                session_agent_label(),
+                                                delegation_child_id=deleg_child)
+                    if refusal:
+                        return [TextContent(type="text", text=f"❌ {refusal}")]
 
-                # Read BEFORE writing: the prior status is part of the answer, and
-                # ownership cannot be checked against a row nobody fetched.
-                try:
-                    rr = await client.get(f"{SERVER_URL}/api/sessions/{target.session_id}")
-                    row = rr.json() if rr.status_code == 200 else None
-                except Exception:  # noqa: BLE001
-                    row = None
+                    live = None
+                    if pointer_id and pointer_id != explicit_id:
+                        try:
+                            pr = await client.get(
+                                f"{SERVER_URL}/api/sessions/{pointer_id}")
+                            live = (pr.status_code == 200
+                                    and pr.json().get("status") == "active")
+                        except Exception:  # noqa: BLE001 — unknown stays LIVE
+                            live = None
 
-                # A delegated child's authority over its own row is the DELEGATION
-                # BINDING, not its label: ATS created that row for this delegation,
-                # which is exact where a name comparison is not (child_env writes
-                # the label, so comparing labels compares the parent with itself).
-                deleg_child = None
-                deleg_id = (os.environ.get("ATS_DELEGATION") or "").strip()
-                if deleg_id:
+                    target = resolve_completion_target(
+                        explicit_id=explicit_id, pointer_id=pointer_id,
+                        pointer_source=pointer_source,
+                        pointer_names_live_session=live)
+                    if not target.ok:
+                        return [TextContent(type="text", text=f"❌ {target.refusal}")]
+                else:
+                    # Legacy path: the pointer IS the candidate, so its own
+                    # safety rule (never the shared file) must settle first.
+                    target = resolve_completion_target(
+                        explicit_id=None, pointer_id=pointer_id,
+                        pointer_source=pointer_source)
+                    if not target.ok:
+                        return [TextContent(type="text", text=f"❌ {target.refusal}")]
                     try:
-                        dr = await client.get(f"{SERVER_URL}/api/delegations/{deleg_id}")
-                        if dr.status_code == 200:
-                            deleg_child = dr.json().get("child_session_id")
-                    except Exception:  # noqa: BLE001 — no binding proven, fall through
-                        deleg_child = None
-
-                refusal = ownership_refusal(target.session_id, row,
-                                            session_agent_label(),
-                                            delegation_child_id=deleg_child)
-                if refusal:
-                    return [TextContent(type="text", text=f"❌ {refusal}")]
+                        rr = await client.get(
+                            f"{SERVER_URL}/api/sessions/{target.session_id}")
+                        row = rr.json() if rr.status_code == 200 else None
+                    except Exception:  # noqa: BLE001
+                        row = None
+                    refusal = ownership_refusal(
+                        target.session_id, row, session_agent_label(),
+                        delegation_child_id=await _delegation_child(client))
+                    if refusal:
+                        return [TextContent(type="text", text=f"❌ {refusal}")]
 
                 prior_status = (row or {}).get("status")
                 if prior_status in ("completed", "cancelled"):
