@@ -202,3 +202,68 @@ def test_validate_resolution_rejects_an_empty_binary():
 def test_spec_for_unknown_worker_raises_rather_than_defaulting():
     with pytest.raises(RoutingFailure):
         spec_for("nobody")
+
+
+# ── 6. the child must be able to act as ITSELF ───────────────────────────────
+
+CHILD_ENV = {
+    "ATS_SESSION_ID": "b328ec1d-0665-43c5-8a22-1141d037c512",
+    "ATS_STATE_DIR": "/home/patrick/.local/share/ai-team-sync/delegations/b52134",
+    "ATS_AGENT": "codex:delegate",
+    "ATS_DELEGATION": "b5213432-0bf2-45d2-b2be-b15ea2c0a882",
+    "PATH": "/usr/bin",          # must NOT be forwarded
+    "HOME": "/home/patrick",     # must NOT be forwarded
+}
+
+
+def test_codex_carries_the_isolation_env_into_its_own_mcp_server():
+    """Codex starts MCP servers from its config, and a declared
+    [mcp_servers.<name>.env] block REPLACES the inherited environment. Observed
+    live on delegation b5213432: the child's ats-mcp never saw ATS_SESSION_ID,
+    fell back to the shared ~/.ats_session and reported the PARENT's session as
+    its own, so it could not log a decision or complete its own session."""
+    argv = build_launch("codex", READ_ONLY, PACKET, repo=REPO,
+                        child_env=CHILD_ENV, which=FOUND_BOTH).argv
+    joined = " ".join(argv)
+    for key in ("ATS_SESSION_ID", "ATS_STATE_DIR", "ATS_AGENT", "ATS_DELEGATION"):
+        assert f"mcp_servers.ai-team-sync.env.{key}=" in joined, f"{key} not forwarded"
+    assert f'mcp_servers.ai-team-sync.env.ATS_SESSION_ID="{CHILD_ENV["ATS_SESSION_ID"]}"' in joined
+    # Values are parsed as TOML, so a bare filesystem path would not parse.
+    assert f'.ATS_STATE_DIR="{CHILD_ENV["ATS_STATE_DIR"]}"' in joined
+
+
+def test_only_the_isolation_keys_are_forwarded():
+    """The override carries identity, not the parent's whole environment."""
+    argv = build_launch("codex", READ_ONLY, PACKET, repo=REPO,
+                        child_env=CHILD_ENV, which=FOUND_BOTH).argv
+    joined = " ".join(argv)
+    assert "PATH=" not in joined
+    assert "HOME=" not in joined
+
+
+def test_the_packet_stays_last_even_with_env_overrides():
+    """`codex exec [OPTIONS] [PROMPT]`: an option appended after the positional
+    would be swallowed as part of the prompt."""
+    argv = build_launch("codex", READ_ONLY, PACKET, repo=REPO,
+                        child_env=CHILD_ENV, which=FOUND_BOTH).argv
+    assert argv[-1] == PACKET
+    assert argv[-2] == REPO and argv[-3] == "-C"
+
+
+def test_claude_needs_no_env_overrides_because_it_inherits():
+    """Claude's MCP children are spawned from the env we hand subprocess.run,
+    so delegation.child_env already reaches them. Adding flags here would be
+    inventing a mechanism Claude does not have."""
+    argv = build_launch("claude-code", READ_ONLY, PACKET, repo=REPO,
+                        child_env=CHILD_ENV, which=FOUND_BOTH).argv
+    assert "-c" not in argv
+    assert "ATS_SESSION_ID" not in " ".join(argv)
+    assert argv[:3] == ["/usr/local/bin/claude", "-p", PACKET]
+
+
+def test_no_child_env_is_not_a_crash():
+    """Callers that spawn nothing (dry-run, tooling) still build an argv."""
+    argv = build_launch("codex", READ_ONLY, PACKET, repo=REPO,
+                        child_env=None, which=FOUND_BOTH).argv
+    assert argv[-1] == PACKET
+    assert "mcp_servers" not in " ".join(argv)

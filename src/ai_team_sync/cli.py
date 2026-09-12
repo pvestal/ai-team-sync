@@ -714,11 +714,16 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
     # build_launch picks the binary AND the enforcement flags together, because
     # swapping only the binary would hand Claude's --disallowedTools to Codex,
     # where they mean nothing and READ_ONLY would decay to a promise.
-    launch = build_launch(worker, mode, packet, repo=repo)
-    argv = launch.argv
+    # The child's environment is computed BEFORE the command line, because for
+    # some workers it IS part of the command line: Codex starts its MCP servers
+    # from its own config, whose env block replaces rather than extends what it
+    # inherits, so the isolation vars have to ride in as -c overrides.
     from ai_team_sync.delegation import child_env as _child_env
     env = _child_env(dict(os.environ), delegation_id=d["id"],
                      child_session_id=child_id, worker=worker)
+
+    launch = build_launch(worker, mode, packet, repo=repo, child_env=env)
+    argv = launch.argv
     click.echo(f"launching {worker} via {launch.resolved_binary} "
                f"({mode}, lease {lease_minutes}m)...", err=True)
     try:

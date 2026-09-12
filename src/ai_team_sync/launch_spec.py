@@ -98,6 +98,19 @@ class LaunchSpec:
     # outside a trusted directory, so a repo-less Codex spawn burns its lease
     # and returns nothing; better to refuse in the parent.
     requires_repo: bool = False
+    # Config prefix through which this worker's own MCP server environment must
+    # be overridden, or None when the worker simply inherits the process env.
+    #
+    # Claude spawns its MCP children from the environment we hand subprocess.run,
+    # so delegation.child_env reaches them and nothing more is needed. Codex does
+    # NOT: it starts MCP servers from its own config file, and a declared
+    # [mcp_servers.<name>.env] block REPLACES the inherited environment rather
+    # than extending it. Observed live 2026-09-12 on delegation b5213432: the
+    # child's ats-mcp never saw ATS_SESSION_ID or ATS_STATE_DIR, fell back to the
+    # shared ~/.ats_session, and reported the PARENT's session as its own. The
+    # mutation guard held (source 'global' is refused), so nothing was corrupted,
+    # but the child could not act as itself at all.
+    mcp_env_config_prefix: str | None = None
     mode_args: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
@@ -134,6 +147,8 @@ _SPECS: dict[str, LaunchSpec] = {
         prompt_flag=None,          # `codex exec [OPTIONS] [PROMPT]`
         repo_flag="-C",
         requires_repo=True,
+        # Must match the server name in ~/.codex/config.toml.
+        mcp_env_config_prefix="mcp_servers.ai-team-sync.env",
         mode_args={
             READ_ONLY: ("--sandbox", "read-only") + _CODEX_NON_INTERACTIVE,
             VERIFY: ("--sandbox", "read-only") + _CODEX_NON_INTERACTIVE,
@@ -143,6 +158,14 @@ _SPECS: dict[str, LaunchSpec] = {
         },
     ),
 }
+
+# The environment a delegated child's ATS client must see to act as ITSELF.
+# ATS_SESSION_ID is the row ATS already created for this delegation and is the
+# first thing resolve_pointer consults; ATS_STATE_DIR keeps the child's pointer
+# writes out of $HOME so they cannot be read by, or clobber, the parent's.
+_ISOLATION_ENV_KEYS = ("ATS_SESSION_ID", "ATS_STATE_DIR", "ATS_AGENT",
+                       "ATS_DELEGATION")
+
 
 # Registered workers with NO launch spec, and why. These are authority classes
 # in the worker registry, not command-line agents, so there is nothing to spawn:
@@ -231,7 +254,30 @@ def validate_launchable(worker: str, mode: str, *, repo: str = "",
     return spec, resolve_binary(spec, which=which)
 
 
+def mcp_env_argv(spec: LaunchSpec, child_env: Mapping[str, str] | None) -> list[str]:
+    """Config overrides that push the ATS isolation env into the worker's OWN
+    MCP server, for workers that do not simply inherit the process environment.
+
+    Empty for Claude, which inherits. Required for Codex: without it the child's
+    ats-mcp resolves the SHARED pointer and answers "who am I" with the parent's
+    session (proven live on delegation b5213432), so the child cannot log a
+    decision, complete its own session, or be attributed anything it did.
+
+    Values are emitted quoted because they are parsed as TOML: an unquoted
+    filesystem path is not a valid bare TOML value.
+    """
+    if not spec.mcp_env_config_prefix or not child_env:
+        return []
+    argv: list[str] = []
+    for key in _ISOLATION_ENV_KEYS:
+        value = (child_env.get(key) or "").strip()
+        if value:
+            argv += ["-c", f'{spec.mcp_env_config_prefix}.{key}="{value}"']
+    return argv
+
+
 def build_launch(worker: str, mode: str, prompt: str, *, repo: str = "",
+                 child_env: Mapping[str, str] | None = None,
                  which: Callable[[str], str | None] = shutil.which) -> ResolvedLaunch:
     """The exact command line for this worker and mode, or RoutingFailure.
 
@@ -242,6 +288,7 @@ def build_launch(worker: str, mode: str, prompt: str, *, repo: str = "",
     enforcement = spec.mode_args[mode]
 
     argv: list[str] = [binary, *spec.subcommand]
+    argv += mcp_env_argv(spec, child_env)
     if spec.prompt_flag:
         argv += [spec.prompt_flag, prompt]
     argv += list(enforcement)
