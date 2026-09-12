@@ -81,11 +81,32 @@ Console entry points: `ats` (CLI), `ats-server` (API/dashboard), `ats-mcp` (MCP 
 Install the **user** unit — the server holds one developer's coordination state, needs no root, and must outlive the terminal that started it:
 
 ```bash
-pipx install --force .                  # deploys server + MCP + CLI + hooks together
+pipx install --force .                  # FIRST INSTALL ONLY — see below
 cp deploy/ats-server.service ~/.config/systemd/user/
 systemctl --user daemon-reload && systemctl --user enable --now ats-server
 sudo loginctl enable-linger "$USER"     # survive logout / start at boot
 ```
+
+### Deploying a change
+
+Use `scripts/deploy.sh`, never a bare `pipx install --force`:
+
+```bash
+scripts/deploy.sh                       # stamp -> install -> restart -> verify
+```
+
+`pipx` copies the source tree, so the installed package reports whatever
+`_build_stamp.py` held at install time. Only `scripts/deploy.sh` regenerates that
+stamp from `git rev-parse HEAD`; a bare `pipx install --force` ships a stale one
+and `ats_version` then reports the OLD commit while the new code runs. Observed
+2026-09-12: a clean install of commit `f1a306b` kept reporting `0b36b92`, so the
+deployment gate silently passed on a build that was never verified.
+
+**Verify from a freshly spawned client.** A stdio MCP server is started once per
+agent session and keeps that build for the session's whole life, so `ats_version`
+from an already-running Claude or Codex session proves nothing about a deploy
+that just happened. `scripts/deploy.sh` ends by spawning a new MCP and printing
+both commits; they must match.
 
 Two things the unit pins deliberately, both of which have bitten this box:
 
