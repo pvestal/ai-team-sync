@@ -17,7 +17,7 @@ nothing here should be treated as one.
 | Tool | Effect | Notes |
 |---|---|---|
 | `start_session` | mutates | Declares scope and takes advisory locks. Returns a context brief when one is available. Pass `repo_root` so patterns anchor to a repo. |
-| `complete_session` | mutates | Releases locks. Refused while a child delegation is still open. |
+| `complete_session` | mutates | Pass `session_id`: it is authoritative for the call and is echoed back with the prior and resulting status, so you can see which row changed. Omitting it uses the legacy pointer path. Releases locks. Refused while a child delegation is still open, and refused on a session you do not own. |
 | `pause_session` / `resume_session` | mutates | Pauses work while keeping locks. |
 | `extend_scope` | mutates | Adds patterns to the current session mid-flight. |
 | `get_session_details` | reads | Locks, decisions and commits for your session. |
@@ -26,6 +26,11 @@ nothing here should be treated as one.
 Session-mutating tools act on *your* session, and the server resolves which one
 that is from process-local identity. An identity that could have been written by
 another agent is refused rather than guessed.
+
+`complete_session` is the exception that proves it: it accepts an explicit
+`session_id`, which is authoritative for that call. Existence and ownership are
+checked first, and only then is a pointer that speaks for *this* caller allowed
+to refuse a mismatch. See [Authority model](authority-model.md).
 
 ## Locks and presence
 
@@ -54,7 +59,7 @@ See [Delegation](delegation.md) for the full contract.
 
 | Tool | Effect | Notes |
 |---|---|---|
-| `delegate` | mutates | Hands a bounded subproblem to another worker. You keep the task. |
+| `delegate` | mutates | Hands a bounded subproblem to another worker. You keep the task. Records the requested worker and the binary actually resolved at spawn; an unsupported worker/mode fails closed. With `task`, the child inherits that Tower task's authority envelope. |
 | `delegation_status` | reads | Whole lifecycle: ids, mode, state, the child's effective authority, lock counts. |
 | `reconcile_delegation` | mutates | Owner-bound: only the parent accepts or rejects. |
 | `my_authority` | reads | What you may do, base and effective. |
@@ -66,7 +71,7 @@ See [Context and preflight](context-and-preflight.md).
 | Tool | Effect | Notes |
 |---|---|---|
 | `task_brief` | reads | Context packet for a piece of work, every line citation-bearing. |
-| `preflight` | reads (records its own analysis) | Has this action already been tried, and what happened. Advisory. |
+| `preflight` | reads (records its own analysis) | Has this action already been tried, and what happened. Advisory. Pass `task_id` and the live Tower task is read first: a finished task returns `ALREADY_COMPLETED` with its closure evidence rather than a generic `CLEAR`. |
 
 ## Shared services
 
@@ -92,4 +97,10 @@ the honest-looking conclusion — "this tool does not exist" — is wrong.
 - On skew, restart the client session rather than debugging the server.
 - Validate new tools from a **fresh** client, never from a long-running one.
 - `scripts/check_mcp_parity.py` checks the installed entrypoint against the
-  checkout and fails if they disagree.
+  checkout, asserts every registered tool appears in this document, and fails if
+  either disagrees.
+- `scripts/proof_context.sh` prints what is actually deployed — both repo HEADs,
+  the running ATS commit, and every live MCP process with its spawn time —
+  before you claim a behaviour was proven.
+- Deploy with `scripts/deploy.sh`. A bare `pipx install --force` does not stamp
+  the build, so `ats_version` keeps reporting the previous commit.
