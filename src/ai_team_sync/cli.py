@@ -165,19 +165,51 @@ def session_pause():
 
 @session.command("complete")
 @click.option("--summary", "-m", default=None, help="Session summary")
-def session_complete(summary):
-    """Complete the current session, release locks, notify team."""
-    sid = _load_active_session()
-    if not sid:
-        click.echo("No active session.", err=True)
+@click.option("--session-id", default="", help=(
+    "The exact session to complete. Authoritative: refused if this process's own "
+    "pointer names a different LIVE session. Omit for the legacy pointer path."))
+def session_complete(summary, session_id):
+    """Complete a session, release locks, notify team.
+
+    Parity with the MCP tool: targeting is part of the contract, not a CLI
+    convenience, so a worker can name the session it means from either surface.
+    """
+    from ai_team_sync import session_pointer as sp
+    from ai_team_sync.session_target import resolve_completion_target
+
+    pointer_id, pointer_source = sp.resolve_pointer_source()
+    live = None
+    if session_id and pointer_id and pointer_id != session_id:
+        try:
+            with httpx.Client(timeout=10) as c:
+                r = c.get(f"{_server_url()}/api/sessions/{pointer_id}")
+            live = r.status_code == 200 and r.json().get("status") == "active"
+        except Exception:  # noqa: BLE001 — unknown stays LIVE, fail closed
+            live = None
+
+    target = resolve_completion_target(
+        explicit_id=session_id or None, pointer_id=pointer_id,
+        pointer_source=pointer_source, pointer_names_live_session=live)
+    if not target.ok:
+        click.echo(target.refusal, err=True)
         raise SystemExit(1)
+    if target.conflict:
+        click.echo(f"note: {target.conflict}", err=True)
+    sid = target.session_id
 
     if summary is None:
         summary = click.prompt("Session summary (what did you accomplish?)", default="")
 
-    _api("patch", f"/sessions/{sid}", json={"status": "completed", "summary": summary})
-    _clear_active_session()
-    click.echo(f"Session {sid[:8]}... completed. Locks released, team notified.")
+    resp = _api("patch", f"/sessions/{sid}",
+                json={"status": "completed", "summary": summary})
+    after = resp.json()
+    # Only drop the pointer when it was OUR session; clearing it after completing
+    # some other row would strand this process's own id.
+    if not session_id or session_id == pointer_id:
+        _clear_active_session()
+    click.echo(f"Session completed: {after.get('id')} "
+               f"(agent {after.get('agent')}, status {after.get('status')}, "
+               f"completed_at {after.get('completed_at')}). Locks released.")
 
 
 @session.command("list")

@@ -13,6 +13,8 @@ import httpx
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 
+from ai_team_sync.session_target import (ownership_refusal,
+                                         resolve_completion_target)
 from ai_team_sync.session_marker import (
     adopted_summary,
     derived_working_description,
@@ -585,13 +587,29 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="complete_session",
-            description="Complete your session and release all locks. Call this when you're done working.",
+            description=(
+                "Complete a session and release its locks. PASS session_id: it is "
+                "authoritative for the call, is verified against this process's own "
+                "pointer rather than silently replaced by it, and is echoed back with "
+                "the prior and resulting status so you can see exactly which row "
+                "changed. Omitting it is the legacy path — the session is resolved "
+                "through the guarded pointer, which still refuses a shared/ambiguous "
+                "one. You may only complete a session you own; a parent does not close "
+                "its child's record and a child does not close its parent's."),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "summary": {
                         "type": "string",
                         "description": "Summary of what you accomplished",
+                    },
+                    "session_id": {
+                        "type": "string",
+                        "description": (
+                            "The exact session to complete. Authoritative for this "
+                            "call. If this process's own pointer names a DIFFERENT "
+                            "live session, the call is refused rather than guessing. "
+                            "Omit only for the legacy pointer-resolved path."),
                     },
                 },
                 "required": ["summary"],
@@ -1638,23 +1656,98 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 return [TextContent(type="text", text=msg)]
 
             elif name == "complete_session":
-                refusal = await deny_mutation(client)
+                summary = arguments["summary"]
+                explicit_id = (arguments.get("session_id") or "").strip()
+
+                # WHICH row, decided before anything is mutated. An explicit id is
+                # authoritative; the pointer is a compatibility path. A pointer that
+                # speaks for THIS caller and disagrees is a refusal, not a tiebreak
+                # — guessing which of two live sessions was meant is exactly the
+                # 2026-09-11 wrong-session completion.
+                pointer_id, pointer_source = resolve_identity()
+                live = None
+                if explicit_id and pointer_id and pointer_id != explicit_id:
+                    try:
+                        pr = await client.get(f"{SERVER_URL}/api/sessions/{pointer_id}")
+                        live = (pr.status_code == 200
+                                and pr.json().get("status") == "active")
+                    except Exception:  # noqa: BLE001 — unknown stays LIVE, fail closed
+                        live = None
+
+                target = resolve_completion_target(
+                    explicit_id=explicit_id or None, pointer_id=pointer_id,
+                    pointer_source=pointer_source, pointer_names_live_session=live)
+                if not target.ok:
+                    return [TextContent(type="text", text=f"❌ {target.refusal}")]
+
+                # Read BEFORE writing: the prior status is part of the answer, and
+                # ownership cannot be checked against a row nobody fetched.
+                try:
+                    rr = await client.get(f"{SERVER_URL}/api/sessions/{target.session_id}")
+                    row = rr.json() if rr.status_code == 200 else None
+                except Exception:  # noqa: BLE001
+                    row = None
+
+                # A delegated child's authority over its own row is the DELEGATION
+                # BINDING, not its label: ATS created that row for this delegation,
+                # which is exact where a name comparison is not (child_env writes
+                # the label, so comparing labels compares the parent with itself).
+                deleg_child = None
+                deleg_id = (os.environ.get("ATS_DELEGATION") or "").strip()
+                if deleg_id:
+                    try:
+                        dr = await client.get(f"{SERVER_URL}/api/delegations/{deleg_id}")
+                        if dr.status_code == 200:
+                            deleg_child = dr.json().get("child_session_id")
+                    except Exception:  # noqa: BLE001 — no binding proven, fall through
+                        deleg_child = None
+
+                refusal = ownership_refusal(target.session_id, row,
+                                            session_agent_label(),
+                                            delegation_child_id=deleg_child)
                 if refusal:
                     return [TextContent(type="text", text=f"❌ {refusal}")]
 
-                summary = arguments["summary"]
+                prior_status = (row or {}).get("status")
+                if prior_status in ("completed", "cancelled"):
+                    # Terminal already. Re-PATCHing would re-stamp completed_at and
+                    # re-emit the completion event to the memory clerk, inventing a
+                    # second closure of one session. Report, mutate nothing.
+                    return [TextContent(type="text", text=(
+                        f"ℹ️  Session {target.session_id} is already {prior_status} "
+                        f"(completed_at {(row or {}).get('completed_at')}). Nothing "
+                        f"was changed.\n\n  existing summary: "
+                        f"{((row or {}).get('summary') or '')[:300]}"))]
+
                 response = await client.patch(
-                    f"{SERVER_URL}/api/sessions/{active_session_id}",
+                    f"{SERVER_URL}/api/sessions/{target.session_id}",
                     json={"status": "completed", "summary": summary},
                 )
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    return [TextContent(type="text", text=(
+                        f"❌ Completion refused for {target.session_id}: "
+                        f"HTTP {response.status_code} {response.text[:400]}"))]
+                after = response.json()
 
-                msg = f"✅ Session completed!\n\n"
-                msg += f"Summary: {summary}\n\n"
-                msg += "All locks released. Team has been notified."
+                lines = [
+                    "✅ Session completed",
+                    "",
+                    f"  session    : {after.get('id')}",
+                    f"  agent      : {after.get('agent')}",
+                    f"  status     : {prior_status} → {after.get('status')}",
+                    f"  completed  : {after.get('completed_at')}",
+                    f"  targeted by: {target.source}",
+                ]
+                if target.conflict:
+                    lines += ["", f"  ⚠ {target.conflict}"]
+                lines += ["", f"  Summary: {summary}", "",
+                          "  All locks released. Team has been notified."]
 
-                clear_session_id()
-                return [TextContent(type="text", text=msg)]
+                # Only drop the pointer when it was OUR session; clearing it after
+                # completing some other row would strand this process's own id.
+                if not explicit_id or explicit_id == pointer_id:
+                    clear_session_id()
+                return [TextContent(type="text", text="\n".join(lines))]
 
             elif name == "log_decision":
                 refusal = await deny_mutation(client)
