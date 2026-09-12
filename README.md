@@ -181,10 +181,20 @@ ats session complete -m "Done"
 ### Works with any agent
 
 Each session records *which agent* created it, so `ats team` shows Claude Code
-vs Codex vs Cursor at a glance. Identity resolves from the `ATS_AGENT` env var —
-set it for any agent (`ATS_AGENT=codex`, `ATS_AGENT=ollama:qwen2.5-coder`) — and
-falls back to auto-detecting known agents. Read what other agents have decided
-with `ats decision list --all`.
+vs Codex vs Cursor at a glance. A session's own label resolves from the
+`ATS_AGENT` env var — set it for any agent (`ATS_AGENT=codex`,
+`ATS_AGENT=ollama:qwen2.5-coder`) — and falls back to auto-detecting known
+agents. Read what other agents have decided with `ats decision list --all`.
+
+**A label is not provenance.** `ATS_AGENT` says what a session calls itself, and
+that is the right answer for a session registering itself. It is the wrong
+answer for "which worker actually ran this delegation", because the parent
+injects that variable into the child it launches — so the child's self-report is
+the parent's own text read back. A delegation therefore records the *requested*
+worker and the absolute executable the parent **resolved at spawn** as separate
+fields, and the server re-derives the pairing from the worker registry before
+storing it. Requesting one worker and resolving another's binary is a routing
+failure, not a satisfied delegation.
 
 ## Lock Modes
 

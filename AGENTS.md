@@ -15,7 +15,11 @@ git hooks. Entry points: `ats` (CLI), `ats-server` (FastAPI :8400), `ats-mcp`
 - `vscode-extension/` — optional editor integration.
 
 ## Dev workflow
-- Install editable: `pip install -e .` (or `pipx install --editable .`).
+- Install for development: `pip install -e .`.
+- **Deploy with `scripts/deploy.sh`, never a bare `pipx install --force`** —
+  only the script stamps the commit, so a bare install leaves `ats_version`
+  reporting the previous build. `scripts/proof_context.sh` prints what is
+  actually deployed before you claim anything about it.
 - Run the server: `ats-server` (binds `127.0.0.1:8400` by default).
 - Tests: `pytest` — or run a file directly, e.g.
   `python tests/test_detect_agent.py`. Follow TDD: write the failing test first.
@@ -26,8 +30,15 @@ git hooks. Entry points: `ats` (CLI), `ats-server` (FastAPI :8400), `ats-mcp`
   `.env` (gitignored) or environment variables.
 - **Versioning:** keep `src/ai_team_sync/__init__.py`, the FastAPI `version=`,
   and `pyproject.toml` in sync.
-- **Agent identity:** resolved by `ATS_AGENT` (explicit, any agent) then known
-  env signatures — see `_detect_agent` in `cli.py`.
+- **Agent identity — two different questions.** `ATS_AGENT` (explicit, any
+  agent) then known env signatures resolve a session's **own label**; the one
+  detection lives in `session_pointer.detect_agent` and `cli._detect_agent`
+  delegates to it. That label is NOT evidence of which worker ran a
+  **delegation**: `delegation.child_env` injects `ATS_AGENT` into the child, so
+  asking the child who it is returns the parent's own text. Delegation
+  provenance is the executable the parent resolved at spawn, recorded as
+  `delegations.resolved_binary` and re-validated server-side against the worker
+  registry. See [Delegation](docs/delegation.md).
 
 ## Coordinate while you work
 If an ai-team-sync server is running, use it on yourself:
