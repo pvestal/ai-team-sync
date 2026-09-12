@@ -768,6 +768,7 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
     argv = launch.argv
     click.echo(f"launching {worker} via {launch.resolved_binary} "
                f"({mode}, lease {lease_minutes}m)...", err=True)
+    launch_error = ""
     try:
         # stdin closed: the child is not interactive, and left open the harness
         # waits on it before starting.
@@ -777,21 +778,52 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         output, failure = proc.stdout.strip(), (proc.returncode != 0)
     except subprocess.TimeoutExpired:
         output, failure = "", True
+        launch_error = "lease expired"
         click.echo("child exceeded its lease", err=True)
+    except Exception as exc:  # noqa: BLE001 — a spawn that never ran is still terminal
+        # Previously only TimeoutExpired was caught, so an OSError or a signal
+        # propagated and skipped finalization, leaving the child session ACTIVE
+        # with its delegation open. A child that failed to start cannot clean up
+        # after itself.
+        output, failure = "", True
+        launch_error = f"{type(exc).__name__}: {exc}"
+        click.echo(f"child did not run: {launch_error}", err=True)
 
+    # FINALIZATION IS THE SUPERVISOR'S DUTY, on every terminal outcome.
+    # The child is never required to close itself for the delegation to be
+    # correct. Under READ_ONLY it cannot: complete_session is a coordination
+    # MUTATION and the launch spec denies it. After a crash there is no child
+    # left to ask. The session close is also independent of the result POST —
+    # the two were sequential in one block, so a failed return left the child
+    # session open forever.
+    return_state = "return_not_attempted"
     with httpx.Client(timeout=30) as c:
-        ret = c.post(f"{server}/api/delegations/{d['id']}/return", json={
-            "result_summary": output[:20000],
-            "evidence": {"exit_ok": not failure, "child_session_id": child_id},
-            "actor_session_id": child_id,
-        })
-        c.patch(f"{server}/api/sessions/{child_id}",
-                json={"status": "completed",
-                      "summary": f"delegated {mode}: {objective[:120]}"})
+        try:
+            ret = c.post(f"{server}/api/delegations/{d['id']}/return", json={
+                "result_summary": output[:20000] or f"(no result: {launch_error})",
+                "evidence": {"exit_ok": not failure, "child_session_id": child_id,
+                             "launch_error": launch_error or None},
+                "actor_session_id": child_id,
+            })
+            return_state = (ret.json().get("state") if ret.status_code < 400
+                            else "return_refused")
+        except Exception as exc:  # noqa: BLE001
+            return_state = f"return_error: {type(exc).__name__}"
+        try:
+            c.patch(f"{server}/api/sessions/{child_id}",
+                    json={"status": "completed",
+                          "summary": f"delegated {mode}: {objective[:120]}"})
+        except Exception as exc:  # noqa: BLE001
+            # Loud, because an unfinalized child IS the orphan condition and must
+            # not be discoverable only by reading the board later.
+            click.echo(f"WARNING: child session {child_id} was NOT finalized "
+                       f"({type(exc).__name__}: {exc}) — it will be reaped on "
+                       f"inactivity rather than closed by its supervisor.",
+                       err=True)
 
     click.echo(json.dumps({
         "delegation_id": d["id"],
-        "state": (ret.json().get("state") if ret.status_code < 400 else "return_refused"),
+        "state": return_state,
         "mode": mode,
         # Requested identity and the binary that actually ran, never collapsed
         # into one "worker" field a reader would have to trust.

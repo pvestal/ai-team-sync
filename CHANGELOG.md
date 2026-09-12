@@ -56,6 +56,51 @@
   handler after the new one was deployed.
 
 ### Changed
+- **READ_ONLY bounds the work product, not the coordination plane.** Operator
+  ruling 2026-09-12, after a Codex-led canary. Claude READ_ONLY was
+  `--permission-mode plan`, which refuses EVERY MCP call including pure reads —
+  measured verbatim: `Cannot call mcp__ai-team-sync__my_authority while in plan
+  mode.` The child launched as the right binary, received the full Tower Task
+  envelope, did useful analysis, and then could not read its own authority, its
+  own session, its delegation state, or the decision history it was delegated to
+  consult. So the implementation equated "cannot mutate the repository" with
+  "cannot participate in coordination", and the delegated lifecycle could not
+  complete. Plan mode was also never a no-write guarantee: it writes a plan file
+  under `~/.claude/plans/`.
+  Replaced with a capability split: `--tools Read,Grep,Glob` (an allow-list of
+  BUILT-INS, so an unlisted one is absent rather than refused — and absent "in
+  subagents as well as here", which closes the spawn-a-subagent-to-write escape),
+  `--permission-prompts none` (anything unlisted is denied automatically, so the
+  policy is fail-closed rather than dependent on nobody answering a prompt), a
+  per-tool MCP allow-list for the six ATS reads plus Echo Brain's canonical
+  `get_tower_task`, and an explicit deny-list as a second lock and a readable
+  contract. Bash is gone by design: it is the single path to `git commit`, `git
+  push` and `echo > file`, and a command-prefix allow-list is pattern matching on
+  a composable shell rather than a boundary.
+  Mutability was determined by INSPECTING each handler, never by reading a tool
+  name, and the names mislead in both directions: `check_locks` and `whos_editing`
+  are POSTs whose handlers issue no write at all, while `delegate` issues no HTTP
+  whatsoever and shells out to `ats delegate` — recursive delegation, which
+  READ_ONLY prohibits. A name-based or verb-based allow-list would have let that
+  one through.
+  `VERIFY` deliberately keeps plan mode and therefore keeps the same coordination
+  limitation: it is the one mode that must run tests, so it needs a shell. Named
+  as a known remaining gap rather than silently widened. Codex enforcement is
+  untouched — its own `--sandbox read-only` runtime, not harness flags.
+- **The supervisor finalizes the child session, unconditionally.** The launcher
+  already closed the exact child on clean exit, non-zero exit and lease expiry, so
+  the preferred architecture was already the observed behaviour — but it was not
+  deterministic. Two orphan paths are now closed: `subprocess.run` raising
+  anything other than `TimeoutExpired` (a spawn that never started, an OSError, a
+  signal) propagated and skipped finalization entirely, leaving the child session
+  ACTIVE with its delegation open; and the result POST and the session close were
+  sequential in one unguarded block, so a refused or unreachable `/return` left
+  the session open. A child that failed to START cannot clean up after itself.
+  Child self-close is removed from the READ_ONLY acceptance requirements rather
+  than re-enabled: `complete_session` is a coordination mutation the launch spec
+  denies, and delegation correctness must not depend on a model remembering to
+  call it. The child packet never asked for it, and a test now holds that. The
+  parent session is untouched on every terminal outcome.
 - **Frontier close authority is model-neutral: `codex` joins `claude-code` in the
   conditional `task_close` class.** Operator ruling 2026-09-12. The Codex-led
   lead-worker canary stopped correctly before selecting work, because the

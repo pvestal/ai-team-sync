@@ -114,13 +114,94 @@ class LaunchSpec:
     mode_args: Mapping[str, tuple[str, ...]] = field(default_factory=dict)
 
 
-# Claude's flags are carried over EXACTLY as `child_launch_argv` emitted them.
-# They are what made READ_ONLY real before this module existed, and the refactor
-# is only allowed to add workers, never to weaken the one that already worked.
-# Tool names must match the harness's own registry: an unknown name is reported
-# as "matches no known tool" and silently denies NOTHING.
-_CLAUDE_READ_ONLY = ("--permission-mode", "plan",
-                     "--disallowedTools", "Edit", "Write", "NotebookEdit")
+# ---------------------------------------------------------------------------
+# Claude READ_ONLY: a capability SPLIT, not a blanket shutdown
+# ---------------------------------------------------------------------------
+# Operator ruling 2026-09-12, after a Codex-led canary. READ_ONLY means the
+# child cannot mutate the WORK PRODUCT or Tower Task authority state. It has
+# never meant the child is expelled from the coordination plane, and conflating
+# the two broke the delegated lifecycle itself.
+#
+# WHAT WENT WRONG. READ_ONLY was `--permission-mode plan`, which refuses EVERY
+# MCP call including pure GETs. Reproduced verbatim before this change:
+#
+#     Cannot call mcp__ai-team-sync__my_authority while in plan mode.
+#
+# So the child could not read its own authority, its own session, the delegation
+# state, or the decision history it was delegated to consult. Plan mode also
+# writes a plan file under ~/.claude/plans/, so it was simultaneously too broad
+# for coordination and not actually a no-write guarantee.
+#
+# Tool names are a LIE in both directions, so the split below was derived by
+# inspecting each handler, never by reading a name (operator instruction):
+#   * `check_locks` and `whos_editing` are POSTs whose handlers issue no DB
+#     write at all -- query endpoints that happen to take a body.
+#   * `delegate` issues NO HTTP and shells out to `ats delegate`: it is
+#     recursive delegation, which READ_ONLY explicitly prohibits. A name-based
+#     or verb-based allow-list would have let it through.
+
+# Coordination reads a READ_ONLY child needs to do its job. Each is a GET
+# against the local service; `get_tower_task` is the canonical Tower Task
+# envelope in Echo Brain, the same builder the packet is rendered from.
+_READ_ONLY_COORDINATION_READS = (
+    "mcp__ai-team-sync__my_authority",        # authority: base, mode, effective
+    "mcp__ai-team-sync__get_session_details",  # its own session
+    "mcp__ai-team-sync__team_status",          # who else holds what
+    "mcp__ai-team-sync__get_decision_history",  # prior rulings it must not re-litigate
+    "mcp__ai-team-sync__delegation_status",    # its own delegation's state
+    "mcp__ai-team-sync__ats_version",          # MCP/REST skew before any claim
+    "mcp__echo-brain__get_tower_task",         # canonical Tower Task authority
+)
+
+# Built-ins a READ_ONLY child keeps. This is an ALLOW-list: `--tools` names the
+# available set, so every unlisted built-in is ABSENT, not merely refused.
+# Verified live -- Write, Edit, Bash and Task each answered "No such tool
+# available: X. X is disabled for this session, in subagents as well as here",
+# and that last clause is what closes the spawn-a-subagent-to-write escape.
+_READ_ONLY_BUILTINS = "Read,Grep,Glob"
+
+# Explicit denial of the acts the ruling names. Redundant by design: the
+# allow-list plus `--permission-prompts none` already denies anything unlisted,
+# so this list is a readable statement of the contract and a second lock if the
+# allow-list is ever widened. It is NOT the primary mechanism, which is why a
+# mutating tool nobody remembered to add here is still denied.
+_READ_ONLY_DENIED = (
+    # The work product.
+    "Edit", "Write", "NotebookEdit",
+    # Coordination-plane mutation, including another worker's session.
+    "mcp__ai-team-sync__start_session", "mcp__ai-team-sync__extend_scope",
+    "mcp__ai-team-sync__complete_session", "mcp__ai-team-sync__pause_session",
+    "mcp__ai-team-sync__resume_session", "mcp__ai-team-sync__delete_lock",
+    "mcp__ai-team-sync__log_decision", "mcp__ai-team-sync__request_override",
+    "mcp__ai-team-sync__respond_to_request", "mcp__ai-team-sync__record_restart",
+    # Marking its own homework, and delegating onward.
+    "mcp__ai-team-sync__reconcile_delegation", "mcp__ai-team-sync__delegate",
+    # Tower Task mutation, task close and gate changes.
+    "mcp__echo-brain__update_tower_task", "mcp__echo-brain__create_tower_task",
+    "mcp__echo-brain__reopen_tower_task", "mcp__echo-brain__rename_task_key",
+    "mcp__echo-brain__review_gate",
+)
+
+_CLAUDE_READ_ONLY = (
+    # Allow-list of built-ins: no shell, no writer, no subagent spawner.
+    "--tools", _READ_ONLY_BUILTINS,
+    # Nobody answers prompts, so anything that WOULD prompt is denied rather
+    # than hanging on an approval no automated parent gives. This is the piece
+    # that makes the policy fail-closed instead of honour-based.
+    "--permission-prompts", "none",
+    "--allowedTools", *_READ_ONLY_COORDINATION_READS,
+    "--disallowedTools", *_READ_ONLY_DENIED,
+)
+
+# VERIFY is DELIBERATELY left on the pre-ruling flags. It is the one mode that
+# must run tests, so it needs a shell, and the READ_ONLY allow-list above has no
+# Bash by design -- a Bash command-prefix allow-list is pattern matching on a
+# composable shell, which is not a boundary a safety property should rest on.
+# VERIFY therefore still carries plan mode and still cannot make coordination
+# reads. That is a KNOWN remaining gap, named here rather than silently widened:
+# the operator scoped this repair to READ_ONLY.
+_CLAUDE_VERIFY = ("--permission-mode", "plan",
+                  "--disallowedTools", "Edit", "Write", "NotebookEdit")
 
 # `-c approval_policy=never` is not a convenience: without it `codex exec`
 # waits on an approval prompt, and an automated parent never answers one.
@@ -133,7 +214,7 @@ _SPECS: dict[str, LaunchSpec] = {
         prompt_flag="-p",
         mode_args={
             READ_ONLY: _CLAUDE_READ_ONLY,
-            VERIFY: _CLAUDE_READ_ONLY,
+            VERIFY: _CLAUDE_VERIFY,
             # IMPLEMENT deliberately adds nothing: the scope lock and the
             # prohibitions list are what bound it, and the harness must stay
             # able to write inside the claimed scope.

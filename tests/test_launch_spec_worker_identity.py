@@ -87,18 +87,43 @@ def test_registry_workers_without_a_launcher_fail_closed():
 
 # ── 2. Claude enforcement must not regress ───────────────────────────────────
 
-@pytest.mark.parametrize("mode", (READ_ONLY, VERIFY))
-def test_claude_read_only_enforcement_is_at_least_as_strong_as_before(mode):
+def test_claude_verify_enforcement_is_unchanged_from_before_this_module():
     """The pre-existing harness flags, unchanged and in the same order.
 
-    These are the flags that made READ_ONLY real for Claude before this module
-    existed. The refactor is only allowed to add workers, never to weaken the
-    one that already worked.
+    VERIFY is the mode this tranche deliberately did not touch: it must run
+    tests, so it needs a shell, and it therefore keeps plan mode.
     """
-    argv = build_launch("claude-code", mode, PACKET, repo=REPO, which=FOUND_BOTH).argv
+    argv = build_launch("claude-code", VERIFY, PACKET, repo=REPO, which=FOUND_BOTH).argv
     assert argv[:3] == ["/usr/local/bin/claude", "-p", PACKET]
     assert argv[3:] == ["--permission-mode", "plan",
                         "--disallowedTools", "Edit", "Write", "NotebookEdit"]
+
+
+def test_claude_read_only_is_at_least_as_strong_as_plan_mode_was():
+    """READ_ONLY moved OFF plan mode by operator ruling 2026-09-12, because plan
+    mode refused every coordination read the delegated lifecycle needs.
+
+    Strength is asserted as a PROPERTY, not as a flag list. The literal-flag
+    assertion this replaces could only ever say "identical", so it could not
+    distinguish a narrowing from a weakening — and the direction is the whole
+    question. Every writer plan mode blocked is still blocked; the shell and the
+    subagent spawner plan mode ALLOWED are now gone as well, so the write surface
+    is strictly smaller. Full coverage in
+    tests/test_readonly_coordination_capability.py.
+    """
+    argv = build_launch("claude-code", READ_ONLY, PACKET, repo=REPO,
+                        which=FOUND_BOTH).argv
+    assert argv[:3] == ["/usr/local/bin/claude", "-p", PACKET]
+
+    tail = argv[3:]
+    # Still denied, exactly as plan mode denied them.
+    for writer in ("Edit", "Write", "NotebookEdit"):
+        assert writer in tail
+    # Built-ins are now an allow-list, so the shell and the subagent spawner are
+    # absent rather than merely discouraged.
+    assert tail[tail.index("--tools") + 1] == "Read,Grep,Glob"
+    # And nothing unlisted can slip through on an unanswered prompt.
+    assert tail[tail.index("--permission-prompts") + 1] == "none"
 
 
 def test_claude_implement_mode_keeps_write_access():

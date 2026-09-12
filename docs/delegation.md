@@ -30,7 +30,7 @@ noted.
 
 | Mode | May do | May not |
 |---|---|---|
-| `READ_ONLY` | read, investigate, report | write files, commit, restart services, submit expensive jobs, mutate task state, delegate onward |
+| `READ_ONLY` | read, investigate, report, **read ATS coordination state** | write files, commit, restart services, submit expensive jobs, mutate task state, delegate onward |
 | `IMPLEMENT` | write inside the declared scope, commit, run tests | restart services, submit expensive jobs, close the parent's task, delegate onward |
 | `VERIFY` | read, run tests | write files, commit, restart services, close the parent's task, delegate onward |
 
@@ -40,13 +40,79 @@ restrictions to the child process, so the prohibition survives the child
 ignoring its instructions. And the record states the prohibitions plainly, so a
 reader can check what was and was not permitted.
 
-Enforcement is per worker, not one flag set for everybody. Claude is launched
-with `--permission-mode plan --disallowedTools …`; Codex with
-`--sandbox read-only`, which its own runtime enforces. Handing Claude's flags to
+Enforcement is per worker, not one flag set for everybody. Codex is launched with
+`--sandbox read-only`, which its own runtime enforces; Claude READ_ONLY with a
+built-in allow-list and a per-tool MCP policy (below). Handing Claude's flags to
 Codex would mean nothing to it, so READ_ONLY would quietly decay from a
 restriction into a request. A worker/mode pair with no enforcement mapping
 **fails closed before anything is spawned** — it is refused, not run
 unrestricted.
+
+## READ_ONLY bounds the work product, not the coordination plane
+
+Operator ruling 2026-09-12. **READ_ONLY means the child cannot mutate the work
+product or Tower Task authority state.** It has never meant the child is expelled
+from coordination, and conflating the two broke the delegated lifecycle itself.
+
+Claude READ_ONLY used to be `--permission-mode plan`, which refuses *every* MCP
+call including pure reads:
+
+```
+Cannot call mcp__ai-team-sync__my_authority while in plan mode.
+```
+
+A Codex-led canary hit exactly that. The child launched correctly, received the
+full task envelope, did useful analysis — and then could not read its own
+authority, its own session, its delegation state, or the decision history it was
+sent to consult. Plan mode was also not a no-write guarantee: it writes a plan
+file under `~/.claude/plans/`.
+
+What Claude READ_ONLY carries now:
+
+| Flag | What it does |
+|---|---|
+| `--tools Read,Grep,Glob` | allow-list of **built-ins**. An unlisted built-in is *absent*, not refused — and absent "in subagents as well as here", which closes the spawn-a-subagent-to-write escape. No `Bash`, so no `git commit`, no `git push`, no `echo > file`. |
+| `--permission-prompts none` | anything that would prompt is denied automatically. This is what makes the policy fail-closed rather than dependent on nobody answering a prompt. |
+| `--allowedTools …` | the specific coordination reads, per tool. |
+| `--disallowedTools …` | explicit denial of the acts the ruling names. A **second** lock and a readable contract, never the primary mechanism — so a mutating tool nobody remembered to list is still denied by the two rows above. |
+
+Available to a READ_ONLY child: `my_authority`, `get_session_details`,
+`team_status`, `get_decision_history`, `delegation_status`, `ats_version`, and
+Echo Brain's `get_tower_task` (the canonical envelope, same builder the packet is
+rendered from).
+
+Blocked: every file writer, the shell, the subagent spawner, every ATS
+coordination mutation (including another worker's session), scope and authority
+escalation, reconciling its own delegation, delegating onward, and Tower Task
+mutation, closure or gate changes.
+
+**Mutability was determined by inspecting handlers, not by reading tool names**,
+because the names mislead in both directions. `check_locks` and `whos_editing`
+are POSTs whose handlers issue no write at all. `delegate` issues no HTTP
+whatsoever and shells out to `ats delegate`, which is recursive delegation — a
+name-based or verb-based allow-list would have let that through.
+
+`VERIFY` still carries plan mode. It is the one mode that must run tests, so it
+needs a shell, and a Bash command-prefix allow-list is pattern matching on a
+composable shell rather than a boundary. VERIFY therefore keeps the same
+coordination limitation; that is a known remaining gap, not an oversight.
+
+## The supervisor finalizes the child session
+
+**The delegation launcher owns child-session finalization. The child is never
+required to close itself.** Delegation correctness must not depend on a model
+remembering to call `complete_session` — and under READ_ONLY it cannot, because
+that call is a coordination mutation the launch spec denies.
+
+After the child process reaches any terminal outcome — clean exit, non-zero exit,
+lease expiry, or a spawn that never ran — the supervisor submits the result on the
+child's behalf and completes **that exact child session**. Both steps are
+unconditional, and the session close does not depend on the result submission
+succeeding. A child that failed to start cannot clean up after itself, and a
+supervisor that dies with its child leaves the orphan the contract exists to
+prevent.
+
+The parent session is never touched by any of this. Delegation is not handoff.
 
 ## Effective authority
 
@@ -80,7 +146,7 @@ Collapsing them either hides the restriction or hides the reason for it.
 | Act | Bound to |
 |---|---|
 | create the delegation | the parent session |
-| submit the result | the child session |
+| submit the result | the child session — posted by the supervisor on its behalf, with `actor_session_id` naming the child |
 | reconcile: accept or reject | the parent owner only; an unidentified caller is refused |
 | inspect (`delegation_status`) | anyone who can reach the service |
 
