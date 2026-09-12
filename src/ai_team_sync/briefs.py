@@ -51,6 +51,99 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("ATS_BRIEF_EMBED_MODEL", "nomic-embed-text")
 
 
+def fetch_tower_task_envelope(task_id: str | int, *, timeout: float = 10.0
+                              ) -> tuple[str, str | None]:
+    """(rendered envelope, error) for one Tower task, from Echo Brain.
+
+    Echo Brain owns Tower Tasks, so ATS asks rather than reaching into its
+    database, the same way preflight is a thin wrapper over Echo's analysis.
+
+    Returns ("", reason) on ANY failure -- unknown id, Echo down, bad shape --
+    and never a partial envelope. The caller decides what a missing envelope
+    means; for a delegation that named the task explicitly, it means refuse.
+    """
+    try:
+        tid = int(str(task_id).strip().lstrip("#"))
+    except (TypeError, ValueError):
+        return "", f"task id {task_id!r} is not numeric"
+
+    import httpx  # lazy, matching this module's other network callers
+
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            r = c.get(f"{ECHO_URL}/api/tower-tasks/{tid}")
+    except Exception as exc:  # noqa: BLE001
+        return "", f"Echo Brain unreachable at {ECHO_URL} ({type(exc).__name__})"
+
+    if r.status_code == 404:
+        return "", f"no Tower task with id {tid}"
+    if r.status_code >= 400:
+        return "", f"Echo Brain returned HTTP {r.status_code} for task {tid}"
+
+    try:
+        env = r.json()
+    except Exception:  # noqa: BLE001
+        return "", f"Echo Brain returned a non-JSON envelope for task {tid}"
+    if not isinstance(env, dict) or "description" not in env:
+        return "", f"envelope for task {tid} is missing its description field"
+
+    return render_task_envelope(env), None
+
+
+def render_task_envelope(env: dict[str, Any]) -> str:
+    """The envelope as a prompt block.
+
+    Mirrors Echo Brain's own render_envelope so a packet reads the same whether
+    the text was rendered here or there. Kept local rather than fetched as
+    pre-rendered text so ATS controls what a CHILD sees, and so a caller that
+    wants the structured fields is not forced through a string.
+    """
+    import json as _json
+
+    def _lines(label: str, body: str) -> list[str]:
+        return ["", f"  {label}", *[f"    {ln}" for ln in body.splitlines()]]
+
+    out = [
+        f"TOWER TASK #{env.get('id')} — {env.get('task_key')}",
+        f"  project : {env.get('project_name') or env.get('project_id')}",
+        f"  title   : {env.get('title') or ''}",
+        f"  status  : {env.get('status')}   gate: {env.get('gate')}"
+        f"   priority: {env.get('priority') if env.get('priority') is not None else '?'}",
+    ]
+    if env.get("parent_id"):
+        out.append(f"  parent  : #{env['parent_id']}")
+    if env.get("blocked_by"):
+        out.append("  blocked_by: " + ", ".join(str(b) for b in env["blocked_by"]))
+
+    claim = env.get("claim") or None
+    if claim:
+        out.append(f"  claim   : run {claim.get('run_id')} state={claim.get('state')} "
+                   f"executor={claim.get('executor')} "
+                   f"lease_expires={claim.get('lease_expires_at')}")
+
+    if env.get("is_closed"):
+        out += ["",
+                "  *** THIS TASK IS ALREADY CLOSED. The work may already be shipped.",
+                "      Verify before doing anything. Closure evidence:",
+                f"      {_json.dumps(env.get('verified_by'), default=str)}"]
+    elif env.get("verified_by"):
+        out.append(f"  verified_by: {_json.dumps(env['verified_by'], default=str)}")
+
+    if env.get("recommendation"):
+        out += _lines("RECOMMENDATION / OPERATOR RULING ON THIS TASK:",
+                      env["recommendation"])
+
+    out += ["",
+            "  DESCRIPTION — the task's authority: the required change, the",
+            "  acceptance criteria, and the prohibited approaches. Binding.",
+            ""]
+    out += [f"    {ln}" for ln in (env.get("description") or "(empty)").splitlines()]
+
+    if env.get("notes"):
+        out += _lines("NOTES:", env["notes"])
+    return "\n".join(out)
+
+
 @dataclass
 class BriefItem:
     provenance: str

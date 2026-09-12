@@ -632,6 +632,8 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
     import sys
     from ai_team_sync.launch_spec import (SPEC_VERSION, RoutingFailure,
                                           build_launch, validate_launchable)
+    from ai_team_sync.briefs import fetch_tower_task_envelope
+    from ai_team_sync.delegation_packet import build_child_packet
 
     server = _server_url()
     parent_session = parent_session or (_load_active_session() or "")
@@ -651,6 +653,24 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
     except RoutingFailure as exc:
         click.echo(f"delegation refused (routing failure): {exc}", err=True)
         sys.exit(3)
+
+    # The CURRENT task's authority, fetched before anything is created so a
+    # missing envelope costs no records. A delegation that NAMES a task and then
+    # launches without its acceptance criteria is worse than one with no task at
+    # all: the packet still says "parent task: 2649", so the child reasonably
+    # assumes the constraints arrived with it and reconstructs them when they
+    # did not. That reconstruction is the failure this whole path exists to end.
+    task_envelope_text = ""
+    if parent_task:
+        task_envelope_text, envelope_error = fetch_tower_task_envelope(parent_task)
+        if envelope_error:
+            click.echo(
+                f"delegation refused (no task authority): task {parent_task!r} was "
+                f"named explicitly but its envelope could not be fetched — "
+                f"{envelope_error}. Refusing to launch a child that would have to "
+                f"reconstruct the acceptance criteria. Drop --task to delegate "
+                f"without task authority, or fix the id / Echo Brain.", err=True)
+            sys.exit(4)
 
     with httpx.Client(timeout=30) as c:
         resp = c.post(f"{server}/api/delegations", json={
@@ -689,19 +709,9 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         except Exception as exc:  # noqa: BLE001
             brief = f"(no brief: {type(exc).__name__})"
 
-    packet = "\n".join([
-        f"DELEGATED TASK — mode {mode}",
-        f"delegation: {d['id']}",
-        f"parent task: {parent_task or '(none)'} — owned by {d['delegating_worker']}, NOT by you.",
-        "",
-        "OBJECTIVE", f"  {objective}",
-        "", "ACCEPTANCE — your answer is judged against this", f"  {acceptance}",
-        "", "SCOPE", "  " + (", ".join(scope) if scope else "(none — claim nothing)"),
-        "", "YOU MAY NOT", *[f"  - {p}" for p in d["prohibitions"]],
-        "", "Return findings with file:line citations. Do not report success you "
-        "have not demonstrated; the parent verifies your claims independently.",
-        "", "-" * 60, brief,
-    ])
+    packet = build_child_packet(
+        mode=mode, delegation=d, objective=objective, acceptance=acceptance,
+        scope=list(scope), task_envelope_text=task_envelope_text, brief=brief)
 
     if dry_run:
         click.echo(json.dumps({"delegation": d, "child_session": child_id,
