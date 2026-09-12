@@ -1390,9 +1390,34 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         f"rules, or retry."))]
 
                 icon = {"CLEAR": "✅", "CAUTION": "⚠", "STRONG_WARNING": "⛔",
-                        "INSUFFICIENT_EVIDENCE": "❔"}.get(d["disposition"], "•")
+                        "INSUFFICIENT_EVIDENCE": "❔",
+                        "ALREADY_COMPLETED": "🏁"}.get(d["disposition"], "•")
                 lines = [f"{icon} {d['disposition']} — preflight {d['preflight_request_id']}",
                          "", f"  {d['recommended_next']}", ""]
+
+                # LIVE TASK STATE, before any history. A closed task or one held
+                # by another worker changes what the caller should do next more
+                # than any amount of recall does, so it is not buried under the
+                # evidence counts.
+                ts = d.get("task_state") or None
+                if ts:
+                    lines += ["", f"  TOWER TASK #{ts.get('task_id')} "
+                                  f"{ts.get('task_key') or ''}".rstrip(),
+                              f"    status: {ts.get('status')}   gate: {ts.get('gate')}"
+                              f"   priority: {ts.get('priority')}"]
+                    if ts.get("is_closed"):
+                        lines.append(f"    CLOSED — verified_by: "
+                                     f"{json.dumps(ts.get('verified_by'), default=str)}")
+                    claim = ts.get("claim") or None
+                    if claim and ts.get("claim_is_live"):
+                        lines.append(f"    HELD BY: run {claim.get('run_id')} "
+                                     f"({claim.get('state')}) {claim.get('executor')}, "
+                                     f"lease until {claim.get('lease_expires_at')}")
+                    if ts.get("recommendation"):
+                        lines.append(f"    ruling: {ts['recommendation'][:200]}")
+                    if ts.get("conflict_with_history"):
+                        lines.append(f"    ⚠ {ts['conflict_with_history'][:300]}")
+
                 counts = d.get("evidence_by_authority") or {}
                 if counts:
                     lines.append("  evidence by authority: " + ", ".join(
