@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 # task_close: "no" | "conditional" | "yes"
 #   conditional = may close only against satisfied acceptance evidence, never on
 #   its own say-so. Closing is an authority act, not an implementation act.
+#   Conditional is held by the frontier workers as a CLASS, not per model: there
+#   is one conditional path and both read the same value through it.
 _BUILTINS: dict[str, dict[str, Any]] = {
     "claude-code": {
         "capabilities": ["repo_read", "multi_file_edit", "architecture",
@@ -42,9 +44,15 @@ _BUILTINS: dict[str, dict[str, Any]] = {
         "cost_class": "cloud",
         "concurrency": None,
     },
+    # Peer frontier worker to claude-code for Tower coding work, so it holds the
+    # SAME conditional close authority (operator ruling 2026-09-12). Withholding
+    # it made the lead-worker lifecycle unprovable by anyone but Claude, which is
+    # a property of the client rather than of the work. Not unconditional, and
+    # not broader autonomy: the acceptance evidence still decides at the gate.
     "codex": {
         "capabilities": ["repo_read", "bounded_edit", "tests", "code_review"],
-        "authority": {"edit": "claimed_scope", "commit": True, "task_close": "no"},
+        "authority": {"edit": "claimed_scope", "commit": True,
+                      "task_close": "conditional"},
         "cost_class": "cloud",
         "concurrency": None,
     },

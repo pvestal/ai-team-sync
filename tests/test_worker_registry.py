@@ -41,7 +41,7 @@ def test_an_unregistered_worker_keeps_pre_registry_rights_by_default():
 
     assert w.name == "default"
     assert w.may_claim_scope
-    assert not w.may_close_task
+    assert w.authority.task_close == "no", "close authority is granted, never inherited"
 
 
 def test_strict_mode_drops_an_unregistered_worker_to_read_only(monkeypatch):
@@ -66,12 +66,21 @@ def test_strict_mode_never_touches_a_registered_worker(monkeypatch):
     registry.cache_clear()
 
 
-def test_codex_may_edit_a_claimed_scope_but_never_closes_a_task():
+def test_codex_closes_on_the_same_conditional_terms_as_claude():
+    """Operator ruling 2026-09-12: frontier close authority is model-neutral.
+
+    Note what `may_close_task` can and cannot tell you. It is the UNCONDITIONAL
+    question, so it reads False for 'no' and for 'conditional' alike — which is
+    why the class is asserted by value here. See
+    tests/test_codex_close_authority.py for the full tranche.
+    """
     w = registry().resolve("codex")
 
     assert w.may_claim_scope
     assert w.may_commit
-    assert not w.may_close_task, "closing work is an authority decision, not an edit"
+    assert w.authority.task_close == "conditional"
+    assert w.authority.task_close == registry().resolve("claude-code").authority.task_close
+    assert not w.may_close_task, "conditional is not unconditional; the evidence decides"
 
 
 def test_capability_questions_are_answered_not_guessed():
@@ -151,4 +160,4 @@ def test_the_legacy_unknown_agent_keeps_editing_rights():
 
     assert w.may_claim_scope
     assert w.may_commit
-    assert not w.may_close_task
+    assert w.authority.task_close == "no"

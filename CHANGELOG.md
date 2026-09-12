@@ -55,6 +55,28 @@
   MCP server kept its spawn-time build so a session closure exercised the old
   handler after the new one was deployed.
 
+### Changed
+- **Frontier close authority is model-neutral: `codex` joins `claude-code` in the
+  conditional `task_close` class.** Operator ruling 2026-09-12. The Codex-led
+  lead-worker canary stopped correctly before selecting work, because the
+  deployed registry gave Claude `conditional` and Codex `no` — so the lifecycle
+  under test was unprovable by anyone but Claude, which is a property of the
+  client rather than of the work. One registry value changed; there is
+  deliberately NO Codex-specific closure policy, because the conditions
+  (ownership, Tower Task envelope, acceptance criteria, blocking gates,
+  verification, closure evidence, CI) live on the shared conditional path both
+  workers already read. Conditional is still not a yes: `may_close_task` remains
+  the unconditional question and answers NO for both, and the acceptance evidence
+  decides at the gate. Unchanged by design — `local`, `default` and `restricted`
+  stay at `no`; no worker is unconditional; and no delegation mode grants closing
+  to a child, since `effective_authority` is a rank-keyed intersection and every
+  mode envelope caps `task_close` at `no`, so a READ_ONLY or VERIFY child of a
+  conditional parent still closes nothing. A future worker such as Cursor
+  resolves to `default` and gets no close authority by arriving.
+  The pre-ruling Codex test could not have caught this either way: it asserted
+  only `may_close_task`, which reads False for `no` and `conditional` alike, so
+  the class is now asserted by value across the whole registry table.
+
 ### Added
 - **Delegation-authority hardening.** `GET /api/authority/{session_id}` and a
   delegation-aware `my_authority` report `base_authority`, the delegation
