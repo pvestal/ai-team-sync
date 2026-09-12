@@ -630,7 +630,8 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
     contaminate the next, and the exchange stays reproducible from the record.
     """
     import sys
-    from ai_team_sync.delegation import child_launch_argv
+    from ai_team_sync.launch_spec import (SPEC_VERSION, RoutingFailure,
+                                          build_launch, validate_launchable)
 
     server = _server_url()
     parent_session = parent_session or (_load_active_session() or "")
@@ -639,12 +640,28 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         sys.exit(1)
     repo = repo or (_repo_root() or "")
 
+    # Resolve the launcher BEFORE creating any record. Two reasons, both learned
+    # the hard way. A worker that cannot be launched must leave no delegation row
+    # and no child session behind for a spawn that never happened. And the binary
+    # is resolved HERE, in the parent, because that is the one identity value the
+    # child cannot influence -- child_env force-sets ATS_AGENT, so the child's own
+    # answer to "who are you" is just the parent's label read back.
+    try:
+        _spec, resolved_binary = validate_launchable(worker, mode, repo=repo)
+    except RoutingFailure as exc:
+        click.echo(f"delegation refused (routing failure): {exc}", err=True)
+        sys.exit(3)
+
     with httpx.Client(timeout=30) as c:
         resp = c.post(f"{server}/api/delegations", json={
             "parent_session_id": parent_session, "parent_task": parent_task,
             "delegated_worker": worker, "mode": mode, "repo_root": repo,
             "scope": list(scope), "objective": objective, "acceptance": acceptance,
             "lease_minutes": lease_minutes,
+            # Truth about the spawn, sent so the SERVER can re-derive whether
+            # this record is allowed to claim `worker` at all.
+            "resolved_binary": resolved_binary,
+            "launch_spec_version": SPEC_VERSION,
         })
         if resp.status_code >= 400:
             click.echo(f"delegation refused: {resp.text}", err=True)
@@ -691,11 +708,19 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
                                "packet": packet}, indent=2))
         return
 
-    argv = ["claude", "-p", packet, *child_launch_argv(mode)]
+    # THE defect this replaced: `argv = ["claude", "-p", packet, ...]` ran Claude
+    # for every worker, so `--worker codex` produced a Claude run recorded as a
+    # Codex review (proven live 2026-09-12, delegations 82fb4676 / 5c04aa74).
+    # build_launch picks the binary AND the enforcement flags together, because
+    # swapping only the binary would hand Claude's --disallowedTools to Codex,
+    # where they mean nothing and READ_ONLY would decay to a promise.
+    launch = build_launch(worker, mode, packet, repo=repo)
+    argv = launch.argv
     from ai_team_sync.delegation import child_env as _child_env
     env = _child_env(dict(os.environ), delegation_id=d["id"],
                      child_session_id=child_id, worker=worker)
-    click.echo(f"launching {worker} ({mode}, lease {lease_minutes}m)...", err=True)
+    click.echo(f"launching {worker} via {launch.resolved_binary} "
+               f"({mode}, lease {lease_minutes}m)...", err=True)
     try:
         # stdin closed: the child is not interactive, and left open the harness
         # waits on it before starting.
@@ -721,6 +746,11 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         "delegation_id": d["id"],
         "state": (ret.json().get("state") if ret.status_code < 400 else "return_refused"),
         "mode": mode,
+        # Requested identity and the binary that actually ran, never collapsed
+        # into one "worker" field a reader would have to trust.
+        "requested_worker": worker,
+        "resolved_binary": launch.resolved_binary,
+        "launch_spec_version": launch.spec_version,
         "parent_still_owns": d["parent_owner_session_id"],
         "child_session_id": child_id,
         "result": output,

@@ -209,7 +209,7 @@ class Delegation(Base):
     Deliberately NOT a handoff: `parent_session_id` keeps owning the work for
     the whole life of the child, and nothing in the child's lifecycle writes to
     the parent. `mode` is enforced (see delegation.effective_authority and
-    child_launch_argv), not merely recorded.
+    launch_spec.build_launch), not merely recorded.
     """
 
     __tablename__ = "delegations"
@@ -221,7 +221,19 @@ class Delegation(Base):
         ForeignKey("sessions.id", ondelete="CASCADE"))
     parent_task: Mapped[str] = mapped_column(String(120), default="")
     delegating_worker: Mapped[str] = mapped_column(String(100), default="")
+    # The worker that was REQUESTED. Kept under its original name because every
+    # existing reader uses it, but it is a request, never evidence of what ran.
     delegated_worker: Mapped[str] = mapped_column(String(100), default="")
+    # What actually ran: the absolute executable the PARENT resolved before
+    # spawning. This is the identity field, and delegated_worker is not. Before
+    # it existed, `--worker codex` recorded a satisfied Codex delegation that a
+    # Claude process had performed (2026-09-12, delegations 82fb4676/5c04aa74).
+    # A child cannot influence this: delegation.child_env force-sets ATS_AGENT,
+    # so any self-report is the parent's own label read back.
+    resolved_binary: Mapped[str] = mapped_column(String(1024), default="")
+    # Which launch contract produced that argv, so a record stays auditable
+    # after the contract moves.
+    launch_spec_version: Mapped[str] = mapped_column(String(20), default="")
     mode: Mapped[str] = mapped_column(String(20), default="READ_ONLY")
     repo_root: Mapped[str] = mapped_column(String(1024), default="")
     scope: Mapped[str] = mapped_column(Text, default="[]")        # JSON list

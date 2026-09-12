@@ -20,6 +20,11 @@ _COLUMN_MIGRATIONS = [
     # which is the conservative direction: a historical auto-completion will not
     # resurrect, it just behaves as it does today.
     ("sessions", "auto_completed", "BOOLEAN DEFAULT 0"),
+    # Truthful delegation provenance. Historical rows backfill to '', which
+    # reads correctly as "this record cannot evidence which worker ran" rather
+    # than silently asserting the requested one did.
+    ("delegations", "resolved_binary", "TEXT DEFAULT ''"),
+    ("delegations", "launch_spec_version", "TEXT DEFAULT ''"),
 ]
 
 engine = create_async_engine(

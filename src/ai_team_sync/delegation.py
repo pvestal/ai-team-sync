@@ -71,24 +71,6 @@ def effective_authority(worker: Worker, mode: str) -> Authority:
                      task_close=task_close)
 
 
-def child_launch_argv(mode: str) -> list[str]:
-    """Harness-level enforcement for a delegated Claude Code child.
-
-    The ATS record refuses the CLAIM; this refuses the ACT. `plan` mode is the
-    harness's own read-only posture, and the disallowed list closes the obvious
-    write paths so 'READ_ONLY' is not honour-system. Kept next to the
-    prohibitions it implements so the two cannot drift apart silently.
-    """
-    if mode == IMPLEMENT:
-        return []
-    # Tool names must match the harness's own registry: an unknown name is
-    # reported as "matches no known tool" and silently denies NOTHING, which is
-    # the worst outcome for a rule whose whole job is to deny. 'MultiEdit' was
-    # in the first draft and does not exist in this Claude Code build.
-    return ["--permission-mode", "plan",
-            "--disallowedTools", "Edit", "Write", "NotebookEdit"]
-
-
 def child_state_dir(delegation_id: str) -> Path:
     """A private pointer directory for one delegated child."""
     return (Path.home() / ".local" / "share" / "ai-team-sync"

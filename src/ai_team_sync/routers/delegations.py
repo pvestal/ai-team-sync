@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_team_sync.database import get_db
 from ai_team_sync.delegation import MODES, READ_ONLY, prohibitions_for
+from ai_team_sync.launch_spec import RoutingFailure, validate_resolution
 from ai_team_sync.models import Delegation, Session
 
 router = APIRouter(prefix="/delegations", tags=["delegations"])
@@ -32,6 +33,11 @@ class DelegationCreate(BaseModel):
     acceptance: str = ""
     extra_prohibitions: list[str] = Field(default_factory=list)
     lease_minutes: int = 60
+    # The absolute executable the caller resolved before spawning, and the
+    # launch contract it used. Empty is accepted only for callers that do not
+    # spawn anything (tests, tooling that records an already-finished exchange).
+    resolved_binary: str = ""
+    launch_spec_version: str = ""
 
 
 class DelegationReturn(BaseModel):
@@ -62,6 +68,12 @@ def _as_dict(d: Delegation) -> dict:
         "parent_task": d.parent_task,
         "delegating_worker": d.delegating_worker,
         "delegated_worker": d.delegated_worker,
+        # Same value, named for what it actually is. A reader deciding whether
+        # to trust "Codex reviewed this" must compare these two, never read the
+        # worker name alone.
+        "requested_worker": d.delegated_worker,
+        "resolved_binary": d.resolved_binary or None,
+        "launch_spec_version": d.launch_spec_version or None,
         "mode": d.mode,
         "repo_root": d.repo_root,
         "scope": json.loads(d.scope or "[]"),
@@ -105,6 +117,21 @@ async def create_delegation(body: DelegationCreate, db: AsyncSession = Depends(g
                                 "parent cannot reconcile what comes back, and "
                                 "'it worked' becomes the acceptance test")})
 
+    # Re-derive the routing rule server-side rather than trusting the caller's
+    # pairing. A record may claim worker X only if the binary that was resolved
+    # is X's. requested=codex + resolved=claude is a ROUTING FAILURE and must
+    # never be stored as a satisfied Codex delegation (observed 2026-09-12).
+    if body.resolved_binary:
+        try:
+            validate_resolution(body.delegated_worker, body.resolved_binary)
+        except RoutingFailure as exc:
+            raise HTTPException(
+                409,
+                detail={"error": "routing_failure",
+                        "requested_worker": body.delegated_worker,
+                        "resolved_binary": body.resolved_binary,
+                        "message": str(exc)}) from exc
+
     parent = await db.get(Session, body.parent_session_id)
     if parent is None:
         raise HTTPException(404, detail={"error": "no_such_parent"})
@@ -123,6 +150,8 @@ async def create_delegation(body: DelegationCreate, db: AsyncSession = Depends(g
         parent_task=body.parent_task,
         delegating_worker=parent.agent,
         delegated_worker=body.delegated_worker,
+        resolved_binary=body.resolved_binary,
+        launch_spec_version=body.launch_spec_version,
         mode=body.mode,
         repo_root=body.repo_root or parent.repo_root,
         scope=json.dumps(body.scope),
