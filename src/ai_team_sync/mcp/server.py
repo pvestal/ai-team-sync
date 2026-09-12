@@ -462,6 +462,40 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="preflight",
+            description=(
+                "Before you spend real work — a render, a GPU canary, a migration, "
+                "a bounded edit — ask whether this exact action has already been "
+                "tried and what happened. Returns a disposition (CLEAR / CAUTION / "
+                "STRONG_WARNING / INSUFFICIENT_EVIDENCE) with every citation behind "
+                "it: failed approaches, operator rulings, prior sessions, failure "
+                "clusters, and whether anything material changed since. ADVISORY: it "
+                "changes nothing and does not block you. A STRONG_WARNING means "
+                "somebody already bought that answer; read the citations before "
+                "buying it again."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "objective": {"type": "string",
+                                  "description": "The action you are about to take."},
+                    "operation_type": {"type": "string",
+                                       "enum": ["investigate", "edit", "test", "render",
+                                                "gpu_canary", "service_restart",
+                                                "migration", "other"]},
+                    "repo_root": {"type": "string"},
+                    "scope": {"type": "array", "items": {"type": "string"},
+                              "description": "Path globs the action would touch."},
+                    "task_id": {"type": "integer", "description": "Tower task id, if any."},
+                    "entities": {"type": "object",
+                                 "description": ("Structured specifics where known: "
+                                                 "scene, shot, cast, method, lane, "
+                                                 "model, subsystem, error_signature.")},
+                },
+                "required": ["objective"],
+            },
+        ),
+        Tool(
             name="task_brief",
             description=(
                 "The context packet for a piece of work: live blockers, prior ATS "
@@ -1324,6 +1358,58 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     text=(proc.stdout.strip() +
                           "\n\nYou still own the parent task. Verify the claims above "
                           "against the acceptance criteria before accepting them."))]
+
+            elif name == "preflight":
+                # Thin wrapper. Echo Brain owns the analysis so authority
+                # ordering and evidence live in one place; ATS never decides a
+                # disposition of its own.
+                echo = os.environ.get("ECHO_BRAIN_URL", "http://localhost:8309")
+                payload = {
+                    "objective": arguments["objective"],
+                    "requesting_worker": session_agent_label(),
+                    "requesting_session": active_session_id or None,
+                    "repo_root": arguments.get("repo_root", ""),
+                    "tower_task_id": arguments.get("task_id"),
+                    "operation_type": arguments.get("operation_type", "other"),
+                    "declared_scope": arguments.get("scope", []),
+                    "entities": arguments.get("entities", {}),
+                }
+                try:
+                    r = await client.post(f"{echo}/api/preflight", json=payload, timeout=90)
+                    r.raise_for_status()
+                    d = r.json()
+                except Exception as exc:  # noqa: BLE001
+                    # Fail HONESTLY. An unavailable support service is unknown,
+                    # never CLEAR — answering "go ahead" because the thing that
+                    # would have warned you is down is the worst possible default.
+                    return [TextContent(type="text", text=(
+                        f"⚠ PREFLIGHT UNAVAILABLE ({type(exc).__name__}). This is NOT "
+                        f"a CLEAR result: no history was checked. Echo Brain at {echo} "
+                        f"did not answer. Proceed on your own judgement and operator "
+                        f"rules, or retry."))]
+
+                icon = {"CLEAR": "✅", "CAUTION": "⚠", "STRONG_WARNING": "⛔",
+                        "INSUFFICIENT_EVIDENCE": "❔"}.get(d["disposition"], "•")
+                lines = [f"{icon} {d['disposition']} — preflight {d['preflight_request_id']}",
+                         "", f"  {d['recommended_next']}", ""]
+                counts = d.get("evidence_by_authority") or {}
+                if counts:
+                    lines.append("  evidence by authority: " + ", ".join(
+                        f"{k}={v}" for k, v in sorted(counts.items())))
+                for label, key in (("OPERATOR RULINGS", "operator_decisions"),
+                                   ("FAILED APPROACHES", "failed_approaches"),
+                                   ("CHANGED SINCE", "change_since_evidence")):
+                    items = d.get(key) or []
+                    if items:
+                        lines += ["", f"  {label}"]
+                        for e in items[:4]:
+                            lines.append(f"    [{e['authority_class']}] {e['citation']}")
+                            if e.get("evidence_text"):
+                                lines.append(f"        {e['evidence_text'][:160]}")
+                if d.get("degraded_reason"):
+                    lines += ["", f"  degraded: {d['degraded_reason']}"]
+                lines += ["", "  Advisory. Nothing was changed; the decision is yours."]
+                return [TextContent(type="text", text="\n".join(lines))]
 
             elif name == "task_brief":
                 response = await client.post(

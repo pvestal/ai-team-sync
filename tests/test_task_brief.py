@@ -174,3 +174,57 @@ def test_a_memory_that_states_its_citation_keeps_it():
                              "content": "x"})
 
     assert cite == "project_facts/43 · ats:session/4df033bf"
+
+
+# --- the preflight hint ----------------------------------------------------
+
+def test_the_hint_fires_on_an_operator_ruling_in_scope():
+    from ai_team_sync.briefs import OPERATOR_DECISION, BriefItem, preflight_hint
+
+    on, why = preflight_hint([], [BriefItem(OPERATOR_DECISION, "do not rerun the lane",
+                                            "echo:/…/operator_rule.md")])
+
+    assert on and "operator_rule.md" in why
+
+
+def test_the_hint_fires_on_a_recorded_prohibition():
+    from ai_team_sync.briefs import INFERRED, BriefItem, preflight_hint
+
+    on, why = preflight_hint(
+        [BriefItem(INFERRED, "Park the cohort: do not rerun the pair lane",
+                   "ats:decision/abc")], [])
+
+    assert on and "ats:decision/abc" in why
+
+
+def test_the_hint_stays_quiet_for_ordinary_history():
+    from ai_team_sync.briefs import INFERRED, BriefItem, preflight_hint
+
+    on, why = preflight_hint(
+        [BriefItem(INFERRED, "Route the render through the guarded lane",
+                   "ats:decision/z")], [])
+
+    assert on is False and why is None
+
+
+def test_a_false_hint_is_not_a_clear_verdict():
+    """False means the cheap trigger found nothing, not that preflight would pass."""
+    from ai_team_sync.briefs import preflight_hint
+
+    on, why = preflight_hint([], [])
+
+    assert on is False and why is None
+
+
+@pytest.mark.asyncio
+async def test_the_brief_carries_the_hint_fields(client, monkeypatch):
+    import ai_team_sync.briefs as briefs
+    monkeypatch.setattr(briefs, "recall_memories", lambda *a, **kw: [])
+
+    resp = await client.post("/api/brief", json={
+        "objective": "anything", "repo_root": "/opt/anime-studio",
+        "scope": [], "recall": False})
+
+    body = resp.json()
+    assert "preflight_recommended" in body and body["preflight_recommended"] is False
+    assert "preflight_reason" in body

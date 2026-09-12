@@ -210,6 +210,38 @@ def _overlaps(pattern: str, scope: list[str]) -> bool:
     return any(fnmatch(p, pattern) or fnmatch(pattern, p) or p == pattern for p in scope)
 
 
+# Phrasings that mark a standing prohibition. Used ONLY to raise a cheap hint,
+# never to assign authority — an agent's wording cannot make its own note a
+# ruling, which is the mistake preflight had to unlearn.
+_PROHIBITION = ("do not ", "don't ", "must not", "never ", "stand down",
+                "prohibited", "do NOT")
+
+
+def preflight_hint(decisions: list[BriefItem], recall: list[BriefItem]
+                   ) -> tuple[bool, str | None]:
+    """Should this worker run a preflight before doing real work?
+
+    Deterministic and free: it reads material the brief ALREADY gathered and
+    runs no query, no embedding and no model. It is a TRIGGER, not an analysis —
+    the analysis lives in Echo Brain's preflight, which does the deterministic
+    matching, change-since check and authority ordering this cannot.
+
+    False means the cheap trigger found nothing obvious. It does NOT mean a
+    preflight would come back CLEAR.
+    """
+    for item in recall:
+        if item.provenance == OPERATOR_DECISION:
+            return True, f"an operator ruling is in scope ({item.citation})"
+
+    for item in decisions + recall:
+        text = (item.text or "").lower()
+        if any(p in text for p in _PROHIBITION):
+            return True, f"prior work records a prohibition ({item.citation})"
+        if "failed_approach" in text or "fails_how" in text:
+            return True, f"a failed approach is already recorded ({item.citation})"
+    return False, None
+
+
 async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
                       scope: list[str] | None = None, recall: bool = True,
                       limit: int = 8) -> dict[str, Any]:
@@ -291,7 +323,11 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
     for bucket in (decisions, prior_work, memories):
         bucket.sort(key=lambda i: order.get(id(i), 10_000))
 
+    recommended, why = preflight_hint(decisions, memories)
+
     packet = {
+        "preflight_recommended": recommended,
+        "preflight_reason": why,
         "objective": objective,
         "repo_root": repo_root,
         "scope": scope,
@@ -327,6 +363,12 @@ def render(packet: dict[str, Any]) -> str:
         for i in items:
             lines.append(f"  [{i['provenance']}] {i['text']}")
             lines.append(f"      ↳ {i['citation']}")
+
+    if packet.get("preflight_recommended"):
+        lines += ["", "PREFLIGHT RECOMMENDED before you spend real work",
+                  f"  {packet.get('preflight_reason')}",
+                  "  Call the `preflight` tool with what you are about to do. "
+                  "This hint is a cheap trigger, not an answer."]
 
     lines += ["", f"recall: {packet['recall_status']}",
               "Provenance is carried, not merged: INFERRED is somebody's reading, "
