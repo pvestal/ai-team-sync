@@ -21,3 +21,7 @@ out/
 
 # Build output: the commit stamped into the package at deploy time.
 src/ai_team_sync/_build_stamp.py
+
+# Lockfile for a package manager this project does not use; pip/pyproject is
+# the install path. Ignored so a stray `uv` run cannot land one.
+uv.lock

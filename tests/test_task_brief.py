@@ -146,7 +146,7 @@ async def test_decisions_from_another_repo_do_not_leak_into_the_brief(client, mo
 
     other = await client.post("/api/sessions", json={
         "developer": "patrick", "agent": "codex", "scope": ["src/**"],
-        "description": "unrelated repo", "repo_root": "/home/patrick/code/ai-team-sync",
+        "description": "unrelated repo", "repo_root": "/srv/other-repo",
     })
     await client.post(f"/api/sessions/{other.json()['id']}/decisions", json={
         "title": "Unrelated choice", "chosen": "something", "reasoning": "elsewhere",

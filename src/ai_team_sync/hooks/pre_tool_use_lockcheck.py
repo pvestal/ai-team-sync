@@ -123,8 +123,12 @@ def find_conflicts(rel: str, sessions: list, my_session_id: str,
 
 
 def _coordinated_roots() -> list[str]:
-    raw = os.environ.get("ATS_COORDINATED_REPOS",
-                         "/opt/anime-studio:/opt/tower-echo-brain")
+    # EMPTY by default. The claim guard fails CLOSED inside a coordinated repo,
+    # so shipping someone else's repo paths as the default would either enforce
+    # nothing (the paths do not exist) or enforce it somewhere unexpected.
+    # Opt in per machine:
+    #   export ATS_COORDINATED_REPOS=/srv/my-repo:/srv/other-repo
+    raw = os.environ.get("ATS_COORDINATED_REPOS", "")
     return [r.rstrip("/") for r in raw.split(":") if r.strip()]
 
 

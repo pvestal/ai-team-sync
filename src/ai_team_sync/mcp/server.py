@@ -256,7 +256,7 @@ async def list_tools() -> list[Tool]:
                     "repo_root": {
                         "type": "string",
                         "description": "Absolute git root your scope patterns are relative to "
-                                       "(e.g., '/opt/anime-studio'). PASS THIS when working a "
+                                       "(e.g., '/srv/my-repo'). PASS THIS when working a "
                                        "specific repo: it anchors your locks so identical "
                                        "patterns in OTHER repos don't false-block anyone. "
                                        "Omit only for cross-repo/unscoped work (legacy "
@@ -353,8 +353,8 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="record_restart",
             description=(
-                "Record that you restarted a SHARED service (comfyui, comfyui-rocm, "
-                "anime-studio, tower-echo-brain, ollama, ...). Call this right after "
+                "Record that you restarted a SHARED service (a build server, a model "
+                "runner, an API other agents depend on). Call this right after "
                 "`systemctl restart`. A restart drops queued prompts, kills in-flight "
                 "renders and deploys whatever is on disk, and it is invisible to every "
                 "other session unless it is recorded here — team_status shows only a "
@@ -366,7 +366,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "unit": {
                         "type": "string",
-                        "description": "systemd unit, e.g. 'comfyui' ('.service' and case are normalized)",
+                        "description": "systemd unit, e.g. 'my-api' ('.service' and case are normalized)",
                     },
                     "reason": {
                         "type": "string",
@@ -405,7 +405,7 @@ async def list_tools() -> list[Tool]:
                 "properties": {
                     "unit": {
                         "type": "string",
-                        "description": "Optional: limit to one unit, e.g. 'comfyui'",
+                        "description": "Optional: limit to one unit, e.g. 'my-api'",
                     },
                     "limit": {"type": "integer", "description": "Max rows (default 20)"},
                 },
@@ -499,7 +499,8 @@ async def list_tools() -> list[Tool]:
             name="task_brief",
             description=(
                 "The context packet for a piece of work: live blockers, prior ATS "
-                "decisions, prior work in this scope, and Echo Brain recall, each "
+                "decisions, prior work in this scope, and recall from a memory service "
+                "if one is configured, each "
                 "line carrying its provenance (OBSERVATION / INFERRED / VERIFIED / "
                 "OPERATOR_DECISION) and a citation you can check. Ask BEFORE "
                 "investigating or spending a canary — it is how you find out a lane "
@@ -515,7 +516,7 @@ async def list_tools() -> list[Tool]:
                     "scope": {"type": "array", "items": {"type": "string"},
                               "description": "Path globs you expect to touch."},
                     "recall": {"type": "boolean",
-                               "description": "Consult Echo Brain (default true)."},
+                               "description": "Consult the configured memory service (default true)."},
                 },
                 "required": ["objective"],
             },

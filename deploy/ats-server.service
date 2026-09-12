@@ -24,11 +24,11 @@ Environment=ATS_PORT=8400
 # repo). A relative sqlite URL resolves against CWD, so a launcher started
 # somewhere else opens an empty/stale database and every session and lock
 # silently disappears.
-Environment=DATABASE_URL=sqlite+aiosqlite:////home/patrick/.local/share/ai-team-sync/ats.db
-WorkingDirectory=/home/patrick/.local/share/ai-team-sync
+Environment=DATABASE_URL=sqlite+aiosqlite:///%h/.local/share/ai-team-sync/ats.db
+WorkingDirectory=%h/.local/share/ai-team-sync
 # The pipx-installed entry point: `pipx install --force <repo>` is the one
 # deploy action for the server, the MCP, the CLI and the hooks together.
-ExecStart=/home/patrick/.local/bin/ats-server
+ExecStart=%h/.local/bin/ats-server
 Restart=on-failure
 RestartSec=3
 

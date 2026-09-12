@@ -4,7 +4,11 @@ Stop AI agents (and humans) from stepping on each other's work.
 
 When two devs both tell their AI agents to change the same files, nobody knows until conflicting PRs appear. ai-team-sync gives instant visibility — who's working on what, and why — through declared **sessions**, file **scope locks** (advisory or exclusive), and logged **decisions**. It surfaces in VS Code, a browser dashboard, a CLI, and natively in Claude Code via MCP.
 
-> Status: built as a personal multi-agent coordination tool, used daily. Small, dependency-light, MIT-licensed — useful if you run more than one coding agent against the same repo.
+> Status: **experimental.** A multi-agent coordination service for coding agents —
+> shared sessions, advisory locks, durable decisions, bounded delegation, authority
+> inspection, and context/preflight support. Built as a personal tool and used daily.
+> Small, dependency-light, MIT-licensed. It coordinates agents that are already
+> cooperating; it is not a security boundary and not an autonomous orchestrator.
 
 ![ai-team-sync dashboard — who's working on what, color-coded by developer, with the files each has open](docs/dashboard.png)
 
@@ -62,6 +66,16 @@ pytest                      # run the test suite (needs the [dev] extra)
 
 Console entry points: `ats` (CLI), `ats-server` (API/dashboard), `ats-mcp` (MCP server for Claude Code).
 
+## Documentation
+
+- [MCP tools](docs/mcp-tools.md) — the full tool surface, what reads and what mutates,
+  and why a running client can hold a stale catalog after a deploy.
+- [Delegation](docs/delegation.md) — bounded work between agents: modes, effective
+  authority, and why a delegation is not a handoff.
+- [Context and preflight](docs/context-and-preflight.md) — what a session claim returns,
+  and how to ask whether an action has already been tried.
+- [Authority model](docs/authority-model.md) — who may change what, and on what evidence.
+
 ### Run as a service
 
 Install the **user** unit — the server holds one developer's coordination state, needs no root, and must outlive the terminal that started it:
@@ -78,7 +92,7 @@ Two things the unit pins deliberately, both of which have bitten this box:
 - **`DATABASE_URL` is absolute.** The default sqlite URL is relative, so it resolves against the process CWD — a launcher started elsewhere opens a different database and every session, lock and decision silently disappears.
 - **`ATS_HOST` is loopback.** The write API is unauthenticated. Expose it to a LAN only deliberately.
 
-Do not also install this as a system unit: two servers fight over 8400, and the second one is the one with the wrong database. Edit the paths if your install location differs from `/home/patrick`.
+Do not also install this as a system unit: two servers fight over 8400, and the second one is the one with the wrong database. Edit the paths if your install location differs; `%h` expands to the invoking user's home in a systemd **user** unit, and the `Environment=` lines below are the two settings worth reviewing.
 
 ## How to use
 

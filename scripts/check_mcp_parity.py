@@ -20,7 +20,8 @@ import subprocess
 import sys
 import urllib.request
 
-ATS_MCP = os.environ.get("ATS_MCP_BIN", "/home/patrick/.local/bin/ats-mcp")
+ATS_MCP = os.environ.get(
+    "ATS_MCP_BIN", os.path.expanduser("~/.local/bin/ats-mcp"))
 SERVER = os.environ.get("ATS_SERVER_URL", "http://localhost:8400")
 
 

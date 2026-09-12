@@ -30,8 +30,13 @@ def test_shipped_unit_pins_an_absolute_database_url_and_loopback_bind():
 
     db = [d for d in directives if d.startswith("Environment=DATABASE_URL=")]
     assert db, "unit must pin DATABASE_URL"
-    assert db[0].split("=", 2)[2].startswith("sqlite+aiosqlite:////"), \
-        "DATABASE_URL must be ABSOLUTE (four slashes) — a relative URL follows CWD"
+    url = db[0].split("=", 2)[2]
+    # Absolute, however it is spelled. systemd expands %h to the invoking user's
+    # home in a USER unit, so 'sqlite+aiosqlite:///%h/...' resolves to the same
+    # four-slash absolute form. What must never appear is a bare relative path,
+    # which would follow the process CWD and silently open a different database.
+    assert url.startswith("sqlite+aiosqlite:////") or url.startswith("sqlite+aiosqlite:///%h/"), \
+        f"DATABASE_URL must resolve ABSOLUTE; got {url!r}"
 
     assert "Environment=ATS_HOST=127.0.0.1" in directives
     # A user unit, not a system one: two servers would fight over 8400.
