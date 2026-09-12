@@ -3,6 +3,59 @@
 ## [Unreleased]
 
 ### Added
+- **The worker ATS names is the worker that actually ran.** `delegate` used one
+  hardcoded command line, so `--worker codex` created a row labelled
+  `codex:delegate`, applied Codex's authority envelope, and then ran the CLAUDE
+  binary. Proven live on two delegations by process tree while `/usr/bin/codex`
+  sat installed and unused; both closed as satisfied Codex work. Replaced by a
+  per-worker launch specification owning the binary, the prompt convention AND
+  the per-mode enforcement flags — swapping only the binary would have handed
+  Claude's `--disallowedTools` to Codex, where they mean nothing, silently
+  decaying READ_ONLY into a promise. A worker/mode pair with no enforcement
+  mapping fails closed *before* anything is spawned, so a refused routing leaves
+  no delegation row and no orphan child session. The absolute executable is
+  resolved in the parent and stored as `delegations.resolved_binary` alongside
+  `requested_worker`; the server re-derives the pairing from the registry, so
+  requested=codex + resolved=claude is a 409 that stores nothing. Identity is
+  deliberately NOT taken from the child's self-report: `child_env` injects
+  `ATS_AGENT`, so that would compare the parent's own text with itself.
+- **A delegated worker inherits the task's authority, not just history.** When a
+  delegation names a Tower task, the packet now carries that task's canonical
+  envelope — id, key, project, status, gate, claim, operator ruling,
+  `verified_by`, and the full description holding the acceptance criteria and
+  prohibited approaches — rendered *before* the objective, because a worker that
+  reads the objective first starts solving. It stays a separate block from the
+  context brief: the envelope is current binding authority, the brief is prior
+  history with per-line provenance. A closed task renders an explicit
+  already-closed warning with its closure evidence. A task named explicitly
+  whose envelope cannot be fetched refuses the delegation before any record
+  exists. Every worker receives a byte-identical packet, so authority is
+  worker-independent by construction.
+- **Preflight answers about the live task, not only its history.** With
+  `task_id`, the Tower task is read before any evidence is gathered. A finished
+  task returns the new `ALREADY_COMPLETED` disposition carrying `verified_by`; a
+  live claim or a blocking gate returns `CAUTION` naming the holder or the gate;
+  an unknown id fails closed persisting nothing. Live state outranks recall when
+  they disagree, and the conflict is shown rather than silently resolved.
+- **`complete_session` completes the session you name.** It accepts an
+  authoritative `session_id` and returns the row, agent, prior→resulting status,
+  timestamp and how the target was chosen. Existence and ownership settle before
+  any pointer question, so a missing session is refused as missing and another
+  worker's as theirs. Only a pointer that speaks for *this* caller can refuse a
+  mismatch; the shared `~/.ats_session` never can, which is what lets a
+  delegated child complete itself while the global file still names its parent.
+  Omitting the id is the legacy path, unchanged and still refusing the shared
+  pointer, but now reporting the resolved id. A terminal session is reported,
+  not re-patched, because the endpoint is not idempotent.
+- **`scripts/proof_context.sh`** — what code a live proof actually exercises:
+  both repo HEADs, the deployed ATS commit with pid and start time, the
+  echo-brain process against its last commit, and every live `ats-mcp` with its
+  spawn time. Written after two proofs ran against code that was not the code
+  under test: a bare `pipx install --force` skipped the build stamp, and a stdio
+  MCP server kept its spawn-time build so a session closure exercised the old
+  handler after the new one was deployed.
+
+### Added
 - **Delegation-authority hardening.** `GET /api/authority/{session_id}` and a
   delegation-aware `my_authority` report `base_authority`, the delegation
   `mode`, and the `effective_authority` intersection separately — reporting only
