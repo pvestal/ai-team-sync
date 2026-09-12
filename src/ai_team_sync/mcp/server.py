@@ -1406,8 +1406,15 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                               f"    status: {ts.get('status')}   gate: {ts.get('gate')}"
                               f"   priority: {ts.get('priority')}"]
                     if ts.get("is_closed"):
-                        lines.append(f"    CLOSED — verified_by: "
-                                     f"{json.dumps(ts.get('verified_by'), default=str)}")
+                        # The full verified_by is already in the recommendation
+                        # above; repeating a 1KB JSON blob two lines later buries
+                        # the rest of the block. Name the commit, point at it.
+                        vb = ts.get("verified_by") or {}
+                        commit = (vb.get("commit") if isinstance(vb, dict) else None)
+                        lines.append(
+                            f"    CLOSED — verified_by commit "
+                            f"{str(commit)[:12] if commit else '(none recorded)'}"
+                            f" (full evidence in the recommendation above)")
                     claim = ts.get("claim") or None
                     if claim and ts.get("claim_is_live"):
                         lines.append(f"    HELD BY: run {claim.get('run_id')} "
@@ -1416,7 +1423,10 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     if ts.get("recommendation"):
                         lines.append(f"    ruling: {ts['recommendation'][:200]}")
                     if ts.get("conflict_with_history"):
-                        lines.append(f"    ⚠ {ts['conflict_with_history'][:300]}")
+                        # Marker only. The full historical reading is already
+                        # carried verbatim in the recommendation.
+                        lines.append("    ⚠ live task state overrode the historical "
+                                     "reading (see HISTORY ALSO SAYS above)")
 
                 counts = d.get("evidence_by_authority") or {}
                 if counts:
