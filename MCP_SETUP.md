@@ -62,47 +62,25 @@ Copy `mcp-config.json` to your project root and Claude Code will auto-load it.
 
 ---
 
-## Available MCP Tools (18 Total)
+## Available MCP tools
 
-### Core Session Management
-| Tool | Purpose | When to Use |
-|------|---------|-------------|
-| `start_session` | Start working session with locks | Beginning work on files |
-| `pause_session` | Pause session (keep locks) | Switching tasks temporarily |
-| `resume_session` | Resume paused session | Returning to paused work |
-| `get_session_details` | View current session info | Check session status |
-| `complete_session` | End session and release locks | When done working |
+The tool list lived here and went stale: it claimed 18 tools against a live
+catalog of 29, and nothing checked it. The maintained surface is
+**[docs/mcp-tools.md](docs/mcp-tools.md)**, which is now asserted against the
+live registry by `scripts/check_mcp_parity.py`, so it cannot drift again
+without failing the suite.
 
-### Lock Coordination
-| Tool | Purpose | When to Use |
-|------|---------|-------------|
-| `check_locks` | Check if files are locked | Before editing files |
-| `list_all_locks` | See all active locks | Get team overview |
-| `delete_lock` | Remove specific lock | Manual lock management |
+Ask the running server rather than trusting any document:
 
-### Override Requests
-| Tool | Purpose | When to Use |
-|------|---------|-------------|
-| `request_override` | Ask permission for locked files | When blocked by exclusive lock |
-| `check_pending_requests` | See requests TO you | Periodically during session |
-| `check_my_override_requests` | See requests FROM you | Monitor your request status |
-| `respond_to_request` | Approve/deny requests | When requests arrive |
-| `get_override_request_details` | Get request details | Check specific request |
+```bash
+ats_version            # via MCP: the commit this process and the REST service run
+python scripts/check_mcp_parity.py
+```
 
-### Team Awareness
-| Tool | Purpose | When to Use |
-|------|---------|-------------|
-| `team_status` | See active sessions | Check before starting work |
-| `log_decision` | Record design decisions | After making architecture choices |
-| `get_decision_history` | View session decisions | Review what was decided |
-
-### Git Integration
-| Tool | Purpose | When to Use |
-|------|---------|-------------|
-| `check_git_changes` | See uncommitted files | Before committing |
-| `pre_commit_check` | Validate files for locks | Before git commit |
-
----
+A stdio MCP server is spawned once per client session and keeps its catalog for
+that session's whole life, so a client started before a deploy will not see
+tools added by it — and "this tool does not exist" is the wrong conclusion. See
+[Build identity and catalog staleness](docs/mcp-tools.md#build-identity-and-catalog-staleness).
 
 ## Usage Examples
 
