@@ -28,11 +28,13 @@ async def test_create_session(client):
 async def test_list_sessions(client):
     # Create two sessions
     await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "patrick",
         "scope": ["src/"],
         "auto_lock": False,
     })
     await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "sarah",
         "scope": ["tests/"],
         "auto_lock": False,
@@ -54,6 +56,7 @@ async def test_session_idle_and_stale(client, db_session):
     from ai_team_sync.models import Session
 
     resp = await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "patrick", "scope": ["src/"], "auto_lock": False})
     sid = resp.json()["id"]
 
@@ -74,6 +77,7 @@ async def test_session_idle_and_stale(client, db_session):
 @pytest.mark.asyncio
 async def test_list_sessions_filter_by_status(client):
     resp = await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "patrick",
         "scope": ["src/"],
         "auto_lock": False,
@@ -95,6 +99,7 @@ async def test_list_sessions_filter_by_status(client):
 @pytest.mark.asyncio
 async def test_complete_session_releases_locks(client):
     resp = await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "patrick",
         "scope": ["src/auth/**"],
         "auto_lock": True,
@@ -122,6 +127,7 @@ async def test_get_session_not_found(client):
 @pytest.mark.asyncio
 async def test_heartbeat_sets_last_heartbeat(client):
     resp = await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "patrick",
         "scope": ["src/"],
         "auto_lock": False,

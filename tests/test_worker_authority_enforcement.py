@@ -115,23 +115,23 @@ async def test_the_registry_is_discoverable_so_a_worker_can_ask_what_it_may_do(c
 
 
 @pytest.mark.asyncio
-async def test_an_unregistered_worker_is_not_broken_by_the_registry(client):
-    """A label nothing registered still works — the registry governs, it does not gate."""
+async def test_an_unregistered_worker_cannot_claim_scope(client):
+    """Unclassified identity can read, but cannot claim an edit scope."""
     one = await client.get("/api/workers/some-new-thing")
     assert one.status_code == 200
-    assert one.json()["worker"] == "default"
+    assert one.json()["worker"] == "restricted"
 
     claim = await client.post("/api/sessions", json={
         "developer": "patrick", "agent": "some-new-thing",
         "scope": ["src/**"], "description": "unregistered worker claiming scope",
         "auto_lock": True,
     })
-    assert claim.status_code == 201
+    assert claim.status_code == 403
 
 
 @pytest.mark.asyncio
-async def test_a_declared_read_only_worker_is_refused_even_in_lenient_mode(client):
-    """Leniency applies to UNREGISTERED labels, never to a declared read-only role."""
+async def test_a_declared_read_only_worker_is_refused(client):
+    """Declared read-only authority remains unchanged."""
     claim = await client.post("/api/sessions", json={
         "developer": "patrick", "agent": "local:gpt-oss-20b",
         "scope": ["src/**"], "description": "local worker claiming scope",

@@ -18,6 +18,7 @@ from ai_team_sync.database import get_db
 from ai_team_sync.delegation import MODES, READ_ONLY, prohibitions_for
 from ai_team_sync.launch_spec import RoutingFailure, validate_resolution
 from ai_team_sync.models import Delegation, Session
+from ai_team_sync.workers import registry
 
 router = APIRouter(prefix="/delegations", tags=["delegations"])
 
@@ -116,6 +117,16 @@ async def create_delegation(body: DelegationCreate, db: AsyncSession = Depends(g
                     "message": ("acceptance criteria are required: without them the "
                                 "parent cannot reconcile what comes back, and "
                                 "'it worked' becomes the acceptance test")})
+
+    # Record-only callers may omit a binary for REGISTERED classes. This must
+    # never be an alternate admission route for an unregistered worker. Refuse
+    # before database access, row creation, child registration or spawn.
+    if registry().registered(body.delegated_worker) is None:
+        raise HTTPException(409, detail={
+            "error": "unregistered_worker",
+            "requested_worker": body.delegated_worker,
+            "message": "unregistered worker: refusing delegation; no launch provenance created",
+        })
 
     # Re-derive the routing rule server-side rather than trusting the caller's
     # pairing. A record may claim worker X only if the binary that was resolved

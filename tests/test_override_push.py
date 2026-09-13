@@ -64,11 +64,13 @@ def test_nudge_skip_list_covers_inbox_tools():
 async def _make_request(client) -> str:
     """Two sessions, one lock, one override request. Returns the request id."""
     owner = (await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "owner-dev", "scope": ["pkg/**"],
         "description": "holds the lock", "auto_lock": True,
     })).json()
     assert owner.get("id"), owner
     requester = (await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "req-dev", "auto_lock": False,
         "description": "wants in",
     })).json()

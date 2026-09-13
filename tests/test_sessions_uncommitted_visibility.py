@@ -30,7 +30,7 @@ async def test_sessions_list_shows_uncommitted_in_scope(client, tmp_path):
 
     resp = await client.post("/api/sessions", json={
         "developer": "tester",
-        "agent": "claude",
+        "agent": "claude-code",
         "scope": ["src/**"],
         "description": "diff visibility test",
         "repo_root": str(repo),
@@ -48,7 +48,7 @@ async def test_sessions_list_shows_uncommitted_in_scope(client, tmp_path):
 async def test_sessions_list_unanchored_session_empty_visibility(client):
     resp = await client.post("/api/sessions", json={
         "developer": "tester2",
-        "agent": "claude",
+        "agent": "claude-code",
         "scope": ["src/**"],
         "description": "no repo_root (legacy)",
     })

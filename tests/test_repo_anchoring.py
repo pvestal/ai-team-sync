@@ -90,6 +90,7 @@ def test_hook_unanchored_file_still_blocks():
 
 async def _anchored_session(client, repo_root: str, scope=("tests/**",)):
     resp = await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "anchor-dev", "scope": list(scope),
         "description": "anchored", "auto_lock": True, "repo_root": repo_root,
     })
@@ -133,6 +134,7 @@ async def test_session_create_no_conflict_across_repos(client):
     await _anchored_session(client, "/repo/a")
     # Same patterns, DIFFERENT repo: must not 409.
     resp = await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "dev-b", "scope": ["tests/**"],
         "description": "other repo, same pattern", "auto_lock": True,
         "repo_root": "/repo/b",

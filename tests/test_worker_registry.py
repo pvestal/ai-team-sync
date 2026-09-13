@@ -30,22 +30,16 @@ def test_a_local_model_resolves_through_its_family_prefix():
     assert not w.may_close_task
 
 
-def test_an_unregistered_worker_keeps_pre_registry_rights_by_default():
-    """Adding a registry must not break clients that predate it.
-
-    The fleet already posts labels nothing has registered. Refusing them would
-    enforce a rule none of them has been told about, so unregistered lands on
-    'default' and is logged by name instead.
-    """
+def test_an_unregistered_worker_fails_closed():
     w = registry().resolve("some-new-thing-nobody-registered")
-
-    assert w.name == "default"
-    assert w.may_claim_scope
-    assert w.authority.task_close == "no", "close authority is granted, never inherited"
+    assert w.name == "restricted"
+    assert w.authority.edit == "none"
+    assert w.authority.commit is False
+    assert w.authority.task_close == "no"
 
 
 def test_strict_mode_drops_an_unregistered_worker_to_read_only(monkeypatch):
-    """The end state, opt-in: once the fleet is registered, unknown means restricted."""
+    """The obsolete strict flag cannot change the fail-closed invariant."""
     monkeypatch.setenv("ATS_STRICT_WORKERS", "1")
     registry.cache_clear()
 
@@ -134,7 +128,7 @@ def test_a_malformed_registry_file_does_not_take_the_server_down(tmp_path, monke
     ("claude-code:fb0bb6bf", "claude-code"),
     ("local:qwen3-30b:7f2a", "local"),
     ("codex", "codex"),
-    ("", "default"),
+    ("", "restricted"),
 ])
 def test_label_resolution_strips_suffixes_until_it_matches(label, expected):
     assert registry().resolve(label).name == expected
@@ -149,15 +143,10 @@ def test_every_builtin_declares_a_complete_authority_block():
         assert isinstance(w.authority.commit, bool)
 
 
-def test_the_legacy_unknown_agent_keeps_editing_rights():
-    """Every pre-registry client posts agent='unknown'.
-
-    Reading that as an unrecognized worker would refuse the VS Code extension,
-    the dashboard and every older CLI at once. Tightening this is a fleet
-    migration, not a one-line default change.
-    """
+def test_the_legacy_unknown_agent_is_restricted():
+    """Operator ruling includes legacy clients; compatibility grants no writes."""
     w = registry().resolve("unknown")
-
-    assert w.may_claim_scope
-    assert w.may_commit
+    assert w.name == "restricted"
+    assert w.authority.edit == "none"
+    assert w.authority.commit is False
     assert w.authority.task_close == "no"

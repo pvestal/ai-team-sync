@@ -57,7 +57,7 @@ async def test_patch_can_anchor_an_auto_registered_session(client, tmp_path):
     repo = _repo_with_dirty(tmp_path, ["src/a.py"])
 
     created = await client.post("/api/sessions", json={
-        "developer": "anchor-tester", "agent": "claude",
+        "developer": "anchor-tester", "agent": "claude-code",
         "scope": [], "description": "auto-registered, unanchored",
     })
     assert created.status_code in (200, 201), created.text
@@ -81,7 +81,7 @@ async def test_anchor_is_stored_without_a_trailing_slash(client, tmp_path):
     repo = _repo_with_dirty(tmp_path, ["src/a.py"])
 
     created = await client.post("/api/sessions", json={
-        "developer": "slash-tester", "agent": "claude", "scope": ["src/**"]})
+        "developer": "slash-tester", "agent": "claude-code", "scope": ["src/**"]})
     sid = created.json()["id"]
     await client.patch(f"/api/sessions/{sid}", json={"repo_root": str(repo) + "/"})
 

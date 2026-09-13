@@ -9,6 +9,7 @@ import pytest
 async def test_check_lock_conflict(client):
     # Create a session with a lock
     resp = await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "patrick",
         "scope": ["src/auth/**"],
         "auto_lock": True,
@@ -31,6 +32,7 @@ async def test_check_lock_conflict(client):
 async def test_check_no_conflict(client):
     # Create a session with a lock on auth
     await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "patrick",
         "scope": ["src/auth/**"],
         "auto_lock": True,
@@ -48,6 +50,7 @@ async def test_check_no_conflict(client):
 @pytest.mark.asyncio
 async def test_list_locks(client):
     await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "patrick",
         "scope": ["src/auth/**", "src/middleware/**"],
         "auto_lock": True,
@@ -66,7 +69,7 @@ async def test_list_locks(client):
 @pytest.mark.asyncio
 async def test_lock_reason_roundtrips_and_surfaces_in_check(client):
     # A lock carries a human-readable reason; pattern stays a real glob.
-    sresp = await client.post("/api/sessions", json={"developer": "patrick", "auto_lock": False})
+    sresp = await client.post("/api/sessions", json={"agent": "default", "developer": "patrick", "auto_lock": False})
     sid = sresp.json()["id"]
     lresp = await client.post("/api/locks", json={
         "session_id": sid, "pattern": "packages/scene_generation/builder.py",
@@ -88,7 +91,7 @@ async def test_lock_reason_roundtrips_and_surfaces_in_check(client):
 async def test_prose_pattern_is_rejected(client):
     # The exact anti-pattern: a sentence as the lock pattern. Must 422 (it would
     # never fnmatch a real path -> a silent no-op lock).
-    sresp = await client.post("/api/sessions", json={"developer": "patrick", "auto_lock": False})
+    sresp = await client.post("/api/sessions", json={"agent": "default", "developer": "patrick", "auto_lock": False})
     sid = sresp.json()["id"]
     resp = await client.post("/api/locks", json={
         "session_id": sid,
@@ -100,7 +103,7 @@ async def test_prose_pattern_is_rejected(client):
 
 @pytest.mark.asyncio
 async def test_valid_globs_accepted(client):
-    sresp = await client.post("/api/sessions", json={"developer": "patrick", "auto_lock": False})
+    sresp = await client.post("/api/sessions", json={"agent": "default", "developer": "patrick", "auto_lock": False})
     sid = sresp.json()["id"]
     for pat in ("src/**", "packages/foo/bar.py", "*.py"):
         resp = await client.post("/api/locks", json={"session_id": sid, "pattern": pat})
@@ -116,6 +119,7 @@ async def test_delete_lock(client):
     test_a_live_lock_is_not_reapable_by_a_stranger for the other half.
     """
     resp = await client.post("/api/sessions", json={
+        "agent": "default",
         "developer": "patrick",
         "scope": ["src/auth/**"],
         "auto_lock": True,

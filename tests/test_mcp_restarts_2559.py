@@ -82,6 +82,7 @@ async def test_record_restart_persists_without_a_session(wired):
 async def test_record_restart_attributes_to_the_active_session(wired, monkeypatch):
     async with _direct(wired) as c:
         sid = (await c.post("/api/sessions", json={
+            "agent": "default",
             "developer": "patrick", "scope": []})).json()["id"]
     monkeypatch.setattr(mcp, "load_session_id", lambda: sid)
 
@@ -113,7 +114,7 @@ async def test_a_stale_session_pointer_does_not_lose_the_record(wired, monkeypat
 async def test_team_status_surfaces_a_recent_restart(wired):
     """THE point of the ticket: a peer session can see the bounce without asking."""
     async with _direct(wired) as c:
-        await c.post("/api/sessions", json={"developer": "patrick", "scope": ["src/**"]})
+        await c.post("/api/sessions", json={"agent": "default", "developer": "patrick", "scope": ["src/**"]})
         await c.post("/api/restarts", json={
             "unit": "comfyui", "developer": "patrick",
             "reason": "reclaiming VRAM before the flux bench"})
@@ -127,7 +128,7 @@ async def test_team_status_surfaces_a_recent_restart(wired):
 @pytest.mark.asyncio
 async def test_team_status_flags_a_failed_restart(wired):
     async with _direct(wired) as c:
-        await c.post("/api/sessions", json={"developer": "patrick", "scope": []})
+        await c.post("/api/sessions", json={"agent": "default", "developer": "patrick", "scope": []})
         await c.post("/api/restarts", json={
             "unit": "comfyui-rocm", "outcome": "failed", "reason": "unit is masked"})
     text = (await mcp.call_tool("team_status", {}))[0].text
@@ -137,7 +138,7 @@ async def test_team_status_flags_a_failed_restart(wired):
 @pytest.mark.asyncio
 async def test_team_status_is_unchanged_when_nothing_was_restarted(wired):
     async with _direct(wired) as c:
-        await c.post("/api/sessions", json={"developer": "patrick", "scope": []})
+        await c.post("/api/sessions", json={"agent": "default", "developer": "patrick", "scope": []})
     text = (await mcp.call_tool("team_status", {}))[0].text
     assert "restarted recently" not in text, "no restarts must add no noise"
 
@@ -150,7 +151,7 @@ async def test_team_status_survives_a_server_without_the_endpoint(wired, monkeyp
         raise RuntimeError("404 / connection refused")
 
     async with _direct(wired) as c:
-        await c.post("/api/sessions", json={"developer": "patrick", "scope": []})
+        await c.post("/api/sessions", json={"agent": "default", "developer": "patrick", "scope": []})
 
     class _Client:
         async def get(self, *a, **k):
@@ -164,7 +165,7 @@ async def test_team_status_survives_a_server_without_the_endpoint(wired, monkeyp
 async def test_an_old_restart_falls_out_of_the_team_status_window(wired):
     """A bounce matters to a peer while its effects are in play, not forever."""
     async with _direct(wired) as c:
-        await c.post("/api/sessions", json={"developer": "patrick", "scope": []})
+        await c.post("/api/sessions", json={"agent": "default", "developer": "patrick", "scope": []})
         await c.post("/api/restarts", json={"unit": "comfyui", "reason": "ancient history"})
 
     class _Aged:

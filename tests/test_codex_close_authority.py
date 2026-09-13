@@ -113,8 +113,8 @@ def test_local_workers_remain_shut_out_of_closing_entirely():
 def test_an_unregistered_worker_still_gets_no_close_authority():
     """Requirement 3 for the fallbacks, and the answer for future workers.
 
-    Cursor and anything else unintegrated resolves to 'default' (or 'restricted'
-    under strict mode) and closes nothing. Frontier close authority is granted
+    Cursor and anything else unintegrated resolves to 'restricted' and closes
+    nothing. Frontier close authority is granted
     per worker, never inherited by arriving.
     """
     for label in ("cursor", "some-worker-nobody-registered", ""):

@@ -10,10 +10,9 @@ Claude Code PreToolUse hook. Codex has no hook mechanism, and a local worker has
 no client at all, so a client-side rule is advice for everyone except Claude.
 Authority is checked here, where every worker meets it on the same terms.
 
-An unregistered worker keeps the pre-registry rights and is logged by name, so
-adding this registry cannot break a client that predates it. Set
-ATS_STRICT_WORKERS=1 to drop unregistered workers to read-only once the fleet is
-registered — that is a fleet migration, not a default.
+Operator ruling 2026-09-12: unmatched identities, including legacy 'unknown'
+clients, fail closed to restricted authority. Explicit 'default' remains a
+registered internal class; an unclassified label is never an explicit default.
 """
 
 from __future__ import annotations
@@ -67,16 +66,9 @@ _BUILTINS: dict[str, dict[str, Any]] = {
         "cost_class": "local",
         "concurrency": 1,
     },
-    # Where an unregistered label lands. Deny-by-default is the right END state
-    # and the wrong DEFAULT today: the fleet already posts labels this registry
-    # has never heard of (the VS Code extension and older CLI builds send
-    # agent="unknown", tests and scripts send their own), and refusing them would
-    # break working clients to enforce a rule none of them has been told about.
-    # So an unregistered worker keeps the pre-registry rights and gets logged by
-    # name, which is how you find out what to register. Flip
-    # ATS_STRICT_WORKERS=1 once the fleet is registered and unregistered drops to
-    # 'restricted' below.
-    #
+    # Explicit internal authority class only. Unmatched identities NEVER land
+    # here, including pre-registry clients labelled 'unknown'. Historical
+    # compatibility cannot grant write authority to an unclassified identity.
     # None of this is access control. The API is unauthenticated by design, so a
     # worker that wants to claim another's name can. It stops a worker exceeding
     # its role by ACCIDENT, and it makes roles discoverable and declared.
@@ -148,7 +140,9 @@ class WorkerRegistry:
         for required in ("default", "restricted"):
             if required not in self._workers:
                 self._workers[required] = _build(required, _BUILTINS[required])
-        self._strict = (os.environ.get("ATS_STRICT_WORKERS") or "").strip() in ("1", "true", "yes")
+        # Unmatched labels get fixed least privilege even if an operator config
+        # overrides the explicit restricted class. No permissive opt-out flag.
+        self._unregistered = _build("restricted", _BUILTINS["restricted"])
         self._unregistered_seen: set[str] = set()
 
     def names(self) -> list[str]:
@@ -157,12 +151,12 @@ class WorkerRegistry:
     def all(self) -> list[Worker]:
         return [self._workers[n] for n in self.names()]
 
-    def resolve(self, label: str | None) -> Worker:
-        """A session label to the worker that governs it.
+    def registered(self, label: str | None) -> Worker | None:
+        """An explicitly registered class or its deterministic suffix family.
 
         Labels carry an instance suffix ('claude-code:fb0bb6bf') and families
         carry a model suffix ('local:qwen3-30b'), so strip one ':'-segment at a
-        time until something matches. No match is 'default', never 'trusted'.
+        time until something matches. Unknown roots never become a known class.
         """
         key = (label or "").strip()
         while key:
@@ -171,12 +165,18 @@ class WorkerRegistry:
             if ":" not in key:
                 break
             key = key.rsplit(":", 1)[0]
+        return None
+
+    def resolve(self, label: str | None) -> Worker:
+        """Resolve registered labels; all unmatched identities fail closed."""
+        worker = self.registered(label)
+        if worker is not None:
+            return worker
 
         if label and label not in self._unregistered_seen:
             self._unregistered_seen.add(label)
-            logger.info("unregistered worker %r -> %s", label,
-                        "restricted" if self._strict else "default")
-        return self._workers["restricted" if self._strict else "default"]
+            logger.info("unregistered worker %r -> restricted", label)
+        return self._unregistered
 
 
 def _build(name: str, spec: dict[str, Any]) -> Worker:
