@@ -25,6 +25,15 @@ _COLUMN_MIGRATIONS = [
     # than silently asserting the requested one did.
     ("delegations", "resolved_binary", "TEXT DEFAULT ''"),
     ("delegations", "launch_spec_version", "TEXT DEFAULT ''"),
+    # Caller identity (#2741). Existing sessions backfill as unidentified and
+    # unbound, and existing locks as non-bearing: nothing that predates the
+    # binding can be read as a grant.
+    ("sessions", "creator_uid", "INTEGER"),
+    ("sessions", "bound_worker", "TEXT DEFAULT ''"),
+    ("sessions", "bound_uid", "INTEGER"),
+    ("sessions", "task_id", "INTEGER"),
+    ("sessions", "delegation_id", "TEXT"),
+    ("scope_locks", "authority_bearing", "BOOLEAN DEFAULT 0"),
 ]
 
 engine = create_async_engine(

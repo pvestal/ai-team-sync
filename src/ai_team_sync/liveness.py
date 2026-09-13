@@ -49,6 +49,7 @@ AGENT_HEADER = "X-ATS-Agent"
 async def touch_session_liveness(
     db: AsyncSession,
     *,
+    peer_uid: int | None,
     session_id: str | None = None,
     agent: str | None = None,
 ) -> bool:
@@ -66,6 +67,13 @@ async def touch_session_liveness(
 
     An unknown id/agent is a no-op, not an error — a stale pointer is normal
     after a reap and must not fail the caller's real request.
+
+    `peer_uid` — the requesting OS account — is REQUIRED, and only sessions that
+    account owns are touched (#2741). Proving liveness moves a session onto the
+    fast reaper window, so any caller that could name another account's session
+    — a header, a heartbeat, a presence post — was a way to have its locks
+    reaped in twenty minutes instead of four hours. There is deliberately no
+    unchecked default: a new caller must decide who is asking.
     """
     if not session_id and not agent:
         return False
@@ -76,6 +84,8 @@ async def touch_session_liveness(
         else:
             stmt = stmt.where(Session.agent == agent)
         sessions = (await db.execute(stmt)).scalars().all()
+        from ai_team_sync.routers.locks import cross_account
+        sessions = [s for s in sessions if not cross_account(peer_uid, s)]
         if not sessions:
             return False
         now = datetime.now(timezone.utc)
@@ -101,4 +111,7 @@ async def liveness_from_request(
     agent = request.headers.get(AGENT_HEADER)
     if not sid and not agent:
         return
-    await touch_session_liveness(db, session_id=sid, agent=agent)
+    from ai_team_sync import peer_identity
+
+    await touch_session_liveness(db, session_id=sid, agent=agent,
+                                 peer_uid=peer_identity.peer_uid_for_request(request))

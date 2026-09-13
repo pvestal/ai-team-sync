@@ -80,6 +80,12 @@ def main():
         # reload=False: in production this server is process-managed (e.g. systemd).
         # uvicorn's StatReload supervisor conflicts with external process tracking.
         reload=False,
+        # Nothing proxies ATS. uvicorn's default trusts X-Forwarded-For from
+        # 127.0.0.1 and rewrites the client address, port included, to whatever
+        # it names — which would let a local caller point caller identity at
+        # another process's socket (#2741). peer_identity refuses such requests
+        # on its own; this keeps the address honest for everything else.
+        proxy_headers=False,
     )
 
 

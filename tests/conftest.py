@@ -17,6 +17,17 @@ from ai_team_sync.server import create_app
 from ai_team_sync.database import get_db
 
 
+@pytest.fixture(autouse=True)
+def _identified_local_caller(monkeypatch):
+    """Every real ATS client reaches it over loopback TCP, where the kernel names
+    the caller's OS account (#2741). The in-process ASGI transport has no socket,
+    so tests get the answer production gets: this process's own uid. Tests about
+    caller identity override this per request."""
+    from ai_team_sync import peer_identity
+
+    monkeypatch.setattr(peer_identity, "peer_uid_for_request", lambda request: os.getuid())
+
+
 @pytest_asyncio.fixture
 async def db_engine():
     engine = create_async_engine("sqlite+aiosqlite://", echo=False)

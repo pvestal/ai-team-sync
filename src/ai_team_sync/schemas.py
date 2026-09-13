@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictInt, field_validator
 
 
 # --- Session ---
@@ -23,6 +23,10 @@ class SessionCreate(BaseModel):
     # Set when this session IS a delegated child. Its authority is then the
     # intersection of its worker's and the delegation mode's — never the union.
     delegation_id: str = ""
+    # The Tower task this session may close (#2741). Fixed at creation; an
+    # ATS task_close grant is only ever for this id. Strict: "2741" is refused
+    # rather than coerced, because it scopes authority.
+    task_id: StrictInt | None = None
 
 
 class SessionUpdate(BaseModel):

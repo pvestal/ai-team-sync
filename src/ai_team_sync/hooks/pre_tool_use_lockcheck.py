@@ -63,14 +63,14 @@ def normalize_pattern(pattern: str, repo_root: str = "") -> str:
     An absolute pattern under this repo is rewritten to its relative form. One
     that is absolute but NOT under this repo is left alone: it genuinely cannot
     describe a file here, and quietly re-rooting it would invent a claim.
+
+    The lexical form comes from scope_paths.canonical_pattern, the one
+    canonicalizer ATS uses server-side too, so 'src//a.py', 'src/./a.py' and a
+    trailing '/' name the file they spell rather than nothing (#2741).
     """
-    pat = (pattern or "").strip().rstrip("/")
-    if not pat.startswith("/"):
-        return pat
-    root = (repo_root or "").rstrip("/")
-    if root and (pat == root or pat.startswith(root + "/")):
-        return pat[len(root):].lstrip("/")
-    return pat
+    from ai_team_sync.scope_paths import canonical_pattern
+
+    return canonical_pattern(pattern, repo_root)
 
 
 def scope_matches(rel: str, pattern: str, repo_root: str = "") -> bool:

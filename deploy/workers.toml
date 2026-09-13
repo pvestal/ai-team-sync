@@ -45,6 +45,24 @@ edit = "none"
 commit = false
 task_close = "no"
 
+# Identity-bound headless worker (#2741). bind_users ties the class to an OS
+# account: a session gets it only when the kernel reports the connection as that
+# account, and only bound sessions receive grants from
+# POST /api/authority/{session}/authorize. Parsed strictly — a typo or "false"
+# as a string rejects the whole file and disables every bound class. Binding to
+# root or to the account ats-server runs as is refused.
+# land is separate from commit and stays false until an operator grants it.
+#
+# [workers.echo-executor]
+# capabilities = ["repo_read", "isolated_worktree", "tests"]
+# cost_class = "local"
+# bind_users = ["echo"]
+# [workers.echo-executor.authority]
+# edit = "claimed_scope"
+# commit = true
+# land = false
+# task_close = "conditional"
+
 # Register a specific model when it needs different limits from its family.
 # The RAM floor and residency policy are infrastructure constraints, not
 # per-worker ones: a worker does not get to override them by asking.

@@ -47,10 +47,11 @@ _PROHIBITIONS: dict[str, tuple[str, ...]] = {
     ),
 }
 
+# No mode lands: a delegated child producing a change is not authority to ship it.
 _MODE_AUTHORITY: dict[str, Authority] = {
-    READ_ONLY: Authority(edit="none", commit=False, task_close="no"),
-    IMPLEMENT: Authority(edit="claimed_scope", commit=True, task_close="no"),
-    VERIFY: Authority(edit="none", commit=False, task_close="no"),
+    READ_ONLY: Authority(edit="none", commit=False, task_close="no", land=False),
+    IMPLEMENT: Authority(edit="claimed_scope", commit=True, task_close="no", land=False),
+    VERIFY: Authority(edit="none", commit=False, task_close="no", land=False),
 }
 
 
@@ -58,17 +59,21 @@ def prohibitions_for(mode: str) -> list[str]:
     return list(_PROHIBITIONS.get(mode, _PROHIBITIONS[READ_ONLY]))
 
 
+def intersect_authority(a: Authority, b: Authority) -> Authority:
+    """Field-wise minimum. Narrowing only, whichever side is larger."""
+    close_rank = {"no": 0, "conditional": 1, "yes": 2}
+    return Authority(
+        edit="claimed_scope" if (a.edit == "claimed_scope" and b.edit == "claimed_scope") else "none",
+        commit=a.commit is True and b.commit is True,
+        task_close=min(a.task_close, b.task_close, key=lambda v: close_rank.get(v, 0)),
+        land=a.land is True and b.land is True,
+    )
+
+
 def effective_authority(worker: Worker, mode: str) -> Authority:
     """min(worker authority, mode authority) — narrowing only."""
-    mode_auth = _MODE_AUTHORITY.get(mode, _MODE_AUTHORITY[READ_ONLY])
-    edit = "claimed_scope" if (worker.authority.edit == "claimed_scope"
-                               and mode_auth.edit == "claimed_scope") else "none"
-    close_rank = {"no": 0, "conditional": 1, "yes": 2}
-    task_close = min(worker.authority.task_close, mode_auth.task_close,
-                     key=lambda v: close_rank.get(v, 0))
-    return Authority(edit=edit,
-                     commit=bool(worker.authority.commit and mode_auth.commit),
-                     task_close=task_close)
+    return intersect_authority(worker.authority,
+                               _MODE_AUTHORITY.get(mode, _MODE_AUTHORITY[READ_ONLY]))
 
 
 def child_state_dir(delegation_id: str) -> Path:

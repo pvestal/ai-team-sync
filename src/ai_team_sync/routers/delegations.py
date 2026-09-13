@@ -9,11 +9,12 @@ from __future__ import annotations
 import json
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ai_team_sync import peer_identity
 from ai_team_sync.database import get_db
 from ai_team_sync.delegation import MODES, READ_ONLY, prohibitions_for
 from ai_team_sync.launch_spec import RoutingFailure, validate_resolution
@@ -105,8 +106,39 @@ async def _is_a_delegated_child(db: AsyncSession, session_id: str) -> bool:
     return row.scalar_one_or_none() is not None
 
 
+def _refuse_other_account(request: Request, session: Session | None, role: str) -> None:
+    """Delegation state is changed only by the OS account that owns the session
+    it belongs to (#2741): a foreign delegation pins another account's session
+    open, and a foreign close/return revokes or advances another account's
+    child. Session ids are public, so naming the right one proves nothing.
+
+    Whatever the session's status: a delegation keeps belonging to the account
+    that created its sessions after the parent is reaped (it can revive on its
+    next heartbeat) or the child dies. Exempting non-live sessions let another
+    account return a childless delegation under a reaped parent, or plant a
+    forged result through a dead child (adversarial review round 5). For rows
+    that never recorded a creator, cross_account's legacy rule applies instead.
+
+    A session row that no longer exists establishes no owner, so nobody may
+    change the delegation through it (round 6: a missing row skipped the check).
+    """
+    from ai_team_sync.routers.locks import cross_account
+
+    if session is None:
+        raise HTTPException(409, detail={
+            "error": "session_missing",
+            "message": (f"this delegation's {role} session no longer exists, so its "
+                        f"owner cannot be established; the delegation is left as it is")})
+    if cross_account(peer_identity.peer_uid_for_request(request), session, any_status=True):
+        raise HTTPException(403, detail={
+            "error": "session_not_yours",
+            "message": f"the {role} session {session.id} belongs to another OS account",
+            "session_id": session.id})
+
+
 @router.post("", status_code=201)
-async def create_delegation(body: DelegationCreate, db: AsyncSession = Depends(get_db)):
+async def create_delegation(body: DelegationCreate, request: Request,
+                            db: AsyncSession = Depends(get_db)):
     if body.mode not in MODES:
         raise HTTPException(422, detail={"error": "bad_mode",
                                          "message": f"mode must be one of {MODES}"})
@@ -146,6 +178,7 @@ async def create_delegation(body: DelegationCreate, db: AsyncSession = Depends(g
     parent = await db.get(Session, body.parent_session_id)
     if parent is None:
         raise HTTPException(404, detail={"error": "no_such_parent"})
+    _refuse_other_account(request, parent, "parent")
 
     # delegation_depth = 1. A chain of workers 'collaborating' on one bug is a
     # chain in which nobody owns it.
@@ -199,7 +232,7 @@ async def get_delegation(delegation_id: str, db: AsyncSession = Depends(get_db))
 
 
 @router.post("/{delegation_id}/return")
-async def return_delegation(delegation_id: str, body: DelegationReturn,
+async def return_delegation(delegation_id: str, body: DelegationReturn, request: Request,
                             db: AsyncSession = Depends(get_db)):
     """The child returns evidence. This deliberately does not touch the parent."""
     d = await db.get(Delegation, delegation_id)
@@ -207,6 +240,14 @@ async def return_delegation(delegation_id: str, body: DelegationReturn,
         raise HTTPException(404, detail={"error": "no_such_delegation"})
     if d.state != "open":
         raise HTTPException(409, detail={"error": "not_open", "state": d.state})
+    # Returned from the child's account; with no child yet, from the parent's.
+    # Checked whatever either session's status is (see _refuse_other_account).
+    # Skipping the check when there was no child let another account mark a
+    # delegation returned and lock out the real child (review round 4).
+    if d.child_session_id:
+        _refuse_other_account(request, await db.get(Session, d.child_session_id), "child")
+    else:
+        _refuse_other_account(request, await db.get(Session, d.parent_session_id), "parent")
     if d.child_session_id and body.actor_session_id \
             and body.actor_session_id != d.child_session_id:
         raise HTTPException(
@@ -233,7 +274,7 @@ async def return_delegation(delegation_id: str, body: DelegationReturn,
 
 
 @router.post("/{delegation_id}/close")
-async def close_delegation(delegation_id: str, body: DelegationClose,
+async def close_delegation(delegation_id: str, body: DelegationClose, request: Request,
                            db: AsyncSession = Depends(get_db)):
     """The PARENT reconciles. Closing a child never advances the parent's own
     work — that is a separate, explicit act."""
@@ -242,6 +283,7 @@ async def close_delegation(delegation_id: str, body: DelegationClose,
         raise HTTPException(404, detail={"error": "no_such_delegation"})
     if body.state not in ("closed", "rejected"):
         raise HTTPException(422, detail={"error": "bad_state"})
+    _refuse_other_account(request, await db.get(Session, d.parent_session_id), "parent")
     if not body.actor_session_id:
         raise HTTPException(
             403,

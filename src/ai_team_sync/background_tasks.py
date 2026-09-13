@@ -63,7 +63,17 @@ async def check_expired_locks(db: AsyncSession) -> int:
     result = await db.execute(
         select(ScopeLock, Session).join(Session).where(ScopeLock.expires_at <= now)
     )
-    expired = list(result.all())
+    # Except an EXCLUSIVE lock whose owner is still live (#2741): active, or
+    # paused and not silent past the heartbeat window. A mutation grant treats
+    # that lock as the owner's claim for as long as the owner lives; sweeping it
+    # at the 8h TTL was reproduced turning a refusal into a grant within a
+    # minute. An active owner that goes silent is completed by the reaper, which
+    # releases it; a PAUSED owner is never reaped, so a silent paused owner's
+    # expired exclusive lock is swept here rather than kept forever.
+    from ai_team_sync.routers.locks import live_exclusive_owner
+
+    expired = [(lock, session) for lock, session in result.all()
+               if not (lock.mode == "exclusive" and live_exclusive_owner(session))]
     for lock, session in expired:
         await broadcast_event(session.id, "lock.expired", {
             "lock_id": lock.id,

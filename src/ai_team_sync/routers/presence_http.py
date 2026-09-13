@@ -7,9 +7,10 @@ each edit acts as a heartbeat: "actively editing right now"; it ages out when ed
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ai_team_sync import peer_identity
 from ai_team_sync.database import get_db
 from ai_team_sync.liveness import touch_session_liveness
 from ai_team_sync.presence import store
@@ -33,7 +34,8 @@ def _path_matches(query: str, presence_file: str) -> bool:
 
 
 @router.post("", response_model=list[PresenceEntry])
-async def update_presence(body: PresenceUpdate, db: AsyncSession = Depends(get_db)):
+async def update_presence(body: PresenceUpdate, request: Request,
+                          db: AsyncSession = Depends(get_db)):
     """Set/refresh a developer's live presence (files + one-line intent).
 
     Also refreshes that agent's session liveness: the PostToolUse presence hook
@@ -43,7 +45,11 @@ async def update_presence(body: PresenceUpdate, db: AsyncSession = Depends(get_d
     silence.
     """
     store.update(body.developer, body.agent, body.files, body.intent)
-    await touch_session_liveness(db, agent=body.agent)
+    # Only the posting account's own sessions (#2741): an agent label is public,
+    # and a presence post from another account used to reset a foreign session
+    # onto the twenty-minute reaper clock.
+    await touch_session_liveness(db, agent=body.agent,
+                                 peer_uid=peer_identity.peer_uid_for_request(request))
     await store.broadcast()
     return store.get_all()
 

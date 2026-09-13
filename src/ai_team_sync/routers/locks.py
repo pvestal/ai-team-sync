@@ -5,10 +5,11 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from fnmatch import fnmatch
 
-from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ai_team_sync import peer_identity
 from ai_team_sync.database import get_db
 from ai_team_sync.models import ScopeLock, Session
 from ai_team_sync.notifications.dispatcher import dispatch
@@ -36,16 +37,34 @@ def _lock_to_response(lock: ScopeLock, developer: str | None = None) -> LockResp
 
 
 async def _get_active_locks(db: AsyncSession) -> list[tuple[ScopeLock, str, str]]:
-    """Return all non-expired locks with their developer names and the owning
-    session's repo_root ('' = unanchored legacy session)."""
+    """Return all live locks with their developer names and the owning
+    session's repo_root ('' = unanchored legacy session).
+
+    Live = unexpired, or EXCLUSIVE and held by a live owner (#2741): the TTL
+    sweep keeps those, and a lock that still blocks a mutation grant must not be
+    invisible to the board and to every other client's conflict check.
+    """
     now = datetime.now(timezone.utc)
     result = await db.execute(
-        select(ScopeLock, Session.developer, Session.repo_root)
+        select(ScopeLock, Session, Session.developer, Session.repo_root)
         .join(Session)
-        .where(ScopeLock.expires_at > now)
+        .where(or_(ScopeLock.expires_at > now, ScopeLock.mode == "exclusive"))
         .where(Session.status.in_(["active", "paused"]))
     )
-    return list(result.all())
+    return [(lock, developer, repo_root) for lock, owner, developer, repo_root in result.all()
+            if _aware(lock.expires_at) > now or live_exclusive_owner(owner)]
+
+
+def _aware(dt: datetime) -> datetime:
+    return dt.replace(tzinfo=timezone.utc) if dt is not None and dt.tzinfo is None else dt
+
+
+def live_exclusive_owner(owner: Session) -> bool:
+    """Whether `owner` still holds its exclusive locks past their TTL: active,
+    or paused and not silent past the heartbeat window."""
+    if owner.status == "active":
+        return True
+    return owner.status == "paused" and not _owner_is_stale(owner)
 
 
 def _cross_repo(caller_repo_root: str, lock_repo_root: str) -> bool:
@@ -59,7 +78,7 @@ def _cross_repo(caller_repo_root: str, lock_repo_root: str) -> bool:
 
 
 @router.post("", response_model=LockResponse, status_code=201)
-async def create_lock(body: LockCreate, db: AsyncSession = Depends(get_db)):
+async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Depends(get_db)):
     # Verify session exists and is active
     result = await db.execute(select(Session).where(Session.id == body.session_id))
     session = result.scalar_one_or_none()
@@ -67,9 +86,19 @@ async def create_lock(body: LockCreate, db: AsyncSession = Depends(get_db)):
         raise HTTPException(404, "Session not found")
     if session.status not in ("active", "paused"):
         raise HTTPException(400, "Session is not active")
+    if cross_account(peer_identity.peer_uid_for_request(request), session):
+        raise HTTPException(403, detail={
+            "error": "session_not_yours",
+            "message": (f"session {session.id} belongs to another OS account; "
+                        f"locks are attached to a session by the account that owns it"),
+            "session_id": session.id})
 
+    # A lock made here coordinates; it never bears authority (#2741). A mutation
+    # grant is measured only against a bound session's creation-time claims, so
+    # a caller cannot manufacture the claim that would authorize it.
     lock = ScopeLock(
-        session_id=body.session_id, pattern=body.pattern, mode=body.mode, reason=body.reason
+        session_id=body.session_id, pattern=body.pattern, mode=body.mode, reason=body.reason,
+        authority_bearing=False,
     )
     db.add(lock)
     await db.commit()
@@ -143,8 +172,37 @@ def _owner_is_stale(owner: Session) -> bool:
     return idle > settings.session_heartbeat_timeout_minutes * 60
 
 
+def cross_account(peer_uid: int | None, owner: Session, *, any_status: bool = False) -> bool:
+    """Is a request from `peer_uid` reaching into a LIVE session another OS
+    account created? (#2741) With any_status=True, into such a session in any
+    status — for callers whose ownership outlives the session being live.
+
+    A session id is not a secret — team_status lists them — so naming one proves
+    nothing. The creating account is the one owner fact the kernel vouches for.
+
+    No staleness exception across accounts. A session that merely went quiet
+    for the heartbeat window was reproduced being completed, re-anchored or
+    stripped of its exclusive lock by another account, which was then granted
+    the file. Another account's ghost is the in-process reaper's to collect;
+    a same-account ghost stays reapable exactly as before.
+
+    Owner never identified (rows older than #2741): an unidentifiable requester
+    or a headless bound account is refused, because a bound worker can make
+    itself unidentifiable on purpose (a forwarding header, a socket closed
+    before the lookup). Ordinary identified accounts keep the old behaviour.
+    """
+    if not any_status and owner.status not in ("active", "paused"):
+        return False
+    creator = getattr(owner, "creator_uid", None)
+    if creator is not None:
+        return peer_uid != creator
+    from ai_team_sync.workers import registry
+
+    return peer_uid is None or peer_uid in registry().bound_account_uids()
+
+
 @router.delete("/{lock_id}", status_code=204)
-async def delete_lock(lock_id: str, actor_session_id: str = "",
+async def delete_lock(lock_id: str, request: Request, actor_session_id: str = "",
                       db: AsyncSession = Depends(get_db)):
     """Owner-bound, with the reap path kept open.
 
@@ -169,6 +227,15 @@ async def delete_lock(lock_id: str, actor_session_id: str = "",
                 "message": (f"lock {lock.id} is held by ACTIVE session "
                             f"{lock.session_id} ({owner.agent}). Coordinate or "
                             f"request_override; a live claim is not reapable."),
+                "owner_session_id": lock.session_id,
+            })
+    if owner is not None and cross_account(peer_identity.peer_uid_for_request(request), owner):
+        raise HTTPException(
+            403,
+            detail={
+                "error": "lock_not_yours",
+                "message": (f"lock {lock.id} belongs to a live session of another OS "
+                            f"account; naming its session id does not make it yours."),
                 "owner_session_id": lock.session_id,
             })
     await db.delete(lock)

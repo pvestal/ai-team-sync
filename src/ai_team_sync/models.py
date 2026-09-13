@@ -63,6 +63,21 @@ class Session(Base):
     # something a security-relevant branch should read.
     auto_completed: Mapped[bool] = mapped_column(
         Boolean, default=False, nullable=False, server_default="0")
+    # Caller identity, recorded once at creation and never re-derived (#2741).
+    # creator_uid: the kernel's owner of the creating connection; NULL = not
+    #   identifiable (legacy rows, in-process test transports).
+    # bound_worker / bound_uid: set only when the agent's class is identity-bound
+    #   AND the creator is one of its accounts. '' / NULL = unbound, which is
+    #   every interactive client; unbound sessions never receive a mutation grant.
+    # task_id: the one Tower task this session may close, declared at creation.
+    creator_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    bound_worker: Mapped[str] = mapped_column(String(100), default="")
+    bound_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # The delegation this session was created as the child of, recorded at
+    # creation. Delegation.child_session_id is a pointer on another row; a grant
+    # must never depend on it alone, or moving it moves the narrowing.
+    delegation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
 
     locks: Mapped[list[ScopeLock]] = relationship(back_populates="session", cascade="all, delete-orphan")
     decisions: Mapped[list[Decision]] = relationship(back_populates="session", cascade="all, delete-orphan")
@@ -91,6 +106,12 @@ class ScopeLock(Base):
     mode: Mapped[str] = mapped_column(String(20), default="advisory")  # advisory|exclusive
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_default_expiry)
+    # TRUE only for a claim an identity-bound session made at creation, in
+    # canonical form. A mutation grant is measured against these and nothing
+    # else, so a lock added later through POST /api/locks — by anyone, including
+    # the session itself — can coordinate but can never confer authority.
+    authority_bearing: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default="0")
 
     session: Mapped[Session] = relationship(back_populates="locks")
 
@@ -173,6 +194,37 @@ class ServiceRestart(Base):
     # column set would force every caller into the wrong shape.
     before_state: Mapped[str] = mapped_column(Text, default="{}")
     after_state: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class AuthorityCheck(Base):
+    """One answer to "may this caller perform this authoritative mutation now?"
+
+    Written for every POST /api/authority/{session}/authorize — allowed, refused,
+    malformed or naming no session — so a mutation a headless worker performs can
+    be traced to the grant it was made under, and a refusal is on the record
+    rather than only in the worker's log. session_id is a plain column, not a
+    foreign key: the audit row outlives the session. Evidence CONTENT is not
+    stored, only its keys.
+    """
+
+    __tablename__ = "authority_checks"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    session_id: Mapped[str] = mapped_column(String(36), index=True)
+    agent: Mapped[str] = mapped_column(String(100), default="")
+    worker: Mapped[str] = mapped_column(String(100), default="")
+    bound_worker: Mapped[str] = mapped_column(String(100), default="")
+    bound_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    peer_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    action: Mapped[str] = mapped_column(String(40), default="")
+    repo_root: Mapped[str] = mapped_column(String(1024), default="")
+    paths: Mapped[str] = mapped_column(Text, default="[]")          # JSON list
+    task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    delegation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    evidence_keys: Mapped[str] = mapped_column(Text, default="[]")  # JSON list
+    allowed: Mapped[bool] = mapped_column(Boolean, default=False)
+    reasons: Mapped[str] = mapped_column(Text, default="[]")        # JSON list
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
