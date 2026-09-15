@@ -3,6 +3,23 @@
 ## [Unreleased]
 
 ### Fixed
+- **Lock readers compare where a path actually is (#2761).** `POST /api/locks/check`
+  and `POST /api/git/pre-commit-check` matched the raw path against the raw
+  repo-relative pattern and skipped locks by a string compare of roots, so an
+  absolute path in a repository was never covered by that repository's own
+  exclusive lock and pre-commit returned `can_proceed: true` over it. Both readers
+  now place each path and each lock once per request, purely lexically (no
+  filesystem I/O), and compare with `fnmatch`: anchored locks are compared in
+  absolute space, unanchored legacy locks still match in every repository (and are
+  never hidden by a caller `repo_root`), a rootless relative caller keeps the legacy
+  conservative answer, and input that cannot be placed (NUL, a non-absolute root,
+  `..` escapes) falls back to the pre-#2761 rule instead of raising. Placement
+  only adds coverage: a lock the pre-#2761 rule reported is still reported unless
+  it is an anchored lock of another repository, and a directory-form query
+  (`src/`, `src/.`) keeps its trailing `/`, so `src/**` still covers it. A
+  generated base-vs-candidate differential test pins both. When several
+  locks cover a path, `locks/check` reports an exclusive one. MCP `whos_editing` now
+  accepts and forwards `repo_root`. Contract and truth table: `docs/lock-readers.md`.
 - **A lock is refused where a session would be (#2756, Gap 4).** `POST /api/locks`
   inserted unconditionally, so a session could lay an exclusive lock over another
   live session's claim that `start_session` would have refused, and

@@ -112,9 +112,10 @@ class LockCreate(BaseModel):
 
 class LockCheckRequest(BaseModel):
     paths: list[str]
-    # Caller's git root: locks held by sessions anchored to a DIFFERENT repo are
-    # skipped (their patterns are relative to that repo, not this one). '' or
-    # omitted = legacy behavior (all locks considered).
+    # Caller's git root: places RELATIVE paths in that repository, so locks
+    # anchored to another repository do not match them. Absolute paths carry their
+    # own location. '' = relative paths match every repository's locks (legacy).
+    # Contract: docs/lock-readers.md.
     repo_root: str = ""
 
 

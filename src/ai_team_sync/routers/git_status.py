@@ -80,8 +80,9 @@ class PreCommitCheckRequest(BaseModel):
     """Request to check if staged files conflict with active locks."""
 
     staged_files: list[str] | None = None  # If None, auto-detect from git
-    # Caller's git root — anchors the check so locks held for a DIFFERENT repo
-    # (repo-relative patterns) don't flag this repo's files. '' = legacy.
+    # Caller's git root: places RELATIVE staged paths in that repository
+    # (docs/lock-readers.md). Absolute paths carry their own location; '' leaves
+    # relative paths on the legacy match-everywhere rule.
     repo_root: str = ""
 
 
@@ -105,7 +106,8 @@ async def pre_commit_check(
     """
     from ai_team_sync.git_utils import get_staged_files
     from ai_team_sync.models import ScopeLock
-    from ai_team_sync.routers.locks import _cross_repo, _get_active_locks
+    from ai_team_sync.routers.locks import _get_active_locks
+    from ai_team_sync.scope_paths import reader_covers, reader_lock, reader_query
 
     # Get staged files
     if body.staged_files is None:
@@ -127,13 +129,12 @@ async def pre_commit_check(
     advisory_locks = []
     warnings = []
 
+    locks = [(lock, developer, reader_lock(lock.pattern, lock_repo_root))
+             for lock, developer, lock_repo_root in active_locks]
     for file in staged_files:
-        for lock, developer, lock_repo_root in active_locks:
-            from fnmatch import fnmatch
-
-            if _cross_repo(caller_repo_root, lock_repo_root):
-                continue  # lock belongs to a different repo — not this commit's concern
-            if fnmatch(file, lock.pattern):
+        query = reader_query(file, caller_repo_root)
+        for lock, developer, form in locks:
+            if reader_covers(query, form):
                 lock_info = {
                     "file": file,
                     "pattern": lock.pattern,

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from fnmatch import fnmatch
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import or_, select
@@ -13,6 +12,7 @@ from ai_team_sync import peer_identity
 from ai_team_sync.database import get_db
 from ai_team_sync.models import ScopeLock, Session
 from ai_team_sync.notifications.dispatcher import dispatch
+from ai_team_sync.scope_paths import reader_covers, reader_lock, reader_query
 from ai_team_sync.schemas import (
     LockCheckRequest,
     LockCheckResult,
@@ -125,30 +125,31 @@ async def list_locks(db: AsyncSession = Depends(get_db)):
 
 @router.post("/check", response_model=list[LockCheckResult])
 async def check_locks(body: LockCheckRequest, db: AsyncSession = Depends(get_db)):
-    """Check if any of the given paths conflict with active locks."""
+    """Which live lock covers each path. Lexical, per docs/lock-readers.md: each
+    path and each lock is placed once per request, then compared with fnmatch."""
     active_locks = await _get_active_locks(db)
     results = []
 
+    locks = [(lock, developer, reader_lock(lock.pattern, lock_repo_root))
+             for lock, developer, lock_repo_root in active_locks]
     for path in body.paths:
-        matched = False
-        for lock, developer, lock_repo_root in active_locks:
-            if _cross_repo(body.repo_root, lock_repo_root):
-                continue  # pattern belongs to a different repo — not a conflict here
-            if fnmatch(path, lock.pattern):
-                results.append(LockCheckResult(
-                    path=path,
-                    locked=True,
-                    lock_id=lock.id,
-                    session_id=lock.session_id,
-                    developer=developer,
-                    mode=lock.mode,
-                    pattern=lock.pattern,
-                    reason=lock.reason or "",
-                ))
-                matched = True
-                break
-        if not matched:
+        query = reader_query(path, body.repo_root)
+        hits = [(lock, developer) for lock, developer, form in locks if reader_covers(query, form)]
+        if not hits:
             results.append(LockCheckResult(path=path, locked=False))
+            continue
+        # One row per path: an exclusive lock that covers it is the one reported.
+        lock, developer = next((h for h in hits if h[0].mode == "exclusive"), hits[0])
+        results.append(LockCheckResult(
+            path=path,
+            locked=True,
+            lock_id=lock.id,
+            session_id=lock.session_id,
+            developer=developer,
+            mode=lock.mode,
+            pattern=lock.pattern,
+            reason=lock.reason or "",
+        ))
 
     # Dispatch conflict notifications for any exclusive locks hit
     conflicts = [r for r in results if r.locked and r.mode == "exclusive"]

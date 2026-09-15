@@ -281,9 +281,10 @@ async def list_tools() -> list[Tool]:
                     },
                     "repo_root": {
                         "type": "string",
-                        "description": "Absolute git root the paths belong to. When given, locks "
-                                       "anchored to a DIFFERENT repo are ignored (their patterns "
-                                       "are relative to that repo). Omit = consider all locks.",
+                        "description": "Absolute git root that RELATIVE paths belong to, so locks "
+                                       "anchored to another repo do not match them. Absolute paths "
+                                       "carry their own location. Omit = relative paths match every "
+                                       "repo's locks (legacy). See docs/lock-readers.md.",
                     },
                 },
                 "required": ["paths"],
@@ -299,6 +300,13 @@ async def list_tools() -> list[Tool]:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": "File paths you're about to edit (e.g., ['src/auth/jwt.py'])",
+                    },
+                    "repo_root": {
+                        "type": "string",
+                        "description": "Absolute git root that RELATIVE paths belong to, so locks "
+                                       "anchored to another repo do not match them. Absolute paths "
+                                       "carry their own location. Omit = relative paths match every "
+                                       "repo's locks (legacy). See docs/lock-readers.md.",
                     },
                 },
                 "required": ["paths"],
@@ -716,9 +724,10 @@ async def list_tools() -> list[Tool]:
                     },
                     "repo_root": {
                         "type": "string",
-                        "description": "Absolute git root of the repo being committed. When "
-                                       "given, locks anchored to a DIFFERENT repo are ignored. "
-                                       "Omit = consider all locks.",
+                        "description": "Absolute git root of the repo being committed; places "
+                                       "RELATIVE paths in it, so locks anchored to another repo do "
+                                       "not match them. Absolute paths carry their own location. "
+                                       "Omit = relative paths match every repo's locks (legacy).",
                     },
                 },
                 "required": ["paths"],
@@ -1128,7 +1137,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 locked_rows: list[dict] = []
                 try:
                     lock_resp = await client.post(
-                        f"{SERVER_URL}/api/locks/check", json={"paths": paths})
+                        f"{SERVER_URL}/api/locks/check",
+                        json={"paths": paths, "repo_root": arguments.get("repo_root", "")})
                     lock_resp.raise_for_status()
                     locked_rows = [r for r in lock_resp.json() if r.get("locked")]
                 except Exception as _lk_err:  # noqa: BLE001
