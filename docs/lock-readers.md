@@ -97,6 +97,15 @@ that lock is reported; otherwise the first covering lock is. The mode of each
 lock is never changed. `pre-commit-check` lists every covering lock and blocks on
 any exclusive one, as before.
 
+> **Known defect (#2757) — this is behaviour, not contract.** "Any exclusive
+> one" includes the CALLER'S OWN exclusive locks. The endpoint takes
+> `staged_files` and `repo_root` and no session identity, so a session using
+> exclusive locks correctly is always told its own commit is blocked. Reporting
+> the lock is right — this file's contract is coverage, and coverage does not
+> depend on who asks. Rendering it as a BLOCKING VERDICT without knowing the
+> caller is the bug. Do not treat the sentence above as the intended rule.
+> See Gap 5 in `docs/product-gaps-reaper-and-scope.md`.
+
 ## Callers and repository identity
 
 A reader can only be as repository-correct as the identity its caller supplies.

@@ -95,6 +95,97 @@ vs `src/**`), and repo roots are compared as strings after stripping a trailing
 comparison in `authority.py` remains the authoritative exclusive-lock check for
 mutation grants.
 
+## Gap 5 — the readers carry no caller identity, so a session is told its own claims block it — OPEN (#2757)
+
+`POST /api/git/pre-commit-check` (`routers/git_status.py`) accepts `staged_files`
+and `repo_root` and nothing else. It carries no session identity, so it classifies
+every covering exclusive lock as commit-blocking, the caller's own included. The
+MCP `pre_commit_check` tool passes no session id either. Observed 2026-09-14
+during #2756: a session was told "9 file(s) BLOCKED by exclusive locks ... Commit
+will be blocked. Resolve conflicts first." — all nine were its own exclusive
+claims.
+
+The same missing-identity root cause reaches the **task brief**. `build_brief`
+(`briefs.py`) selects every live lock overlapping the requested scope in the same
+repo and lists it under "BLOCKERS NOW", with no exclusion of the calling session —
+and its signature takes no session or agent argument, so it has no identity to
+filter on. Because `start_session` creates the session's locks and *then* builds
+its brief, a session is guaranteed to be shown its own brand-new locks as
+blockers. Reproduced 2026-09-15 on session `048705db`: both locks it had just been
+granted came back to it as "BLOCKERS NOW". This is the same defect as the
+pre-commit one, not a second bug, and it is recorded on #2757.
+
+**Reporting is not the defect.** `/api/locks/check` is a namespace reader; it is
+asked "which live locks cover this path" and answering with the caller's own lock
+is correct (`docs/lock-readers.md`). What is wrong is the **verdict** — "BLOCKED",
+"Commit will be blocked", "BLOCKERS NOW" — rendered by a surface that does not
+know who is asking. A fix belongs in the verdict, not in the reader's coverage
+answer.
+
+Enforcement status, re-verified 2026-09-15: in this repository the tool is
+advisory text only. `.git/hooks` holds only `*.sample`, `core.hooksPath` is unset,
+and `hooks/pre_commit.py` is installed in no repository. The only enforcing guard
+on that path is the Claude PreToolUse lock-guard, which *does* self-exclude the
+caller's session. So the severity is "teaches agents to distrust the tool", not
+"blocks sanctioned commits" — re-check that judgement in any repo where the ats
+hooks ARE installed (`scripts/install-hooks.sh`).
+
+Fix direction (not decided): pass the caller's session identity and exclude that
+session's own locks, mirroring `create_lock`'s `exclude_session_id`; keep other
+live sessions' exclusive locks blocking; decide what an *unidentified* caller is
+told. Tests: own exclusive lock -> not blocking; another live session's exclusive
+lock -> blocking; advisory -> warning; cross-repo anchoring unchanged.
+
+## Gap 6 — a resurrected session keeps its scope and silently loses its locks — OPEN (#2760)
+
+`session_heartbeat_timeout_minutes` is 20 (`config.py`). A session silent past
+that is completed by the reaper, which deletes its locks (`background_tasks.py`:
+select `ScopeLock` where `session_id == sess.id`, then `db.delete(lock)`). A later
+heartbeat resurrects it: `routers/sessions.py` restores `status`, `completed_at`,
+`auto_completed` and the summary marker — but nothing restores the locks. The
+board then shows an ACTIVE claim, with its declared scope intact, holding nothing.
+
+**This is a regression, and the two halves were written fifteen days apart.**
+Resurrection landed in `b99ddc3` (2026-08-10), when reaping did *not* release
+locks — a reaped session kept them for the full `lock_ttl_hours`, so there was
+nothing for resurrection to restore and the path was coherent. `06d91b9`
+(2026-08-25, "reaping a session now actually frees its lane") correctly fixed that
+lingering-lane bug, and in doing so gave resurrection something to put back. The
+resurrect branch was never updated to match.
+
+The path is not an edge case: the reaper's own comment records that a long-running
+interactive session is routinely silent past the window, so "reap -> heartbeat ->
+resurrect is the NORMAL cycle". Its measurement — 2026-08-14 over 1116 live rows,
+16 sessions carrying thrash, 55 resurrect events, worst single session 10 cycles —
+says how often the path fires, *not* how many locks were lost, because it predates
+the 2026-08-25 change that created the loss. The blast radius is resurrect events
+since 06d91b9, which has not been counted.
+
+One real scope limit: an identity-bound session is refused resurrection outright
+with 409 (`bound_worker`, #2741 — its authority must not outlive it). The defect
+therefore reaches only sessions with no identity binding.
+
+Observed 2026-09-14 during the #2759 canary: session `08353591` (agent
+`claude-code:6ad57ba1`) started with 3 advisory locks; heartbeats at 18:10:09 then
+18:49:05, a 39-minute gap across a long observation wait. At 18:49 `team_status`
+showed it active with scope intact and "Locks: 0"; `scope_locks` held no rows for
+it and the server journal has no DELETE /api/locks call, so the reaper removed
+them, not the owner. Its summary reads "[resurrected: heartbeat proved the reap
+wrong]". For that canary it changed nothing — those locks were deliberately
+advisory, and advisory locks never block grants.
+
+Impact: the owner believes it holds its claims while every reader
+(`check_locks`, `whos_editing`, the PreToolUse guard) sees nothing. An exclusive
+claim would stop protecting its files, and stop blocking mutation grants, with no
+signal to the owner.
+
+Fix direction (not decided): on resurrection either restore the reaped locks under
+a conflict check (another session may have taken the lane meanwhile), or resurrect
+into a visibly lockless state and tell the owner on its next tool call. At minimum
+`team_status` should say "resurrected, locks released" instead of showing intact
+scope. Tests: reap by silence, then heartbeat — the owner is told its locks are
+gone, or they are restored without overlapping a newer claim.
+
 ## The attention model — how much must an agent actively monitor?
 
 Short answer: for the common case, **almost none** — coordination is enforced by
