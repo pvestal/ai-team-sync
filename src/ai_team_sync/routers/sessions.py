@@ -109,12 +109,15 @@ async def _check_scope_conflicts(
     new_patterns: list[str],
     current_developer: str,
     repo_root: str = "",
+    exclude_session_id: str = "",
 ) -> list[dict]:
     """Check if new scope patterns conflict with existing active locks.
 
     `repo_root` anchors the check: locks held by sessions anchored to a
     DIFFERENT repo use patterns relative to that repo, so they cannot conflict
     with this session's patterns ('' on either side = legacy match-everywhere).
+    `exclude_session_id` leaves out the requester's own locks: a session
+    extending its own scope does not conflict with itself.
     """
     from ai_team_sync.routers.locks import _cross_repo, _get_active_locks
 
@@ -124,6 +127,8 @@ async def _check_scope_conflicts(
     conflicts = []
     for new_pattern in new_patterns:
         for lock, developer, lock_repo_root in active_locks:
+            if exclude_session_id and lock.session_id == exclude_session_id:
+                continue
             if _cross_repo(repo_root, lock_repo_root):
                 continue  # other repo's patterns can't collide with ours
             # Check if patterns overlap using bidirectional matching
@@ -140,6 +145,38 @@ async def _check_scope_conflicts(
                 })
 
     return conflicts
+
+
+def blocking_conflict(conflicts: list[dict], requested_mode: str) -> dict | None:
+    """The conflict that refuses a new claim, or None when the overlap is shared.
+
+    Refused when an overlapping lock is exclusive, or when the request itself is
+    exclusive and anything overlaps. Session creation and POST /api/locks apply
+    this one rule (#2756).
+    """
+    exclusive = [c for c in conflicts if c["lock_mode"] == "exclusive"]
+    if exclusive:
+        return exclusive[0]
+    if requested_mode == "exclusive" and conflicts:
+        return conflicts[0]
+    return None
+
+
+def scope_conflict_detail(what: str, conflict: dict, conflicts: list[dict]) -> dict:
+    """The 409 body for a refused claim; `what` names the refused object."""
+    mode_msg = (
+        f"exclusive lock '{conflict['existing_pattern']}'"
+        if conflict["lock_mode"] == "exclusive"
+        else f"existing lock '{conflict['existing_pattern']}' (you requested exclusive mode)"
+    )
+    return {
+        "error": "scope_conflict",
+        "message": (
+            f"Cannot create {what}: scope '{conflict['new_pattern']}' conflicts "
+            f"with {mode_msg} held by {conflict['existing_developer']}"
+        ),
+        "conflicts": conflicts,
+    }
 
 
 
@@ -323,32 +360,12 @@ async def create_session(body: SessionCreate, request: Request,
             db, scope, body.developer, repo_root=repo_root)
 
         if conflicts:
-            # Determine lock mode for new session
             new_lock_mode = getattr(body, 'lock_mode', settings.lock_default_mode)
-
-            # Separate exclusive vs advisory conflicts
-            exclusive_conflicts = [c for c in conflicts if c["lock_mode"] == "exclusive"]
-
-            # Block if:
-            # 1. Any existing lock is exclusive, OR
-            # 2. User is requesting exclusive mode (can't coexist with any lock)
-            if exclusive_conflicts or new_lock_mode == "exclusive":
-                conflict = exclusive_conflicts[0] if exclusive_conflicts else conflicts[0]
-                mode_msg = (
-                    f"exclusive lock '{conflict['existing_pattern']}'"
-                    if conflict["lock_mode"] == "exclusive"
-                    else f"existing lock '{conflict['existing_pattern']}' (you requested exclusive mode)"
-                )
+            conflict = blocking_conflict(conflicts, new_lock_mode)
+            if conflict is not None:
                 raise HTTPException(
                     status_code=409,
-                    detail={
-                        "error": "scope_conflict",
-                        "message": (
-                            f"Cannot create session: scope '{conflict['new_pattern']}' conflicts "
-                            f"with {mode_msg} held by {conflict['existing_developer']}"
-                        ),
-                        "conflicts": conflicts,
-                    }
+                    detail=scope_conflict_detail("session", conflict, conflicts),
                 )
 
             # Advisory conflicts: warn via notification but allow

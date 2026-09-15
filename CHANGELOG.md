@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+### Fixed
+- **A lock is refused where a session would be (#2756, Gap 4).** `POST /api/locks`
+  inserted unconditionally, so a session could lay an exclusive lock over another
+  live session's claim that `start_session` would have refused, and
+  `extend_scope`'s refusal branch was dead code. `create_lock` now applies session
+  creation's own overlap check and refusal rule — one rule, shared, excluding the
+  session's own locks — and answers 409 `scope_conflict` naming the holder.
+  Repo anchoring and advisory sharing are unchanged. `extend_scope` now takes
+  locks before declaring scope, adds only granted patterns, and reports
+  `NOT extended` / `PARTIALLY extended` with each refusal instead of "Scope
+  extended". The #2741 grant tests that relied on the old unconditional insert
+  now write the foreign lock row directly; their grant assertions are unchanged.
+
 ### Added
 - **The worker ATS names is the worker that actually ran.** `delegate` used one
   hardcoded command line, so `--worker codex` created a row labelled

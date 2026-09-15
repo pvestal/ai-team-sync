@@ -131,7 +131,10 @@ Allowed requires ALL of:
 **Claims cannot be self-granted.** Only the locks a bound session creates at
 creation, from its bound account, in canonical form (exact file or `dir/**`),
 bear authority. `POST /api/locks` still creates coordination locks for anyone
-who owns the session, but they never bear authority.
+who owns the session, but they never bear authority. Such a lock is refused
+(409 `scope_conflict`) under the same overlap rule as session creation (#2756),
+and that refusal is coordination, not protection: grants apply their own
+conservative exclusive-lock comparison regardless of how a lock came to exist.
 
 **Cross-account changes.** Sessions record the uid that created them. A live
 session — however long it has been silent — cannot be completed, patched,

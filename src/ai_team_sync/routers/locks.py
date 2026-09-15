@@ -93,6 +93,17 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
                         f"locks are attached to a session by the account that owns it"),
             "session_id": session.id})
 
+    # Session creation's overlap rule, applied to every lock (#2756).
+    from ai_team_sync.routers.sessions import (
+        _check_scope_conflicts, blocking_conflict, scope_conflict_detail)
+
+    conflicts = await _check_scope_conflicts(
+        db, [body.pattern], session.developer, repo_root=session.repo_root or "",
+        exclude_session_id=session.id)
+    conflict = blocking_conflict(conflicts, body.mode)
+    if conflict is not None:
+        raise HTTPException(409, detail=scope_conflict_detail("lock", conflict, conflicts))
+
     # A lock made here coordinates; it never bears authority (#2741). A mutation
     # grant is measured only against a bound session's creation-time claims, so
     # a caller cannot manufacture the claim that would authorize it.

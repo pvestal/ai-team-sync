@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ai_team_sync import peer_identity, scope_paths
 from ai_team_sync.hooks.pre_tool_use_lockcheck import normalize_pattern, scope_matches
@@ -442,17 +443,35 @@ async def test_a_rejected_configuration_breaks_no_session_and_grants_nothing(cli
 
 # ── 9-11. one canonical path; no spelling evades a lock ────────────────────
 
+_raw_db: dict = {}
+
+
+@pytest.fixture(autouse=True)
+def _direct_lock_writer(db_engine):
+    _raw_db["factory"] = async_sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
+    yield
+    _raw_db.clear()
+
+
+async def _lay_exclusive_lock(owner, pattern):
+    """Write another session's exclusive lock row directly, as a create race or
+    a pre-#2756 row leaves it. POST /api/locks now refuses most overlapping
+    spellings, and the grant check must refuse however the lock arrived."""
+    async with _raw_db["factory"]() as s:
+        lock = ScopeLock(session_id=owner, pattern=pattern, mode="exclusive")
+        s.add(lock)
+        await s.commit()
+        return lock.id
+
+
 async def _exec_with_foreign_exclusive_lock(client, peer, pattern="src/a.py", owner_root=ROOT):
-    """The executor claims first; another account's exclusive lock arrives
-    afterwards through POST /api/locks, which checks no conflicts. Session
-    creation would have refused the opposite order, so only the grant-time
-    check stands between the executor and the locked file here."""
+    """The executor claims first; another account's exclusive lock lands on the
+    claimed file afterwards, so only the grant-time check stands between the
+    executor and the locked file here."""
     executor = await _sid(client, peer, EXEC_UID, "echo-executor:run1", ["src/**"])
     owner = await _sid(client, peer, OTHER_UID, "claude-code:owner", repo_root=owner_root)
     peer["uid"] = OTHER_UID
-    lock = await client.post("/api/locks", json={"session_id": owner, "pattern": pattern, "mode": "exclusive"})
-    assert lock.status_code == 201, lock.text
-    return owner, lock.json()["id"], executor
+    return owner, await _lay_exclusive_lock(owner, pattern), executor
 
 
 @pytest.mark.parametrize("path", ["src//a.py", "src/./a.py", "./src/a.py", "src/a.py/", "src", "src/"])
@@ -503,8 +522,7 @@ async def test_symlinks_cannot_escape_or_alias_a_locked_file(client, bound_regis
     executor = await _sid(client, peer, EXEC_UID, "echo-executor:run1", ["src/**"], repo_root=root)
     owner = await _sid(client, peer, OTHER_UID, "claude-code:owner", repo_root=root)
     peer["uid"] = OTHER_UID
-    assert (await client.post("/api/locks", json={"session_id": owner, "pattern": "src/a.py",
-                                                  "mode": "exclusive"})).status_code == 201
+    await _lay_exclusive_lock(owner, "src/a.py")
     escaped = await _authorize(client, peer, EXEC_UID, executor, "commit", **_commit(["src/out/passwd"], root))
     assert escaped["allowed"] is False and any("outside the repository" in r for r in escaped["reasons"])
     aliased = await _authorize(client, peer, EXEC_UID, executor, "commit", **_commit(["src/alias.py"], root))
@@ -847,8 +865,7 @@ async def _foreign_lock(client, peer, root, pattern, owner_root=None):
     owner = await _sid(client, peer, OTHER_UID, "claude-code:owner",
                        repo_root=root if owner_root is None else owner_root)
     peer["uid"] = OTHER_UID
-    assert (await client.post("/api/locks", json={"session_id": owner, "pattern": pattern,
-                                                  "mode": "exclusive"})).status_code == 201
+    await _lay_exclusive_lock(owner, pattern)
 
 
 async def test_r1_f3_a_lock_spelled_through_a_symlink_protects_the_real_file(client, bound_registry, peer, tmp_path):

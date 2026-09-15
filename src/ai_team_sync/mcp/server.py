@@ -2081,31 +2081,10 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 patterns = arguments["patterns"]
                 mode = arguments.get("mode", "advisory")
 
-                # Merge into the session's declared scope (board text), de-duped.
-                sess = await client.get(f"{SERVER_URL}/api/sessions/{active_session_id}")
-                sess.raise_for_status()
-                sess_data = sess.json()
-                current = sess_data.get("scope") or []
-                merged = list(dict.fromkeys([*current, *patterns]))
-                patch_body: dict[str, Any] = {"scope": merged}
-                # Adoption variant (ats-sessionstart-orphan-adoption-p01): a
-                # session taking real locks must not keep the placeholder
-                # description — a working session with 'auto-registered on
-                # SessionStart' reads as an orphan on the board (observed
-                # 2026-07-02, agent 4f5c927a). Derive a minimal honest one.
-                # Same dead-equality bug as the adoption path above: this compared
-                # against a bare prefix the hook never writes, so a session that
-                # took real locks kept reading as an unclaimed orphan forever.
-                if is_autoregistered(sess_data.get("description")):
-                    patch_body["description"] = derived_working_description(merged)
-                patch = await client.patch(
-                    f"{SERVER_URL}/api/sessions/{active_session_id}",
-                    json=patch_body,
-                )
-                patch.raise_for_status()
-
-                # Create enforceable locks for the newly-added patterns.
-                created, conflicts = [], []
+                # Locks FIRST, scope second (#2756): the board must never declare
+                # a pattern this session was refused. The old order patched the
+                # merged scope, then announced "Scope extended" over refused locks.
+                created, refused = [], []
                 for pat in patterns:
                     lr = await client.post(
                         f"{SERVER_URL}/api/locks",
@@ -2114,16 +2093,57 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     )
                     if lr.status_code in (200, 201):
                         created.append(pat)
-                    elif lr.status_code == 409:
-                        conflicts.append(pat)
-                    else:
-                        lr.raise_for_status()
+                        continue
+                    # Any refusal is reported and the loop continues, so a lock
+                    # already taken for an earlier pattern is never hidden by a
+                    # later pattern's error.
+                    try:
+                        body = lr.json()
+                        detail = body.get("detail") if isinstance(body, dict) else body
+                    except ValueError:
+                        detail = lr.text
+                    why = str((detail.get("message") if isinstance(detail, dict) else detail)
+                              or "refused")[:300]
+                    refused.append((pat, lr.status_code,
+                                    why if lr.status_code == 409 else f"HTTP {lr.status_code}: {why}"))
 
-                msg = f"✅ Scope extended (+{len(created)} {mode} lock(s)).\n\n"
-                msg += "Now covering:\n" + "\n".join(f"  • {p}" for p in merged) + "\n"
-                if conflicts:
-                    msg += ("\n⚠️ Not locked (held by another active session): "
-                            + ", ".join(conflicts) + " — coordinate or request_override.")
+                # Merge only what was locked into the declared scope, de-duped.
+                sess = await client.get(f"{SERVER_URL}/api/sessions/{active_session_id}")
+                sess.raise_for_status()
+                sess_data = sess.json()
+                current = sess_data.get("scope") or []
+                merged = list(dict.fromkeys([*current, *created]))
+                if created:
+                    patch_body: dict[str, Any] = {"scope": merged}
+                    # Adoption variant (ats-sessionstart-orphan-adoption-p01): a
+                    # session taking real locks must not keep the placeholder
+                    # description — a working session with 'auto-registered on
+                    # SessionStart' reads as an orphan on the board (observed
+                    # 2026-07-02, agent 4f5c927a). Derive a minimal honest one.
+                    # Same dead-equality bug as the adoption path above: this compared
+                    # against a bare prefix the hook never writes, so a session that
+                    # took real locks kept reading as an unclaimed orphan forever.
+                    if is_autoregistered(sess_data.get("description")):
+                        patch_body["description"] = derived_working_description(merged)
+                    patch = await client.patch(
+                        f"{SERVER_URL}/api/sessions/{active_session_id}",
+                        json=patch_body,
+                    )
+                    patch.raise_for_status()
+
+                if not refused:
+                    msg = f"✅ Scope extended (+{len(created)} {mode} lock(s)).\n\n"
+                elif created:
+                    msg = (f"⚠️ Scope PARTIALLY extended: +{len(created)} {mode} lock(s), "
+                           f"{len(refused)} refused.\n\n")
+                else:
+                    msg = "❌ Scope NOT extended: every requested lock was refused.\n\n"
+                msg += "Now covering:\n" + ("\n".join(f"  • {p}" for p in merged) or "  (nothing)") + "\n"
+                if refused:
+                    msg += "\nRefused — not locked and not added to your scope:\n"
+                    msg += "\n".join(f"  • {p}: {why}" for p, _code, why in refused) + "\n"
+                    if any(code == 409 for _p, code, _why in refused):
+                        msg += "Coordinate with the holder or request_override."
                 return [TextContent(type="text", text=msg)]
 
             elif name == "get_override_request_details":

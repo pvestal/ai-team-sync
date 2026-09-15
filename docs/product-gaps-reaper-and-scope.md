@@ -78,15 +78,22 @@ heartbeat hook all route through it, so concurrent sessions no longer cross-bump
 Covered by `tests/test_session_autostart.py` (per-session-beats-global-clobber +
 env-override-wins).
 
-## Gap 4 — `POST /api/locks` has no conflict check (OPEN)
+## Gap 4 — `POST /api/locks` had no conflict check — SHIPPED (2026-09-14, #2756)
 
-`create_lock` creates the lock unconditionally (only validates the session exists
-and the pattern is a glob). It never returns 409. So `extend_scope`'s "not locked —
-held by another active session" branch is effectively dead: an extended scope can
-silently overlap another session's locks. The PreToolUse lock-guard still catches
-the actual edit, so this is a *reporting* gap, not a safety hole — but the tool
-output is misleading. Fix: have `create_lock` run the same overlap check as
-`create_session` and return 409 on exclusive conflicts.
+`create_lock` created the lock unconditionally, so `extend_scope`'s refusal branch
+never fired and an extended scope could silently overlap another session's
+exclusive lock. It now runs session creation's overlap check and refusal rule
+(`_check_scope_conflicts` + `blocking_conflict`, excluding the session's own
+locks) and answers 409 `scope_conflict`: refused when an overlapping lock of
+another live session is exclusive, or when the request is exclusive and anything
+overlaps; advisory over advisory still shares. `extend_scope` now takes locks
+first and adds only granted patterns to the declared scope, reporting each
+refusal with its reason (the holder, for a conflict). The check-then-insert is
+not atomic, the rule's bidirectional fnmatch does not see every spelling (`src`
+vs `src/**`), and repo roots are compared as strings after stripping a trailing
+`/` (`/srv//repo` reads as a different repo), so the grant-time conservative
+comparison in `authority.py` remains the authoritative exclusive-lock check for
+mutation grants.
 
 ## The attention model — how much must an agent actively monitor?
 
