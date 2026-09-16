@@ -95,7 +95,7 @@ vs `src/**`), and repo roots are compared as strings after stripping a trailing
 comparison in `authority.py` remains the authoritative exclusive-lock check for
 mutation grants.
 
-## Gap 5 — the readers carry no caller identity, so a session is told its own claims block it — OPEN (#2757)
+## Gap 5 — the readers carried no caller identity, so a session was told its own claims blocked it — SHIPPED (2026-09-15, #2757)
 
 `POST /api/git/pre-commit-check` (`routers/git_status.py`) accepts `staged_files`
 and `repo_root` and nothing else. It carries no session identity, so it classifies
@@ -130,11 +130,38 @@ caller's session. So the severity is "teaches agents to distrust the tool", not
 "blocks sanctioned commits" — re-check that judgement in any repo where the ats
 hooks ARE installed (`scripts/install-hooks.sh`).
 
-Fix direction (not decided): pass the caller's session identity and exclude that
-session's own locks, mirroring `create_lock`'s `exclude_session_id`; keep other
-live sessions' exclusive locks blocking; decide what an *unidentified* caller is
-told. Tests: own exclusive lock -> not blocking; another live session's exclusive
-lock -> blocking; advisory -> warning; cross-repo anchoring unchanged.
+**Shipped in `c7a6334`.** One resolver, `caller_session.resolve_caller_session`,
+answers "which session is asking" for BOTH readers, so a verdict cannot mean two
+things depending on which endpoint rendered it. A caller is resolved only by
+identifying itself — an explicit `session_id`, the `X-ATS-Session-Id` header, or
+`X-ATS-Agent` when that label has exactly one active session for the account —
+and every path is validated with `cross_account` against the kernel's owner of
+the requesting socket, exactly as liveness validates its own headers. An
+unresolved caller excludes nothing: it keeps the full conservative answer and is
+told so, via `caller_identity_unresolved` and human-readable text.
+
+Rejected, and recorded in the module docstring so it is not retried: "this uid
+owns exactly one live session, so that must be the caller." A uid owning one
+session is a coincidence, not proof the request came FROM it, and a bare `git
+commit` hook owns none. It was caught by rows 3, 7 and 8b of
+`test_lock_readers_lexical` and by `test_mcp_pre_commit_check` going green when
+they should have been red — a real caller being told a foreign exclusive lock did
+not block it.
+
+Blocker diagnostics now name the agent and the WHOLE session id. One human runs
+many agents, so the developer name cannot say whose lock it is; it stays as
+display, never as identity.
+
+The trust granularity is the OS account, and this is a limit rather than a
+guarantee: within one account a caller can name a sibling session and drop its
+locks from ITS OWN answer only — no lock is released, no claim taken, no mutation
+granted. That is #2741's own boundary; it is not widened here, and `cross_account`
+is unchanged.
+
+Follow-up `ec9d97c` (tests only, no production change): the two new `start_session`
+tests inherited the developer shell's `ATS_AGENT`/`CLAUDECODE` identity, so they
+passed locally and failed CI as `restricted`. They now declare the identity each
+assertion depends on. CI green on `ec9d97c`: 1013 passed, 23 skipped.
 
 ## Gap 6 — a resurrected session keeps its scope and silently loses its locks — OPEN (#2760)
 

@@ -97,13 +97,19 @@ that lock is reported; otherwise the first covering lock is. The mode of each
 lock is never changed. `pre-commit-check` lists every covering lock and blocks on
 any exclusive one, as before.
 
-> **Known defect (#2757) — this is behaviour, not contract.** "Any exclusive
-> one" includes the CALLER'S OWN exclusive locks. The endpoint takes
-> `staged_files` and `repo_root` and no session identity, so a session using
-> exclusive locks correctly is always told its own commit is blocked. Reporting
-> the lock is right — this file's contract is coverage, and coverage does not
-> depend on who asks. Rendering it as a BLOCKING VERDICT without knowing the
-> caller is the bug. Do not treat the sentence above as the intended rule.
+> **Coverage is not the verdict (#2757, shipped `c7a6334`).** The sentence above
+> describes COVERAGE, and coverage never depends on who asks: `/api/locks/check`
+> still reports the caller's own lock, because "which live locks cover this path"
+> has one answer for everyone.
+>
+> `pre-commit-check` also renders a VERDICT, and a verdict does depend on the
+> caller: a session is never blocked by its OWN locks. It resolves the caller via
+> `caller_session.resolve_caller_session` — explicit `session_id`,
+> `X-ATS-Session-Id`, or `X-ATS-Agent` when unambiguous for the account — each
+> validated with `cross_account` against the kernel's owner of the requesting
+> socket. Foreign exclusive locks still block. A caller that cannot be resolved
+> keeps the full conservative answer and is told so in `caller_identity_unresolved`.
+> The task brief's "BLOCKERS NOW" uses the same resolver, so the two cannot drift.
 > See Gap 5 in `docs/product-gaps-reaper-and-scope.md`.
 
 ## Callers and repository identity
