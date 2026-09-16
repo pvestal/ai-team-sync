@@ -126,7 +126,7 @@ async def _check_scope_conflicts(
 
     conflicts = []
     for new_pattern in new_patterns:
-        for lock, developer, lock_repo_root in active_locks:
+        for lock, owner, lock_repo_root in active_locks:
             if exclude_session_id and lock.session_id == exclude_session_id:
                 continue
             if _cross_repo(repo_root, lock_repo_root):
@@ -139,7 +139,7 @@ async def _check_scope_conflicts(
                 conflicts.append({
                     "new_pattern": new_pattern,
                     "existing_pattern": lock.pattern,
-                    "existing_developer": developer,
+                    "existing_developer": owner.developer,
                     "lock_mode": lock.mode,
                     "session_id": lock.session_id,
                 })

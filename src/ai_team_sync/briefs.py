@@ -337,9 +337,17 @@ def preflight_hint(decisions: list[BriefItem], recall: list[BriefItem]
 
 async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
                       scope: list[str] | None = None, recall: bool = True,
-                      limit: int = 8) -> dict[str, Any]:
+                      limit: int = 8, caller_session_id: str | None = None,
+                      caller_identity_unresolved: bool = False) -> dict[str, Any]:
     """Assemble the packet. ATS state is authoritative and local; Echo Brain
-    recall is additive and may be absent."""
+    recall is additive and may be absent.
+
+    `caller_session_id` is the session this brief is FOR, already validated
+    against the #2741 identity boundary by the caller of this function. Its own
+    locks are not blockers (#2757) -- start_session creates a session's locks and
+    then builds its brief, so without this every session was handed its own
+    brand-new claims under BLOCKERS NOW. Unresolved (None) keeps every lock, the
+    same conservative rule pre-commit-check applies."""
     scope = scope or []
 
     # A lock is live while its session is active and it has not expired; there
@@ -360,6 +368,7 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
         and _aware(lk.expires_at) > now
         and _same_repo(lk.session.repo_root, repo_root)
         and _overlaps(lk.pattern, scope)
+        and not (caller_session_id and lk.session_id == caller_session_id)
     ]
 
     decision_rows = (await db.execute(
@@ -424,6 +433,8 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
         "objective": objective,
         "repo_root": repo_root,
         "scope": scope,
+        "caller_session_id": caller_session_id,
+        "caller_identity_unresolved": caller_identity_unresolved,
         "blockers": [i.as_dict() for i in compress(blockers, max_items=limit)],
         "decisions": [i.as_dict() for i in compress(decisions, max_items=limit)],
         "prior_work": [i.as_dict() for i in compress(prior_work, max_items=limit)],
@@ -456,6 +467,9 @@ def render(packet: dict[str, Any]) -> str:
         for i in items:
             lines.append(f"  [{i['provenance']}] {i['text']}")
             lines.append(f"      ↳ {i['citation']}")
+        if key == "blockers" and packet.get("caller_identity_unresolved"):
+            lines.append("  (caller identity unresolved — your own locks may be "
+                         "listed above; pass session_id to exclude them)")
 
     if packet.get("preflight_recommended"):
         lines += ["", "PREFLIGHT RECOMMENDED before you spend real work",

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -84,6 +84,10 @@ class PreCommitCheckRequest(BaseModel):
     # (docs/lock-readers.md). Absolute paths carry their own location; '' leaves
     # relative paths on the legacy match-everywhere rule.
     repo_root: str = ""
+    # The caller's own session, so its own locks do not block its own commit
+    # (#2757). A CLAIM, not proof: honoured only when the requesting OS account
+    # owns it. Omit it and the server resolves the caller itself.
+    session_id: str = ""
 
 
 class PreCommitCheckResponse(BaseModel):
@@ -93,21 +97,33 @@ class PreCommitCheckResponse(BaseModel):
     warnings: list[str]
     blocking_locks: list[dict]
     advisory_locks: list[dict]
+    # True when no session could be established for this caller, so the verdict
+    # is the conservative one and may count the caller's own locks (#2757).
+    caller_identity_unresolved: bool = False
+    caller_session_id: str | None = None
 
 
 @router.post("/pre-commit-check", response_model=PreCommitCheckResponse)
 async def pre_commit_check(
-    body: PreCommitCheckRequest, db: AsyncSession = Depends(get_db)
+    body: PreCommitCheckRequest, request: Request, db: AsyncSession = Depends(get_db)
 ):
     """
     Check if staged files conflict with active locks.
 
     Used by pre-commit hook to warn/block commits.
+
+    A session is never blocked by its OWN locks (#2757). Which session is asking
+    comes from the #2741 identity boundary via caller_session.resolve_caller_session
+    -- the same resolver the task brief uses, so one verdict rule, not two. A
+    caller that cannot be resolved keeps the full conservative answer and is told
+    so in caller_identity_unresolved.
     """
+    from ai_team_sync.caller_session import resolve_caller_session
     from ai_team_sync.git_utils import get_staged_files
-    from ai_team_sync.models import ScopeLock
     from ai_team_sync.routers.locks import _get_active_locks
     from ai_team_sync.scope_paths import reader_covers, reader_lock, reader_query
+
+    caller = await resolve_caller_session(db, request=request, session_id=body.session_id)
 
     # Get staged files
     if body.staged_files is None:
@@ -119,7 +135,9 @@ async def pre_commit_check(
 
     if not staged_files:
         return PreCommitCheckResponse(
-            can_proceed=True, warnings=[], blocking_locks=[], advisory_locks=[]
+            can_proceed=True, warnings=[], blocking_locks=[], advisory_locks=[],
+            caller_identity_unresolved=caller.unresolved,
+            caller_session_id=caller.session_id,
         )
 
     # Get active locks
@@ -129,29 +147,41 @@ async def pre_commit_check(
     advisory_locks = []
     warnings = []
 
-    locks = [(lock, developer, reader_lock(lock.pattern, lock_repo_root))
-             for lock, developer, lock_repo_root in active_locks]
+    # The caller's own locks are left out of the VERDICT. Coverage itself is
+    # unchanged -- /api/locks/check still reports them, because what covers a
+    # path does not depend on who asks (docs/lock-readers.md).
+    locks = [(lock, owner, reader_lock(lock.pattern, lock_repo_root))
+             for lock, owner, lock_repo_root in active_locks
+             if not caller.owns(lock)]
     for file in staged_files:
         query = reader_query(file, caller_repo_root)
-        for lock, developer, form in locks:
+        for lock, owner, form in locks:
             if reader_covers(query, form):
+                # The agent and session are the identity; the developer name is
+                # shared by every agent one human runs, so it is display only.
                 lock_info = {
                     "file": file,
                     "pattern": lock.pattern,
-                    "developer": developer,
+                    "developer": owner.developer,
+                    "agent": owner.agent,
+                    "session_id": lock.session_id,
                     "mode": lock.mode,
                 }
+                held_by = f"{owner.agent} (session {lock.session_id}, {owner.developer})"
 
                 if lock.mode == "exclusive":
                     blocking_locks.append(lock_info)
                     warnings.append(
-                        f"BLOCKED: {file} matches exclusive lock '{lock.pattern}' held by {developer}"
+                        f"BLOCKED: {file} matches exclusive lock '{lock.pattern}' held by {held_by}"
                     )
                 else:
                     advisory_locks.append(lock_info)
                     warnings.append(
-                        f"WARNING: {file} matches advisory lock '{lock.pattern}' held by {developer}"
+                        f"WARNING: {file} matches advisory lock '{lock.pattern}' held by {held_by}"
                     )
+
+    if caller.unresolved and (blocking_locks or advisory_locks):
+        warnings.append(caller.note())
 
     can_proceed = len(blocking_locks) == 0
 
@@ -160,4 +190,6 @@ async def pre_commit_check(
         warnings=warnings,
         blocking_locks=blocking_locks,
         advisory_locks=advisory_locks,
+        caller_identity_unresolved=caller.unresolved,
+        caller_session_id=caller.session_id,
     )

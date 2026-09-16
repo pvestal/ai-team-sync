@@ -1064,7 +1064,11 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         f"{SERVER_URL}/api/brief",
                         json={"objective": description,
                               "repo_root": arguments.get("repo_root", ""),
-                              "scope": scope, "limit": 6},
+                              "scope": scope, "limit": 6,
+                              # The session this brief is FOR. Without it the
+                              # brief lists back the locks this very call just
+                              # created, as BLOCKERS NOW (#2757).
+                              "session_id": data["id"]},
                         timeout=25,
                     )
                     brief_resp.raise_for_status()
@@ -1501,6 +1505,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         "repo_root": arguments.get("repo_root", ""),
                         "scope": arguments.get("scope", []),
                         "recall": arguments.get("recall", True),
+                        "session_id": load_session_id() or "",
                     },
                     timeout=30,
                 )
@@ -2038,7 +2043,11 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 response = await client.post(
                     f"{SERVER_URL}/api/git/pre-commit-check",
                     json={"staged_files": paths,
-                          "repo_root": arguments.get("repo_root", "")},
+                          "repo_root": arguments.get("repo_root", ""),
+                          # Our own locks are not a reason we cannot commit
+                          # (#2757); the server validates this against the
+                          # requesting OS account before honouring it.
+                          "session_id": load_session_id() or ""},
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -2051,19 +2060,36 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
                 msg = ""
 
+                # The agent and session are the identity. One human runs many
+                # agents, so the developer name alone cannot say whose lock this
+                # is -- it stays as display, behind the identity (#2757).
+                def _held_by(f: dict) -> str:
+                    agent = f.get("agent") or "unknown agent"
+                    sid = f.get("session_id") or ""
+                    who = f"{agent} (session {sid})" if sid else agent
+                    return f"{who}, developer {f['developer']}"
+
                 if blocked:
                     msg += f"⛔ {len(blocked)} file(s) BLOCKED by exclusive locks:\n\n"
                     for f in blocked:
                         msg += f"  {f['file']}\n"
-                        msg += f"    Locked by: {f['developer']} (pattern: {f['pattern']})\n"
+                        msg += f"    Locked by: {_held_by(f)} (pattern: {f['pattern']})\n"
                     msg += "\n❌ Commit will be blocked. Resolve conflicts first.\n\n"
 
                 if warned:
                     msg += f"⚠️ {len(warned)} file(s) have advisory locks:\n\n"
                     for f in warned:
                         msg += f"  {f['file']}\n"
-                        msg += f"    Locked by: {f['developer']} (pattern: {f['pattern']})\n"
+                        msg += f"    Locked by: {_held_by(f)} (pattern: {f['pattern']})\n"
                     msg += "\n💡 Commit allowed but coordinate with team.\n"
+
+                # Carried from the server rather than restated, so there is one
+                # wording for "this verdict may include your own locks".
+                if data.get("caller_identity_unresolved"):
+                    note = next((w for w in data.get("warnings", [])
+                                 if w.startswith("caller identity unresolved")), "")
+                    if note:
+                        msg += f"\n⚠️ {note}\n"
 
                 return [TextContent(type="text", text=msg)]
 

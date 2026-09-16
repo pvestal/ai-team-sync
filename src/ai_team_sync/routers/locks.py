@@ -36,9 +36,13 @@ def _lock_to_response(lock: ScopeLock, developer: str | None = None) -> LockResp
     )
 
 
-async def _get_active_locks(db: AsyncSession) -> list[tuple[ScopeLock, str, str]]:
-    """Return all live locks with their developer names and the owning
-    session's repo_root ('' = unanchored legacy session).
+async def _get_active_locks(db: AsyncSession) -> list[tuple[ScopeLock, Session, str]]:
+    """Return all live locks with their OWNING SESSION and that session's
+    repo_root ('' = unanchored legacy session).
+
+    The owner is carried, not just its developer name: a verdict reader has to
+    know WHICH SESSION holds a lock to leave the caller's own out (#2757), and
+    the shared human name cannot answer that.
 
     Live = unexpired, or EXCLUSIVE and held by a live owner (#2741): the TTL
     sweep keeps those, and a lock that still blocks a mutation grant must not be
@@ -51,7 +55,7 @@ async def _get_active_locks(db: AsyncSession) -> list[tuple[ScopeLock, str, str]
         .where(or_(ScopeLock.expires_at > now, ScopeLock.mode == "exclusive"))
         .where(Session.status.in_(["active", "paused"]))
     )
-    return [(lock, developer, repo_root) for lock, owner, developer, repo_root in result.all()
+    return [(lock, owner, repo_root) for lock, owner, developer, repo_root in result.all()
             if _aware(lock.expires_at) > now or live_exclusive_owner(owner)]
 
 
@@ -120,7 +124,7 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
 @router.get("", response_model=list[LockResponse])
 async def list_locks(db: AsyncSession = Depends(get_db)):
     locks = await _get_active_locks(db)
-    return [_lock_to_response(lock, developer=dev) for lock, dev, _root in locks]
+    return [_lock_to_response(lock, developer=owner.developer) for lock, owner, _root in locks]
 
 
 @router.post("/check", response_model=list[LockCheckResult])
@@ -130,8 +134,8 @@ async def check_locks(body: LockCheckRequest, db: AsyncSession = Depends(get_db)
     active_locks = await _get_active_locks(db)
     results = []
 
-    locks = [(lock, developer, reader_lock(lock.pattern, lock_repo_root))
-             for lock, developer, lock_repo_root in active_locks]
+    locks = [(lock, owner.developer, reader_lock(lock.pattern, lock_repo_root))
+             for lock, owner, lock_repo_root in active_locks]
     for path in body.paths:
         query = reader_query(path, body.repo_root)
         hits = [(lock, developer) for lock, developer, form in locks if reader_covers(query, form)]
