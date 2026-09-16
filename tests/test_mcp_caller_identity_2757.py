@@ -30,6 +30,14 @@ def _wire(monkeypatch, db_engine, tmp_path):
     the real :8400 server). Pre-existing global state, isolated rather than
     worked around."""
     monkeypatch.setenv("ATS_STATE_DIR", str(tmp_path))
+    # STRIP ambient worker identity. session_pointer.detect_agent reads ATS_AGENT,
+    # then CLAUDECODE / CLAUDE_CODE, so on a developer box every one of these tests
+    # silently ran as `claude-code` while CI, which exports none of them, ran as
+    # `restricted` (edit authority "none"). That is how c7a6334 passed locally and
+    # failed CI run 35038754439. Each test below now declares the identity its own
+    # assertion depends on; none inherits one.
+    for var in ("ATS_AGENT", "CLAUDECODE", "CLAUDE_CODE", "CLAUDE_CODE_SESSION_ID"):
+        monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", None)
     app = create_app()
     factory = async_sessionmaker(db_engine, class_=AsyncSession, expire_on_commit=False)
@@ -71,6 +79,9 @@ async def _foreign(transport, scope, mode="exclusive", agent="codex:theirs"):
 async def test_start_session_brief_does_not_list_its_own_new_locks(
         db_engine, monkeypatch, tmp_path):
     _wire(monkeypatch, db_engine, tmp_path)
+    # start_session is a mutation: the server resolves this label through the
+    # worker registry, and an unknown one is refused 403 worker_authority.
+    monkeypatch.setenv("ATS_AGENT", "claude-code")
 
     out = await mcp.call_tool("start_session", {
         "scope": ["docs/**"], "description": "2757 own-lock brief", "repo_root": ROOT})
@@ -85,6 +96,9 @@ async def test_start_session_brief_still_shows_a_foreign_blocker(
         db_engine, monkeypatch, tmp_path):
     transport = _wire(monkeypatch, db_engine, tmp_path)
     await _foreign(transport, ["docs/**"], mode="advisory")
+    # start_session is a mutation: the server resolves this label through the
+    # worker registry, and an unknown one is refused 403 worker_authority.
+    monkeypatch.setenv("ATS_AGENT", "claude-code")
 
     out = await mcp.call_tool("start_session", {
         "scope": ["docs/**"], "description": "2757 foreign blocker", "repo_root": ROOT})
