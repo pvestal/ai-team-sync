@@ -10,8 +10,9 @@ from ai_team_sync.config import settings
 
 # Idempotent lightweight column additions for existing DBs (init_db uses create_all,
 # which creates missing TABLES but never alters existing ones). Each entry is applied
-# inside try/except so a re-run / already-present column is a harmless no-op. Keep
-# these append-only and backwards-compatible (new nullable/defaulted columns only).
+# inside a savepoint so a re-run / already-present column is a harmless no-op even
+# on PostgreSQL, where one failed statement otherwise aborts the whole transaction.
+# Keep these append-only and backwards-compatible (new nullable/defaulted columns only).
 _COLUMN_MIGRATIONS = [
     ("scope_locks", "reason", "TEXT DEFAULT ''"),
     ("sessions", "last_heartbeat", "TIMESTAMP"),  # nullable liveness signal (Gap 1)
@@ -68,6 +69,7 @@ async def init_db():
         await conn.run_sync(Base.metadata.create_all)
         for table, column, coldef in _COLUMN_MIGRATIONS:
             try:
-                await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}"))
+                async with conn.begin_nested():
+                    await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}"))
             except Exception:
                 pass  # column already exists (or DB doesn't support it) — harmless

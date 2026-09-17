@@ -59,6 +59,22 @@ jobs:
   # survived shipping in the first place.
   full-suite:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: ats_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ats_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      ATS_TEST_POSTGRES_URL: postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/ats_test
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
