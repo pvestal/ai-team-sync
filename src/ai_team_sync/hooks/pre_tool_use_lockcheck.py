@@ -172,6 +172,12 @@ def claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,
             continue
         if scope_matches(rel, str(lk.get("pattern", "")), froot):
             return True, ""
+    # Lanes this session asked for back and did NOT get. Scope keeps naming them
+    # forever, so without this a reaped-and-resurrected session goes on passing
+    # the guard for a file another session now holds exclusively (#2760). The
+    # lock loop above has already granted everything genuinely held, so a pattern
+    # reaching here that is on this list is a lane the session lost.
+    lost: list[str] = []
     for s in mine_active:
         sroot = str(s.get("repo_root") or "").rstrip("/")
         if sroot and froot and sroot != froot:
@@ -179,9 +185,34 @@ def claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,
         scope = s.get("scope") or []
         if isinstance(scope, str):
             scope = [scope]
+        not_restored = s.get("locks_not_restored") or []
+        if isinstance(not_restored, str):
+            not_restored = [not_restored]
+        # ASK THE LANE ABOUT THE FILE, not the scope string about the lane.
+        # Comparing spellings let a respelled scope entry walk past its own loss
+        # ('src//**' is not the string 'src/**' but covers the same files), and
+        # scope is caller-supplied text. Matching the lost lane against `rel`
+        # uses the one comparison that is already authoritative for coverage, so
+        # no spelling of scope can dodge a lane this session does not hold.
+        covered_by_a_lost_lane = [
+            str(lane) for lane in not_restored
+            if scope_matches(rel, str(lane), froot)]
+        if covered_by_a_lost_lane:
+            lost.extend(covered_by_a_lost_lane)
+            continue
         for pat in scope:
             if scope_matches(rel, str(pat), froot):
                 return True, ""
+
+    # Name the real reason before the generic ones: "you had this and lost it"
+    # is a different instruction from "you never declared it".
+    if lost:
+        return False, (
+            f"your ATS scope still names '{lost[0]}', but that lane was NOT restored "
+            f"when this session was resurrected — another session took it while you "
+            f"were reaped, or it expired. Scope is a declaration; the lock is the "
+            f"claim. Check who holds it (ats lock check) and re-take it before "
+            f"editing.")
 
     # Say WHY, not just no. An absolute pattern that would have matched once
     # read as repo-relative is the single most common way this guard fires on

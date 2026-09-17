@@ -78,6 +78,31 @@ class Session(Base):
     # creation. Delegation.child_session_id is a pointer on another row; a grant
     # must never depend on it alone, or moving it moves the narrowing.
     delegation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    # The locks the REAPER deleted, as JSON, so resurrection can re-take the lane
+    # it was wrongly stripped of (#2760). Written at reap, CLAIMED atomically and
+    # cleared at resurrection. It records what was HELD, never what `scope`
+    # declared — scope is a declaration, a lock is a grant.
+    #
+    # The envelope is an object, not a bare list, because a lock is pinned in
+    # SPACE as well as time: `{"repo_root": <canonical>, "locks": [...]}`. A
+    # pattern is only meaningful inside the repo it was authored against, so the
+    # anchor travels with it and restoration refuses when the session has been
+    # re-anchored since (#2760 F4). An owner completion empties this field
+    # permanently — see routers.sessions.update_session (#2760 F1).
+    reaped_locks: Mapped[str] = mapped_column(Text, default="")
+    # The lanes resurrection REFUSED to give back, as a JSON list of patterns
+    # (#2760 item 3). Durable because the authority question outlives the request
+    # that answered it: the heartbeat response carries `locks_not_restored`, but
+    # the Stop hook and the MCP both discard the body, so without this the only
+    # record of a lane being gone died with the response — and `scope`, which
+    # still names that lane, went on reading as a live claim to the PreToolUse
+    # guard and as held authority on the board.
+    #
+    # It is NOT authority and never grants anything: it exists so the guard, the
+    # board and the owner agree with the locks table about what is NOT held. A
+    # lane re-taken later needs no write here — every reader subtracts the locks
+    # actually held, so a real lock always wins over this record of its absence.
+    locks_not_restored: Mapped[str] = mapped_column(Text, default="")
 
     locks: Mapped[list[ScopeLock]] = relationship(back_populates="session", cascade="all, delete-orphan")
     decisions: Mapped[list[Decision]] = relationship(back_populates="session", cascade="all, delete-orphan")

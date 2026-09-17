@@ -76,6 +76,35 @@ class SessionResponse(BaseModel):
     # so a client can tell "I was reaped" (recoverable — heartbeat resurrects it)
     # from "I finished" (terminal), instead of both reading as plain 'completed'.
     auto_completed: bool = False
+    # Resurrection result, STRUCTURED (#2760). The lifecycle marker carries only
+    # counts and an outcome, because a lock pattern is arbitrary glob syntax and
+    # narrative text is the wrong place to encode it. Anything that needs the
+    # patterns reads them here, or off the session.resurrected event — never by
+    # parsing `summary`.
+    #
+    # `restoration_outcome` is the STATE and is always set. It exists because
+    # every distinct thing that can happen used to render as an empty refusal
+    # string: "this request was not a revival", "it was, and there was nothing
+    # to give back", and "it was, and something went wrong" were indistinguishable
+    # to a caller.
+    #   not_attempted      - this request did not revive anything
+    #   restored           - revival ran; see locks_restored / locks_not_restored
+    #   nothing_journalled - revival ran; the reaper had banked no locks
+    #   refused            - revival ran; restoration refused, see restoration_reason
+    #   concurrent         - another request holds the restoration claim
+    restoration_outcome: str = "not_attempted"
+    restoration_reason: str = ""    # '' | owner_completed | identity_bound |
+                                    # unidentified_owner | anchor_moved |
+                                    # invalid_journal
+    restoration_detail: str = ""
+    locks_restored: list[str] = []
+    locks_not_restored: list[str] = []
+    # Why each entry in `locks_not_restored` was not restored — 'newer_holder'
+    # or 'expired'. PARALLEL to that list, index for index, and always the same
+    # length: a count alone cannot tell an owner whether its lane was taken or
+    # simply aged out, and a dict keyed by pattern could not answer it either
+    # once a journal named the same lane twice for two different reasons.
+    not_restored_reasons: list[str] = []
 
     model_config = {"from_attributes": True}
 

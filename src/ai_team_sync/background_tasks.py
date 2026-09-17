@@ -14,6 +14,7 @@ from ai_team_sync.config import settings
 from ai_team_sync.database import get_db
 from ai_team_sync.git_utils import uncommitted_for_scope
 from ai_team_sync.models import CommitRecord, Decision, OverrideRequest, ScopeLock, Session
+from ai_team_sync.scope_paths import canonical_root
 from ai_team_sync.events import broadcast_event
 
 # Lifecycle bookkeeping the reaper/resurrect pair writes into `summary`. Matched so a
@@ -35,6 +36,11 @@ from ai_team_sync.events import broadcast_event
 #
 # STRANDED is matched too because it is re-derived on every reap: the new note carries a
 # fresh file list, so a stale one must not linger beside it.
+# The body is machine-written and pattern-free BY CONTRACT (#2760): a marker
+# carries counts and a refusal code, never a lock pattern, because a pattern is
+# arbitrary fnmatch syntax and no amount of bracket-matching here makes prose a
+# safe container for it. The structured fields on the heartbeat response and the
+# session.resurrected event are where a pattern is read.
 _LIFECYCLE_MARKER_RE = re.compile(
     r"\s*\[(?:auto-completed|resurrected|STRANDED)\b[^\]]*\]")
 
@@ -187,6 +193,34 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
             # 4.4h earlier, still held two advisory locks due to expire 9h out.
             released = (await db.execute(
                 select(ScopeLock).where(ScopeLock.session_id == sess.id))).scalars().all()
+            # Journal BEFORE deleting. The deletion is 06d91b9's fix and is NOT
+            # weakened here: the rows still go, so the lane is genuinely free for
+            # anyone else while the session is dead. What changes is that a
+            # heartbeat disproving this reap can re-take what it took, under the
+            # same overlap rule as any other claim (#2760).
+            # authority_bearing is deliberately NOT journalled: it is only ever
+            # true for an identity-bound session's creation claim, and such a
+            # session is refused resurrection outright (#2741), so nothing here
+            # can reconstitute a grant.
+            # The ANCHOR travels with the claim (#2760 F4). A pattern means
+            # something only inside the repo it was authored against, and an
+            # ordinary session may be re-anchored by PATCH while it is dead, so
+            # restoration compares this against the session's anchor at the time
+            # and refuses a claim that would land in another namespace.
+            sess.reaped_locks = json.dumps({
+                "repo_root": canonical_root(getattr(sess, "repo_root", "") or ""),
+                "locks": [
+                    {"pattern": l.pattern, "mode": l.mode, "reason": l.reason or "",
+                     "expires_at": _aware(l.expires_at).isoformat(),
+                     # The ORIGINAL clock travels with the claim. A restored lock
+                     # that took `created_at=now` would reset the activity score
+                     # this very function computes (max of started_at,
+                     # last_heartbeat and the newest lock/commit/decision), so
+                     # restoring a lane would buy the session another full
+                     # inactivity window it had not earned (#2760).
+                     "created_at": _aware(l.created_at).isoformat()}
+                    for l in released],
+            })
             for lock in released:
                 await db.delete(lock)
             # Mark WHO completed it. A later heartbeat on a reaper-completed

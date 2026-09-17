@@ -34,6 +34,14 @@ _COLUMN_MIGRATIONS = [
     ("sessions", "task_id", "INTEGER"),
     ("sessions", "delegation_id", "TEXT"),
     ("scope_locks", "authority_bearing", "BOOLEAN DEFAULT 0"),
+    # What the reaper took, so resurrection can give it back (#2760). Historical
+    # rows backfill to '', which reads correctly as "nothing was journalled" —
+    # a session reaped before this shipped resurrects exactly as it does today.
+    ("sessions", "reaped_locks", "TEXT DEFAULT ''"),
+    # Which lanes resurrection refused, so the guard and the board can disagree
+    # with a stale `scope` (#2760). Backfills to '' — a session that never lost a
+    # lane reads exactly as it does today.
+    ("sessions", "locks_not_restored", "TEXT DEFAULT ''"),
 ]
 
 engine = create_async_engine(

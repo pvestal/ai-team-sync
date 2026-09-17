@@ -1679,6 +1679,17 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     msg += f"  Branch: {s['branch']}\n"
                     msg += f"  Description: {s['description']}\n"
                     msg += f"  Locks: {s['lock_count']}  Decisions: {s['decision_count']}\n"
+                    # Scope alone has always been printed as though it were the
+                    # claim. For a session resurrected without some of its lanes
+                    # that reads as authority it does not have, so name the gap
+                    # here rather than letting "Scope: src/**  Locks: 0" be read
+                    # as a live claim (#2760).
+                    lost = s.get("locks_not_restored") or []
+                    if lost:
+                        shown = ", ".join(lost[:5]) + ("…" if len(lost) > 5 else "")
+                        msg += (f"  ⚠ NOT restored after resurrection ({len(lost)}): {shown}"
+                                f" — declared in scope, NOT held. Not a blocker for others;"
+                                f" this session must re-take them.\n")
                     unc = s.get("uncommitted_in_scope") or []
                     if unc:
                         shown = ", ".join(unc[:5]) + ("…" if len(unc) > 5 else "")
