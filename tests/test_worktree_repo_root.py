@@ -98,7 +98,9 @@ def test_a_lock_taken_in_the_main_checkout_blocks_the_same_file_in_a_worktree(tm
 
     rel = _rel(str(wt / "src" / "x.py"))
     _, froot = _roots(str(wt / "src" / "x.py"))
-    conflicts = find_conflicts(rel, sessions, "mine", file_repo_root=froot)
+    conflicts = find_conflicts(rel, sessions, "mine", file_repo_root=froot,
+                               locks=[{"session_id": "other", "pattern": "src/**",
+                                       "mode": "exclusive"}])
 
     assert conflicts, "worktree edit must see the main checkout's lock"
 

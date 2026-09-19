@@ -1,4 +1,4 @@
-"""ats-lockcheck-repo-anchoring-p01: repo-relative scope patterns must not
+"""ats-lockcheck-repo-anchoring-p01: repo-relative lock patterns must not
 collide across repos.
 
 Observed 2026-07-04 (twice in one session): a 'tests/**' lock held for
@@ -39,6 +39,7 @@ def test_cross_repo_legacy_unanchored():
 
 def _sess(**over):
     base = {
+        "id": "other",
         "status": "active",
         "agent": "claude-code:e4a6e21c",
         "scope": ["tests/**"],
@@ -49,12 +50,16 @@ def _sess(**over):
     return base
 
 
+def _lock():
+    return {"session_id": "other", "pattern": "tests/**", "mode": "exclusive"}
+
+
 def test_hook_skips_other_repo_lock():
     # The exact observed false positive: anime-studio 'tests/**' vs an
     # ai-team-sync test file.
     conflicts = find_conflicts(
         "tests/test_override_push.py", [_sess()], "me000000",
-        file_repo_root="/home/p/code/ai-team-sync",
+        file_repo_root="/home/p/code/ai-team-sync", locks=[_lock()],
     )
     assert conflicts == []
 
@@ -62,7 +67,7 @@ def test_hook_skips_other_repo_lock():
 def test_hook_still_blocks_same_repo():
     conflicts = find_conflicts(
         "tests/test_x.py", [_sess()], "me000000",
-        file_repo_root="/opt/anime-studio",
+        file_repo_root="/opt/anime-studio", locks=[_lock()],
     )
     assert len(conflicts) == 1
 
@@ -71,7 +76,7 @@ def test_hook_legacy_unanchored_session_still_blocks():
     # Session without repo_root (pre-upgrade row): conservative legacy match.
     conflicts = find_conflicts(
         "tests/test_x.py", [_sess(repo_root="")], "me000000",
-        file_repo_root="/home/p/code/ai-team-sync",
+        file_repo_root="/home/p/code/ai-team-sync", locks=[_lock()],
     )
     assert len(conflicts) == 1
 
@@ -80,6 +85,7 @@ def test_hook_unanchored_file_still_blocks():
     # File outside any git repo: conservative legacy match.
     conflicts = find_conflicts(
         "tests/test_x.py", [_sess()], "me000000", file_repo_root="",
+        locks=[_lock()],
     )
     assert len(conflicts) == 1
 

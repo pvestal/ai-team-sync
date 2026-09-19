@@ -85,11 +85,14 @@ def test_cli_explicit_agent_still_gets_the_token(monkeypatch):
 
 
 def test_hook_attributes_a_cli_registered_session(monkeypatch):
-    # The filed reproduction: MY OWN session's scope must never conflict.
-    sessions = [{"agent": "claude-code:5ead4223", "status": "active",
+    # The filed reproduction: MY OWN session's lock must never conflict.
+    sessions = [{"id": "mine", "agent": "claude-code:5ead4223", "status": "active",
                  "scope": ["packages/scene_generation/*"],
                  "description": "mine", "repo_root": ""}]
-    out = find_conflicts("packages/scene_generation/x.py", sessions, CID, "")
+    out = find_conflicts("packages/scene_generation/x.py", sessions, CID, "",
+                         locks=[{"session_id": "mine",
+                                 "pattern": "packages/scene_generation/*",
+                                 "mode": "exclusive"}])
     assert out == []
 
 

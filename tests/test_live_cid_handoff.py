@@ -112,8 +112,7 @@ def test_agent_label_uses_the_live_cid(monkeypatch):
 
 
 def test_lock_guard_no_longer_self_blocks_after_clear(monkeypatch):
-    """The actual regression: a session that declared scope via the MCP must not
-    block the very hook invocation that shares its Claude process."""
+    """A session's own live lock must not block its Claude process."""
     from ai_team_sync.hooks import pre_tool_use_lockcheck as guard
     from ai_team_sync.mcp import server as mcp_server
 
@@ -123,6 +122,7 @@ def test_lock_guard_no_longer_self_blocks_after_clear(monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", STALE)
 
     my_row = {
+        "id": "mine",
         "status": "active",
         "agent": mcp_server.session_agent_label(),
         "scope": ["packages/core/migrations/**"],
@@ -132,6 +132,8 @@ def test_lock_guard_no_longer_self_blocks_after_clear(monkeypatch):
     conflicts = guard.find_conflicts(
         "packages/core/migrations/scene_cohort.py", [my_row],
         my_session_id=LIVE, file_repo_root="/opt/anime-studio",
+        locks=[{"session_id": "mine", "pattern": "packages/core/migrations/**",
+                "mode": "exclusive"}],
     )
     assert conflicts == []
 
@@ -141,6 +143,7 @@ def test_lock_guard_still_blocks_a_genuinely_different_session(monkeypatch):
     from ai_team_sync.hooks import pre_tool_use_lockcheck as guard
 
     other = {
+        "id": "other",
         "status": "active",
         "agent": "claude-code:1177bf5e",
         "scope": ["packages/core/migrations/**"],
@@ -150,5 +153,7 @@ def test_lock_guard_still_blocks_a_genuinely_different_session(monkeypatch):
     conflicts = guard.find_conflicts(
         "packages/core/migrations/scene_cohort.py", [other],
         my_session_id=LIVE, file_repo_root="/opt/anime-studio",
+        locks=[{"session_id": "other", "pattern": "packages/core/migrations/**",
+                "mode": "exclusive"}],
     )
     assert len(conflicts) == 1

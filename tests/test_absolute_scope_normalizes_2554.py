@@ -1,19 +1,8 @@
-"""An ABSOLUTE scope pattern must claim the file it obviously names (#2554).
+"""Absolute patterns under a repo normalize before matching (#2554).
 
-ATS scope is repo-RELATIVE, but nothing said so at the point of writing it and
-nothing caught it afterwards. The guard compares against a repo-relative `rel`,
-so a scope declared as '/opt/anime-studio/packages/x.py' matched NOTHING:
-fnmatch('packages/x.py', '/opt/anime-studio/packages/x.py') is False.
-
-Observed 2026-08-23: a session set scope to absolute paths, got a 200, was then
-blocked from editing those exact files, and read "your active ATS session holds
-no lock or scope covering X" — a message that names neither the path form nor
-the fix. So it took locks instead of correcting the scope, and the broken scope
-stayed broken. That is a coordination failure dressed as a permissions one.
-
-Two halves pinned here: absolute patterns now RESOLVE, and when a block does
-happen with an absolute pattern present, the reason SAYS SO and gives the exact
-replacement.
+#2813 makes scope intent only. The hook still normalizes an absolute lock
+pattern under its repo and names an absolute scope pattern in a missing-lock
+diagnostic. Correcting a declared scope alone does not authorize an edit.
 """
 from ai_team_sync.hooks.pre_tool_use_lockcheck import (
     claim_check,
@@ -68,18 +57,24 @@ def test_unknown_repo_root_leaves_absolute_unresolved():
 
 # ── the guard actually honours it ───────────────────────────────────────────
 
-def test_absolute_scope_now_claims_the_file():
+def test_absolute_scope_does_not_claim_the_file_without_a_lock():
     ok, reason = claim_check(REL, REPO, MY_SID, MY_CID8,
                              [_sess(scope=[ABS])], [])
+    assert not ok and "live lock" in reason
+
+
+def test_absolute_lock_claims_the_file():
+    ok, reason = claim_check(REL, REPO, MY_SID, MY_CID8,
+                             [_sess(scope=[])],
+                             [{"session_id": MY_SID, "pattern": ABS}])
     assert ok, reason
 
 
-def test_absolute_scope_still_conflicts_for_other_sessions():
-    """The other half of coordination: if an absolute pattern claims a file for
-    ME, it must also warn me off someone ELSE's file. A one-sided fix would let
-    two sessions both believe they held it."""
+def test_absolute_lock_still_conflicts_for_other_sessions():
     other = _sess(sid="other-sid", agent="codex:aaaaaaaa", scope=[ABS])
-    hits = find_conflicts(REL, [other], MY_SID, file_repo_root=REPO)
+    hits = find_conflicts(REL, [other], MY_SID, file_repo_root=REPO,
+                          locks=[{"session_id": "other-sid", "pattern": ABS,
+                                  "mode": "exclusive"}])
     assert len(hits) == 1 and hits[0][2] == ABS
 
 
