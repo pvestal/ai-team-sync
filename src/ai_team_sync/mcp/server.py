@@ -269,6 +269,14 @@ async def list_tools() -> list[Tool]:
                 "message_id": {"type": "string"},
             }, "required": ["message_id"]},
         ),
+        Tool(
+            name="readdress_message",
+            description="As the original sender, move an unread direct message from an ended session to one active session. Preserves its ID and delivery history.",
+            inputSchema={"type": "object", "properties": {
+                "message_id": {"type": "string"},
+                "recipient_session_id": {"type": "string"},
+            }, "required": ["message_id", "recipient_session_id"]},
+        ),
         # Original 8 tools
         Tool(
             name="start_session",
@@ -1097,7 +1105,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
         try:
             if (name == "send_message" or name == "message_inbox" or
-                    name == "acknowledge_message" or name == "message_status"):
+                    name == "acknowledge_message" or name == "message_status" or
+                    name == "readdress_message"):
                 refusal = await deny_mutation(client)
                 if refusal:
                     return [TextContent(type="text", text=f"❌ {refusal}")]
@@ -1138,6 +1147,21 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     if response.status_code != 200:
                         return [TextContent(type="text", text=f"❌ Acknowledgement failed ({response.status_code}): {response.text}")]
                     return [TextContent(type="text", text=f"✅ Message {arguments['message_id']} acknowledged.")]
+                if name == "readdress_message":
+                    response = await client.post(
+                        f"{SERVER_URL}/api/messages/{arguments['message_id']}/readdress",
+                        json={"sender_session_id": active_session_id,
+                              "recipient_session_id": arguments["recipient_session_id"]},
+                        headers=headers)
+                    if response.status_code != 200:
+                        return [TextContent(type="text", text=(
+                            f"❌ Readdress failed ({response.status_code}): {response.text}"))]
+                    row = response.json()
+                    return [TextContent(type="text", text=(
+                        f"📨 Message {row['id']} readdressed from original session "
+                        f"{row['original_recipient_session_id']} to "
+                        f"{row['recipient_session_id']}. Receipt remains unconfirmed "
+                        "until the new recipient acknowledges it."))]
                 response = await client.get(
                     f"{SERVER_URL}/api/messages/{arguments['message_id']}",
                     params={"sender_session_id": active_session_id}, headers=headers)

@@ -164,13 +164,19 @@ class Decision(Base):
 
 
 class AgentMessage(Base):
-    """Durable, session-addressed instruction with an explicit receipt."""
+    """One durable logical message, with a single explicit receipt."""
 
     __tablename__ = "agent_messages"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     sender_session_id: Mapped[str] = mapped_column(String(36), index=True)
     recipient_session_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    # Immutable direct-message addressee. NULL for a ticket mailbox message.
+    original_recipient_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    addressing_mode: Mapped[str] = mapped_column(String(20), default="session")
+    # Append-only assignment/release events. One message row and one receipt are
+    # retained across every ticket claim or sender-authorized readdress.
+    delivery_history: Mapped[str] = mapped_column(Text, default="[]")
     ticket_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     kind: Mapped[str] = mapped_column(String(20), default="message")
     handoff_id: Mapped[str | None] = mapped_column(String(36), nullable=True)

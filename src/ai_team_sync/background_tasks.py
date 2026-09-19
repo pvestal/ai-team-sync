@@ -14,6 +14,7 @@ from ai_team_sync.config import settings
 from ai_team_sync.database import get_db
 from ai_team_sync.git_utils import uncommitted_for_scope
 from ai_team_sync.models import CommitRecord, Decision, OverrideRequest, ScopeLock, Session
+from ai_team_sync.message_lifecycle import release_unread_ticket_messages
 from ai_team_sync.scope_paths import canonical_root
 from ai_team_sync.events import broadcast_event
 
@@ -184,6 +185,7 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
 
             sess.status = "completed"
             sess.completed_at = now
+            await release_unread_ticket_messages(db, sess.id)
             # RELEASE THE LANE -- what the comment above has always claimed.
             # update_session deletes these on completion; the reaper sets
             # status directly on the model and so never did, which meant a

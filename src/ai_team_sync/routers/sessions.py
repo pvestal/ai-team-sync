@@ -18,6 +18,7 @@ from sqlalchemy.orm import selectinload
 from ai_team_sync.database import get_db
 from ai_team_sync.background_tasks import replace_lifecycle_marker
 from ai_team_sync.models import AgentMessage, Handoff, ScopeLock, Session
+from ai_team_sync.message_lifecycle import append_delivery_event, release_unread_ticket_messages
 from ai_team_sync.git_utils import uncommitted_for_scope
 from ai_team_sync.notifications.dispatcher import dispatch
 from ai_team_sync.schemas import SessionCreate, SessionResponse, SessionUpdate
@@ -43,12 +44,15 @@ async def _queue_ticket_event(db: AsyncSession, session: Session, body: str) -> 
         Session.status == "active", Session.id != session.id,
     ))).scalars().all()
     for peer in peers:
-        db.add(AgentMessage(
+        message = AgentMessage(
             sender_session_id=session.id, recipient_session_id=peer.id,
+            original_recipient_session_id=peer.id, addressing_mode="session",
             sender_agent=session.agent, sender_developer=session.developer,
             recipient_agent=peer.agent, ticket_id=session.ticket_id,
             kind="event", body=body,
-        ))
+        )
+        append_delivery_event(message, "assigned", peer.id, "ticket_event")
+        db.add(message)
 
 
 def _session_liveness(s: Session) -> tuple[float | None, bool]:
@@ -1160,6 +1164,11 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
             ).values(recipient_session_id=session.id, recipient_agent=session.agent))
             if claimed.rowcount:
                 message = await db.get(AgentMessage, message_id)
+                if message:
+                    message.recipient_session_id = session.id
+                    message.recipient_agent = session.agent
+                    append_delivery_event(message, "assigned", session.id,
+                                          "ticket_claim")
                 if message and message.handoff_id:
                     handoff = await db.get(Handoff, message.handoff_id)
                     if handoff is not None:
@@ -1385,6 +1394,7 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
         session.status = body.status
         if body.status == "completed":
             session.completed_at = datetime.now(timezone.utc)
+            await release_unread_ticket_messages(db, session.id)
             # Release all locks
             for lock in session.locks:
                 await db.delete(lock)
@@ -1413,6 +1423,7 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
         await db.flush()
         db.add(AgentMessage(
             sender_session_id=session.id, recipient_session_id=None,
+            original_recipient_session_id=None, addressing_mode="ticket",
             sender_agent=session.agent, sender_developer=session.developer,
             recipient_agent="", ticket_id=session.ticket_id, kind="handoff",
             handoff_id=handoff.id,

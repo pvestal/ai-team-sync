@@ -13,14 +13,15 @@ import json
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field, StrictInt
-from sqlalchemy import select
+from pydantic import BaseModel, Field, StrictInt, field_validator
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_team_sync import peer_identity
 from ai_team_sync.database import get_db
 from ai_team_sync.events import broadcast_event
 from ai_team_sync.models import AgentMessage, Handoff, Session
+from ai_team_sync.message_lifecycle import append_delivery_event
 from ai_team_sync.routers.locks import cross_account
 
 router = APIRouter(tags=["messages"])
@@ -37,10 +38,18 @@ class MessageAck(BaseModel):
     recipient_session_id: str
 
 
+class MessageReaddress(BaseModel):
+    sender_session_id: str
+    recipient_session_id: str
+
+
 class MessageResponse(BaseModel):
     id: str
     sender_session_id: str
     recipient_session_id: str | None
+    original_recipient_session_id: str | None
+    addressing_mode: str
+    delivery_history: list[dict]
     ticket_id: int | None
     kind: str
     handoff_id: str | None
@@ -52,6 +61,11 @@ class MessageResponse(BaseModel):
     acknowledged_at: datetime | None
 
     model_config = {"from_attributes": True}
+
+    @field_validator("delivery_history", mode="before")
+    @classmethod
+    def parse_history(cls, value):
+        return json.loads(value or "[]") if isinstance(value, str) else value
 
 
 async def _actor(session_id: str, request: Request, db: AsyncSession,
@@ -88,15 +102,71 @@ async def send_message(body: MessageCreate, request: Request,
     row = AgentMessage(
         sender_session_id=sender.id,
         recipient_session_id=recipient.id if recipient else None,
+        original_recipient_session_id=recipient.id if recipient else None,
+        addressing_mode="session" if recipient else "ticket",
         ticket_id=body.ticket_id or (recipient.ticket_id if recipient else None),
         sender_agent=sender.agent, sender_developer=sender.developer,
         recipient_agent=recipient.agent if recipient else "", body=body.body,
     )
+    if recipient:
+        append_delivery_event(row, "assigned", recipient.id, "direct_send")
     db.add(row)
     await db.commit()
     await db.refresh(row)
     if recipient:
         await broadcast_event(recipient.id, "message.received", {"message_id": row.id})
+    return row
+
+
+@router.post("/messages/{message_id}/readdress", response_model=MessageResponse)
+async def readdress_message(message_id: str, body: MessageReaddress, request: Request,
+                            db: AsyncSession = Depends(get_db)):
+    """The original sender may move one unread direct message after turnover.
+
+    A new recipient cannot adopt an old inbox by naming its session ID. The
+    sender's exact session capability authorizes the change, even if that
+    sender session has since completed but its capability remains available.
+    """
+    await _actor(body.sender_session_id, request, db, require_active=False)
+    row = await db.get(AgentMessage, message_id)
+    if row is None or row.sender_session_id != body.sender_session_id:
+        raise HTTPException(404, "Message not found in this session outbox")
+    if row.addressing_mode != "session" or row.acknowledged_at is not None:
+        raise HTTPException(409, "Only an unread direct message can be readdressed")
+    old_id = row.recipient_session_id
+    old = await db.get(Session, old_id) if old_id else None
+    if old is None or old.status != "completed":
+        raise HTTPException(409, "Original recipient must have ended")
+    recipient = await db.get(Session, body.recipient_session_id)
+    if recipient is None or recipient.status != "active":
+        raise HTTPException(409, "New recipient must be active")
+    if recipient.id in (old_id, body.sender_session_id):
+        raise HTTPException(400, "New recipient must be another session")
+    if (old.creator_uid is None or old.creator_uid != recipient.creator_uid
+            or old.developer != recipient.developer
+            or old.ticket_id != recipient.ticket_id
+            or (old.repo_root or "") != (recipient.repo_root or "")
+            or old.agent.split(":", 1)[0] != recipient.agent.split(":", 1)[0]):
+        raise HTTPException(403, "New recipient does not match the ended recipient context")
+    moved = await db.execute(update(AgentMessage).where(
+        AgentMessage.id == message_id,
+        AgentMessage.recipient_session_id == old_id,
+        AgentMessage.acknowledged_at.is_(None),
+    ).values(recipient_session_id=recipient.id, recipient_agent=recipient.agent)
+      .execution_options(synchronize_session=False))
+    if not moved.rowcount:
+        raise HTTPException(409, "Message changed during readdress")
+    if not json.loads(row.delivery_history or "[]"):
+        append_delivery_event(row, "assigned", old_id, "legacy_direct_send",
+                              at=row.created_at)
+    row.original_recipient_session_id = row.original_recipient_session_id or old_id
+    append_delivery_event(row, "released", old_id, "sender_readdress")
+    append_delivery_event(row, "assigned", recipient.id, "sender_readdress")
+    row.recipient_session_id = recipient.id
+    row.recipient_agent = recipient.agent
+    await db.commit()
+    await db.refresh(row)
+    await broadcast_event(recipient.id, "message.received", {"message_id": row.id})
     return row
 
 
@@ -143,7 +213,14 @@ async def acknowledge_message(message_id: str, body: MessageAck, request: Reques
     if row is None or row.recipient_session_id != body.recipient_session_id:
         raise HTTPException(404, "Message not found in this session inbox")
     if row.acknowledged_at is None:
-        row.acknowledged_at = datetime.now(timezone.utc)
+        acked = await db.execute(update(AgentMessage).where(
+            AgentMessage.id == message_id,
+            AgentMessage.recipient_session_id == body.recipient_session_id,
+            AgentMessage.acknowledged_at.is_(None),
+        ).values(acknowledged_at=datetime.now(timezone.utc))
+          .execution_options(synchronize_session=False))
+        if not acked.rowcount:
+            raise HTTPException(409, "Message changed before acknowledgement")
         await db.commit()
         await db.refresh(row)
     return row

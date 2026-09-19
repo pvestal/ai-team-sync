@@ -62,6 +62,7 @@ to refuse a mismatch. See [Authority model](authority-model.md).
 | `message_inbox` | reads | Shows pending messages for this exact session, with sender and message IDs. |
 | `acknowledge_message` | mutates | Persist receipt of one message addressed to this session. Other sessions cannot acknowledge it. |
 | `message_status` | reads | Sender checks whether its message has an `acknowledged_at` receipt. |
+| `readdress_message` | mutates | Original sender moves one unread direct message from a completed session to an active recipient with the same OS owner, developer, worker class, ticket, and repo. The message ID and sender stay the same; `original_recipient_session_id` and `delivery_history` show the transfer. The recipient must acknowledge it. |
 
 The Claude `UserPromptSubmit` hook shows pending addressed messages in the next
 turn. A fresh Codex MCP process shows them in `message_inbox` and on ATS MCP
@@ -69,10 +70,17 @@ responses. Both paths require the recipient session's saved capability. A client
 that created its ATS session before capability persistence cannot recover that
 secret from the server: at a safe pause, finish that ATS session, refresh the MCP
 client, start a new ATS session, and have the sender address its new session ID.
-The old exact-session message remains unacknowledged; ATS does not silently
-retarget it. The Claude hook reports a missing capability instead of silently
-hiding its inbox. No message appears in the hook when an authenticated inbox is
-empty, and an unavailable ATS server never blocks a prompt.
+Unread exact-session messages are not silently retargeted. Their original sender
+can use `readdress_message` after the recipient ends; ATS records the original
+and new assignment on the same message and retains one receipt. If the original
+sender capability is unavailable too, send a new ticket-addressed handoff and
+record the prior message ID in its body. A ticket message is claimed by the first
+later session on that ticket. If that session ends unread, ATS returns it to the
+ticket for the next later session; it keeps the same ID and assignment history.
+It does not appear in an already-active session's inbox. The Claude hook reports
+a missing capability instead of silently hiding its inbox. No message appears
+in the hook when an authenticated inbox is empty, and an unavailable ATS server
+never blocks a prompt.
 
 ## Delegation
 

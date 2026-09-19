@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_team_sync.database import get_db
 from ai_team_sync.models import AgentMessage, Decision, Session
+from ai_team_sync.message_lifecycle import append_delivery_event
 from ai_team_sync import peer_identity
 from ai_team_sync.routers.locks import cross_account
 from ai_team_sync.notifications.dispatcher import dispatch
@@ -98,14 +99,17 @@ async def create_decision(body: DecisionCreate, request: Request,
     db.add(decision)
     await db.flush()
     if recipient:
-        db.add(AgentMessage(
+        message = AgentMessage(
             sender_session_id=session.id, recipient_session_id=recipient.id,
+            original_recipient_session_id=recipient.id, addressing_mode="session",
             sender_agent=session.agent, sender_developer=session.developer,
             recipient_agent=recipient.agent, ticket_id=decision.ticket_id,
             kind="decision",
             body=(f"Decision {decision.id} — {decision.title}\n"
                   f"Chosen: {decision.chosen}\nReasoning: {decision.reasoning}"),
-        ))
+        )
+        append_delivery_event(message, "assigned", recipient.id, "addressed_decision")
+        db.add(message)
     await db.commit()
     await db.refresh(decision)
 

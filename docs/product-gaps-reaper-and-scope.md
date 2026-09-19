@@ -27,6 +27,13 @@ after their processes were gone; cleared manually via the HTTP API.
 5. Explicit `run_startup_cleanup()` sweep on server boot, so a restart promptly
    reclaims sessions/locks orphaned while the server was down.
 
+With the server running, the sweep runs every 60 seconds. Locks on a session
+that has heartbeated are released at most 21 minutes after its last derived
+activity (20-minute threshold plus one sweep); for a session that never
+heartbeated, the bound is 4 hours plus one sweep. An ATS outage suspends that
+clock; startup cleanup runs when the server returns. Reaping deletes only the
+completed session's lock rows, and a later session's claims stay in place.
+
 Why a tool-agnostic `Stop` hook (not the edit hooks): the lock-guard and presence
 hooks fire only on Edit/Write/MultiEdit/NotebookEdit. A read- or bash-heavy live
 session emits no edits for long stretches, so an edit-only heartbeat plus a short

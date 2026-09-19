@@ -1,13 +1,19 @@
 """A message belongs to two exact ATS sessions and needs a receipt."""
 
 import pytest
+from datetime import datetime, timedelta, timezone
+from sqlalchemy import select
+from ai_team_sync.background_tasks import auto_complete_stale_sessions
+from ai_team_sync.config import settings
 from ai_team_sync.hooks.override_inbox import format_message_inbox
 from ai_team_sync.mcp.server import format_message_nudge
+from ai_team_sync.models import ScopeLock, Session
 
 
-async def _session(client, agent):
+async def _session(client, agent, *, ticket_id=None):
     response = await client.post("/api/sessions", json={
         "developer": "pvestal", "agent": agent, "scope": [],
+        "ticket_id": ticket_id,
     })
     assert response.status_code == 201, response.text
     return response.json()["id"], response.headers["X-ATS-Approval-Token"]
@@ -59,6 +65,140 @@ async def test_completed_recipient_cannot_be_messaged(client):
         "sender_session_id": sender, "recipient_session_id": recipient,
         "body": "hello"}, headers={"X-ATS-Approval-Token": token})
     assert sent.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_unread_direct_message_can_be_readdressed_by_sender_after_turnover(client):
+    sender, sender_token = await _session(client, "codex:sender", ticket_id=2907)
+    old, old_token = await _session(client, "claude-code:old", ticket_id=2907)
+    sent = await client.post("/api/messages", json={
+        "sender_session_id": sender, "recipient_session_id": old, "body": "keep this text",
+    }, headers={"X-ATS-Approval-Token": sender_token})
+    assert sent.status_code == 201, sent.text
+    message_id = sent.json()["id"]
+    assert (await client.patch(f"/api/sessions/{old}", json={
+        "status": "completed", "summary": "turnover",
+    })).status_code == 200
+    successor, successor_token = await _session(client, "claude-code:new", ticket_id=2907)
+    unrelated, unrelated_token = await _session(client, "codex:unrelated", ticket_id=9999)
+
+    endpoint = f"/api/messages/{message_id}/readdress"
+    body = {"sender_session_id": sender, "recipient_session_id": successor}
+    assert (await client.post(endpoint, json=body, headers={
+        "X-ATS-Approval-Token": successor_token})).status_code == 403
+    assert (await client.post(endpoint, json=body, headers={
+        "X-ATS-Approval-Token": unrelated_token})).status_code == 403
+    assert (await client.post(endpoint, json={
+        "sender_session_id": sender, "recipient_session_id": unrelated,
+    }, headers={"X-ATS-Approval-Token": sender_token})).status_code == 403
+    assert (await client.get(f"/api/sessions/{unrelated}/messages", headers={
+        "X-ATS-Approval-Token": unrelated_token})).json() == []
+    moved = await client.post(endpoint, json=body, headers={
+        "X-ATS-Approval-Token": sender_token})
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["id"] == message_id
+    assert moved.json()["original_recipient_session_id"] == old
+    assert moved.json()["recipient_session_id"] == successor
+    assert moved.json()["body"] == "keep this text"
+    assert [event["recipient_session_id"] for event in moved.json()["delivery_history"]
+            if event["action"] == "assigned"] == [old, successor]
+    inbox = await client.get(f"/api/sessions/{successor}/messages", headers={
+        "X-ATS-Approval-Token": successor_token})
+    assert [row["id"] for row in inbox.json() if row["id"] == message_id] == [message_id]
+    assert (await client.post(f"/api/messages/{message_id}/acknowledge", json={
+        "recipient_session_id": old}, headers={"X-ATS-Approval-Token": old_token})).status_code == 403
+    first_ack = await client.post(f"/api/messages/{message_id}/acknowledge", json={
+        "recipient_session_id": successor}, headers={"X-ATS-Approval-Token": successor_token})
+    assert first_ack.status_code == 200, first_ack.text
+    assert first_ack.json()["acknowledged_at"] is not None
+    second_ack = await client.post(f"/api/messages/{message_id}/acknowledge", json={
+        "recipient_session_id": successor}, headers={"X-ATS-Approval-Token": successor_token})
+    assert second_ack.json()["acknowledged_at"] == first_ack.json()["acknowledged_at"]
+    assert (await client.post(endpoint, json=body, headers={
+        "X-ATS-Approval-Token": sender_token})).status_code == 409
+    status = await client.get(f"/api/messages/{message_id}", params={
+        "sender_session_id": sender}, headers={"X-ATS-Approval-Token": sender_token})
+    assert status.json()["acknowledged_at"] == first_ack.json()["acknowledged_at"]
+
+
+@pytest.mark.asyncio
+async def test_ticket_message_requeues_after_unread_recipient_ends(client):
+    sender, sender_token = await _session(client, "codex:sender", ticket_id=2899)
+    sent = await client.post("/api/messages", json={
+        "sender_session_id": sender, "ticket_id": 2899, "body": "durable handoff",
+    }, headers={"X-ATS-Approval-Token": sender_token})
+    assert sent.status_code == 201, sent.text
+    message_id = sent.json()["id"]
+    assert (await client.patch(f"/api/sessions/{sender}", json={
+        "status": "completed", "summary": "sender done",
+    })).status_code == 200
+    first, first_token = await _session(client, "claude-code:first", ticket_id=2899)
+    assert message_id in [row["id"] for row in (await client.get(
+        f"/api/sessions/{first}/messages", headers={
+            "X-ATS-Approval-Token": first_token})).json()]
+    assert (await client.patch(f"/api/sessions/{first}", json={
+        "status": "completed", "summary": "recipient unread",
+    })).status_code == 200
+    wrong, wrong_token = await _session(client, "claude-code:wrong", ticket_id=2907)
+    assert message_id not in [row["id"] for row in (await client.get(
+        f"/api/sessions/{wrong}/messages", headers={
+            "X-ATS-Approval-Token": wrong_token})).json()]
+    second, second_token = await _session(client, "claude-code:second", ticket_id=2899)
+    inbox = await client.get(f"/api/sessions/{second}/messages", headers={
+        "X-ATS-Approval-Token": second_token})
+    assert message_id in [row["id"] for row in inbox.json()]
+    assert (await client.post(f"/api/messages/{message_id}/acknowledge", json={
+        "recipient_session_id": wrong}, headers={
+            "X-ATS-Approval-Token": wrong_token})).status_code == 404
+    assert (await client.post(f"/api/messages/{message_id}/acknowledge", json={
+        "recipient_session_id": first}, headers={
+            "X-ATS-Approval-Token": first_token})).status_code == 403
+    ack = await client.post(f"/api/messages/{message_id}/acknowledge", json={
+        "recipient_session_id": second}, headers={"X-ATS-Approval-Token": second_token})
+    assert ack.status_code == 200, ack.text
+    status = await client.get(f"/api/messages/{message_id}", params={
+        "sender_session_id": sender}, headers={"X-ATS-Approval-Token": sender_token})
+    assert status.json()["acknowledged_at"] == ack.json()["acknowledged_at"]
+    assert status.json()["original_recipient_session_id"] is None
+    assert [event["recipient_session_id"] for event in status.json()["delivery_history"]
+            if event["action"] == "assigned"] == [first, second]
+
+
+@pytest.mark.asyncio
+async def test_reaper_requeues_unread_ticket_and_only_drops_dead_locks(client, db_session):
+    sender, sender_token = await _session(client, "codex:sender", ticket_id=2907)
+    sent = await client.post("/api/messages", json={
+        "sender_session_id": sender, "ticket_id": 2907, "body": "survive reap",
+    }, headers={"X-ATS-Approval-Token": sender_token})
+    message_id = sent.json()["id"]
+    old, _ = await _session(client, "claude-code:old", ticket_id=2907)
+    live, _ = await _session(client, "claude-code:live", ticket_id=2907)
+    now = datetime.now(timezone.utc)
+    old_row = await db_session.get(Session, old)
+    old_row.started_at = now - timedelta(hours=1)
+    old_row.last_heartbeat = now - timedelta(
+        minutes=settings.session_heartbeat_timeout_minutes + 2)
+    db_session.add_all([
+        ScopeLock(session_id=old, pattern="old/**", mode="advisory",
+                  created_at=now - timedelta(hours=1),
+                  expires_at=now + timedelta(hours=1)),
+        ScopeLock(session_id=live, pattern="live/**", mode="advisory",
+                  expires_at=now + timedelta(hours=1)),
+    ])
+    await db_session.commit()
+
+    assert await auto_complete_stale_sessions(db_session) == 1
+    assert (await db_session.get(Session, old)).status == "completed"
+    locks = (await db_session.execute(select(ScopeLock))).scalars().all()
+    assert [lock.session_id for lock in locks] == [live]
+    successor, successor_token = await _session(client, "claude-code:successor",
+                                                ticket_id=2907)
+    inbox = await client.get(f"/api/sessions/{successor}/messages", headers={
+        "X-ATS-Approval-Token": successor_token})
+    assert message_id in [row["id"] for row in inbox.json()]
+    message = next(row for row in inbox.json() if row["id"] == message_id)
+    assert [event["action"] for event in message["delivery_history"]] == [
+        "assigned", "released", "assigned"]
 
 
 def test_client_delivery_text_includes_sender_and_ack_instruction():

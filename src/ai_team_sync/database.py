@@ -47,6 +47,13 @@ _COLUMN_MIGRATIONS = [
     # with a stale `scope` (#2760). Backfills to '' — a session that never lost a
     # lane reads exactly as it does today.
     ("sessions", "locks_not_restored", "TEXT DEFAULT ''"),
+    # Existing direct vs ticket rows can be classified by their chronology:
+    # a ticket claim is made only by a session created AFTER the message.
+    # The one-time backfill below preserves that distinction for already-claimed
+    # ticket messages. New writers always set addressing_mode explicitly.
+    ("agent_messages", "original_recipient_session_id", "VARCHAR(36)"),
+    ("agent_messages", "addressing_mode", "VARCHAR(20) DEFAULT 'legacy'"),
+    ("agent_messages", "delivery_history", "TEXT DEFAULT '[]'"),
 ]
 
 engine = create_async_engine(
@@ -77,3 +84,20 @@ async def init_db():
                     await conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {column} {coldef}"))
             except Exception:
                 pass  # column already exists (or DB doesn't support it) — harmless
+        # Classify historical rows only once. A direct send could not predate
+        # its recipient session; a deferred ticket claim always does. If the
+        # recipient row is gone, keep the row as legacy instead of guessing.
+        await conn.execute(text("""
+            UPDATE agent_messages SET addressing_mode = 'ticket'
+            WHERE addressing_mode = 'legacy' AND ticket_id IS NOT NULL AND (
+                recipient_session_id IS NULL OR created_at < (
+                    SELECT started_at FROM sessions
+                    WHERE sessions.id = agent_messages.recipient_session_id))
+        """))
+        await conn.execute(text("""
+            UPDATE agent_messages SET addressing_mode = 'session',
+                original_recipient_session_id = recipient_session_id
+            WHERE addressing_mode = 'legacy' AND recipient_session_id IS NOT NULL
+              AND EXISTS (SELECT 1 FROM sessions
+                          WHERE sessions.id = agent_messages.recipient_session_id)
+        """))

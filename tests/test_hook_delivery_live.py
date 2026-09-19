@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -228,5 +229,44 @@ def test_fresh_codex_mcp_nudge_and_ack(live_ats, tmp_path):
             "sender_session_id": sender}, headers={"X-ATS-Approval-Token": sender_token})
         assert status.json()["acknowledged_at"]
         assert message_id not in mcp.tool("message_inbox")
+    finally:
+        mcp.close()
+
+
+def test_fresh_mcp_sender_readdresses_to_new_claude_hook(live_ats, tmp_path):
+    url, client, base = live_ats
+    sender_cid = "fffffff1-0000-0000-0000-000000000007"
+    sender_state = tmp_path / "sender-state"
+    sender_env = _client_env(base, sender_state, url, sender_cid, agent="codex")
+    old_cid = "aaaaaaa1-0000-0000-0000-000000000008"
+    new_cid = "aaaaaaa2-0000-0000-0000-000000000009"
+    old_state, new_state = tmp_path / "old-state", tmp_path / "new-state"
+    old_env = _client_env(base, old_state, url, old_cid)
+    new_env = _client_env(base, new_state, url, new_cid)
+    mcp = McpClient(sender_env)
+    try:
+        assert "Session ID:" in mcp.tool("start_session", {
+            "scope": [], "description": "turnover sender"})
+        _hook("ai_team_sync.hooks.session_autostart", old_env, old_cid)
+        old = _pointer(old_state, old_cid)
+        sent = mcp.tool("send_message", {
+            "recipient_session_id": old, "body": "survive exact-session turnover"})
+        message_id = re.search(r"Message ID: ([a-f0-9-]{36})", sent).group(1)
+        assert client.post(f"/api/sessions/{old}/complete", json={
+            "summary": "ended unread"}).status_code == 200
+        _hook("ai_team_sync.hooks.session_autostart", new_env, new_cid)
+        new = _pointer(new_state, new_cid)
+        assert message_id not in _hook("ai_team_sync.hooks.override_inbox", new_env,
+                                       new_cid)
+        moved = mcp.tool("readdress_message", {
+            "message_id": message_id, "recipient_session_id": new})
+        assert message_id in moved and old in moved and new in moved
+        assert message_id in _hook("ai_team_sync.hooks.override_inbox", new_env,
+                                    new_cid)
+        ack = client.post(f"/api/messages/{message_id}/acknowledge", json={
+            "recipient_session_id": new}, headers={
+                "X-ATS-Approval-Token": _token(new_state, new_cid)})
+        assert ack.status_code == 200, ack.text
+        assert "acknowledged" in mcp.tool("message_status", {"message_id": message_id})
     finally:
         mcp.close()
