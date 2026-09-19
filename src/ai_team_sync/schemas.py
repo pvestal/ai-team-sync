@@ -185,6 +185,7 @@ class LockResponse(BaseModel):
     expires_at: datetime
     developer: str | None = None
     agent: str | None = None
+    repo_root: str = ""
 
     model_config = {"from_attributes": True}
 

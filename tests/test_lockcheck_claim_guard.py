@@ -107,8 +107,28 @@ def test_foreign_live_locks_report_mode_even_outside_declared_scope():
 def test_lock_from_new_owner_is_not_lost_between_separate_api_reads():
     hits = find_conflicts(REL, [], MY_CID8, REPO,
                           locks=[dict(_lock(sid="new-session"), mode="exclusive",
-                                      developer="new-owner")])
-    assert hits == [("new-owner", "", REL, "exclusive")]
+                                      developer="new-owner", agent="new-agent")])
+    assert hits == [("new-agent", "", REL, "exclusive")]
+
+
+def test_exact_session_identity_keeps_same_label_foreign_lock_visible():
+    same_label = f"claude-code:{MY_CID8}"
+    sessions = [_sess(), _sess(sid="other", agent=same_label)]
+    locks = [dict(_lock(sid="other"), id="foreign-lock", mode="exclusive")]
+    hits = find_conflicts(REL, sessions, MY_CID8, REPO, locks=locks,
+                          my_ats_session_id=MY_SID)
+    assert hits == [(same_label, "", REL, "exclusive")]
+    ok, _ = claim_check(REL, REPO, MY_SID, MY_CID8, sessions, locks)
+    assert not ok
+
+
+def test_approved_override_clears_only_the_granted_lock():
+    sessions = [_sess(sid="other", agent="codex:other")]
+    locks = [dict(_lock(sid="other"), id="approved", mode="exclusive"),
+             dict(_lock(sid="other"), id="still-held", mode="exclusive")]
+    hits = find_conflicts(REL, sessions, MY_CID8, REPO, locks=locks,
+                          approved_lock_ids={"approved"}, my_ats_session_id=MY_SID)
+    assert len(hits) == 1 and hits[0][3] == "exclusive"
 
 
 @pytest.mark.parametrize("other_mode,own_lock,coordinated,exit_code,message", [
@@ -161,7 +181,7 @@ def test_edit_hook_uses_live_locks_for_both_sides(
     monkeypatch.setattr(guard, "_roots", lambda _path: (REPO, REPO))
     monkeypatch.setattr(guard, "_coordinated_roots",
                         lambda: [REPO] if coordinated else [])
-    monkeypatch.setattr(session_pointer, "resolve_pointer", lambda: MY_SID)
+    monkeypatch.setattr(session_pointer, "resolve_pointer", lambda *_a, **_kw: MY_SID)
     monkeypatch.delenv("ATS_LOCKCHECK_BLOCK", raising=False)
     monkeypatch.delenv("ATS_CLAIMCHECK", raising=False)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
@@ -208,7 +228,7 @@ def _invoke_edit_hook(monkeypatch, capsys, *, sessions, locks, sid=MY_SID,
     monkeypatch.setattr(guard, "_roots", lambda _path: (REPO, REPO))
     monkeypatch.setattr(guard, "_coordinated_roots",
                         lambda: [REPO] if coordinated else [])
-    monkeypatch.setattr(session_pointer, "resolve_pointer", lambda: sid)
+    monkeypatch.setattr(session_pointer, "resolve_pointer", lambda *_a, **_kw: sid)
     monkeypatch.delenv("ATS_CLAIMCHECK", raising=False)
     if block is None:
         monkeypatch.delenv("ATS_LOCKCHECK_BLOCK", raising=False)
@@ -359,8 +379,10 @@ async def test_scope_only_session_cannot_block_the_exclusive_holder(client):
     locks = (await client.get("/api/locks")).json()
     sid = scope_only.json()["id"]
     holder_sid = holder.json()["id"]
+    assert locks[0]["repo_root"] == REPO
     assert claim_check("src/a.py", REPO, sid, "", sessions, locks)[0] is False
     assert claim_check("src/a.py", REPO, holder_sid, "", sessions, locks)[0] is True
+    assert claim_check("src/a.py", "/another-repo", holder_sid, "", sessions, locks)[0] is False
     assert find_conflicts("src/a.py", sessions, "aaaaaaaa", REPO,
                           locks=locks) == [
         ("claude-code:bbbbbbbb", "", "src/a.py", "exclusive")]

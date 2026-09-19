@@ -25,7 +25,8 @@ router = APIRouter(prefix="/locks", tags=["locks"])
 
 
 def _lock_to_response(lock: ScopeLock, developer: str | None = None,
-                      agent: str | None = None) -> LockResponse:
+                      agent: str | None = None,
+                      repo_root: str = "") -> LockResponse:
     return LockResponse(
         id=lock.id,
         session_id=lock.session_id,
@@ -36,6 +37,7 @@ def _lock_to_response(lock: ScopeLock, developer: str | None = None,
         expires_at=lock.expires_at,
         developer=developer,
         agent=agent,
+        repo_root=repo_root,
     )
 
 
@@ -121,13 +123,15 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
     db.add(lock)
     await db.commit()
     await db.refresh(lock)
-    return _lock_to_response(lock, developer=session.developer, agent=session.agent)
+    return _lock_to_response(lock, developer=session.developer, agent=session.agent,
+                             repo_root=session.repo_root or "")
 
 
 @router.get("", response_model=list[LockResponse])
 async def list_locks(db: AsyncSession = Depends(get_db)):
     locks = await _get_active_locks(db)
-    return [_lock_to_response(lock, developer=owner.developer, agent=owner.agent)
+    return [_lock_to_response(lock, developer=owner.developer, agent=owner.agent,
+                              repo_root=owner.repo_root or "")
             for lock, owner, _root in locks]
 
 

@@ -118,7 +118,7 @@ def find_conflicts(rel: str, sessions: list, my_session_id: str,
             continue
         if not my_ats_session_id and mine and mine in agent:
             continue
-        sroot = str(s.get("repo_root") or "").rstrip("/") if s else ""
+        sroot = str((s.get("repo_root") if s else lk.get("repo_root")) or "").rstrip("/")
         if froot and sroot and froot != sroot:
             continue                        # anchored to a different repo
         pat = str(lk.get("pattern", ""))
@@ -152,8 +152,8 @@ def claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,
     comes from GET /api/locks, which serves only live locks. Pure function of
     its inputs, for tests."""
     def _mine(s) -> bool:
-        if my_sid and str(s.get("id", "")) == my_sid:
-            return True
+        if my_sid:
+            return str(s.get("id", "")) == my_sid
         return bool(my_cid8) and my_cid8 in str(s.get("agent", ""))
 
     mine_active = [s for s in sessions or []
