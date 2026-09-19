@@ -257,7 +257,7 @@ across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately before starting
       "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.session_heartbeat" } ] }
   ]
   ```
-- **Override-inbox hook** (surfaces unlock requests without polling): wire `override_inbox.py` as a Claude Code `UserPromptSubmit` hook. Each turn it injects a one-line "N override request(s) awaiting YOUR response" — with requester, pattern, and request IDs — when another session has asked to work in a path *you* locked. Closes the one coordination step that otherwise needs active polling (`check_pending_requests`) or a human relay. Owner-only, fail-open, exit 0.
+- **Agent inbox hook**: wire `override_inbox.py` as a Claude Code `UserPromptSubmit` hook. It shows pending lock override requests and messages addressed to that exact session, including structured handoffs claimed from a ticket. Messages remain visible until `acknowledge_message` confirms receipt. Codex receives the same pending messages in each ATS MCP response. Use `send_message` with `recipient_session_id` for a live agent, or `ticket_id` for the first later session on that ticket; `message_status` distinguishes queued from acknowledged. A decision can name `recipient_session_id` to notify that agent. `get_decision_history` now reads other agents' decisions on the current ticket or repository, with explicit team, ticket, and time filters. Both delivery paths fail open if ATS is unavailable.
 
   ```jsonc
   // ~/.claude/settings.json

@@ -34,6 +34,9 @@ _COLUMN_MIGRATIONS = [
     ("sessions", "bound_worker", "TEXT DEFAULT ''"),
     ("sessions", "bound_uid", "INTEGER"),
     ("sessions", "task_id", "INTEGER"),
+    ("sessions", "ticket_id", "INTEGER"),
+    ("decisions", "ticket_id", "INTEGER"),
+    ("decisions", "recipient_session_id", "VARCHAR(36)"),
     ("sessions", "delegation_id", "TEXT"),
     ("scope_locks", "authority_bearing", "BOOLEAN DEFAULT 0"),
     # What the reaper took, so resurrection can give it back (#2760). Historical

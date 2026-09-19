@@ -11,13 +11,13 @@ from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from ai_team_sync.database import get_db
 from ai_team_sync.background_tasks import replace_lifecycle_marker
-from ai_team_sync.models import ScopeLock, Session
+from ai_team_sync.models import AgentMessage, Handoff, ScopeLock, Session
 from ai_team_sync.git_utils import uncommitted_for_scope
 from ai_team_sync.notifications.dispatcher import dispatch
 from ai_team_sync.schemas import SessionCreate, SessionResponse, SessionUpdate
@@ -32,6 +32,23 @@ from ai_team_sync.scope_paths import (UnsafePath, canonical_claim, canonical_pat
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sessions", tags=["sessions"])
+
+
+async def _queue_ticket_event(db: AsyncSession, session: Session, body: str) -> None:
+    """Notify active peers on this ticket, with exact session recipients."""
+    if session.ticket_id is None:
+        return
+    peers = (await db.execute(select(Session).where(
+        Session.ticket_id == session.ticket_id,
+        Session.status == "active", Session.id != session.id,
+    ))).scalars().all()
+    for peer in peers:
+        db.add(AgentMessage(
+            sender_session_id=session.id, recipient_session_id=peer.id,
+            sender_agent=session.agent, sender_developer=session.developer,
+            recipient_agent=peer.agent, ticket_id=session.ticket_id,
+            kind="event", body=body,
+        ))
 
 
 def _session_liveness(s: Session) -> tuple[float | None, bool]:
@@ -246,6 +263,7 @@ def _session_to_response(s: Session, uncommitted_cache: dict[str, list[str]] | N
         status=s.status,
         branch=s.branch,
         repo_root=getattr(s, "repo_root", "") or "",
+        ticket_id=getattr(s, "ticket_id", None),
         started_at=s.started_at,
         completed_at=s.completed_at,
         last_heartbeat=s.last_heartbeat,
@@ -1121,10 +1139,31 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
         bound_worker=worker.name if bound else "",
         bound_uid=bound_uid,
         task_id=body.task_id,
+        ticket_id=body.ticket_id,
         delegation_id=delegation.id if delegation is not None else None,
     )
     db.add(session)
     await db.flush()  # Ensure session.id is populated
+    # Claim deferred messages atomically for the FIRST later session on this
+    # ticket. The ticket is coordination metadata; this grants no task authority.
+    if body.ticket_id is not None:
+        queued = (await db.execute(select(AgentMessage.id).where(
+            AgentMessage.ticket_id == body.ticket_id,
+            AgentMessage.recipient_session_id.is_(None),
+            AgentMessage.sender_session_id != session.id,
+            AgentMessage.created_at <= session.started_at,
+        ))).scalars().all()
+        for message_id in queued:
+            claimed = await db.execute(update(AgentMessage).where(
+                AgentMessage.id == message_id,
+                AgentMessage.recipient_session_id.is_(None),
+            ).values(recipient_session_id=session.id, recipient_agent=session.agent))
+            if claimed.rowcount:
+                message = await db.get(AgentMessage, message_id)
+                if message and message.handoff_id:
+                    handoff = await db.get(Handoff, message.handoff_id)
+                    if handoff is not None:
+                        handoff.recipient_session_id = session.id
     if delegation is not None:
         delegation.child_session_id = session.id
 
@@ -1136,6 +1175,12 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
             lock = ScopeLock(session_id=session.id, pattern=pattern, mode=lock_mode,
                              authority_bearing=bound)
             db.add(lock)
+
+    await _queue_ticket_event(
+        db, session,
+        f"Session {session.id} ({session.agent}) started on ticket #{session.ticket_id}: "
+        f"{session.description}",
+    )
 
     await db.commit()
 
@@ -1298,6 +1343,23 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
                 },
             )
 
+    if body.handoff is not None:
+        if body.status != "completed" or session.ticket_id is None:
+            raise HTTPException(422, "Handoff requires completing a ticket-linked session")
+        if session.status == "completed" and not session.auto_completed:
+            raise HTTPException(409, "Session already completed; handoff is immutable")
+        existing_handoff = (await db.execute(select(Handoff.id).where(
+            Handoff.source_session_id == session.id))).scalar_one_or_none()
+        if existing_handoff:
+            raise HTTPException(409, "This session already recorded a handoff")
+        import hashlib
+        import hmac
+        token = request.headers.get("X-ATS-Approval-Token", "")
+        if not token or not hmac.compare_digest(
+                hashlib.sha256(token.encode()).hexdigest(),
+                session.approval_token_hash or ""):
+            raise HTTPException(403, "Session capability is required for handoff")
+
     # THE SAME DOOR AS CREATION (#2760). PATCH is the other supported writer of
     # an authority-bearing scope, and MCP extend_scope reaches it: extend_scope
     # takes its new locks through POST /api/locks (validated) and then writes the
@@ -1339,6 +1401,35 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
         # read as two different repos.
         session.repo_root = body.repo_root.rstrip("/")
 
+    if body.handoff is not None:
+        handoff = Handoff(
+            ticket_id=session.ticket_id, source_session_id=session.id,
+            verdict=body.handoff.verdict,
+            blockers=json.dumps(body.handoff.blockers),
+            next_steps=json.dumps(body.handoff.next_steps),
+            artifacts=json.dumps(body.handoff.artifacts),
+        )
+        db.add(handoff)
+        await db.flush()
+        db.add(AgentMessage(
+            sender_session_id=session.id, recipient_session_id=None,
+            sender_agent=session.agent, sender_developer=session.developer,
+            recipient_agent="", ticket_id=session.ticket_id, kind="handoff",
+            handoff_id=handoff.id,
+            body=(f"Ticket #{session.ticket_id} handoff from {session.agent}:\n"
+                  f"Verdict: {handoff.verdict}\n"
+                  f"Blockers: {', '.join(body.handoff.blockers) or 'none'}\n"
+                  f"Next steps: {', '.join(body.handoff.next_steps) or 'none'}\n"
+                  f"Artifacts: {', '.join(body.handoff.artifacts) or 'none'}"),
+        ))
+
+    if body.status == "completed":
+        await _queue_ticket_event(
+            db, session,
+            f"Session {session.id} ({session.agent}) completed on ticket "
+            f"#{session.ticket_id}. Summary: {session.summary or ''}",
+        )
+
     await db.commit()
     await db.refresh(session)
     await db.refresh(session, ["locks"])
@@ -1371,7 +1462,8 @@ async def complete_session_alias(
     session.completed dispatch) stay single-sourced.
     """
     patch = SessionUpdate(status="completed",
-                          summary=(body.summary if body else None))
+                          summary=(body.summary if body else None),
+                          handoff=(body.handoff if body else None))
     return await update_session(session_id, patch, request, db)
 
 

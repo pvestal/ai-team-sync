@@ -24,6 +24,7 @@ Always fail-OPEN and exit 0 (never block a prompt). No requests / server down / 
 from __future__ import annotations
 
 import os
+import json
 import sys
 from pathlib import Path
 
@@ -38,10 +39,13 @@ def _session_file() -> Path:
         return Path.home() / ".ats_session"
 
 
-def _resolve_session_id() -> str | None:
+def _resolve_session_id(cid: str = "") -> str | None:
     sid = (os.environ.get("ATS_SESSION_ID") or os.environ.get("ATS_SESSION") or "").strip()
     if sid:
         return sid
+    if cid:
+        from ai_team_sync import session_pointer as sp
+        return sp.resolve_pointer(cid, allow_global=False)
     try:
         return _session_file().read_text().strip() or None
     except Exception:
@@ -72,8 +76,26 @@ def format_inbox(requests: list, session_id: str) -> str | None:
     return "\n".join(lines)
 
 
+def format_message_inbox(rows: list[dict]) -> str | None:
+    """One copy per prompt; no message disappears before explicit acknowledgement."""
+    if not rows:
+        return None
+    lines = [f"ATS: {len(rows)} message(s) addressed to this session:"]
+    for row in rows[:10]:
+        lines.append(f"- Message {row['id']} from {row['sender_agent']} "
+                     f"(session {row['sender_session_id']}): {row['body']}")
+    lines.append("Acknowledge each after reading with ATS acknowledge_message; "
+                 "the sender otherwise sees delivery as unconfirmed.")
+    return "\n".join(lines)
+
+
 def main() -> None:
-    session_id = _resolve_session_id()
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        payload = {}
+    cid = str(payload.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID") or "")
+    session_id = _resolve_session_id(cid)
     if not session_id:
         sys.exit(0)
     server = os.environ.get("ATS_SERVER_URL", "http://localhost:8400")
@@ -84,11 +106,23 @@ def main() -> None:
                 f"{server}/api/override-requests",
                 params={"session_id": session_id, "status": "pending"},
             ).json()
+            from ai_team_sync import session_pointer as sp
+            token = sp.load_approval_token(session_id, cid)
+            messages = []
+            if token:
+                response = client.get(
+                    f"{server}/api/sessions/{session_id}/messages",
+                    headers={"X-ATS-Approval-Token": token})
+                if response.status_code == 200:
+                    messages = response.json()
     except Exception:
         sys.exit(0)  # best-effort: never block the prompt
     note = format_inbox(requests if isinstance(requests, list) else [], session_id)
     if note:
         print(note)  # stdout -> injected into the agent's turn context
+    message_note = format_message_inbox(messages if isinstance(messages, list) else [])
+    if message_note:
+        print(message_note)
     sys.exit(0)
 
 
