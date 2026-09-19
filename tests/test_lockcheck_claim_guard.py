@@ -175,6 +175,143 @@ def test_edit_hook_uses_live_locks_for_both_sides(
     assert message in capsys.readouterr().err
 
 
+def _invoke_edit_hook(monkeypatch, capsys, *, sessions, locks, sid=MY_SID,
+                      cid=MY_CID8, coordinated=True, block=None):
+    """Exercise main() with the two ATS read responses and Claude hook input."""
+    import httpx
+    from ai_team_sync import session_pointer
+
+    class Response:
+        def __init__(self, body):
+            self.body = body
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self.body
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def get(self, url):
+            return Response(locks if url.endswith("/api/locks") else sessions)
+
+    monkeypatch.setattr(httpx, "Client", Client)
+    monkeypatch.setattr(guard, "_roots", lambda _path: (REPO, REPO))
+    monkeypatch.setattr(guard, "_coordinated_roots",
+                        lambda: [REPO] if coordinated else [])
+    monkeypatch.setattr(session_pointer, "resolve_pointer", lambda: sid)
+    monkeypatch.delenv("ATS_CLAIMCHECK", raising=False)
+    if block is None:
+        monkeypatch.delenv("ATS_LOCKCHECK_BLOCK", raising=False)
+    else:
+        monkeypatch.setenv("ATS_LOCKCHECK_BLOCK", block)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
+        "tool_name": "Edit", "session_id": cid,
+        "tool_input": {"file_path": f"{REPO}/{REL}"},
+    })))
+
+    with pytest.raises(SystemExit) as stopped:
+        guard.main()
+    captured = capsys.readouterr()
+    return stopped.value.code, captured.out, captured.err
+
+
+def _agent_warning(stdout):
+    """One JSON object, with the supported Claude Code PreToolUse context field."""
+    parsed, end = json.JSONDecoder().raw_decode(stdout.lstrip())
+    assert stdout.lstrip()[end:].strip() == ""
+    assert set(parsed) == {"hookSpecificOutput"}
+    specific = parsed["hookSpecificOutput"]
+    assert specific["hookEventName"] == "PreToolUse"
+    assert "permissionDecision" not in specific
+    return specific["additionalContext"]
+
+
+def test_main_advisory_warning_reaches_agent_and_lists_all_holders(monkeypatch, capsys):
+    sessions = [_sess(),
+                _sess(sid="other-1", agent="claude-code:other111"),
+                _sess(sid="other-2", agent="claude-code:other222")]
+    locks = [dict(_lock(), mode="advisory"),
+             dict(_lock(sid="other-1"), mode="advisory"),
+             dict(_lock(sid="other-2"), mode="advisory")]
+    code, stdout, _stderr = _invoke_edit_hook(
+        monkeypatch, capsys, sessions=sessions, locks=locks)
+    assert code == 0
+    warning = _agent_warning(stdout)
+    assert "LIVE ADVISORY" in warning
+    assert "other111" in warning and "other222" in warning
+
+
+def test_main_warn_only_exclusive_reaches_agent_without_blocking(monkeypatch, capsys):
+    sessions = [_sess(), _sess(sid="other", agent="claude-code:other111"),
+                _sess(sid="adviser", agent="claude-code:other222")]
+    locks = [dict(_lock(), mode="advisory"),
+             dict(_lock(sid="other"), mode="exclusive"),
+             dict(_lock(sid="adviser"), mode="advisory")]
+    code, stdout, _stderr = _invoke_edit_hook(
+        monkeypatch, capsys, sessions=sessions, locks=locks, block="0")
+    assert code == 0
+    warning = _agent_warning(stdout)
+    assert "LIVE EXCLUSIVE" in warning and "other111" in warning
+    assert "LIVE ADVISORY" in warning and "other222" in warning
+
+
+def test_main_default_exclusive_still_blocks_a_lock_holder(monkeypatch, capsys):
+    sessions = [_sess(), _sess(sid="other", agent="claude-code:other111")]
+    locks = [dict(_lock(), mode="advisory"),
+             dict(_lock(sid="other"), mode="exclusive")]
+    code, stdout, stderr = _invoke_edit_hook(
+        monkeypatch, capsys, sessions=sessions, locks=locks)
+    assert code == 2
+    assert "LIVE EXCLUSIVE" in stderr
+    assert stdout == ""
+
+
+def test_main_lost_lane_precedes_foreign_exclusive_inside_coordinated_repo(
+        monkeypatch, capsys):
+    loser = dict(_sess(scope=["packages/**"]), locks_not_restored=[REL])
+    holder = _sess(sid="other", agent="claude-code:other111", scope=["docs/**"])
+    locks = [dict(_lock(sid="other"), mode="exclusive")]
+
+    code, _stdout, stderr = _invoke_edit_hook(
+        monkeypatch, capsys, sessions=[loser, holder], locks=locks)
+    assert code == 2
+    assert "NOT restored" in stderr and "ATS CLAIM GUARD" in stderr
+
+    code, _stdout, stderr = _invoke_edit_hook(
+        monkeypatch, capsys, sessions=[loser, holder], locks=locks,
+        sid="other", cid="other111")
+    assert code == 0 and stderr == ""
+
+    ordinary = _sess(scope=["packages/**"])
+    code, _stdout, stderr = _invoke_edit_hook(
+        monkeypatch, capsys, sessions=[ordinary, holder], locks=locks)
+    assert code == 2
+    assert "LIVE EXCLUSIVE" in stderr or "no live lock" in stderr
+    assert "NOT restored" not in stderr
+
+
+def test_main_noncoordinated_repo_does_not_run_lost_lane_claim_guard(
+        monkeypatch, capsys):
+    loser = dict(_sess(scope=["packages/**"]), locks_not_restored=[REL])
+    holder = _sess(sid="other", agent="claude-code:other111")
+    code, _stdout, stderr = _invoke_edit_hook(
+        monkeypatch, capsys, sessions=[loser, holder],
+        locks=[dict(_lock(sid="other"), mode="exclusive")], coordinated=False)
+    assert code == 2
+    assert "LIVE EXCLUSIVE" in stderr
+    assert "NOT restored" not in stderr
+
+
 async def test_ordinary_expiry_removes_both_claim_and_conflict(client, db_session):
     """A normal TTL expiry needs no resurrection journal to remove authority."""
     from datetime import datetime, timedelta, timezone

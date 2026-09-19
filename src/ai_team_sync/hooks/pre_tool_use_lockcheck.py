@@ -285,6 +285,17 @@ def main() -> None:
                                approved_lock_ids=approved_lock_ids,
                                my_ats_session_id=my_sid or "")
 
+    # In coordinated repos, explain a lost #2760 lane before a foreign lock's
+    # diagnostic can hide it. The same claim guard still decides edit authority.
+    if froot in _coordinated_roots():
+        my_cid8 = str(payload.get("session_id", ""))[:8]
+        ok, reason = claim_check(rel, froot, my_sid, my_cid8, sessions, locks)
+        if not ok:
+            print(f"ATS CLAIM GUARD: {reason}", file=sys.stderr)
+            if os.environ.get("ATS_CLAIMCHECK", "1") != "0":
+                sys.exit(2)
+
+    warnings = []
     exclusive = [hit for hit in conflicts if hit[3] == "exclusive"]
     advisory = [hit for hit in conflicts if hit[3] != "exclusive"]
     if exclusive:
@@ -293,24 +304,27 @@ def main() -> None:
             lines.append(f"  - {agent}  [{pat}]  {desc}")
         lines.append("Coordinate with the holder or request override. "
                      "Set ATS_LOCKCHECK_BLOCK=0 to downgrade to warn-only.")
-        print("\n".join(lines), file=sys.stderr)
+        warning = "\n".join(lines)
+        print(warning, file=sys.stderr)
         if os.environ.get("ATS_LOCKCHECK_BLOCK", "2") != "0":
             sys.exit(2)
+        warnings.append(warning)
     if advisory:
         lines = [f"ATS LOCK GUARD: '{rel}' is covered by another session's LIVE ADVISORY lock:"]
         for agent, desc, pat, _mode in advisory:
             lines.append(f"  - {agent}  [{pat}]  {desc}")
-        print("\n".join(lines), file=sys.stderr)
+        warning = "\n".join(lines)
+        print(warning, file=sys.stderr)
+        warnings.append(warning)
 
-    # Claim guard — only inside coordinated repos, after the same live-lock
-    # read used for foreign conflicts. ATS_CLAIMCHECK=0 downgrades to warn-only.
-    if froot in _coordinated_roots():
-        my_cid8 = str(payload.get("session_id", ""))[:8]
-        ok, reason = claim_check(rel, froot, my_sid, my_cid8, sessions, locks)
-        if ok:
-            sys.exit(0)
-        print(f"ATS CLAIM GUARD: {reason}", file=sys.stderr)
-        sys.exit(2 if os.environ.get("ATS_CLAIMCHECK", "1") != "0" else 0)
+    if warnings:
+        # Claude Code consumes successful PreToolUse JSON on stdout. Exit-0
+        # stderr is debug-only, so send every nonblocking lock warning into
+        # the editing agent's context without changing permission handling.
+        print(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "additionalContext": "\n\n".join(warnings),
+        }}))
 
     sys.exit(0)
 
