@@ -241,6 +241,34 @@ def format_conflict_guidance(conflicts: list[dict]) -> str:
 async def list_tools() -> list[Tool]:
     """List available MCP tools."""
     return [
+        Tool(
+            name="send_message",
+            description="Send a durable message to one active session or the first later session on your ticket. Receipt needs acknowledgement.",
+            inputSchema={"type": "object", "properties": {
+                "recipient_session_id": {"type": "string"},
+                "ticket_id": {"type": "integer", "minimum": 1},
+                "body": {"type": "string", "minLength": 1, "maxLength": 4000},
+            }, "required": ["body"]},
+        ),
+        Tool(
+            name="message_inbox",
+            description="Read messages addressed to your current ATS session; messages remain pending until you acknowledge them.",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="acknowledge_message",
+            description="Confirm that you received one message addressed to your current ATS session.",
+            inputSchema={"type": "object", "properties": {
+                "message_id": {"type": "string"},
+            }, "required": ["message_id"]},
+        ),
+        Tool(
+            name="message_status",
+            description="Check whether the recipient has acknowledged a message sent by your current ATS session.",
+            inputSchema={"type": "object", "properties": {
+                "message_id": {"type": "string"},
+            }, "required": ["message_id"]},
+        ),
         # Original 8 tools
         Tool(
             name="start_session",
@@ -271,6 +299,8 @@ async def list_tools() -> list[Tool]:
                                        "Omit only for cross-repo/unscoped work (legacy "
                                        "match-everywhere).",
                     },
+                    "ticket_id": {"type": "integer", "minimum": 1,
+                                  "description": "Optional Tower ticket for handoff lineage; grants no task authority."},
                 },
                 "required": ["scope", "description"],
             },
@@ -641,6 +671,17 @@ async def list_tools() -> list[Tool]:
                             "live session, the call is refused rather than guessing. "
                             "Omit only for the legacy pointer-resolved path."),
                     },
+                    "handoff": {
+                        "type": "object",
+                        "description": "Structured verdict for the first later session on this session's ticket.",
+                        "properties": {
+                            "verdict": {"type": "string"},
+                            "blockers": {"type": "array", "items": {"type": "string"}},
+                            "next_steps": {"type": "array", "items": {"type": "string"}},
+                            "artifacts": {"type": "array", "items": {"type": "string"}},
+                        },
+                        "required": ["verdict"],
+                    },
                 },
                 "required": ["summary"],
             },
@@ -666,6 +707,10 @@ async def list_tools() -> list[Tool]:
                     "reasoning": {
                         "type": "string",
                         "description": "Why this decision was made",
+                    },
+                    "recipient_session_id": {
+                        "type": "string",
+                        "description": "Optional exact peer session to notify and require acknowledgement from.",
                     },
                 },
                 "required": ["title", "chosen", "reasoning"],
@@ -727,10 +772,20 @@ async def list_tools() -> list[Tool]:
         # NEW: Phase 3 tools (Nice to have)
         Tool(
             name="get_decision_history",
-            description="Get all decisions logged during your current session.",
+            description="Read cross-agent decisions on your ticket or repo by default; override with team_wide, ticket, repo, or session filters.",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "session_only": {"type": "boolean", "default": False},
+                    "team_wide": {"type": "boolean", "default": False},
+                    "repo_root": {"type": "string",
+                                  "description": "Limit team decisions to this repo."},
+                    "ticket_id": {"type": "integer", "minimum": 1},
+                    "since": {"type": "string", "format": "date-time",
+                              "description": "Only decisions at or after this ISO timestamp."},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 200,
+                              "default": 30},
+                },
             },
         ),
         Tool(
@@ -817,6 +872,38 @@ async def list_tools() -> list[Tool]:
 # piggyback nudge to these would just duplicate their own output.
 _OVERRIDE_NUDGE_SKIP = {"check_pending_requests", "respond_to_request",
                         "get_override_request_details"}
+
+
+def format_message_nudge(messages: list) -> str | None:
+    """Pending messages are repeated until the recipient explicitly acknowledges."""
+    if not messages:
+        return None
+    lines = [f"📨 {len(messages)} ATS message(s) awaiting YOUR acknowledgement:"]
+    for row in messages[:5]:
+        lines.append(f"  • {row['id']} from {row['sender_agent']} "
+                     f"(session {row['sender_session_id']}): {row['body'][:500]}")
+    lines.append("Use acknowledge_message after reading. Until then the sender sees it as unconfirmed.")
+    return "\n".join(lines)
+
+
+async def _incoming_message_nudge(client: httpx.AsyncClient,
+                                  session_id: str | None) -> str | None:
+    if not session_id:
+        return None
+    from ai_team_sync import session_pointer as sp
+    token = (_IN_PROCESS_APPROVAL_TOKEN
+             if session_id == _IN_PROCESS_SESSION_ID else None) or sp.load_approval_token(session_id)
+    if not token:
+        return None
+    try:
+        response = await client.get(
+            f"{SERVER_URL}/api/sessions/{session_id}/messages",
+            headers={"X-ATS-Approval-Token": token}, timeout=2.0)
+        response.raise_for_status()
+        rows = response.json()
+    except Exception:
+        return None
+    return format_message_nudge(rows if isinstance(rows, list) else [])
 
 
 def format_override_nudge(requests: list, session_id: str) -> str | None:
@@ -928,15 +1015,19 @@ async def _incoming_override_nudge(client: httpx.AsyncClient, tool_name: str,
 
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    """Handle MCP tool calls, then piggyback the override-request inbox."""
+    """Handle MCP tool calls, then surface pending coordination requests."""
     result = await _call_tool_impl(name, arguments)
     try:
-        session_id = load_session_id()
-        if session_id:
+        session_id, source = resolve_identity()
+        if session_id and source != "global":
             async with httpx.AsyncClient(timeout=2.0) as client:
                 nudge = await _incoming_override_nudge(client, name, session_id)
+                message_nudge = (None if name == "message_inbox" else
+                                 await _incoming_message_nudge(client, session_id))
             if nudge:
                 result = list(result) + [TextContent(type="text", text=nudge)]
+            if message_nudge:
+                result = list(result) + [TextContent(type="text", text=message_nudge)]
     except Exception:
         pass  # the nudge is advisory; the tool result must always go through
     return result
@@ -962,6 +1053,7 @@ async def _delegation_child(client) -> str | None:
 
 async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle MCP tool calls."""
+    global _IN_PROCESS_SESSION_ID, _IN_PROCESS_APPROVAL_TOKEN
     # Identity AND where it came from. A read may use any of it; a mutation may
     # not use the shared pointer (see mutation_refusal).
     active_session_id, identity_source = resolve_identity()
@@ -1004,6 +1096,57 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 pass
 
         try:
+            if (name == "send_message" or name == "message_inbox" or
+                    name == "acknowledge_message" or name == "message_status"):
+                refusal = await deny_mutation(client)
+                if refusal:
+                    return [TextContent(type="text", text=f"❌ {refusal}")]
+                from ai_team_sync import session_pointer as sp
+                token = (_IN_PROCESS_APPROVAL_TOKEN
+                         if active_session_id == _IN_PROCESS_SESSION_ID else None) or \
+                        sp.load_approval_token(active_session_id)
+                if not token:
+                    return [TextContent(type="text", text="❌ Session capability missing; restart your ATS session/MCP client.")]
+                headers = {"X-ATS-Approval-Token": token}
+                if name == "send_message":
+                    response = await client.post(f"{SERVER_URL}/api/messages", json={
+                        "sender_session_id": active_session_id,
+                        "recipient_session_id": arguments.get("recipient_session_id"),
+                        "ticket_id": arguments.get("ticket_id"),
+                        "body": arguments["body"]}, headers=headers)
+                    if response.status_code != 201:
+                        return [TextContent(type="text", text=f"❌ Message not sent ({response.status_code}): {response.text}")]
+                    row = response.json()
+                    target = (f"{row['recipient_agent']} (session {row['recipient_session_id']})"
+                              if row['recipient_session_id'] else
+                              f"first later session on ticket #{row['ticket_id']}")
+                    return [TextContent(type="text", text=(
+                        f"📨 Message queued for {target}. Message ID: {row['id']}. "
+                        "Delivery is unconfirmed until the recipient acknowledges it. "
+                        "Use message_status to monitor."))]
+                if name == "message_inbox":
+                    response = await client.get(
+                        f"{SERVER_URL}/api/sessions/{active_session_id}/messages",
+                        headers=headers)
+                    response.raise_for_status()
+                    return [TextContent(type="text", text=(
+                        format_message_nudge(response.json()) or "📭 No pending ATS messages."))]
+                if name == "acknowledge_message":
+                    response = await client.post(
+                        f"{SERVER_URL}/api/messages/{arguments['message_id']}/acknowledge",
+                        json={"recipient_session_id": active_session_id}, headers=headers)
+                    if response.status_code != 200:
+                        return [TextContent(type="text", text=f"❌ Acknowledgement failed ({response.status_code}): {response.text}")]
+                    return [TextContent(type="text", text=f"✅ Message {arguments['message_id']} acknowledged.")]
+                response = await client.get(
+                    f"{SERVER_URL}/api/messages/{arguments['message_id']}",
+                    params={"sender_session_id": active_session_id}, headers=headers)
+                if response.status_code != 200:
+                    return [TextContent(type="text", text=f"❌ Status unavailable ({response.status_code}): {response.text}")]
+                row = response.json()
+                state = "acknowledged" if row["acknowledged_at"] else "queued, unacknowledged"
+                return [TextContent(type="text", text=f"Message {row['id']}: {state}.")]
+
             # Original tools
             if name == "start_session":
                 scope = arguments["scope"]
@@ -1019,6 +1162,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         "description": description,
                         "branch": get_git_branch(),
                         "repo_root": arguments.get("repo_root", ""),
+                        "ticket_id": arguments.get("ticket_id"),
                         "auto_lock": True,
                         "lock_mode": "exclusive" if exclusive else "advisory",
                     },
@@ -1039,9 +1183,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 response.raise_for_status()
                 data = response.json()
                 save_session_id(data["id"])
-                global _IN_PROCESS_SESSION_ID
                 _IN_PROCESS_SESSION_ID = data["id"]
-                global _IN_PROCESS_APPROVAL_TOKEN
                 _IN_PROCESS_APPROVAL_TOKEN = response.headers.get("X-ATS-Approval-Token", "")
                 from ai_team_sync import session_pointer as sp
                 sp.save_approval_token(data["id"], _IN_PROCESS_APPROVAL_TOKEN)
@@ -1081,6 +1223,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 if adopted:
                     msg += f"(auto-registered placeholder session completed: {adopted})\n"
                 msg += f"Session ID: {data['id']}\n"
+                if data.get("ticket_id") is not None:
+                    msg += f"Ticket: #{data['ticket_id']}\n"
                 msg += f"Scope: {', '.join(data['scope'])}\n"
                 msg += f"Branch: {data['branch']}\n"
                 msg += f"Locks created: {data['lock_count']}\n"
@@ -1784,6 +1928,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
             elif name == "complete_session":
                 summary = arguments["summary"]
+                handoff = arguments.get("handoff")
                 explicit_id = (arguments.get("session_id") or "").strip()
 
                 # WHICH row, decided before anything is mutated. An explicit id is
@@ -1864,9 +2009,22 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         f"was changed.\n\n  existing summary: "
                         f"{((row or {}).get('summary') or '')[:300]}"))]
 
+                if handoff and target.session_id != active_session_id:
+                    return [TextContent(type="text", text=(
+                        "❌ A handoff must come from this MCP process's exact active session."))]
+                headers = {}
+                if handoff:
+                    from ai_team_sync import session_pointer as sp
+                    token = (_IN_PROCESS_APPROVAL_TOKEN
+                             if active_session_id == _IN_PROCESS_SESSION_ID else None) or \
+                            sp.load_approval_token(active_session_id)
+                    if not token:
+                        return [TextContent(type="text", text="❌ Session capability missing for handoff.")]
+                    headers["X-ATS-Approval-Token"] = token
                 response = await client.patch(
                     f"{SERVER_URL}/api/sessions/{target.session_id}",
-                    json={"status": "completed", "summary": summary},
+                    json={"status": "completed", "summary": summary,
+                          "handoff": handoff}, headers=headers,
                 )
                 if response.status_code >= 400:
                     return [TextContent(type="text", text=(
@@ -1905,17 +2063,28 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 chosen = arguments["chosen"]
                 rejected = arguments.get("rejected", "")
                 reasoning = arguments["reasoning"]
+                recipient_id = arguments.get("recipient_session_id")
+                headers = {}
+                if recipient_id:
+                    from ai_team_sync import session_pointer as sp
+                    token = (_IN_PROCESS_APPROVAL_TOKEN
+                             if active_session_id == _IN_PROCESS_SESSION_ID else None) or \
+                            sp.load_approval_token(active_session_id)
+                    if not token:
+                        return [TextContent(type="text", text="❌ Session capability missing for addressed decision.")]
+                    headers["X-ATS-Approval-Token"] = token
 
                 response = await client.post(
                     f"{SERVER_URL}/api/decisions",
                     json={
                         "session_id": active_session_id,
+                        "recipient_session_id": recipient_id,
                         "title": title,
                         "chosen": chosen,
                         "rejected": rejected,
                         "reasoning": reasoning,
                         "files": [],
-                    },
+                    }, headers=headers,
                 )
                 response.raise_for_status()
 
@@ -1992,6 +2161,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 msg += f"Status: {data['status']}\n"
                 msg += f"Branch: {data['branch']}\n"
                 msg += f"Scope: {scope}\n"
+                if data.get("ticket_id") is not None:
+                    msg += f"Ticket: #{data['ticket_id']}\n"
                 msg += f"Description: {data['description']}\n\n"
                 msg += f"📈 Activity:\n"
                 msg += f"  Locks: {data['lock_count']}\n"
@@ -2109,9 +2280,27 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 if not active_session_id:
                     return [TextContent(type="text", text="❌ No active session.")]
 
+                params = {"limit": arguments.get("limit", 30)}
+                if arguments.get("session_only"):
+                    params["session_id"] = active_session_id
+                elif arguments.get("ticket_id"):
+                    params["ticket_id"] = arguments["ticket_id"]
+                elif arguments.get("repo_root"):
+                    params["repo_root"] = arguments["repo_root"]
+                elif not arguments.get("team_wide"):
+                    current = await client.get(
+                        f"{SERVER_URL}/api/sessions/{active_session_id}")
+                    if current.status_code == 200:
+                        current_row = current.json()
+                        if current_row.get("ticket_id") is not None:
+                            params["ticket_id"] = current_row["ticket_id"]
+                        elif current_row.get("repo_root"):
+                            params["repo_root"] = current_row["repo_root"]
+                if arguments.get("since"):
+                    params["since"] = arguments["since"]
                 response = await client.get(
                     f"{SERVER_URL}/api/decisions",
-                    params={"session_id": active_session_id},
+                    params=params,
                 )
                 response.raise_for_status()
                 decisions = response.json()
@@ -2119,9 +2308,12 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 if not decisions:
                     return [TextContent(type="text", text="✅ No decisions logged yet.")]
 
-                msg = f"📚 {len(decisions)} decision(s) in this session:\n\n"
+                msg = f"📚 {len(decisions)} decision(s):\n\n"
                 for d in decisions:
                     msg += f"**{d['title']}**\n"
+                    msg += f"  Session: {d['session_id']}\n"
+                    if d.get("ticket_id") is not None:
+                        msg += f"  Ticket: #{d['ticket_id']}\n"
                     msg += f"  Chose: {d['chosen']}\n"
                     if d.get("rejected"):
                         msg += f"  Rejected: {d['rejected']}\n"

@@ -27,6 +27,14 @@ class SessionCreate(BaseModel):
     # ATS task_close grant is only ever for this id. Strict: "2741" is refused
     # rather than coerced, because it scopes authority.
     task_id: StrictInt | None = None
+    ticket_id: StrictInt | None = Field(default=None, gt=0)
+
+
+class HandoffCreate(BaseModel):
+    verdict: str = Field(min_length=1, max_length=4000)
+    blockers: list[str] = Field(default_factory=list)
+    next_steps: list[str] = Field(default_factory=list)
+    artifacts: list[str] = Field(default_factory=list)
 
 
 class SessionUpdate(BaseModel):
@@ -44,6 +52,7 @@ class SessionUpdate(BaseModel):
     # [] for an unanchored session, so an agent's dirty files stayed invisible
     # to the whole team, and the reaper completed it without ever surfacing them.
     repo_root: str | None = None
+    handoff: HandoffCreate | None = None
 
 
 class SessionResponse(BaseModel):
@@ -55,6 +64,7 @@ class SessionResponse(BaseModel):
     status: str
     branch: str
     repo_root: str = ""  # '' = unanchored (legacy session)
+    ticket_id: int | None = None
     started_at: datetime
     completed_at: datetime | None = None
     last_heartbeat: datetime | None = None  # NULL = never heartbeated (see Gap 1)
@@ -194,6 +204,8 @@ class LockResponse(BaseModel):
 
 class DecisionCreate(BaseModel):
     session_id: str
+    ticket_id: StrictInt | None = Field(default=None, gt=0)
+    recipient_session_id: str | None = None
     title: str
     chosen: str
     rejected: str | None = None
@@ -204,6 +216,8 @@ class DecisionCreate(BaseModel):
 class DecisionResponse(BaseModel):
     id: str
     session_id: str
+    ticket_id: int | None = None
+    recipient_session_id: str | None = None
     title: str
     chosen: str
     rejected: str | None = None

@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from ai_team_sync.config import settings
@@ -75,6 +75,8 @@ class Session(Base):
     bound_worker: Mapped[str] = mapped_column(String(100), default="")
     bound_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Coordination lineage only. Never interpreted as task-close authority.
+    ticket_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
     # The delegation this session was created as the child of, recorded at
     # creation. Delegation.child_session_id is a pointer on another row; a grant
     # must never depend on it alone, or moving it moves the narrowing.
@@ -149,6 +151,8 @@ class Decision(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
+    ticket_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    recipient_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     title: Mapped[str] = mapped_column(String(500))
     chosen: Mapped[str] = mapped_column(Text)
     rejected: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -157,6 +161,42 @@ class Decision(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
     session: Mapped[Session] = relationship(back_populates="decisions")
+
+
+class AgentMessage(Base):
+    """Durable, session-addressed instruction with an explicit receipt."""
+
+    __tablename__ = "agent_messages"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    sender_session_id: Mapped[str] = mapped_column(String(36), index=True)
+    recipient_session_id: Mapped[str | None] = mapped_column(String(36), index=True, nullable=True)
+    ticket_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(20), default="message")
+    handoff_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    sender_agent: Mapped[str] = mapped_column(String(100))
+    sender_developer: Mapped[str] = mapped_column(String(255))
+    recipient_agent: Mapped[str] = mapped_column(String(100), default="")
+    body: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Handoff(Base):
+    """Structured verdict that survives session completion and reaping."""
+
+    __tablename__ = "handoffs"
+    __table_args__ = (UniqueConstraint("source_session_id"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    ticket_id: Mapped[int] = mapped_column(Integer, index=True)
+    source_session_id: Mapped[str] = mapped_column(String(36), index=True)
+    recipient_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    verdict: Mapped[str] = mapped_column(Text)
+    blockers: Mapped[str] = mapped_column(Text, default="[]")
+    next_steps: Mapped[str] = mapped_column(Text, default="[]")
+    artifacts: Mapped[str] = mapped_column(Text, default="[]")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
 class CommitRecord(Base):
