@@ -11,8 +11,8 @@ passive one: each turn, if requests are waiting on YOU, you're told — with the
 respond_to_request.
 
 Owner-only: shows requests where this session is the lock OWNER (incoming), not ones
-you sent. Same session resolution as the heartbeat hook: ATS_SESSION_ID / ATS_SESSION
-env, else ~/.ats_session.
+you sent. ATS_SESSION_ID is an explicit ATS row id; ATS_SESSION is a client
+session key and must resolve through its per-session pointer.
 
 Wire (~/.claude/settings.json):
   "UserPromptSubmit": [{ "hooks": [{ "type": "command",
@@ -40,7 +40,7 @@ def _session_file() -> Path:
 
 
 def _resolve_session_id(cid: str = "") -> str | None:
-    sid = (os.environ.get("ATS_SESSION_ID") or os.environ.get("ATS_SESSION") or "").strip()
+    sid = (os.environ.get("ATS_SESSION_ID") or "").strip()
     if sid:
         return sid
     if cid:
@@ -89,12 +89,21 @@ def format_message_inbox(rows: list[dict]) -> str | None:
     return "\n".join(lines)
 
 
+def format_missing_capability(session_id: str) -> str:
+    """A pre-capability client cannot read or acknowledge this exact inbox."""
+    return (f"ATS inbox unavailable for session {session_id}: no saved session "
+            "capability. At a safe pause, finish this ATS session, refresh the "
+            "MCP client, and start a new ATS session. Ask senders to address the "
+            "new session; old messages remain unacknowledged.")
+
+
 def main() -> None:
     try:
         payload = json.load(sys.stdin)
     except Exception:
         payload = {}
-    cid = str(payload.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID") or "")
+    cid = str(payload.get("session_id") or os.environ.get("CLAUDE_CODE_SESSION_ID")
+              or os.environ.get("ATS_SESSION") or "")
     session_id = _resolve_session_id(cid)
     if not session_id:
         sys.exit(0)
@@ -109,12 +118,17 @@ def main() -> None:
             from ai_team_sync import session_pointer as sp
             token = sp.load_approval_token(session_id, cid)
             messages = []
+            missing_capability = False
             if token:
                 response = client.get(
                     f"{server}/api/sessions/{session_id}/messages",
                     headers={"X-ATS-Approval-Token": token})
                 if response.status_code == 200:
                     messages = response.json()
+            else:
+                response = client.get(f"{server}/api/sessions/{session_id}")
+                missing_capability = (response.status_code == 200
+                                      and response.json().get("status") == "active")
     except Exception:
         sys.exit(0)  # best-effort: never block the prompt
     note = format_inbox(requests if isinstance(requests, list) else [], session_id)
@@ -123,6 +137,8 @@ def main() -> None:
     message_note = format_message_inbox(messages if isinstance(messages, list) else [])
     if message_note:
         print(message_note)
+    if missing_capability:
+        print(format_missing_capability(session_id))
     sys.exit(0)
 
 

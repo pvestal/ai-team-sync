@@ -16,8 +16,8 @@ nothing here should be treated as one.
 
 | Tool | Effect | Notes |
 |---|---|---|
-| `start_session` | mutates | Declares scope and takes advisory locks. Returns a context brief when one is available. Pass `repo_root` so patterns anchor to a repo. |
-| `complete_session` | mutates | Pass `session_id`: it is authoritative for the call and is echoed back with the prior and resulting status, so you can see which row changed. Omitting it uses the legacy pointer path. Releases locks. Refused while a child delegation is still open, and refused on a session you do not own. |
+| `start_session` | mutates | Declares scope and takes advisory locks. Returns a context brief when one is available. Pass `repo_root` so patterns anchor to a repo and `ticket_id` when working a Tower ticket. |
+| `complete_session` | mutates | Pass `session_id`: it is authoritative for the call and is echoed back with the prior and resulting status, so you can see which row changed. Omitting it uses the legacy pointer path. Releases locks. A ticket-linked session may attach a structured `handoff` for the first later claimant. Refused while a child delegation is still open, and refused on a session you do not own. |
 | `pause_session` / `resume_session` | mutates | Pauses work while keeping locks. |
 | `extend_scope` | mutates | Adds patterns to the current session mid-flight. |
 | `get_session_details` | reads | Locks, decisions and commits for your session. |
@@ -49,10 +49,30 @@ to refuse a mismatch. See [Authority model](authority-model.md).
 | Tool | Effect | Notes |
 |---|---|---|
 | `log_decision` | mutates | Records what was chosen and why, for later readers. |
-| `get_decision_history` | reads | Decisions from your session. |
+| `get_decision_history` | reads | Cross-agent decisions on your current ticket or repo by default; supports `team_wide`, `ticket_id`, `repo_root`, `session_id`, and `since` filters. |
 | `request_override` | mutates | Ask the lock holder for permission to cross their claim. |
 | `respond_to_request` | mutates | Owner-bound: only the session the request is addressed to may answer. |
 | `check_pending_requests` / `check_my_override_requests` / `get_override_request_details` | reads | Inbox and status. |
+
+## Addressed messages
+
+| Tool | Effect | Notes |
+|---|---|---|
+| `send_message` | mutates | Address one active ATS session by `recipient_session_id`, or the first later claimant of your `ticket_id`. Returns a message ID; queueing is not delivery. |
+| `message_inbox` | reads | Shows pending messages for this exact session, with sender and message IDs. |
+| `acknowledge_message` | mutates | Persist receipt of one message addressed to this session. Other sessions cannot acknowledge it. |
+| `message_status` | reads | Sender checks whether its message has an `acknowledged_at` receipt. |
+
+The Claude `UserPromptSubmit` hook shows pending addressed messages in the next
+turn. A fresh Codex MCP process shows them in `message_inbox` and on ATS MCP
+responses. Both paths require the recipient session's saved capability. A client
+that created its ATS session before capability persistence cannot recover that
+secret from the server: at a safe pause, finish that ATS session, refresh the MCP
+client, start a new ATS session, and have the sender address its new session ID.
+The old exact-session message remains unacknowledged; ATS does not silently
+retarget it. The Claude hook reports a missing capability instead of silently
+hiding its inbox. No message appears in the hook when an authenticated inbox is
+empty, and an unavailable ATS server never blocks a prompt.
 
 ## Delegation
 
