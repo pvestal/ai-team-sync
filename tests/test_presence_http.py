@@ -157,6 +157,22 @@ async def test_concurrent_same_developer_sessions_coexist(client):
 
 
 @pytest.mark.asyncio
+async def test_same_developer_and_worker_keep_distinct_session_presence(client):
+    for sid, path in (("codex-session-1", "a.py"), ("codex-session-2", "b.py")):
+        resp = await client.post("/api/presence", json={
+            "developer": "pvestal", "agent": "codex", "session_id": sid,
+            "files": [path]})
+        assert resp.status_code == 200
+    listed = (await client.get("/api/presence")).json()
+    assert {(p["session_id"], tuple(p["files"])) for p in listed} == {
+        ("codex-session-1", ("a.py",)), ("codex-session-2", ("b.py",))}
+    checked = (await client.post("/api/presence/check", json={
+        "paths": ["a.py", "b.py"], "exclude_session_id": "codex-session-1"})).json()
+    assert checked[0]["editors"] == []
+    assert checked[1]["editors"][0]["session_id"] == "codex-session-2"
+
+
+@pytest.mark.asyncio
 async def test_whos_editing_excludes_only_my_session_not_developer(client):
     # session aaa is editing jwt.py; session bbb (SAME developer) checks it.
     await client.post("/api/presence", json={

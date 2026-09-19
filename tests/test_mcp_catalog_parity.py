@@ -55,6 +55,7 @@ async def test_the_contract_surface_stays_registered():
         "start_session", "complete_session", "extend_scope", "check_locks",
         "team_status", "log_decision", "task_brief", "my_authority",
         "delegate", "reconcile_delegation", "ats_version",
+        "recent_file_activities",
     }
 
     missing = required - await _tool_names()

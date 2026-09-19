@@ -16,6 +16,7 @@ from ai_team_sync.scope_paths import reader_covers, reader_lock, reader_query
 from ai_team_sync.schemas import (
     LockCheckRequest,
     LockCheckResult,
+    LockMatch,
     LockCreate,
     LockResponse,
 )
@@ -23,7 +24,8 @@ from ai_team_sync.schemas import (
 router = APIRouter(prefix="/locks", tags=["locks"])
 
 
-def _lock_to_response(lock: ScopeLock, developer: str | None = None) -> LockResponse:
+def _lock_to_response(lock: ScopeLock, developer: str | None = None,
+                      agent: str | None = None) -> LockResponse:
     return LockResponse(
         id=lock.id,
         session_id=lock.session_id,
@@ -33,6 +35,7 @@ def _lock_to_response(lock: ScopeLock, developer: str | None = None) -> LockResp
         created_at=lock.created_at,
         expires_at=lock.expires_at,
         developer=developer,
+        agent=agent,
     )
 
 
@@ -103,7 +106,7 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
 
     conflicts = await _check_scope_conflicts(
         db, [body.pattern], session.developer, repo_root=session.repo_root or "",
-        exclude_session_id=session.id)
+        exclude_session_id=session.id, requester_session_id=session.id)
     conflict = blocking_conflict(conflicts, body.mode)
     if conflict is not None:
         raise HTTPException(409, detail=scope_conflict_detail("lock", conflict, conflicts))
@@ -118,41 +121,61 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
     db.add(lock)
     await db.commit()
     await db.refresh(lock)
-    return _lock_to_response(lock, developer=session.developer)
+    return _lock_to_response(lock, developer=session.developer, agent=session.agent)
 
 
 @router.get("", response_model=list[LockResponse])
 async def list_locks(db: AsyncSession = Depends(get_db)):
     locks = await _get_active_locks(db)
-    return [_lock_to_response(lock, developer=owner.developer) for lock, owner, _root in locks]
+    return [_lock_to_response(lock, developer=owner.developer, agent=owner.agent)
+            for lock, owner, _root in locks]
 
 
 @router.post("/check", response_model=list[LockCheckResult])
-async def check_locks(body: LockCheckRequest, db: AsyncSession = Depends(get_db)):
+async def check_locks(body: LockCheckRequest, request: Request,
+                      db: AsyncSession = Depends(get_db)):
     """Which live lock covers each path. Lexical, per docs/lock-readers.md: each
     path and each lock is placed once per request, then compared with fnmatch."""
+    from ai_team_sync.caller_session import resolve_caller_session
+    from ai_team_sync.routers.override_requests import approved_override_for_lock
+
+    caller = await resolve_caller_session(db, request=request, session_id=body.session_id)
     active_locks = await _get_active_locks(db)
     results = []
 
-    locks = [(lock, owner.developer, reader_lock(lock.pattern, lock_repo_root))
+    locks = [(lock, owner, reader_lock(lock.pattern, lock_repo_root))
              for lock, owner, lock_repo_root in active_locks]
     for path in body.paths:
         query = reader_query(path, body.repo_root)
-        hits = [(lock, developer) for lock, developer, form in locks if reader_covers(query, form)]
+        hits = [(lock, owner) for lock, owner, form in locks if reader_covers(query, form)]
         if not hits:
-            results.append(LockCheckResult(path=path, locked=False))
+            results.append(LockCheckResult(
+                path=path, locked=False, caller_identity_unresolved=caller.unresolved))
             continue
-        # One row per path: an exclusive lock that covers it is the one reported.
-        lock, developer = next((h for h in hits if h[0].mode == "exclusive"), hits[0])
+        matches = []
+        for lock, owner in hits:
+            matches.append(LockMatch(
+                lock_id=lock.id, session_id=lock.session_id, agent=owner.agent,
+                developer=owner.developer, mode=lock.mode, pattern=lock.pattern,
+                reason=lock.reason or "", is_own=caller.owns(lock),
+                override_granted=await approved_override_for_lock(
+                    db, caller.session_id or "", lock)))
+        # Keep the legacy top-level fields, choosing a foreign exclusive claim first.
+        lock, owner = next((h for h in hits if h[0].mode == "exclusive"
+                            and not caller.owns(h[0])),
+                           next((h for h in hits if not caller.owns(h[0])), hits[0]))
         results.append(LockCheckResult(
             path=path,
             locked=True,
             lock_id=lock.id,
             session_id=lock.session_id,
-            developer=developer,
+            developer=owner.developer,
+            agent=owner.agent,
             mode=lock.mode,
             pattern=lock.pattern,
             reason=lock.reason or "",
+            matches=matches,
+            caller_identity_unresolved=caller.unresolved,
         ))
 
     # Dispatch conflict notifications for any exclusive locks hit

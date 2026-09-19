@@ -141,11 +141,24 @@ class LockCreate(BaseModel):
 
 class LockCheckRequest(BaseModel):
     paths: list[str]
+    session_id: str = ""
     # Caller's git root: places RELATIVE paths in that repository, so locks
     # anchored to another repository do not match them. Absolute paths carry their
     # own location. '' = relative paths match every repository's locks (legacy).
     # Contract: docs/lock-readers.md.
     repo_root: str = ""
+
+
+class LockMatch(BaseModel):
+    lock_id: str
+    session_id: str
+    agent: str
+    developer: str
+    mode: str
+    pattern: str
+    reason: str = ""
+    is_own: bool = False
+    override_granted: bool = False
 
 
 class LockCheckResult(BaseModel):
@@ -157,6 +170,9 @@ class LockCheckResult(BaseModel):
     mode: str | None = None
     pattern: str | None = None
     reason: str | None = None  # WHY the path is locked (surfaced so the blocker is actionable)
+    agent: str | None = None
+    matches: list[LockMatch] = Field(default_factory=list)
+    caller_identity_unresolved: bool = False
 
 
 class LockResponse(BaseModel):
@@ -168,6 +184,7 @@ class LockResponse(BaseModel):
     created_at: datetime
     expires_at: datetime
     developer: str | None = None
+    agent: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -235,6 +252,8 @@ class OverrideRequestResponse(BaseModel):
     expires_at: datetime
     requester_developer: str | None = None
     owner_developer: str | None = None
+    requester_agent: str | None = None
+    owner_agent: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -244,7 +263,7 @@ class OverrideRequestRespond(BaseModel):
     message: str = ""
     # The lock OWNER answers. An override is permission to cross someone's
     # claim, so the only session that can grant it is the one holding it.
-    actor_session_id: str = ""
+    actor_session_id: str
 
 
 # --- Presence (HTTP, for hook-driven auto-emit; WS path is for the live UI) ---
@@ -252,6 +271,7 @@ class OverrideRequestRespond(BaseModel):
 class PresenceUpdate(BaseModel):
     developer: str
     agent: str = "unknown"
+    session_id: str = ""
     files: list[str] = Field(default_factory=list)
     intent: str = ""  # one-line WHAT they're doing
 
@@ -259,12 +279,14 @@ class PresenceUpdate(BaseModel):
 class PresenceEntry(BaseModel):
     developer: str
     agent: str
+    session_id: str = ""
     files: list[str]
     intent: str = ""
 
 
 class WhosEditingRequest(BaseModel):
     paths: list[str]
+    exclude_session_id: str = ""
     exclude_developer: str = ""  # legacy: omit yourself by developer name
     exclude_agent: str = ""  # preferred: omit only YOUR session (per-session agent
     # label), so a concurrent same-developer session is still reported. Falls back to
@@ -356,6 +378,7 @@ class RestartResponse(BaseModel):
     unit: str
     session_id: str | None = None
     developer: str = ""
+    agent: str = ""
     reason: str = ""
     outcome: str
     old_pid: int | None = None

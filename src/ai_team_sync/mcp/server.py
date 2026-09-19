@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from ai_team_sync.session_marker import (
 
 # MCP Server instance
 mcp_server = Server("ai-team-sync")
+_MCP_INSTANCE_TOKEN = secrets.token_hex(4)
 
 # Server URL from environment
 SERVER_URL = os.environ.get("ATS_SERVER_URL", "http://localhost:8400")
@@ -97,7 +99,11 @@ def session_agent_label() -> str:
     """
     from ai_team_sync import session_pointer as sp
 
-    return sp.agent_label(detect_agent())  # one label (#2517)
+    base = detect_agent()
+    label = sp.agent_label(base)
+    if base == "codex" and label == base and not os.environ.get("ATS_DELEGATION"):
+        return f"codex:{_MCP_INSTANCE_TOKEN}"
+    return label
 
 
 # Identity of the session THIS MCP process started. A stdio MCP server is
@@ -108,6 +114,7 @@ def session_agent_label() -> str:
 # global file, which is exactly how it completed a delegated child's row on
 # 2026-09-11 while reporting that its own session had completed.
 _IN_PROCESS_SESSION_ID: str | None = None
+_IN_PROCESS_APPROVAL_TOKEN: str | None = None
 
 
 def resolve_identity() -> tuple[str | None, str]:
@@ -213,7 +220,7 @@ def format_conflict_guidance(conflicts: list[dict]) -> str:
     if has_exclusive:
         msg += "**Option 1:** Request override permission\n"
         msg += "   Use: request_override tool with justification\n"
-        msg += "   Keywords for auto-approval: urgent, security, hotfix, critical\n\n"
+        msg += "   The exclusive lock owner must approve this request.\n\n"
 
         msg += "**Option 2:** Coordinate with lock owner\n"
         msg += "   Use: team_status to see who's working\n"
@@ -314,7 +321,7 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="request_override",
-            description="Request permission to work on files locked by someone else. Use when blocked by exclusive lock. Keywords 'urgent', 'security', 'hotfix', 'critical' may auto-approve.",
+            description="Request permission to work on files locked by another session. An exclusive lock requires its owner's approval.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -418,6 +425,21 @@ async def list_tools() -> list[Tool]:
                         "description": "Optional: limit to one unit, e.g. 'my-api'",
                     },
                     "limit": {"type": "integer", "description": "Max rows (default 20)"},
+                },
+            },
+        ),
+        Tool(
+            name="recent_file_activities",
+            description=(
+                "Observed file reads and edits reported by instrumented clients, "
+                "with worker and full ATS session identity. Uninstrumented commands "
+                "and agents are not represented."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Optional ATS session filter"},
+                    "limit": {"type": "integer", "description": "Max rows (default 50)"},
                 },
             },
         ),
@@ -812,7 +834,9 @@ def format_override_nudge(requests: list, session_id: str) -> str | None:
         return None
     lines = [f"⚠️ {len(incoming)} pending override request(s) awaiting YOUR response:"]
     for r in incoming:
-        who = r.get("requester_developer") or "unknown"
+        who = (f"{r.get('requester_agent') or 'unknown agent'} "
+               f"(session {r.get('requester_session_id') or '?'}, "
+               f"operator {r.get('requester_developer') or 'unknown'})")
         lines.append(
             f"  • {r.get('id')} — {who} wants '{r.get('conflicting_pattern', '?')}'"
         )
@@ -864,7 +888,9 @@ async def _recent_restarts_block(client: httpx.AsyncClient) -> str:
 
     out = "\n\U0001f501 Shared services restarted recently:\n"
     for r in recent:
-        who = r.get("developer") or "unknown"
+        who = (f"{r['agent']} (session {r.get('session_id') or '?'}, "
+               f"operator {r.get('developer') or 'unknown'})" if r.get("agent")
+               else f"operator {r.get('developer') or 'unknown'} (unattributed session)")
         line = f"• {r['unit']} — {_fmt_age(r.get('age_seconds'))} by {who}"
         if r.get("outcome") == "failed":
             line += "  \u274c FAILED"
@@ -1004,7 +1030,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     msg = f"❌ Cannot start session - conflicts detected:\n\n"
                     for c in conflicts:
                         msg += f"  • Pattern '{c['new_pattern']}' conflicts with '{c['existing_pattern']}'\n"
-                        msg += f"    Held by: {c['existing_developer']} ({c['lock_mode']} lock)\n\n"
+                        msg += (f"    Held by: {c.get('existing_agent') or 'unknown agent'} "
+                                f"(session {c.get('session_id') or '?'}, "
+                                f"operator {c['existing_developer']}; {c['lock_mode']} lock)\n\n")
                     msg += format_conflict_guidance(conflicts)
                     return [TextContent(type="text", text=msg)]
 
@@ -1013,6 +1041,10 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 save_session_id(data["id"])
                 global _IN_PROCESS_SESSION_ID
                 _IN_PROCESS_SESSION_ID = data["id"]
+                global _IN_PROCESS_APPROVAL_TOKEN
+                _IN_PROCESS_APPROVAL_TOKEN = response.headers.get("X-ATS-Approval-Token", "")
+                from ai_team_sync import session_pointer as sp
+                sp.save_approval_token(data["id"], _IN_PROCESS_APPROVAL_TOKEN)
 
                 # Adopt-or-complete the SessionStart auto-registration
                 # (ats-sessionstart-orphan-adoption-p01): the hook registers a
@@ -1085,7 +1117,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 response = await client.post(
                     f"{SERVER_URL}/api/locks/check",
                     json={"paths": paths,
-                          "repo_root": arguments.get("repo_root", "")},
+                          "repo_root": arguments.get("repo_root", ""),
+                          "session_id": active_session_id or ""},
                 )
                 response.raise_for_status()
                 results = response.json()
@@ -1094,21 +1127,30 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 if not locked:
                     return [TextContent(type="text", text="✅ No locks found. All files are available.")]
 
-                msg = "🔒 Lock conflicts detected:\n\n"
+                msg = "🔒 Lock coverage:\n\n"
+                foreign_exclusive = False
                 for r in locked:
-                    icon = "⛔" if r["mode"] == "exclusive" else "⚠️"
-                    msg += f"{icon} {r['path']}\n"
-                    msg += f"   Locked by: {r['developer']}\n"
-                    msg += f"   Pattern: {r['pattern']}\n"
-                    msg += f"   Mode: {r['mode']}\n"
-                    # Lock id makes a stale conflict reapable via delete_lock(lock_id).
-                    msg += f"   Lock ID: {r.get('lock_id', '?')}  (reap: delete_lock)\n\n"
-
-                exclusive = [r for r in locked if r["mode"] == "exclusive"]
-                if exclusive:
-                    msg += "⛔ Exclusive locks block you. Use request_override to ask permission."
+                    msg += f"{r['path']}\n"
+                    for match in r.get("matches") or [r]:
+                        own = bool(match.get("is_own"))
+                        foreign_exclusive |= (match.get("mode") == "exclusive" and not own
+                                              and not match.get("override_granted"))
+                        who = ("YOUR SESSION" if own else
+                               f"{match.get('agent') or 'unknown agent'} "
+                               f"(session {match.get('session_id') or '?'})")
+                        msg += (f"   {match.get('mode')} — {who}; "
+                                f"operator {match.get('developer')}; "
+                                f"pattern {match.get('pattern')}; "
+                                f"lock {match.get('lock_id') or '?'}\n")
+                        if match.get("override_granted"):
+                            msg += "   Approved override for this session is active.\n"
+                    if r.get("caller_identity_unresolved"):
+                        msg += "   ⚠ Caller session unresolved; your own lock may appear as foreign.\n"
+                    msg += "\n"
+                if foreign_exclusive:
+                    msg += "⛔ Another session holds an exclusive lock. Request an override."
                 else:
-                    msg += "⚠️ Advisory locks - you can proceed but coordinate with team members."
+                    msg += "No foreign exclusive lock found. Coordinate on foreign advisory locks."
 
                 return [TextContent(type="text", text=msg)]
 
@@ -1117,7 +1159,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 response = await client.post(
                     f"{SERVER_URL}/api/presence/check",
                     json={"paths": paths, "exclude_developer": get_git_user(),
-                          "exclude_agent": session_agent_label()},
+                          "exclude_agent": session_agent_label(),
+                          "exclude_session_id": active_session_id or ""},
                 )
                 response.raise_for_status()
                 results = response.json()
@@ -1225,11 +1268,13 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
                 msg += f"Request ID: {data['id']}\n"
                 msg += f"Pattern: {data['conflicting_pattern']}\n"
-                msg += f"Owner: {data['owner_developer']}\n"
+                msg += (f"Owner: {data.get('owner_agent') or 'unknown agent'} "
+                        f"(session {data.get('owner_session_id') or '?'}, "
+                        f"operator {data['owner_developer']})\n")
 
                 if not auto_decided:
                     msg += f"Expires: {data['expires_at']}\n\n"
-                    msg += "💡 Tip: Use keywords 'urgent', 'security', 'hotfix', 'critical' for auto-approval\n"
+                    msg += "An exclusive lock requires its owner's response.\n"
                     msg += "Use check_my_override_requests to monitor response.\n"
                     msg += ("If it EXPIRES unanswered and the lock is ADVISORY: proceed with a "
                             "tightly-scoped change + log_decision (visible to the holder); "
@@ -1260,7 +1305,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 msg = f"📬 {len(requests)} pending override request(s) TO YOU:\n\n"
                 for req in requests:
                     msg += f"Request ID: {req['id']}\n"
-                    msg += f"From: {req['requester_developer']}\n"
+                    msg += (f"From: {req.get('requester_agent') or 'unknown agent'} "
+                            f"(session {req.get('requester_session_id') or '?'}, "
+                            f"operator {req['requester_developer']})\n")
                     msg += f"Pattern: {req['conflicting_pattern']}\n"
                     msg += f"Justification: {req['justification']}\n"
                     msg += f"Expires: {req['expires_at']}\n\n"
@@ -1269,13 +1316,26 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 return [TextContent(type="text", text=msg)]
 
             elif name == "respond_to_request":
+                if not active_session_id:
+                    return [TextContent(type="text", text="❌ Start an ATS session before answering an override.")]
+                from ai_team_sync import session_pointer as sp
+                token = ((_IN_PROCESS_APPROVAL_TOKEN
+                          if _IN_PROCESS_SESSION_ID == active_session_id else "")
+                         or sp.load_approval_token(active_session_id)
+                         or os.environ.get("ATS_APPROVAL_TOKEN", ""))
+                if not token:
+                    return [TextContent(type="text", text=(
+                        "❌ This session has no owner approval capability. Start a new "
+                        "ATS session before answering an override."))]
                 request_id = arguments["request_id"]
                 approved = arguments["approved"]
                 message = arguments["message"]
 
                 response = await client.post(
                     f"{SERVER_URL}/api/override-requests/{request_id}/respond",
-                    json={"approved": approved, "message": message},
+                    json={"approved": approved, "message": message,
+                          "actor_session_id": active_session_id or ""},
+                    headers={"X-ATS-Approval-Token": token},
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -1283,7 +1343,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 status = "✅ APPROVED" if approved else "❌ DENIED"
                 msg = f"{status} Override request response sent!\n\n"
                 msg += f"Request ID: {data['id']}\n"
-                msg += f"Requester: {data['requester_developer']}\n"
+                msg += (f"Requester: {data.get('requester_agent') or 'unknown agent'} "
+                        f"(session {data['requester_session_id']}, "
+                        f"operator {data['requester_developer']})\n")
                 msg += f"Your message: {message}\n\n"
                 msg += "Requester has been notified."
 
@@ -1348,7 +1410,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 msg = f"\U0001f501 {len(rows)} recorded restart(s), newest first:\n\n"
                 for r in rows:
                     msg += f"• {r['unit']} — {_fmt_age(r.get('age_seconds'))}"
-                    msg += f" by {r.get('developer') or 'unknown'}"
+                    msg += (f" by {r.get('agent') or 'unattributed'} "
+                            f"(session {r.get('session_id') or '?'}, "
+                            f"operator {r.get('developer') or 'unknown'})")
                     if r.get("outcome") != "completed":
                         msg += f"  [{r['outcome']}]"
                     msg += "\n"
@@ -1359,6 +1423,24 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     if r.get("before") or r.get("after"):
                         msg += f"  before={r.get('before')} after={r.get('after')}\n"
                     msg += "\n"
+                return [TextContent(type="text", text=msg)]
+
+            elif name == "recent_file_activities":
+                params: dict[str, Any] = {"limit": arguments.get("limit", 50)}
+                if arguments.get("session_id"):
+                    params["session_id"] = arguments["session_id"]
+                response = await client.get(f"{SERVER_URL}/api/file-activities", params=params)
+                response.raise_for_status()
+                rows = response.json()
+                if not rows:
+                    return [TextContent(type="text", text=(
+                        "No instrumented file actions recorded for this filter. "
+                        "This does not prove no files were read or edited."))]
+                msg = f"📁 {len(rows)} observed file action(s), newest first:\n\n"
+                for row in rows:
+                    msg += (f"• {row['action']} {row['path']} — {row['agent']} "
+                            f"(session {row['session_id']}, operator {row['developer']}) "
+                            f"at {row['created_at']}\n")
                 return [TextContent(type="text", text=msg)]
 
             elif name == "reconcile_delegation":
@@ -1674,7 +1756,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                                f"auto-completes on the reaper's next sweep)")
                     else:
                         tag = f"  (active, idle {idle_txt})"
-                    msg += f"• {s['developer']} ({s['agent']}){tag}\n"
+                    msg += (f"• {s['agent']} · session {s['id']} "
+                            f"(operator {s['developer']}){tag}\n")
                     msg += f"  Scope: {scope}\n"
                     msg += f"  Branch: {s['branch']}\n"
                     msg += f"  Description: {s['description']}\n"
@@ -1944,7 +2027,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     icon = status_icon.get(req["status"], "?")
 
                     msg += f"{icon} Request ID: {req['id']}\n"
-                    msg += f"   To: {req['owner_developer']}\n"
+                    msg += (f"   To: {req.get('owner_agent') or 'unknown agent'} "
+                            f"(session {req['owner_session_id']}, "
+                            f"operator {req['owner_developer']})\n")
                     msg += f"   Pattern: {req['conflicting_pattern']}\n"
                     msg += f"   Status: {req['status']}\n"
 
@@ -2008,7 +2093,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 for lock in locks:
                     mode_icon = "⛔" if lock["mode"] == "exclusive" else "⚠️"
                     msg += f"{mode_icon} {lock['pattern']} ({lock['mode']})\n"
-                    msg += f"   Developer: {lock.get('developer', 'unknown')}\n"
+                    msg += (f"   Holder: {lock.get('agent') or 'unknown agent'} "
+                            f"(session {lock.get('session_id') or '?'})\n"
+                            f"   Operator: {lock.get('developer', 'unknown')}\n")
                     # Surface the lock id so a stale/ghost lock is reapable via
                     # delete_lock(lock_id) without completing its (dead) session.
                     msg += f"   Lock ID: {lock['id']}  (reap: delete_lock)\n"
@@ -2207,8 +2294,12 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
                 msg = f"{icon} Override Request Details\n\n"
                 msg += f"ID: {data['id']}\n"
-                msg += f"From: {data['requester_developer']}\n"
-                msg += f"To: {data['owner_developer']}\n"
+                msg += (f"From: {data.get('requester_agent') or 'unknown agent'} "
+                        f"(session {data['requester_session_id']}, "
+                        f"operator {data['requester_developer']})\n")
+                msg += (f"To: {data.get('owner_agent') or 'unknown agent'} "
+                        f"(session {data['owner_session_id']}, "
+                        f"operator {data['owner_developer']})\n")
                 msg += f"Pattern: {data['conflicting_pattern']}\n"
                 msg += f"Status: {data['status']}\n\n"
                 msg += f"Justification:\n{data['justification']}\n\n"

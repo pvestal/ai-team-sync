@@ -57,13 +57,14 @@ def _age_seconds(created_at) -> float:
     return max(0.0, (datetime.now(timezone.utc) - created_at).total_seconds())
 
 
-def _to_response(r: ServiceRestart) -> RestartResponse:
+def _to_response(r: ServiceRestart, agent: str = "") -> RestartResponse:
     return RestartResponse(
         age_seconds=_age_seconds(r.created_at),
         id=r.id,
         unit=r.unit,
         session_id=r.session_id,
         developer=r.developer or "",
+        agent=agent,
         reason=r.reason or "",
         outcome=r.outcome,
         old_pid=r.old_pid,
@@ -77,6 +78,7 @@ def _to_response(r: ServiceRestart) -> RestartResponse:
 @router.post("", response_model=RestartResponse, status_code=201)
 async def record_restart(body: RestartCreate, db: AsyncSession = Depends(get_db)):
     developer = body.developer or ""
+    agent = ""
     if body.session_id:
         result = await db.execute(select(Session).where(Session.id == body.session_id))
         session = result.scalar_one_or_none()
@@ -85,6 +87,7 @@ async def record_restart(body: RestartCreate, db: AsyncSession = Depends(get_db)
             # which defeats the point of recording it.
             raise HTTPException(404, "Session not found")
         developer = developer or session.developer
+        agent = session.agent
 
     restart = ServiceRestart(
         unit=body.unit,  # already normalized by RestartCreate
@@ -100,7 +103,7 @@ async def record_restart(body: RestartCreate, db: AsyncSession = Depends(get_db)
     db.add(restart)
     await db.commit()
     await db.refresh(restart)
-    return _to_response(restart)
+    return _to_response(restart, agent)
 
 
 @router.get("", response_model=list[RestartResponse])
@@ -116,7 +119,12 @@ async def list_restarts(
         # stored as 'comfyui' and the caller would conclude it was never restarted.
         stmt = stmt.where(ServiceRestart.unit == normalize_unit(unit))
     result = await db.execute(stmt)
-    return [_to_response(r) for r in result.scalars().all()]
+    rows = result.scalars().all()
+    agents = {}
+    for sid in {r.session_id for r in rows if r.session_id}:
+        session = await db.get(Session, sid)
+        agents[sid] = session.agent if session else ""
+    return [_to_response(r, agents.get(r.session_id, "")) for r in rows]
 
 
 @router.patch("/{restart_id}", response_model=RestartResponse)
@@ -142,4 +150,5 @@ async def update_restart(
 
     await db.commit()
     await db.refresh(restart)
-    return _to_response(restart)
+    session = await db.get(Session, restart.session_id) if restart.session_id else None
+    return _to_response(restart, session.agent if session else "")

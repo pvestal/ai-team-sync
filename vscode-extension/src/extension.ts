@@ -1,12 +1,14 @@
 import * as vscode from "vscode";
 import * as http from "http";
 import * as https from "https";
+import * as crypto from "crypto";
 
 // --- Types ---
 
 interface Presence {
   developer: string;
   agent: string;
+  session_id?: string;
   files: string[];
 }
 
@@ -19,6 +21,7 @@ let sidebar: SidebarProvider;
 let teammates: Presence[] = [];
 let myName = "unknown";
 let myAgent = "vscode";
+const mySessionId = crypto.randomUUID();
 let serverUrl = "";
 let reconnectTimer: NodeJS.Timeout | undefined;
 
@@ -133,12 +136,14 @@ function connect() {
     try {
       const msg = JSON.parse(data.toString());
       if (msg.type === "update") {
-        // Filter out self
-        teammates = (msg.presence as Presence[]).filter((p) => p.developer !== myName);
+        // The operator may have several agents and editor windows open.
+        teammates = (msg.presence as Presence[]).filter(
+          (p) => p.session_id !== mySessionId
+        );
 
         // Update status bar
         if (teammates.length > 0) {
-          const names = teammates.map((t) => t.developer.split(" ")[0]).join(", ");
+          const names = teammates.map((t) => t.agent).join(", ");
           statusBar.text = `$(people) ${names}`;
           statusBar.backgroundColor = undefined;
         } else {
@@ -171,7 +176,8 @@ function sendPresence() {
 
   try {
     (ws as any).send(
-      JSON.stringify({ type: "presence", developer: myName, agent: myAgent, files })
+      JSON.stringify({ type: "presence", developer: myName, agent: myAgent,
+        session_id: mySessionId, files })
     );
   } catch {}
 }

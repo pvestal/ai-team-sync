@@ -56,9 +56,12 @@ async def test_a_restart_is_recorded_and_readable(client):
     assert body["old_pid"] == 1969400
     assert body["before"] == {"commits_behind": 20}
     assert body["developer"] == "patrick", "denormalized from the session for display"
+    assert body["agent"] == "unknown"
 
     listed = (await client.get("/api/restarts")).json()
     assert [r["unit"] for r in listed] == ["anime-studio"]
+    assert listed[0]["session_id"] == sid
+    assert listed[0]["agent"] == "unknown"
 
 
 @pytest.mark.asyncio

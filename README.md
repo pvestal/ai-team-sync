@@ -236,7 +236,8 @@ across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately before starting
 ## Optional extras
 
 - **Git hooks**: `./scripts/install-hooks.sh /path/to/repo` — auto-warns on commits to locked files
-- **Agent edit hook** (auto-presence): wire `ats-presence-hook` as a Claude Code `PostToolUse` hook on `Edit|Write|MultiEdit` and your agent broadcasts what it's editing — and why — with zero manual steps. Set `ATS_INTENT="..."` once per session for the one-line intent. See the docstring in `src/ai_team_sync/hooks/post_tool_use_presence.py`.
+- **Agent file hook**: wire `ats-presence-hook` as a Claude Code `PostToolUse` hook on `Read|Edit|Write|MultiEdit|NotebookEdit`. It records reported reads and edits under the ATS session ID; edits also broadcast short-lived presence. It does not infer which agent changed an uncommitted file, and commands such as `cat` are not observed file reads. Set `ATS_INTENT="..."` once per session for the one-line edit intent. See `src/ai_team_sync/hooks/post_tool_use_presence.py`.
+- **Override grants**: an exclusive lock requires its owner's session capability to approve; words in the request cannot auto-approve it. The approval is valid for the requester, the owner's existing lock pattern, and the request's 15-minute lifetime. A lock created later does not inherit it. Sessions opened before this capability was deployed must be restarted before they can answer override requests.
 - **Agent lock-guard hook** (auto-READ — the other half of coordination): wire `pre_tool_use_lockcheck.py` as a Claude Code `PreToolUse` hook on `Edit|Write|MultiEdit|NotebookEdit`. Before an edit it asks the server whether the target file is inside *another active session's* declared scope and **blocks** the edit (exit 2; owner + scope + intent on stderr) when it is — excluding your own session via the hook payload's `session_id` so you never self-block. Fail-open: server down / bad payload ⇒ the edit proceeds. Set `ATS_LOCKCHECK_BLOCK=0` to downgrade from block to warn-only. Without this, presence is write-only — agents *broadcast* what they touch but nothing makes them *read* who owns a file before clobbering it.
 
   ```jsonc
@@ -271,3 +272,8 @@ across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately before starting
 ## License
 
 MIT
+
+## Contributors
+
+- Patrick Vestal — project author and operator
+- Codex (OpenAI coding agent) — session identity and coordination fixes

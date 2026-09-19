@@ -29,6 +29,22 @@ async def test_check_lock_conflict(client):
 
 
 @pytest.mark.asyncio
+async def test_lock_check_names_session_and_distinguishes_own_lock(client):
+    created = await client.post("/api/sessions", json={
+        "agent": "codex", "developer": "pvestal", "scope": ["src/auth/**"],
+        "auto_lock": True, "lock_mode": "exclusive"})
+    sid = created.json()["id"]
+    own = (await client.post("/api/locks/check", json={
+        "paths": ["src/auth/jwt.py"], "session_id": sid})).json()[0]
+    assert own["matches"][0]["session_id"] == sid
+    assert own["matches"][0]["agent"] == "codex"
+    assert own["matches"][0]["is_own"] is True
+    foreign = (await client.post("/api/locks/check", json={
+        "paths": ["src/auth/jwt.py"]})).json()[0]
+    assert foreign["matches"][0]["is_own"] is False
+
+
+@pytest.mark.asyncio
 async def test_check_no_conflict(client):
     # Create a session with a lock on auth
     await client.post("/api/sessions", json={

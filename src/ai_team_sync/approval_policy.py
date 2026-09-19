@@ -60,6 +60,11 @@ class ApprovalPolicy:
             if keyword.lower() in justification_lower:
                 return False
 
+        # An exclusive claim needs the holder's decision. A requester-chosen
+        # keyword cannot turn its own justification into that decision.
+        if lock_mode == "exclusive":
+            return None
+
         # Check auto-approve keywords
         for keyword in self.auto_approve_keywords:
             if keyword.lower() in justification_lower:

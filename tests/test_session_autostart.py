@@ -47,6 +47,8 @@ async def test_autostart_creates_session_visible_in_team_status(client):
     assert row["scope"] == []  # auto-register claims no locks
     # Pointer recorded so heartbeat/complete act on THIS session.
     assert sp.resolve_pointer() == sid
+    assert sp.load_approval_token(sid)
+    assert "approval_token_hash" not in row
 
 
 @pytest.mark.asyncio

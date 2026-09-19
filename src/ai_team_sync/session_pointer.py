@@ -27,6 +27,7 @@ import time
 from pathlib import Path
 
 GLOBAL_FILE_NAME = ".ats_session"
+APPROVAL_TOKEN_PREFIX = ".ats_approval_"
 
 # Live-cid handoff (Tower #2003). A Claude process spawns the stdio MCP server
 # ONCE; /clear (and resume/compact) then rotates CLAUDE_CODE_SESSION_ID for every
@@ -201,6 +202,35 @@ def global_pointer_path() -> Path:
 
 def session_pointer_path(cid: str) -> Path:
     return _state_dir() / f"{GLOBAL_FILE_NAME}_{cid[:8]}"
+
+
+def save_approval_token(session_id: str, token: str, cid: str | None = None) -> None:
+    """Keep an approval capability private to this Claude session's pointer key."""
+    cid = cid or claude_session_id()
+    if not cid or not session_id or not token:
+        return
+    try:
+        sd = _state_dir()
+        sd.mkdir(parents=True, exist_ok=True)
+        path = sd / f"{APPROVAL_TOKEN_PREFIX}{cid[:8]}"
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"session_id": session_id, "token": token}, stream)
+    except Exception:
+        pass  # hook storage is best-effort; a missing token fails closed
+
+
+def load_approval_token(session_id: str, cid: str | None = None) -> str:
+    cid = cid or claude_session_id()
+    if not cid or not session_id:
+        return ""
+    try:
+        path = _state_dir() / f"{APPROVAL_TOKEN_PREFIX}{cid[:8]}"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return str(data.get("token") or "") if data.get("session_id") == session_id else ""
+    except Exception:
+        return ""
 
 
 def save_pointer(session_id: str, cid: str | None = None) -> None:

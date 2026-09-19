@@ -85,3 +85,10 @@ def test_backcompat_no_lock_context_keyword_only(monkeypatch):
     policy = _policy(monkeypatch, {"auto_approve_keywords": ["hotfix"]})
     assert policy.should_auto_approve(_request("urgent hotfix")) is True
     assert policy.should_auto_approve(_request()) is None
+
+
+def test_exclusive_lock_never_auto_approves_from_keyword(monkeypatch):
+    policy = _policy(monkeypatch, {"auto_approve_keywords": ["hotfix"]})
+    assert policy.should_auto_approve(
+        _request("urgent hotfix"), lock_mode="exclusive", owner_idle_seconds=10_000
+    ) is None

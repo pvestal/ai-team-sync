@@ -406,6 +406,9 @@ async def authorize(session_id: str, request: Request,
                         continue
                     held = _lock_hits(lock.pattern, lock_root, root, forms)
                     if held:
+                        from ai_team_sync.routers.override_requests import approved_override_for_lock
+                        if await approved_override_for_lock(db, session_id, lock):
+                            continue
                         reasons.append(f"{held} may be under exclusive lock {lock.pattern!r} "
                                        f"held by {developer} (session {lock.session_id})")
         else:  # task_close

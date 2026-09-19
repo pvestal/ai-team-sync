@@ -44,7 +44,7 @@ async def update_presence(body: PresenceUpdate, request: Request,
     signals and a session could be broadcasting edits while being reaped for
     silence.
     """
-    store.update(body.developer, body.agent, body.files, body.intent)
+    store.update(body.developer, body.agent, body.files, body.intent, body.session_id)
     # Only the posting account's own sessions (#2741): an agent label is public,
     # and a presence post from another account used to reset a foreign session
     # onto the twenty-minute reaper clock.
@@ -70,8 +70,11 @@ async def whos_editing(body: WhosEditingRequest):
     """
     present = store.get_all()
     ex_agent = (body.exclude_agent or "").strip()
+    ex_session = (body.exclude_session_id or "").strip()
 
     def _is_me(p: dict) -> bool:
+        if ex_session:
+            return p.get("session_id") == ex_session
         # Prefer excluding by session (agent label) so a concurrent same-developer
         # session is still surfaced; fall back to developer for legacy callers.
         if ex_agent:

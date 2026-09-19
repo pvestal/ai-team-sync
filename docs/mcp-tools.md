@@ -39,6 +39,7 @@ to refuse a mismatch. See [Authority model](authority-model.md).
 | `check_locks` | reads | Ask before editing. Anchored by repo so identical patterns in different repos do not collide. |
 | `list_all_locks` | reads | Every active lock, with ids so a stale one can be reaped. |
 | `whos_editing` | reads | Live presence: who has these files open right now. |
+| `recent_file_activities` | reads | File reads and edits actually reported by instrumented clients, attributed to an ATS session. Absence is not proof of no activity. |
 | `delete_lock` | mutates | Owner-bound. Refused while the holder is active and heartbeating; a lock left by a silent session stays reapable. |
 | `pre_commit_check` | reads | Do staged files collide with someone's lock. |
 | `check_git_changes` | reads | Uncommitted files inside your declared scope. |

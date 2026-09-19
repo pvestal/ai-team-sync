@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -266,6 +266,7 @@ async def _check_scope_conflicts(
     current_developer: str,
     repo_root: str = "",
     exclude_session_id: str = "",
+    requester_session_id: str = "",
 ) -> list[dict]:
     """Check if new scope patterns conflict with existing active locks.
 
@@ -276,6 +277,7 @@ async def _check_scope_conflicts(
     extending its own scope does not conflict with itself.
     """
     from ai_team_sync.routers.locks import _cross_repo, _get_active_locks
+    from ai_team_sync.routers.override_requests import approved_override_for_lock
 
     # Same notion of a live lock as the board and the grant check (#2741).
     active_locks = await _get_active_locks(db)
@@ -287,6 +289,8 @@ async def _check_scope_conflicts(
                 continue
             if _cross_repo(repo_root, lock_repo_root):
                 continue  # other repo's patterns can't collide with ours
+            if await approved_override_for_lock(db, requester_session_id, lock):
+                continue
             # Check if patterns overlap using bidirectional matching
             # Pattern A matches Pattern B, or Pattern B matches Pattern A
             if (fnmatch(new_pattern, lock.pattern) or
@@ -296,6 +300,7 @@ async def _check_scope_conflicts(
                     "new_pattern": new_pattern,
                     "existing_pattern": lock.pattern,
                     "existing_developer": owner.developer,
+                    "existing_agent": owner.agent,
                     "lock_mode": lock.mode,
                     "session_id": lock.session_id,
                 })
@@ -979,7 +984,7 @@ def emit_session_completed(session: Session) -> None:
 
 
 @router.post("", response_model=SessionResponse, status_code=201)
-async def create_session(body: SessionCreate, request: Request,
+async def create_session(body: SessionCreate, request: Request, response: Response,
                          db: AsyncSession = Depends(get_db)):
     # Authority BEFORE conflicts: whether this worker may claim at all precedes
     # whether the claim collides with someone else's.
@@ -1098,8 +1103,12 @@ async def create_session(body: SessionCreate, request: Request,
                     "existing_pattern": conflict["existing_pattern"],
                     "new_developer": body.developer,
                     "existing_developer": conflict["existing_developer"],
+                    "existing_agent": conflict["existing_agent"],
                 })
 
+    import hashlib
+    import secrets
+    approval_token = secrets.token_urlsafe(32)
     session = Session(
         developer=body.developer,
         agent=body.agent,
@@ -1108,6 +1117,7 @@ async def create_session(body: SessionCreate, request: Request,
         branch=body.branch,
         repo_root=repo_root,
         creator_uid=peer_uid,
+        approval_token_hash=hashlib.sha256(approval_token.encode()).hexdigest(),
         bound_worker=worker.name if bound else "",
         bound_uid=bound_uid,
         task_id=body.task_id,
@@ -1146,6 +1156,7 @@ async def create_session(body: SessionCreate, request: Request,
         "session_id": session.id,
     })
 
+    response.headers["X-ATS-Approval-Token"] = approval_token
     return _session_to_response(session)
 
 

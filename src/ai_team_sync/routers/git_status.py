@@ -121,6 +121,7 @@ async def pre_commit_check(
     from ai_team_sync.caller_session import resolve_caller_session
     from ai_team_sync.git_utils import get_staged_files
     from ai_team_sync.routers.locks import _get_active_locks
+    from ai_team_sync.routers.override_requests import approved_override_for_lock
     from ai_team_sync.scope_paths import reader_covers, reader_lock, reader_query
 
     caller = await resolve_caller_session(db, request=request, session_id=body.session_id)
@@ -157,6 +158,8 @@ async def pre_commit_check(
         query = reader_query(file, caller_repo_root)
         for lock, owner, form in locks:
             if reader_covers(query, form):
+                if await approved_override_for_lock(db, caller.session_id or "", lock):
+                    continue
                 # The agent and session are the identity; the developer name is
                 # shared by every agent one human runs, so it is display only.
                 lock_info = {

@@ -92,7 +92,8 @@ def scope_matches(rel: str, pattern: str, repo_root: str = "") -> bool:
 
 
 def find_conflicts(rel: str, sessions: list, my_session_id: str,
-                   file_repo_root: str = "") -> list:
+                   file_repo_root: str = "",
+                   approved_owner_session_ids: set[str] | None = None) -> list:
     """OTHER active sessions whose scope covers `rel`. Excludes my own session
     (matched by the session-id prefix the server appends to the agent id).
 
@@ -108,6 +109,8 @@ def find_conflicts(rel: str, sessions: list, my_session_id: str,
             continue
         agent = str(s.get("agent", ""))
         if mine and mine in agent:          # my own session — never self-block
+            continue
+        if str(s.get("id", "")) in (approved_owner_session_ids or set()):
             continue
         sroot = str(s.get("repo_root") or "").rstrip("/")
         if froot and sroot and froot != sroot:
@@ -263,8 +266,27 @@ def main() -> None:
     sessions = data if isinstance(data, list) else data.get("sessions", data.get("data", []))
 
     froot = (repo_root or "").rstrip("/")
+    # An approved override only clears the exact owner's covered locks for this
+    # session. Failed lookups leave the original conflict intact.
+    approved_owners: set[str] = set()
+    try:
+        from ai_team_sync import session_pointer as sp
+        my_sid = sp.resolve_pointer(payload.get("session_id", ""), allow_global=False)
+        if my_sid:
+            with httpx.Client(timeout=2) as client:
+                check = client.post(f"{server}/api/locks/check", json={
+                    "paths": [rel], "repo_root": froot, "session_id": my_sid})
+                check.raise_for_status()
+                matches = check.json()[0].get("matches", [])
+            owner_ids = {m["session_id"] for m in matches if not m.get("is_own")}
+            approved_owners = {sid for sid in owner_ids if all(
+                m.get("override_granted") for m in matches
+                if m["session_id"] == sid)}
+    except Exception:
+        pass
     conflicts = find_conflicts(rel, sessions, payload.get("session_id", ""),
-                               file_repo_root=froot)
+                               file_repo_root=froot,
+                               approved_owner_session_ids=approved_owners)
 
     # Claim guard — only inside coordinated repos, and only when the server
     # ANSWERED (the fail-open above already exited on server errors): being

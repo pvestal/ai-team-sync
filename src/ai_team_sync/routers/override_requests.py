@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from ai_team_sync.database import get_db
-from ai_team_sync.models import OverrideRequest, Session
+from ai_team_sync.models import OverrideRequest, ScopeLock, Session
+from ai_team_sync import peer_identity
 from ai_team_sync.notifications.dispatcher import dispatch
 from ai_team_sync.events import broadcast_event
 from ai_team_sync.approval_policy import ApprovalPolicy
@@ -21,6 +24,30 @@ from ai_team_sync.schemas import (
 )
 
 router = APIRouter(prefix="/override-requests", tags=["override-requests"])
+
+
+async def approved_override_for_lock(db: AsyncSession, requester_session_id: str,
+                                     lock: ScopeLock) -> bool:
+    """A time-limited grant for this requester and this owner's existing lane.
+
+    Recreating a lock cannot inherit an earlier approval for the same pattern.
+    """
+    if not requester_session_id:
+        return False
+    now = datetime.now(timezone.utc)
+    rows = (await db.execute(select(OverrideRequest).where(
+        OverrideRequest.requester_session_id == requester_session_id,
+        OverrideRequest.owner_session_id == lock.session_id,
+        OverrideRequest.conflicting_pattern == lock.pattern,
+        OverrideRequest.status == "approved",
+        OverrideRequest.expires_at > now,
+    ))).scalars().all()
+    lock_created = lock.created_at
+    if lock_created and lock_created.tzinfo is None:
+        lock_created = lock_created.replace(tzinfo=timezone.utc)
+    return any((r.created_at.replace(tzinfo=timezone.utc)
+                if r.created_at.tzinfo is None else r.created_at) >= lock_created
+               for r in rows if lock_created is not None)
 
 
 async def _load_request_by_id_or_prefix(
@@ -74,12 +101,14 @@ def _override_to_response(req: OverrideRequest) -> OverrideRequestResponse:
         expires_at=req.expires_at,
         requester_developer=req.requester_session.developer if req.requester_session else None,
         owner_developer=req.owner_session.developer if req.owner_session else None,
+        requester_agent=req.requester_session.agent if req.requester_session else None,
+        owner_agent=req.owner_session.agent if req.owner_session else None,
     )
 
 
 @router.post("", response_model=OverrideRequestResponse, status_code=201)
 async def create_override_request(
-    body: OverrideRequestCreate, db: AsyncSession = Depends(get_db)
+    body: OverrideRequestCreate, request: Request, db: AsyncSession = Depends(get_db)
 ):
     """Request permission to proceed despite a lock conflict."""
     # Verify requester session exists
@@ -89,42 +118,32 @@ async def create_override_request(
     requester_session = result.scalar_one_or_none()
     if not requester_session:
         raise HTTPException(404, "Requester session not found")
+    from ai_team_sync.routers.locks import cross_account, _cross_repo
+    if requester_session.status != "active" or cross_account(
+            peer_identity.peer_uid_for_request(request), requester_session):
+        raise HTTPException(403, "Requester session is not active or does not belong to caller")
 
-    # Find owner session from conflicting pattern
-    # (In practice, this would come from the conflict detection)
-    # For now, we'll need to pass owner_session_id in the request
-    # Let me add that to the schema...
+    # Resolve the named lock in the same active-lock set used by the board.
+    from ai_team_sync.routers.locks import _get_active_locks
+    active_locks = await _get_active_locks(db)
 
-    # Actually, let's find it by pattern matching
-    from ai_team_sync.models import ScopeLock
-    from fnmatch import fnmatch
-
-    now = datetime.now(timezone.utc)
-    result = await db.execute(
-        select(ScopeLock, Session)
-        .join(Session)
-        .where(ScopeLock.expires_at > now)
-        .where(Session.status.in_(["active", "paused"]))
-    )
-    active_locks = list(result.all())
-
-    owner_session_id = None
     owner_lock = None
     owner_session = None
-    for lock, session in active_locks:
-        if lock.pattern == body.conflicting_pattern:
-            owner_session_id = session.id
+    for lock, session, _repo_root in active_locks:
+        if (lock.pattern == body.conflicting_pattern
+                and session.id != requester_session.id
+                and not _cross_repo(requester_session.repo_root or "", session.repo_root or "")):
             owner_lock = lock
             owner_session = session
             break
 
-    if not owner_session_id:
+    if owner_lock is None or owner_session is None:
         raise HTTPException(404, "No active lock found for that pattern")
 
     # Create the override request
     request = OverrideRequest(
         requester_session_id=body.requester_session_id,
-        owner_session_id=owner_session_id,
+        owner_session_id=owner_session.id,
         conflicting_pattern=body.conflicting_pattern,
         justification=body.justification,
     )
@@ -179,7 +198,7 @@ async def create_override_request(
         "requester_agent": requester_session.agent,
         "pattern": body.conflicting_pattern,
         "justification": body.justification,
-        "owner_session_id": owner_session_id,
+        "owner_session_id": owner_session.id,
     })
 
     # Broadcast to WebSocket subscribers
@@ -193,7 +212,7 @@ async def create_override_request(
         "status": request.status,
     }
 
-    await broadcast_event(owner_session_id, "override.requested", event_data)
+    await broadcast_event(owner_session.id, "override.requested", event_data)
 
     # If auto-decided, also notify requester immediately
     if auto_decision is not None:
@@ -234,11 +253,6 @@ async def list_override_requests(
 
     # Auto-expire old requests
     now = datetime.now(timezone.utc)
-    await db.execute(
-        select(OverrideRequest)
-        .where(OverrideRequest.status == "pending")
-        .where(OverrideRequest.expires_at < now)
-    )
     expired = (await db.execute(
         select(OverrideRequest)
         .where(OverrideRequest.status == "pending")
@@ -264,7 +278,8 @@ async def get_override_request(request_id: str, db: AsyncSession = Depends(get_d
 
 @router.post("/{request_id}/respond", response_model=OverrideRequestResponse)
 async def respond_to_override_request(
-    request_id: str, body: OverrideRequestRespond, db: AsyncSession = Depends(get_db)
+    request_id: str, body: OverrideRequestRespond, http_request: Request,
+    db: AsyncSession = Depends(get_db)
 ):
     """Approve or deny an override request (called by lock owner).
 
@@ -279,7 +294,12 @@ async def respond_to_override_request(
     # claim; a third party approving it would make the lock advisory to anyone
     # who asks. An unidentified caller is refused rather than assumed to be the
     # owner.
-    if body.actor_session_id and body.actor_session_id != request.owner_session_id:
+    from ai_team_sync.routers.locks import cross_account
+    if (not body.actor_session_id
+            or body.actor_session_id != request.owner_session_id
+            or request.owner_session is None
+            or request.owner_session.status not in ("active", "paused")
+            or cross_account(peer_identity.peer_uid_for_request(http_request), request.owner_session)):
         raise HTTPException(
             403,
             detail={"error": "not_the_lock_owner",
@@ -287,6 +307,14 @@ async def respond_to_override_request(
                                 f"session {request.owner_session_id}; "
                                 f"{body.actor_session_id} cannot answer it"),
                     "owner_session_id": request.owner_session_id})
+
+    token = http_request.headers.get("X-ATS-Approval-Token", "")
+    expected = request.owner_session.approval_token_hash or ""
+    if (not token or not expected or not hmac.compare_digest(
+            hashlib.sha256(token.encode()).hexdigest(), expected)):
+        raise HTTPException(403, detail={
+            "error": "owner_capability_required",
+            "message": "Only the lock owner's session can answer this request; restart its ATS session to obtain an approval capability."})
 
     # Check if expired
     now = datetime.now(timezone.utc)

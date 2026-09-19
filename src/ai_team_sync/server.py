@@ -14,7 +14,7 @@ from fastapi import Depends
 from ai_team_sync.database import init_db
 from ai_team_sync.config import settings
 from ai_team_sync.liveness import liveness_from_request
-from ai_team_sync.routers import sessions, locks, decisions, override_requests, git_status, websocket, dashboard, presence_ws, presence_http, restarts, workers, briefs, delegations, version, authority
+from ai_team_sync.routers import sessions, locks, decisions, override_requests, git_status, websocket, dashboard, presence_ws, presence_http, restarts, workers, briefs, delegations, version, authority, file_activities
 
 
 @asynccontextmanager
@@ -55,6 +55,7 @@ def create_app() -> FastAPI:
     app.include_router(dashboard.router)
     app.include_router(presence_ws.router)
     app.include_router(presence_http.router, prefix="/api")
+    app.include_router(file_activities.router, prefix="/api")
 
     # Serve extension download
     project_root = Path(__file__).resolve().parent.parent.parent

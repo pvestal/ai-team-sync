@@ -17,17 +17,22 @@ async def presence_ws(ws: WebSocket):
     await ws.accept()
     queue = store.subscribe()
     developer = None
+    agent = None
+    session_id = ""
 
     async def reader():
-        nonlocal developer
+        nonlocal developer, agent, session_id
         try:
             while True:
                 raw = await ws.receive_text()
                 msg = json.loads(raw)
                 if msg.get("type") == "presence":
                     developer = msg["developer"]
+                    agent = msg.get("agent", "?")
+                    session_id = msg.get("session_id", "")
                     store.update(msg["developer"], msg.get("agent", "?"),
-                                 msg.get("files", []), msg.get("intent", ""))
+                                 msg.get("files", []), msg.get("intent", ""),
+                                 session_id)
                     await store.broadcast()
         except (WebSocketDisconnect, Exception):
             pass
@@ -50,5 +55,5 @@ async def presence_ws(ws: WebSocket):
     finally:
         store.unsubscribe(queue)
         if developer:
-            store.remove(developer)
+            store.remove(developer, agent, session_id)
             await store.broadcast()

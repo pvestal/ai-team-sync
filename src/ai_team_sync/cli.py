@@ -254,7 +254,8 @@ def lock_check(paths):
             any_locked = True
             icon = "BLOCKED" if r["mode"] == "exclusive" else "WARNING"
             why = f' — "{r["reason"]}"' if r.get("reason") else ""
-            click.echo(f"  [{icon}] {r['path']} — locked by {r['developer']} (pattern: {r['pattern']}){why}")
+            holder = f"{r.get('agent') or 'unknown agent'} (session {r.get('session_id') or '?'}, operator {r['developer']})"
+            click.echo(f"  [{icon}] {r['path']} — locked by {holder} (pattern: {r['pattern']}){why}")
         else:
             click.echo(f"  [ok] {r['path']}")
 

@@ -61,14 +61,16 @@ def test_nudge_skip_list_covers_inbox_tools():
 # id-prefix resolution on the HTTP API
 # ---------------------------------------------------------------------------
 
-async def _make_request(client) -> str:
-    """Two sessions, one lock, one override request. Returns the request id."""
-    owner = (await client.post("/api/sessions", json={
+async def _make_request(client) -> tuple[str, str]:
+    """Two sessions, one lock, one override request and the owner's capability."""
+    owner_resp = await client.post("/api/sessions", json={
         "agent": "default",
         "developer": "owner-dev", "scope": ["pkg/**"],
         "description": "holds the lock", "auto_lock": True,
-    })).json()
+    })
+    owner = owner_resp.json()
     assert owner.get("id"), owner
+    assert "approval_token_hash" not in owner
     requester = (await client.post("/api/sessions", json={
         "agent": "default",
         "developer": "req-dev", "auto_lock": False,
@@ -80,12 +82,12 @@ async def _make_request(client) -> str:
         "justification": "small scoped change",
     })
     assert resp.status_code == 201, resp.text
-    return resp.json()["id"]
+    return resp.json()["id"], owner_resp.headers["x-ats-approval-token"]
 
 
 @pytest.mark.asyncio
 async def test_get_by_prefix(client):
-    rid = await _make_request(client)
+    rid, _ = await _make_request(client)
     resp = await client.get(f"/api/override-requests/{rid[:8]}")
     assert resp.status_code == 200
     assert resp.json()["id"] == rid
@@ -94,7 +96,7 @@ async def test_get_by_prefix(client):
 @pytest.mark.asyncio
 async def test_get_by_truncated_display_form(client):
     # The exact string agents used to paste: 8 chars + '...'
-    rid = await _make_request(client)
+    rid, _ = await _make_request(client)
     resp = await client.get(f"/api/override-requests/{rid[:8]}...")
     assert resp.status_code == 200
     assert resp.json()["id"] == rid
@@ -102,19 +104,68 @@ async def test_get_by_truncated_display_form(client):
 
 @pytest.mark.asyncio
 async def test_short_prefix_404s(client):
-    rid = await _make_request(client)
+    rid, _ = await _make_request(client)
     resp = await client.get(f"/api/override-requests/{rid[:4]}")
     assert resp.status_code == 404
 
 
 @pytest.mark.asyncio
 async def test_respond_by_prefix(client):
-    rid = await _make_request(client)
+    rid, token = await _make_request(client)
+    owner = (await client.get(f"/api/override-requests/{rid}")).json()["owner_session_id"]
     resp = await client.post(
         f"/api/override-requests/{rid[:8]}/respond",
-        json={"approved": True, "message": "go ahead"},
+        json={"approved": True, "message": "go ahead", "actor_session_id": owner},
+        headers={"X-ATS-Approval-Token": token},
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["id"] == rid
     assert body["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_override_response_requires_the_owner_session(client):
+    rid, token = await _make_request(client)
+    target = f"/api/override-requests/{rid}/respond"
+    missing = await client.post(target, json={"approved": True})
+    assert missing.status_code == 422
+    wrong = await client.post(target, json={
+        "approved": True, "actor_session_id": "another-session"})
+    assert wrong.status_code == 403
+    owner = (await client.get(f"/api/override-requests/{rid}")).json()["owner_session_id"]
+    no_token = await client.post(target, json={
+        "approved": True, "actor_session_id": owner})
+    assert no_token.status_code == 403
+    forged = await client.post(target, json={
+        "approved": True, "actor_session_id": owner},
+        headers={"X-ATS-Approval-Token": "not-the-token"})
+    assert forged.status_code == 403
+    assert (await client.get(f"/api/override-requests/{rid}")).json()["status"] == "pending"
+
+
+@pytest.mark.asyncio
+async def test_approved_override_is_scoped_to_requester_and_enforced(client):
+    rid, token = await _make_request(client)
+    request = (await client.get(f"/api/override-requests/{rid}")).json()
+    requester = request["requester_session_id"]
+    blocked = await client.post("/api/locks", json={
+        "session_id": requester, "pattern": "pkg/**", "mode": "exclusive"})
+    assert blocked.status_code == 409
+
+    response = await client.post(f"/api/override-requests/{rid}/respond", json={
+        "approved": True, "actor_session_id": request["owner_session_id"]},
+        headers={"X-ATS-Approval-Token": token})
+    assert response.status_code == 200
+
+    coverage = (await client.post("/api/locks/check", json={
+        "paths": ["pkg/a.py"], "session_id": requester})).json()[0]
+    assert any(m["override_granted"] for m in coverage["matches"])
+    allowed = await client.post("/api/locks", json={
+        "session_id": requester, "pattern": "pkg/**", "mode": "exclusive"})
+    assert allowed.status_code == 201, allowed.text
+
+    commit = (await client.post("/api/git/pre-commit-check", json={
+        "staged_files": ["pkg/a.py"], "session_id": requester})).json()
+    assert commit["blocking_locks"] == []
+    assert commit["can_proceed"] is True

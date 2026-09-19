@@ -96,6 +96,7 @@ async def ensure_session(server_url: str, client) -> str | None:
         if r.status_code in (200, 201):
             sid = r.json()["id"]
             sp.save_pointer(sid, cid)
+            sp.save_approval_token(sid, r.headers.get("X-ATS-Approval-Token", ""), cid)
             return sid
     except Exception:
         pass

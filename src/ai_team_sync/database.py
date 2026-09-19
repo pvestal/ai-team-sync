@@ -30,6 +30,7 @@ _COLUMN_MIGRATIONS = [
     # unbound, and existing locks as non-bearing: nothing that predates the
     # binding can be read as a grant.
     ("sessions", "creator_uid", "INTEGER"),
+    ("sessions", "approval_token_hash", "VARCHAR(64) DEFAULT ''"),
     ("sessions", "bound_worker", "TEXT DEFAULT ''"),
     ("sessions", "bound_uid", "INTEGER"),
     ("sessions", "task_id", "INTEGER"),

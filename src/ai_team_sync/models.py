@@ -71,6 +71,7 @@ class Session(Base):
     #   every interactive client; unbound sessions never receive a mutation grant.
     # task_id: the one Tower task this session may close, declared at creation.
     creator_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    approval_token_hash: Mapped[str] = mapped_column(String(64), default="")
     bound_worker: Mapped[str] = mapped_column(String(100), default="")
     bound_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -250,6 +251,21 @@ class AuthorityCheck(Base):
     evidence_keys: Mapped[str] = mapped_column(Text, default="[]")  # JSON list
     allowed: Mapped[bool] = mapped_column(Boolean, default=False)
     reasons: Mapped[str] = mapped_column(Text, default="[]")        # JSON list
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+
+class FileActivity(Base):
+    """A file action reported by an instrumented client, not inferred from git."""
+
+    __tablename__ = "file_activities"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    session_id: Mapped[str] = mapped_column(String(36), index=True)
+    agent: Mapped[str] = mapped_column(String(100))
+    developer: Mapped[str] = mapped_column(String(255))
+    action: Mapped[str] = mapped_column(String(10))
+    path: Mapped[str] = mapped_column(String(1024))
+    repo_root: Mapped[str] = mapped_column(String(1024), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
