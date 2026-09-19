@@ -23,7 +23,8 @@ def append_delivery_event(message: AgentMessage, action: str, session_id: str,
     message.delivery_history = json.dumps(history)
 
 
-async def release_unread_ticket_messages(db: AsyncSession, session_id: str) -> int:
+async def release_unread_ticket_messages(db: AsyncSession, session_id: str,
+                                         *, reason: str = "recipient_completed") -> int:
     """Return unread ticket claims to the mailbox when their owner ends.
 
     The compare-and-set against recipient and receipt serializes this with an
@@ -49,7 +50,7 @@ async def release_unread_ticket_messages(db: AsyncSession, session_id: str) -> i
         if not json.loads(row.delivery_history or "[]"):
             append_delivery_event(row, "assigned", session_id,
                                   "legacy_ticket_claim_time_unknown")
-        append_delivery_event(row, "released", session_id, "recipient_completed")
+        append_delivery_event(row, "released", session_id, reason)
         row.recipient_session_id = None
         row.recipient_agent = ""
         if row.handoff_id:

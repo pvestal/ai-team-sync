@@ -185,7 +185,7 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
 
             sess.status = "completed"
             sess.completed_at = now
-            await release_unread_ticket_messages(db, sess.id)
+            await release_unread_ticket_messages(db, sess.id, reason="recipient_reaped")
             # RELEASE THE LANE -- what the comment above has always claimed.
             # update_session deletes these on completion; the reaper sets
             # status directly on the model and so never did, which meant a

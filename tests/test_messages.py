@@ -199,6 +199,7 @@ async def test_reaper_requeues_unread_ticket_and_only_drops_dead_locks(client, d
     message = next(row for row in inbox.json() if row["id"] == message_id)
     assert [event["action"] for event in message["delivery_history"]] == [
         "assigned", "released", "assigned"]
+    assert message["delivery_history"][1]["reason"] == "recipient_reaped"
 
 
 def test_client_delivery_text_includes_sender_and_ack_instruction():
