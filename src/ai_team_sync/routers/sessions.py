@@ -1329,6 +1329,14 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
     if body.status is not None or body.handoff is not None:
         _require_session_capability(request, session)
 
+    # Explicit completion transfers unread ticket authority to the mailbox.
+    # Reopening that same session would let it act beside a later claimant.
+    # Reaper completion remains different: auto_completed is reversible by a
+    # late heartbeat, and its unread mail was never released.
+    if (session.status == "completed" and not session.auto_completed
+            and body.status in ("active", "paused")):
+        raise HTTPException(409, "Owner-completed session is terminal; start a new session")
+
     # ONE DOOR (#2760). A session the reaper stripped carries an armed journal,
     # and the only path that may spend it is the heartbeat — the one signal that
     # actually proves the process alive. Refused HERE, before a single field is

@@ -171,6 +171,31 @@ async def test_successor_claim_before_late_heartbeat_blocks_resurrection(client,
 
 
 @pytest.mark.asyncio
+async def test_explicit_completion_cannot_patch_reopen_after_successor_claim(client):
+    sender, sender_token = await new_session(client, "codex:sender")
+    mid = await send_ticket(client, sender, sender_token)
+    old, old_token = await new_session(client, "claude-code:old")
+    assert mid in [m["id"] for m in await inbox(client, old, old_token)]
+    assert (await client.patch(f"/api/sessions/{old}", json={
+        "status": "completed"}, headers=auth(old_token))).status_code == 200
+    successor, successor_token = await new_session(client, "claude-code:successor")
+    assert mid in [m["id"] for m in await inbox(client, successor, successor_token)]
+    for status in ("active", "paused"):
+        attempt = await client.patch(f"/api/sessions/{old}", json={
+            "status": status}, headers=auth(old_token))
+        assert attempt.status_code == 409, attempt.text
+    assert (await client.post(f"/api/sessions/{old}/heartbeat")).status_code == 409
+    assert (await client.get(f"/api/sessions/{old}/messages",
+                             headers=auth(old_token))).status_code == 403
+    ack = await client.post(f"/api/messages/{mid}/acknowledge", json={
+        "recipient_session_id": successor}, headers=auth(successor_token))
+    assert ack.status_code == 200
+    status = await client.get(f"/api/messages/{mid}", params={
+        "sender_session_id": sender}, headers=auth(sender_token))
+    assert status.json()["acknowledged_at"] == ack.json()["acknowledged_at"]
+
+
+@pytest.mark.asyncio
 async def test_paused_session_retains_mail_and_locks_until_owner_resumes(client):
     sender, sender_token = await new_session(client, "codex:sender")
     mid = await send_ticket(client, sender, sender_token)
