@@ -19,7 +19,8 @@ async def _completed_session(client, **over):
     assert created.status_code == 201
     sid = created.json()["id"]
     done = await client.patch(f"/api/sessions/{sid}",
-                              json={"status": "completed", "summary": "a distinctive finding"})
+                              json={"status": "completed", "summary": "a distinctive finding"},
+                              headers={"X-ATS-Approval-Token": created.headers["X-ATS-Approval-Token"]})
     return sid, done
 
 

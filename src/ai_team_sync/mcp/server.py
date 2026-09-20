@@ -2036,15 +2036,13 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 if handoff and target.session_id != active_session_id:
                     return [TextContent(type="text", text=(
                         "❌ A handoff must come from this MCP process's exact active session."))]
-                headers = {}
-                if handoff:
-                    from ai_team_sync import session_pointer as sp
-                    token = (_IN_PROCESS_APPROVAL_TOKEN
-                             if active_session_id == _IN_PROCESS_SESSION_ID else None) or \
-                            sp.load_approval_token(active_session_id)
-                    if not token:
-                        return [TextContent(type="text", text="❌ Session capability missing for handoff.")]
-                    headers["X-ATS-Approval-Token"] = token
+                from ai_team_sync import session_pointer as sp
+                token = (_IN_PROCESS_APPROVAL_TOKEN
+                         if target.session_id == _IN_PROCESS_SESSION_ID else None) or \
+                        sp.load_approval_token(target.session_id)
+                if not token:
+                    return [TextContent(type="text", text="❌ Session capability missing for completion.")]
+                headers = {"X-ATS-Approval-Token": token}
                 response = await client.patch(
                     f"{SERVER_URL}/api/sessions/{target.session_id}",
                     json={"status": "completed", "summary": summary,
@@ -2131,9 +2129,17 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 if not active_session_id:
                     return [TextContent(type="text", text="❌ No active session to pause.")]
 
+                from ai_team_sync import session_pointer as sp
+                token = (_IN_PROCESS_APPROVAL_TOKEN
+                         if active_session_id == _IN_PROCESS_SESSION_ID else None) or \
+                        sp.load_approval_token(active_session_id)
+                if not token:
+                    return [TextContent(type="text", text="❌ Session capability missing for pause.")]
+
                 response = await client.patch(
                     f"{SERVER_URL}/api/sessions/{active_session_id}",
                     json={"status": "paused"},
+                    headers={"X-ATS-Approval-Token": token},
                 )
                 response.raise_for_status()
                 data = response.json()
@@ -2152,9 +2158,17 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 if not active_session_id:
                     return [TextContent(type="text", text="❌ No session to resume.")]
 
+                from ai_team_sync import session_pointer as sp
+                token = (_IN_PROCESS_APPROVAL_TOKEN
+                         if active_session_id == _IN_PROCESS_SESSION_ID else None) or \
+                        sp.load_approval_token(active_session_id)
+                if not token:
+                    return [TextContent(type="text", text="❌ Session capability missing for resume.")]
+
                 response = await client.patch(
                     f"{SERVER_URL}/api/sessions/{active_session_id}",
                     json={"status": "active"},
+                    headers={"X-ATS-Approval-Token": token},
                 )
                 response.raise_for_status()
                 data = response.json()

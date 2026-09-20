@@ -85,7 +85,8 @@ async def test_list_sessions_filter_by_status(client):
     session_id = resp.json()["id"]
 
     # Complete the session
-    await client.patch(f"/api/sessions/{session_id}", json={"status": "completed"})
+    await client.patch(f"/api/sessions/{session_id}", json={"status": "completed"},
+                       headers={"X-ATS-Approval-Token": resp.headers["X-ATS-Approval-Token"]})
 
     # Only active sessions
     resp = await client.get("/api/sessions", params={"status": "active"})
@@ -111,7 +112,7 @@ async def test_complete_session_releases_locks(client):
     await client.patch(f"/api/sessions/{session_id}", json={
         "status": "completed",
         "summary": "Done refactoring",
-    })
+    }, headers={"X-ATS-Approval-Token": resp.headers["X-ATS-Approval-Token"]})
 
     # Locks should be gone
     resp = await client.get("/api/locks")

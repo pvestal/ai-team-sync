@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -36,11 +38,12 @@ router = APIRouter(prefix="/sessions", tags=["sessions"])
 
 
 async def _queue_ticket_event(db: AsyncSession, session: Session, body: str) -> None:
-    """Notify active peers on this ticket, with exact session recipients."""
-    if session.ticket_id is None:
+    """Notify current same-account peers; each event addresses an exact session."""
+    if session.ticket_id is None or session.creator_uid is None:
         return
     peers = (await db.execute(select(Session).where(
         Session.ticket_id == session.ticket_id,
+        Session.creator_uid == session.creator_uid,
         Session.status == "active", Session.id != session.id,
     ))).scalars().all()
     for peer in peers:
@@ -1150,17 +1153,26 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
     await db.flush()  # Ensure session.id is populated
     # Claim deferred messages atomically for the FIRST later session on this
     # ticket. The ticket is coordination metadata; this grants no task authority.
-    if body.ticket_id is not None:
+    if body.ticket_id is not None and session.creator_uid is not None:
         queued = (await db.execute(select(AgentMessage.id).where(
             AgentMessage.ticket_id == body.ticket_id,
+            AgentMessage.addressing_mode == "ticket",
+            AgentMessage.acknowledged_at.is_(None),
             AgentMessage.recipient_session_id.is_(None),
             AgentMessage.sender_session_id != session.id,
             AgentMessage.created_at <= session.started_at,
+            AgentMessage.sender_session_id.in_(select(Session.id).where(
+                Session.creator_uid == session.creator_uid)),
         ))).scalars().all()
         for message_id in queued:
             claimed = await db.execute(update(AgentMessage).where(
                 AgentMessage.id == message_id,
+                AgentMessage.ticket_id == body.ticket_id,
+                AgentMessage.addressing_mode == "ticket",
+                AgentMessage.acknowledged_at.is_(None),
                 AgentMessage.recipient_session_id.is_(None),
+                AgentMessage.sender_session_id.in_(select(Session.id).where(
+                    Session.creator_uid == session.creator_uid)),
             ).values(recipient_session_id=session.id, recipient_agent=session.agent))
             if claimed.rowcount:
                 message = await db.get(AgentMessage, message_id)
@@ -1293,6 +1305,15 @@ def _refuse_foreign_change(request: Request, session: Session, body: SessionUpda
             "message": f"only the account bound to session {session.id} may change it"})
 
 
+def _require_session_capability(request: Request, session: Session) -> None:
+    """A status transition belongs to this exact session, not another same-UID actor."""
+    token = request.headers.get("X-ATS-Approval-Token", "")
+    expected = session.approval_token_hash or ""
+    if not token or not expected or not hmac.compare_digest(
+            hashlib.sha256(token.encode()).hexdigest(), expected):
+        raise HTTPException(403, "Session capability is required for lifecycle mutation")
+
+
 @router.patch("/{session_id}", response_model=SessionResponse)
 async def update_session(session_id: str, body: SessionUpdate, request: Request,
                          db: AsyncSession = Depends(get_db)):
@@ -1305,6 +1326,8 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
     if not session:
         raise HTTPException(404, "Session not found")
     _refuse_foreign_change(request, session, body)
+    if body.status is not None or body.handoff is not None:
+        _require_session_capability(request, session)
 
     # ONE DOOR (#2760). A session the reaper stripped carries an armed journal,
     # and the only path that may spend it is the heartbeat — the one signal that
@@ -1361,13 +1384,6 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
             Handoff.source_session_id == session.id))).scalar_one_or_none()
         if existing_handoff:
             raise HTTPException(409, "This session already recorded a handoff")
-        import hashlib
-        import hmac
-        token = request.headers.get("X-ATS-Approval-Token", "")
-        if not token or not hmac.compare_digest(
-                hashlib.sha256(token.encode()).hexdigest(),
-                session.approval_token_hash or ""):
-            raise HTTPException(403, "Session capability is required for handoff")
 
     # THE SAME DOOR AS CREATION (#2760). PATCH is the other supported writer of
     # an authority-bearing scope, and MCP extend_scope reaches it: extend_scope

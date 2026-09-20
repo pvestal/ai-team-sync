@@ -129,6 +129,9 @@ async def _mk(client, agent, scope, desc):
         "developer": "patrick", "agent": agent, "scope": scope,
         "description": desc, "repo_root": "/opt/anime-studio", "auto_lock": True})
     assert r.status_code == 201, r.text
+    if not hasattr(client, "session_tokens"):
+        client.session_tokens = {}
+    client.session_tokens[r.json()["id"]] = r.headers["X-ATS-Approval-Token"]
     return r.json()
 
 
@@ -139,7 +142,8 @@ async def test_completing_one_session_never_releases_another_sessions_locks(clie
     c = await _mk(client, "claude-code:delegate", [], "C delegated child")
 
     done_c = await client.patch(f"/api/sessions/{c['id']}",
-                                json={"status": "completed", "summary": "child returned"})
+                                json={"status": "completed", "summary": "child returned"},
+                                headers={"X-ATS-Approval-Token": client.session_tokens[c["id"]]})
     assert done_c.status_code == 200
 
     a_after = (await client.get(f"/api/sessions/{a['id']}")).json()
@@ -148,7 +152,8 @@ async def test_completing_one_session_never_releases_another_sessions_locks(clie
     assert b_after["status"] == "active" and b_after["lock_count"] == b["lock_count"]
 
     done_a = await client.patch(f"/api/sessions/{a['id']}",
-                                json={"status": "completed", "summary": "A done"})
+                                json={"status": "completed", "summary": "A done"},
+                                headers={"X-ATS-Approval-Token": client.session_tokens[a["id"]]})
     assert done_a.status_code == 200
 
     b_final = (await client.get(f"/api/sessions/{b['id']}")).json()

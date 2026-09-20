@@ -31,8 +31,14 @@ With the server running, the sweep runs every 60 seconds. Locks on a session
 that has heartbeated are released at most 21 minutes after its last derived
 activity (20-minute threshold plus one sweep); for a session that never
 heartbeated, the bound is 4 hours plus one sweep. An ATS outage suspends that
-clock; startup cleanup runs when the server returns. Reaping deletes only the
-completed session's lock rows, and a later session's claims stay in place.
+clock; startup cleanup runs when the server returns. Reaping deletes the
+completed session's lock rows and journals them for a possible late-heartbeat
+resurrection. It leaves unread messages assigned to that session. If the
+session resurrects, its inbox is still its own. If its capability holder
+explicitly completes it instead, unread ticket messages return to the ticket
+pool; a newly created same-account ticket session can then claim them. Direct
+messages remain bound to their exact recipient until their sender readdresses
+them with its own capability. Acknowledged messages never return to the pool.
 
 Why a tool-agnostic `Stop` hook (not the edit hooks): the lock-guard and presence
 hooks fire only on Edit/Write/MultiEdit/NotebookEdit. A read- or bash-heavy live

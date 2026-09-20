@@ -91,7 +91,14 @@ async def _create(client, peer, uid, agent, scope=(), repo_root=ROOT, **extra):
 async def _sid(client, peer, uid, agent, scope=(), **extra):
     resp = await _create(client, peer, uid, agent, scope, **extra)
     assert resp.status_code == 201, resp.text
+    if not hasattr(client, "session_tokens"):
+        client.session_tokens = {}
+    client.session_tokens[resp.json()["id"]] = resp.headers["X-ATS-Approval-Token"]
     return resp.json()["id"]
+
+
+def _owner(client, sid):
+    return {"X-ATS-Approval-Token": client.session_tokens[sid]}
 
 
 async def _authorize(client, peer, uid, sid, action, **body):
@@ -707,20 +714,24 @@ async def test_expired_claims_authorize_nothing(client, bound_registry, peer, db
 async def test_paused_and_completed_sessions_cannot_reuse_authority(client, bound_registry, peer, db_session):
     sid = await _sid(client, peer, EXEC_UID, "echo-executor:run1", ["src/**"], task_id=2741)
     peer["uid"] = EXEC_UID
-    assert (await client.patch(f"/api/sessions/{sid}", json={"status": "paused"})).status_code == 200
+    assert (await client.patch(f"/api/sessions/{sid}", json={"status": "paused"},
+                               headers=_owner(client, sid))).status_code == 200
     assert not (await _authorize(client, peer, EXEC_UID, sid, "commit", **_commit(["src/a.py"])))["allowed"]
     peer["uid"] = OTHER_UID
     assert (await client.patch(f"/api/sessions/{sid}", json={"status": "active"})).status_code == 403
     peer["uid"] = EXEC_UID
-    assert (await client.patch(f"/api/sessions/{sid}", json={"status": "active"})).status_code == 200
+    assert (await client.patch(f"/api/sessions/{sid}", json={"status": "active"},
+                               headers=_owner(client, sid))).status_code == 200
     assert (await _authorize(client, peer, EXEC_UID, sid, "commit", **_commit(["src/a.py"])))["allowed"]
 
-    assert (await client.post(f"/api/sessions/{sid}/complete", json={})).status_code == 200
+    assert (await client.post(f"/api/sessions/{sid}/complete", json={},
+                              headers=_owner(client, sid))).status_code == 200
     assert not (await _authorize(client, peer, EXEC_UID, sid, "commit", **_commit(["src/a.py"])))["allowed"]
     assert not (await _authorize(client, peer, EXEC_UID, sid, "task_close", task_id=2741,
                                  evidence={"a": 1}))["allowed"]
     peer["uid"] = EXEC_UID
-    assert (await client.patch(f"/api/sessions/{sid}", json={"status": "active"})).status_code == 409
+    assert (await client.patch(f"/api/sessions/{sid}", json={"status": "active"},
+                               headers=_owner(client, sid))).status_code == 409
     assert (await client.post(f"/api/sessions/{sid}/heartbeat")).status_code == 409
     await db_session.execute(update(Session).where(Session.id == sid).values(auto_completed=True))
     await db_session.commit()
@@ -849,7 +860,8 @@ async def test_r1_f2_unidentified_owners_stay_manageable_by_an_ordinary_account(
     await db_session.execute(update(Session).where(Session.id == owner).values(creator_uid=None))
     await db_session.commit()
     peer["uid"] = OTHER_UID
-    assert (await client.post(f"/api/sessions/{owner}/complete", json={})).status_code == 200
+    assert (await client.post(f"/api/sessions/{owner}/complete", json={},
+                              headers=_owner(client, owner))).status_code == 200
 
 
 def _repo(tmp_path):
@@ -1062,7 +1074,8 @@ async def test_r3_f3_paused_owners_exclusive_locks_are_kept_while_live_and_swept
 
     owner, lock_id, executor = await _exec_with_foreign_exclusive_lock(client, peer)
     peer["uid"] = OTHER_UID
-    assert (await client.patch(f"/api/sessions/{owner}", json={"status": "paused"})).status_code == 200
+    assert (await client.patch(f"/api/sessions/{owner}", json={"status": "paused"},
+                               headers=_owner(client, owner))).status_code == 200
     await db_session.execute(update(ScopeLock).where(ScopeLock.id == lock_id)
                              .values(expires_at=datetime.now(timezone.utc) - timedelta(hours=1)))
     await db_session.commit()
@@ -1200,7 +1213,8 @@ async def test_r6_another_account_cannot_revive_or_edit_a_reaped_session(client,
         assert (await client.patch(f"/api/sessions/{sid}", json={"status": "active"})).status_code == 403
         assert (await client.patch(f"/api/sessions/{sid}", json={"summary": "not mine"})).status_code == 403
     peer["uid"] = OTHER_UID
-    assert (await client.patch(f"/api/sessions/{sid}", json={"status": "active"})).json()["status"] == "active"
+    assert (await client.patch(f"/api/sessions/{sid}", json={"status": "active"},
+                               headers=_owner(client, sid))).json()["status"] == "active"
 
 
 @needs_proc
@@ -1269,7 +1283,8 @@ def test_the_real_server_records_and_enforces_kernel_identity_end_to_end(tmp_pat
             anon = http.post("/api/sessions", json={"developer": "t", "agent": "claude-code:anon2741"},
                              headers=forwarded)
             assert anon.status_code == 201 and row(anon.json()["id"])[0] is None
-            assert http.post(f"/api/sessions/{sid}/complete", json={}).status_code == 200
+            assert http.post(f"/api/sessions/{sid}/complete", json={}, headers={
+                "X-ATS-Approval-Token": made.headers["X-ATS-Approval-Token"]}).status_code == 200
             assert row(sid)[1] == "completed"
     finally:
         server.should_exit = True

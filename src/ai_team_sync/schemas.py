@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, Field, StrictInt, field_validator
 
@@ -38,7 +39,7 @@ class HandoffCreate(BaseModel):
 
 
 class SessionUpdate(BaseModel):
-    status: str | None = None  # active|paused|completed
+    status: Literal["active", "paused", "completed"] | None = None
     summary: str | None = None
     scope: list[str] | None = None
     description: str | None = None

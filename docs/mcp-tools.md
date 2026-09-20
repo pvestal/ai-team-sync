@@ -27,10 +27,12 @@ Session-mutating tools act on *your* session, and the server resolves which one
 that is from process-local identity. An identity that could have been written by
 another agent is refused rather than guessed.
 
-`complete_session` is the exception that proves it: it accepts an explicit
-`session_id`, which is authoritative for that call. Existence and ownership are
-checked first, and only then is a pointer that speaks for *this* caller allowed
-to refuse a mismatch. See [Authority model](authority-model.md).
+`complete_session` accepts an explicit `session_id`. The server verifies that
+exact session's capability before changing its lifecycle or releasing its
+locks and unread ticket mail; another session's valid capability cannot close
+it. Existence and ownership are checked first, and only then is a pointer that
+speaks for *this* caller allowed to refuse a mismatch. See
+[Authority model](authority-model.md).
 
 ## Locks and presence
 
@@ -75,12 +77,40 @@ can use `readdress_message` after the recipient ends; ATS records the original
 and new assignment on the same message and retains one receipt. If the original
 sender capability is unavailable too, send a new ticket-addressed handoff and
 record the prior message ID in its body. A ticket message is claimed by the first
-later session on that ticket. If that session ends unread, ATS returns it to the
-ticket for the next later session; it keeps the same ID and assignment history.
-It does not appear in an already-active session's inbox. The Claude hook reports
+later same-account session on that ticket. If that session explicitly completes
+with its own capability while the message is unread, ATS returns the message to
+the ticket for a new session to claim; it keeps the same ID and assignment
+history. Reaping leaves unread ticket mail assigned because a late heartbeat can
+resurrect the original session. A paused session keeps its locks and mail but
+cannot read or acknowledge until resumed; it is not reaped. An explicit
+completion is terminal and releases locks and unread ticket claims. Only a newly
+created session claims available ticket mail; an already-active peer has no
+automatic refresh. Reading the inbox is not a receipt: only an authenticated
+acknowledgment persists one logical receipt, and acknowledged mail is never
+released or readdressed. Ticket event copies sent to current active peers are
+direct session notifications, not ticket-pool instructions. The six historical
+event messages addressed to ghost session `93cc6040` remain unchanged, as do
+other historically stranded direct messages; this repair does not recover the
+old backlog. The Claude hook reports
 a missing capability instead of silently hiding its inbox. No message appears
 in the hook when an authenticated inbox is empty, and an unavailable ATS server
 never blocks a prompt.
+
+### Session states and message authority
+
+| State | Inbox and locks | Reaper and turnover |
+|---|---|---|
+| `active` | Own capability reads and acknowledges inbox; held locks are live. | Silence may reap it. Ticket claims happen only at session creation. |
+| `paused` | Inbox reads and acknowledgments are refused; locks stay held. | No automatic reap while paused. Owner capability may resume or complete it. |
+| `completed` by owner | Inbox reads and acknowledgments are refused; locks are released. | Terminal. Unread ticket claims return to the pool; direct mail stays addressed. Heartbeat cannot resurrect it. |
+| `completed` by reaper (`auto_completed=true`) | Inbox reads and acknowledgments are refused; locks are journaled and released. | Unread mail stays assigned. A late same-account heartbeat can resurrect the session and restore eligible locks, with the same inbox. Its capability holder may explicitly complete it instead, releasing unread ticket claims. |
+
+`SessionUpdate.status` accepts only `active`, `paused`, and `completed`.
+Unknown status text is rejected. Ticket claims require the creating account of
+the message's sender; messages whose sender account is unknown are not claimed
+across that boundary. An ACK always belongs to the current recipient and is
+stored once on the original message row. Reading, including a hook display,
+never counts as an ACK.
 
 ## Delegation
 

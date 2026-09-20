@@ -57,9 +57,10 @@ async def test_message_requires_sender_capability_and_recipient_ack(client):
 @pytest.mark.asyncio
 async def test_completed_recipient_cannot_be_messaged(client):
     sender, token = await _session(client, "codex:one")
-    recipient, _ = await _session(client, "claude-code:two")
+    recipient, recipient_token = await _session(client, "claude-code:two")
     response = await client.patch(f"/api/sessions/{recipient}", json={
-        "status": "completed", "summary": "done"})
+        "status": "completed", "summary": "done"}, headers={
+            "X-ATS-Approval-Token": recipient_token})
     assert response.status_code == 200, response.text
     sent = await client.post("/api/messages", json={
         "sender_session_id": sender, "recipient_session_id": recipient,
@@ -78,7 +79,7 @@ async def test_unread_direct_message_can_be_readdressed_by_sender_after_turnover
     message_id = sent.json()["id"]
     assert (await client.patch(f"/api/sessions/{old}", json={
         "status": "completed", "summary": "turnover",
-    })).status_code == 200
+    }, headers={"X-ATS-Approval-Token": old_token})).status_code == 200
     successor, successor_token = await _session(client, "claude-code:new", ticket_id=2907)
     unrelated, unrelated_token = await _session(client, "codex:unrelated", ticket_id=9999)
 
@@ -131,14 +132,14 @@ async def test_ticket_message_requeues_after_unread_recipient_ends(client):
     message_id = sent.json()["id"]
     assert (await client.patch(f"/api/sessions/{sender}", json={
         "status": "completed", "summary": "sender done",
-    })).status_code == 200
+    }, headers={"X-ATS-Approval-Token": sender_token})).status_code == 200
     first, first_token = await _session(client, "claude-code:first", ticket_id=2899)
     assert message_id in [row["id"] for row in (await client.get(
         f"/api/sessions/{first}/messages", headers={
             "X-ATS-Approval-Token": first_token})).json()]
     assert (await client.patch(f"/api/sessions/{first}", json={
         "status": "completed", "summary": "recipient unread",
-    })).status_code == 200
+    }, headers={"X-ATS-Approval-Token": first_token})).status_code == 200
     wrong, wrong_token = await _session(client, "claude-code:wrong", ticket_id=2907)
     assert message_id not in [row["id"] for row in (await client.get(
         f"/api/sessions/{wrong}/messages", headers={
@@ -165,13 +166,13 @@ async def test_ticket_message_requeues_after_unread_recipient_ends(client):
 
 
 @pytest.mark.asyncio
-async def test_reaper_requeues_unread_ticket_and_only_drops_dead_locks(client, db_session):
+async def test_reaper_keeps_unread_ticket_with_revivable_owner(client, db_session):
     sender, sender_token = await _session(client, "codex:sender", ticket_id=2907)
     sent = await client.post("/api/messages", json={
         "sender_session_id": sender, "ticket_id": 2907, "body": "survive reap",
     }, headers={"X-ATS-Approval-Token": sender_token})
     message_id = sent.json()["id"]
-    old, _ = await _session(client, "claude-code:old", ticket_id=2907)
+    old, old_token = await _session(client, "claude-code:old", ticket_id=2907)
     live, _ = await _session(client, "claude-code:live", ticket_id=2907)
     now = datetime.now(timezone.utc)
     old_row = await db_session.get(Session, old)
@@ -195,11 +196,13 @@ async def test_reaper_requeues_unread_ticket_and_only_drops_dead_locks(client, d
                                                 ticket_id=2907)
     inbox = await client.get(f"/api/sessions/{successor}/messages", headers={
         "X-ATS-Approval-Token": successor_token})
-    assert message_id in [row["id"] for row in inbox.json()]
-    message = next(row for row in inbox.json() if row["id"] == message_id)
-    assert [event["action"] for event in message["delivery_history"]] == [
-        "assigned", "released", "assigned"]
-    assert message["delivery_history"][1]["reason"] == "recipient_reaped"
+    assert message_id not in [row["id"] for row in inbox.json()]
+    assert (await client.post(f"/api/sessions/{old}/heartbeat")).status_code == 200
+    old_inbox = await client.get(f"/api/sessions/{old}/messages", headers={
+        "X-ATS-Approval-Token": old_token})
+    assert message_id in [row["id"] for row in old_inbox.json()]
+    assert [event["action"] for event in old_inbox.json()[0]["delivery_history"]] == [
+        "assigned"]
 
 
 def test_client_delivery_text_includes_sender_and_ack_instruction():

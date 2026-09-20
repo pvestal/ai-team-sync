@@ -90,7 +90,7 @@ async def init_db():
         await conn.execute(text("""
             UPDATE agent_messages SET addressing_mode = 'ticket'
             WHERE addressing_mode = 'legacy' AND ticket_id IS NOT NULL AND (
-                recipient_session_id IS NULL OR created_at < (
+                recipient_session_id IS NULL OR created_at <= (
                     SELECT started_at FROM sessions
                     WHERE sessions.id = agent_messages.recipient_session_id))
         """))

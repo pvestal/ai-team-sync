@@ -18,6 +18,9 @@ async def _session(client, scope=(), mode="advisory", repo_root=REPO):
         "developer": "patrick", "agent": "default", "scope": list(scope),
         "auto_lock": True, "lock_mode": mode, "repo_root": repo_root})
     assert resp.status_code == 201, resp.text
+    if not hasattr(client, "session_tokens"):
+        client.session_tokens = {}
+    client.session_tokens[resp.json()["id"]] = resp.headers["X-ATS-Approval-Token"]
     return resp.json()["id"]
 
 
@@ -101,7 +104,8 @@ async def test_a_completed_holder_no_longer_conflicts(client):
     holder = await _session(client, ["src/auth/**"], mode="exclusive")
     other = await _session(client)
     assert (await _lock(client, other, "src/auth/jwt.py", "exclusive")).status_code == 409
-    assert (await client.patch(f"/api/sessions/{holder}", json={"status": "completed"})).status_code == 200
+    assert (await client.patch(f"/api/sessions/{holder}", json={"status": "completed"},
+                               headers={"X-ATS-Approval-Token": client.session_tokens[holder]})).status_code == 200
     assert (await _lock(client, other, "src/auth/jwt.py", "exclusive")).status_code == 201
 
 

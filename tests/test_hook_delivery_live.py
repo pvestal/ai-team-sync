@@ -91,6 +91,64 @@ def _send(client, sender, token, recipient, body):
     return result.json()["id"]
 
 
+def test_isolated_server_ticket_turnover_and_direct_authority(live_ats):
+    """Fresh loopback server, real HTTP requests, one receipt per message."""
+    _, client, _ = live_ats
+
+    def ticket_session(agent, ticket=2907):
+        made = client.post("/api/sessions", json={
+            "developer": "pvestal", "agent": agent, "scope": [],
+            "ticket_id": ticket})
+        assert made.status_code == 201, made.text
+        return made.json()["id"], made.headers["X-ATS-Approval-Token"]
+
+    def headers(token):
+        return {"X-ATS-Approval-Token": token}
+
+    sender, sender_token = ticket_session("codex:sender")
+    queued = client.post("/api/messages", json={
+        "sender_session_id": sender, "ticket_id": 2907, "body": "ticket handoff",
+    }, headers=headers(sender_token))
+    assert queued.status_code == 201, queued.text
+    ticket_mid = queued.json()["id"]
+    first, first_token = ticket_session("claude-code:first")
+    direct_mid = _send(client, sender, sender_token, first, "exact direct")
+    first_inbox = client.get(f"/api/sessions/{first}/messages",
+                             headers=headers(first_token)).json()
+    assert [row["id"] for row in first_inbox if row["id"] in (ticket_mid, direct_mid)] == [
+        ticket_mid, direct_mid]
+    foreign, foreign_token = ticket_session("codex:foreign", ticket=9999)
+    assert client.patch(f"/api/sessions/{first}", json={
+        "status": "completed"}, headers=headers(foreign_token)).status_code == 403
+    assert client.post(f"/api/messages/{direct_mid}/readdress", json={
+        "sender_session_id": foreign, "recipient_session_id": sender,
+    }, headers=headers(foreign_token)).status_code == 404
+    assert client.patch(f"/api/sessions/{first}", json={
+        "status": "completed"}, headers=headers(first_token)).status_code == 200
+    second, second_token = ticket_session("claude-code:second")
+    second_inbox = client.get(f"/api/sessions/{second}/messages",
+                              headers=headers(second_token)).json()
+    assert [row["id"] for row in second_inbox if row["id"] == ticket_mid] == [ticket_mid]
+    assert direct_mid not in [row["id"] for row in second_inbox]
+    moved = client.post(f"/api/messages/{direct_mid}/readdress", json={
+        "sender_session_id": sender, "recipient_session_id": second,
+    }, headers=headers(sender_token))
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["original_recipient_session_id"] == first
+    assert moved.json()["sender_session_id"] == sender
+    for mid in (ticket_mid, direct_mid):
+        ack = client.post(f"/api/messages/{mid}/acknowledge", json={
+            "recipient_session_id": second}, headers=headers(second_token))
+        assert ack.status_code == 200 and ack.json()["acknowledged_at"]
+        again = client.post(f"/api/messages/{mid}/acknowledge", json={
+            "recipient_session_id": second}, headers=headers(second_token))
+        assert again.json()["acknowledged_at"] == ack.json()["acknowledged_at"]
+        status = client.get(f"/api/messages/{mid}", params={
+            "sender_session_id": sender}, headers=headers(sender_token))
+        assert status.json()["acknowledged_at"] == ack.json()["acknowledged_at"]
+        assert status.json()["sender_session_id"] == sender
+
+
 def test_claude_hook_exact_delivery_and_ack(live_ats, tmp_path):
     url, client, base = live_ats
     sender, sender_token = _new_session(client, "codex:sender")
@@ -135,7 +193,7 @@ def test_stale_claude_session_warns_and_needs_new_address(live_ats, tmp_path):
     old_cid = "cccccccc-0000-0000-0000-000000000003"
     state = tmp_path / "stale-state"
     env = _client_env(base, state, url, old_cid)
-    stale, _ = _new_session(client, "claude-code:cccccccc")
+    stale, stale_token = _new_session(client, "claude-code:cccccccc")
     (state / ".ats_session_cccccccc").write_text(stale)
     message_id = _send(client, sender, sender_token, stale, "old exact recipient")
     warning = _hook("ai_team_sync.hooks.override_inbox", env, old_cid)
@@ -147,7 +205,8 @@ def test_stale_claude_session_warns_and_needs_new_address(live_ats, tmp_path):
     assert not (state / ".ats_approval_cccccccc").exists()
 
     completed = client.post(f"/api/sessions/{stale}/complete", json={
-        "summary": "old client finished at safe pause"})
+        "summary": "old client finished at safe pause"}, headers={
+            "X-ATS-Approval-Token": stale_token})
     assert completed.status_code == 200
     new_cid = "dddddddd-0000-0000-0000-000000000004"
     fresh_env = _client_env(base, tmp_path / "fresh-state", url, new_cid)
@@ -253,7 +312,8 @@ def test_fresh_mcp_sender_readdresses_to_new_claude_hook(live_ats, tmp_path):
             "recipient_session_id": old, "body": "survive exact-session turnover"})
         message_id = re.search(r"Message ID: ([a-f0-9-]{36})", sent).group(1)
         assert client.post(f"/api/sessions/{old}/complete", json={
-            "summary": "ended unread"}).status_code == 200
+            "summary": "ended unread"}, headers={
+                "X-ATS-Approval-Token": _token(old_state, old_cid)}).status_code == 200
         _hook("ai_team_sync.hooks.session_autostart", new_env, new_cid)
         new = _pointer(new_state, new_cid)
         assert message_id not in _hook("ai_team_sync.hooks.override_inbox", new_env,

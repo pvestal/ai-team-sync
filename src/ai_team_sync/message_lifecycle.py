@@ -25,12 +25,12 @@ def append_delivery_event(message: AgentMessage, action: str, session_id: str,
 
 async def release_unread_ticket_messages(db: AsyncSession, session_id: str,
                                          *, reason: str = "recipient_completed") -> int:
-    """Return unread ticket claims to the mailbox when their owner ends.
+    """Return unread ticket claims after their owner explicitly completes.
 
     The compare-and-set against recipient and receipt serializes this with an
     acknowledgement. Acknowledged messages stay assigned to their one reader.
-    Direct messages remain addressed to their exact session until their sender
-    explicitly readdresses them.
+    Reaping is reversible and never calls this function. Direct messages stay
+    addressed to their exact session until their sender explicitly readdresses.
     """
     rows = (await db.execute(select(AgentMessage).where(
         AgentMessage.recipient_session_id == session_id,

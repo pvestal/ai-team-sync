@@ -78,7 +78,8 @@ async def test_a_completed_session_does_not_count_against_the_cap(client):
     })
     sid = first.json()["id"]
     done = await client.patch(f"/api/sessions/{sid}", json={
-        "status": "completed", "summary": "clustered"})
+        "status": "completed", "summary": "clustered"}, headers={
+            "X-ATS-Approval-Token": first.headers["X-ATS-Approval-Token"]})
     assert done.status_code == 200
 
     again = await client.post("/api/sessions", json={

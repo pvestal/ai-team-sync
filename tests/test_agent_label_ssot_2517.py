@@ -50,6 +50,7 @@ def test_cli_session_start_posts_attributable_label(monkeypatch):
     posted = {}
 
     class _Resp:
+        headers = {"X-ATS-Approval-Token": "test-capability"}
         def json(self):
             return {"id": "sess-1", "developer": "d", "scope": [], "branch": "",
                     "lock_count": 0}
@@ -72,6 +73,7 @@ def test_cli_explicit_agent_still_gets_the_token(monkeypatch):
     posted = {}
 
     class _Resp:
+        headers = {"X-ATS-Approval-Token": "test-capability"}
         def json(self):
             return {"id": "sess-1", "developer": "d", "scope": [], "branch": "",
                     "lock_count": 0}

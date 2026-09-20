@@ -86,6 +86,9 @@ async def _parent(client, **over):
     body.update(over)
     resp = await client.post("/api/sessions", json=body)
     assert resp.status_code == 201, resp.text
+    if not hasattr(client, "session_tokens"):
+        client.session_tokens = {}
+    client.session_tokens[resp.json()["id"]] = resp.headers["X-ATS-Approval-Token"]
     return resp.json()
 
 
@@ -192,7 +195,8 @@ async def test_a_parent_cannot_be_completed_while_a_child_delegation_is_open(cli
     await _delegate(client, parent["id"])
 
     done = await client.patch(f"/api/sessions/{parent['id']}",
-                              json={"status": "completed", "summary": "done"})
+                              json={"status": "completed", "summary": "done"},
+                              headers={"X-ATS-Approval-Token": client.session_tokens[parent["id"]]})
 
     assert done.status_code == 409
     assert done.json()["detail"]["error"] == "open_delegations"

@@ -15,6 +15,9 @@ async def _mk_session(client):
         "scope": ["a/*"], "description": "t", "auto_lock": False,
     })
     assert r.status_code == 201, r.text
+    if not hasattr(client, "session_tokens"):
+        client.session_tokens = {}
+    client.session_tokens[r.json()["id"]] = r.headers["X-ATS-Approval-Token"]
     return r.json()["id"]
 
 
@@ -22,7 +25,8 @@ async def _mk_session(client):
 async def test_nested_complete_completes_and_releases(client):
     sid = await _mk_session(client)
     r = await client.post(f"/api/sessions/{sid}/complete",
-                          json={"summary": "done via nested alias"})
+                          json={"summary": "done via nested alias"},
+                          headers={"X-ATS-Approval-Token": client.session_tokens[sid]})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["status"] == "completed"
@@ -32,7 +36,8 @@ async def test_nested_complete_completes_and_releases(client):
 @pytest.mark.asyncio
 async def test_nested_complete_empty_body(client):
     sid = await _mk_session(client)
-    r = await client.post(f"/api/sessions/{sid}/complete")
+    r = await client.post(f"/api/sessions/{sid}/complete", headers={
+        "X-ATS-Approval-Token": client.session_tokens[sid]})
     assert r.status_code == 200, r.text
     assert r.json()["status"] == "completed"
 

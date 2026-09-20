@@ -177,7 +177,14 @@ async def _mk(client, agent, desc="s"):
         "developer": "tester", "agent": agent, "scope": [],
         "description": desc, "auto_lock": False})
     assert r.status_code in (200, 201), r.text
+    if not hasattr(client, "session_tokens"):
+        client.session_tokens = {}
+    client.session_tokens[r.json()["id"]] = r.headers["X-ATS-Approval-Token"]
     return r.json()["id"]
+
+
+def _owner(client, sid):
+    return {"X-ATS-Approval-Token": client.session_tokens[sid]}
 
 
 @pytest.mark.asyncio
@@ -191,7 +198,8 @@ async def test_completing_one_session_changes_exactly_that_row(client):
               for sid in (b, c)}
 
     r = await client.patch(f"/api/sessions/{a}",
-                           json={"status": "completed", "summary": "done"})
+                           json={"status": "completed", "summary": "done"},
+                           headers=_owner(client, a))
     assert r.status_code == 200, r.text
     assert r.json()["id"] == a, "the response must name the row actually mutated"
     assert r.json()["status"] == "completed"
@@ -209,11 +217,13 @@ async def test_a_parent_completion_leaves_the_child_row_untouched(client):
     child = await _mk(client, "codex:delegate", "delegated child")
     await client.patch(f"/api/sessions/{child}",
                        json={"status": "completed",
-                             "summary": "delegated READ_ONLY: inspect one function"})
+                             "summary": "delegated READ_ONLY: inspect one function"},
+                       headers=_owner(client, child))
     child_before = _persisted((await client.get(f"/api/sessions/{child}")).json())
 
     await client.patch(f"/api/sessions/{parent}",
-                       json={"status": "completed", "summary": "parent done"})
+                       json={"status": "completed", "summary": "parent done"},
+                       headers=_owner(client, parent))
 
     child_after = _persisted((await client.get(f"/api/sessions/{child}")).json())
     assert child_after == child_before
@@ -232,7 +242,8 @@ async def test_an_open_delegation_blocks_its_parents_completion(client):
     assert d.status_code == 201, d.text
 
     r = await client.patch(f"/api/sessions/{parent}",
-                           json={"status": "completed", "summary": "premature"})
+                           json={"status": "completed", "summary": "premature"},
+                           headers=_owner(client, parent))
     assert r.status_code == 409
     assert r.json()["detail"]["error"] == "open_delegations"
 
@@ -251,9 +262,10 @@ async def test_the_server_would_restamp_a_second_completion(client):
     s = await _mk(client, "claude-code:aaaa")
     first = (await client.patch(f"/api/sessions/{s}",
                                 json={"status": "completed",
-                                      "summary": "real"})).json()
+                                      "summary": "real"}, headers=_owner(client, s))).json()
     second = (await client.patch(f"/api/sessions/{s}",
                                  json={"status": "completed",
-                                       "summary": "accidental re-run"})).json()
+                                       "summary": "accidental re-run"},
+                                 headers=_owner(client, s))).json()
     assert second["summary"] == "accidental re-run"
     assert second["completed_at"] >= first["completed_at"]

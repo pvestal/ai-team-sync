@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 from datetime import datetime, timedelta, timezone
@@ -42,6 +43,8 @@ from ai_team_sync.config import settings
 from ai_team_sync.models import Base, ScopeLock, Session
 
 ROOT = "/srv/echo-2760"
+OWNER_TOKEN = "test-owner-capability-2760"
+OWNER_HEADERS = {"X-ATS-Approval-Token": OWNER_TOKEN}
 
 # Every valid-but-awkward glob the marker used to mangle. They are lock
 # PATTERNS, not prose, and nothing in the narrative path may special-case them.
@@ -61,6 +64,7 @@ async def _silent_session(db, *, agent="claude-code:owner", scope=(), locks=(),
     """An active session that has gone silent, holding `locks`."""
     if identified:
         extra.setdefault("creator_uid", os.getuid())
+    extra.setdefault("approval_token_hash", hashlib.sha256(OWNER_TOKEN.encode()).hexdigest())
     sess = Session(developer="pvestal", agent=agent, repo_root=repo_root,
                    scope=json.dumps(list(scope)), status="active",
                    started_at=_long_ago(), last_heartbeat=_long_ago(), **extra)
@@ -255,9 +259,11 @@ async def test_owner_completion_after_reap_permanently_blocks_resurrection(
     assert await _journal_of(db_session, sid) != "", "precondition: journal armed"
 
     payload = {"summary": "handed off, lane released"}
-    done = await (client.patch(f"/api/sessions/{sid}", json={"status": "completed", **payload})
+    done = await (client.patch(f"/api/sessions/{sid}", json={"status": "completed", **payload},
+                               headers=OWNER_HEADERS)
                   if closer == "patch"
-                  else client.post(f"/api/sessions/{sid}/complete", json=payload))
+                  else client.post(f"/api/sessions/{sid}/complete", json=payload,
+                                   headers=OWNER_HEADERS))
     assert done.status_code == 200, done.text
     assert await _journal_of(db_session, sid) == "", "owner completion left the journal armed"
 
@@ -325,7 +331,7 @@ async def test_patch_cannot_revive_a_session_holding_an_armed_journal(
     was = (before.status, before.repo_root, before.summary, before.scope,
            before.description, before.reaped_locks, before.auto_completed)
 
-    resp = await client.patch(f"/api/sessions/{sid}", json=payload)
+    resp = await client.patch(f"/api/sessions/{sid}", json=payload, headers=OWNER_HEADERS)
     assert resp.status_code == 409, resp.text
     detail = resp.json()["detail"]
     assert detail["error"] == "restoration_requires_heartbeat"
@@ -345,11 +351,13 @@ async def test_the_pause_resume_pair_cannot_launder_a_revival(client, db_session
     the session with zero locks and left the journal armed for nobody."""
     sid = await _armed_reaped_session(db_session)
 
-    paused = await client.patch(f"/api/sessions/{sid}", json={"status": "paused"})
+    paused = await client.patch(f"/api/sessions/{sid}", json={"status": "paused"},
+                                headers=OWNER_HEADERS)
     assert paused.status_code == 409, paused.text
     assert (await _row(db_session, sid)).status == "completed"
 
-    resumed = await client.patch(f"/api/sessions/{sid}", json={"status": "active"})
+    resumed = await client.patch(f"/api/sessions/{sid}", json={"status": "active"},
+                                 headers=OWNER_HEADERS)
     assert resumed.status_code == 409, resumed.text
     assert (await _row(db_session, sid)).status == "completed"
     assert await _locks_of(db_session, sid) == {}
@@ -363,7 +371,8 @@ async def test_the_refusal_leaves_the_journal_spendable_by_a_heartbeat(
 
     for payload in ({"status": "active"}, {"status": "paused"},
                     {"status": "active", "repo_root": "/srv/OTHER"}):
-        assert (await client.patch(f"/api/sessions/{sid}", json=payload)).status_code == 409
+        assert (await client.patch(f"/api/sessions/{sid}", json=payload,
+                                   headers=OWNER_HEADERS)).status_code == 409
     assert await _journal_of(db_session, sid) == journal_before, "a refusal ate the journal"
 
     body = (await _heartbeat(client, sid)).json()
@@ -388,7 +397,8 @@ async def test_owner_completion_is_not_a_revival_and_is_still_allowed(client, db
     must pass, and it must disarm the journal permanently."""
     sid = await _armed_reaped_session(db_session)
     resp = await client.patch(f"/api/sessions/{sid}",
-                              json={"status": "completed", "summary": "done"})
+                              json={"status": "completed", "summary": "done"},
+                              headers=OWNER_HEADERS)
     assert resp.status_code == 200, resp.text
     assert await _journal_of(db_session, sid) == ""
     assert (await _heartbeat(client, sid)).status_code == 409
@@ -822,11 +832,13 @@ async def test_a_lockless_reaped_session_can_still_be_paused_and_resumed(
     assert journal, "precondition: reap writes an envelope even with no locks"
     assert json.loads(journal)["locks"] == [], journal
 
-    paused = await client.patch(f"/api/sessions/{sid}", json={"status": "paused"})
+    paused = await client.patch(f"/api/sessions/{sid}", json={"status": "paused"},
+                                headers=OWNER_HEADERS)
     assert paused.status_code == 200, paused.text
     assert (await _row(db_session, sid)).status == "paused"
 
-    resumed = await client.patch(f"/api/sessions/{sid}", json={"status": "active"})
+    resumed = await client.patch(f"/api/sessions/{sid}", json={"status": "active"},
+                                 headers=OWNER_HEADERS)
     assert resumed.status_code == 200, resumed.text
     assert (await _row(db_session, sid)).status == "active"
 
@@ -841,7 +853,8 @@ async def test_a_malformed_journal_still_refuses_the_patch_door(client, db_sessi
     assert await auto_complete_stale_sessions(db_session) == 1
     await _set_journal(db_session, sid, "not json at all")
 
-    resp = await client.patch(f"/api/sessions/{sid}", json={"status": "active"})
+    resp = await client.patch(f"/api/sessions/{sid}", json={"status": "active"},
+                              headers=OWNER_HEADERS)
     assert resp.status_code == 409, resp.text
     assert (await _row(db_session, sid)).status == "completed"
 
@@ -1497,7 +1510,8 @@ async def test_a_second_empty_resurrection_cannot_erase_an_unresolved_loss(clien
     first = await client.post(f"/api/sessions/{aid}/heartbeat")
     assert first.json()["locks_not_restored"] == ["src/**"]
 
-    await client.post(f"/api/sessions/{bid}/complete", json={"summary": "B leaves"})
+    await client.post(f"/api/sessions/{bid}/complete", json={"summary": "B leaves"},
+                      headers={"X-ATS-Approval-Token": b.headers["X-ATS-Approval-Token"]})
 
     # A is reaped again holding NOTHING, so the reaper journals an empty list.
     await _age_session(db_session, aid)
@@ -1521,7 +1535,8 @@ async def test_repeated_cycles_cannot_wear_the_loss_away(client, db_session):
     assert await auto_complete_stale_sessions(db_session) == 1
     b = await _create_session(client, scope=["src/**"], agent="claude-code:bbbbbbbb")
     assert (await client.post(f"/api/sessions/{aid}/heartbeat")).status_code == 200
-    await client.post(f"/api/sessions/{b.json()['id']}/complete", json={"summary": "gone"})
+    await client.post(f"/api/sessions/{b.json()['id']}/complete", json={"summary": "gone"},
+                      headers={"X-ATS-Approval-Token": b.headers["X-ATS-Approval-Token"]})
 
     for cycle in range(3):
         await _age_session(db_session, aid)

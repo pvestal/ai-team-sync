@@ -280,13 +280,15 @@ async def test_completing_the_child_leaves_the_parent_active(client):
         "resolved_binary": "/usr/local/bin/claude", "launch_spec_version": "1",
     })).json()
 
-    child = (await client.post("/api/sessions", json={
+    child_response = await client.post("/api/sessions", json={
         "developer": "tester", "agent": "claude-code:delegate", "scope": [],
         "description": "delegated READ_ONLY", "repo_root": "/opt/anime-studio",
-        "delegation_id": d["id"]})).json()
+        "delegation_id": d["id"]})
+    child = child_response.json()
 
     r = await client.patch(f"/api/sessions/{child['id']}",
-                           json={"status": "completed", "summary": "done"})
+                           json={"status": "completed", "summary": "done"},
+                           headers={"X-ATS-Approval-Token": child_response.headers["X-ATS-Approval-Token"]})
     assert r.status_code < 400, r.text
 
     assert (await client.get(f"/api/sessions/{child['id']}")).json()["status"] == "completed"

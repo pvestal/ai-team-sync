@@ -150,6 +150,9 @@ def session_start(scope, desc, agent, no_lock, exclusive):
 
     # Save session ID for other commands
     _save_active_session(data["id"])
+    token = resp.headers.get("X-ATS-Approval-Token", "")
+    sp.save_approval_token(data["id"], token, cid=data["id"])
+    sp.save_approval_token(data["id"], token)
 
 
 @session.command("pause")
@@ -159,7 +162,10 @@ def session_pause():
     if not sid:
         click.echo("No active session. Start one with: ats session start", err=True)
         raise SystemExit(1)
-    _api("patch", f"/sessions/{sid}", json={"status": "paused"})
+    from ai_team_sync import session_pointer as sp
+    token = sp.load_approval_token(sid, cid=sid) or sp.load_approval_token(sid)
+    _api("patch", f"/sessions/{sid}", json={"status": "paused"},
+         headers={"X-ATS-Approval-Token": token})
     click.echo(f"Session {sid[:8]}... paused (locks retained)")
 
 
@@ -200,8 +206,10 @@ def session_complete(summary, session_id):
     if summary is None:
         summary = click.prompt("Session summary (what did you accomplish?)", default="")
 
+    token = sp.load_approval_token(sid, cid=sid) or sp.load_approval_token(sid)
     resp = _api("patch", f"/sessions/{sid}",
-                json={"status": "completed", "summary": summary})
+                json={"status": "completed", "summary": summary},
+                headers={"X-ATS-Approval-Token": token})
     after = resp.json()
     # Only drop the pointer when it was OUR session; clearing it after completing
     # some other row would strand this process's own id.

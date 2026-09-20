@@ -220,13 +220,15 @@ async def test_heartbeat_on_an_operator_completed_session_is_refused(client, db_
     This is the half that must not become a resurrection loophole: 'I said I was
     done' outranks a late hook firing from a process that is shutting down.
     """
-    sid = (await client.post("/api/sessions", json={
+    created = await client.post("/api/sessions", json={
         "developer": "patrick", "agent": "claude-code:done",
         "scope": ["src/**"], "description": "done",
-    })).json()["id"]
+    })
+    sid = created.json()["id"]
 
     done = await client.patch(f"/api/sessions/{sid}",
-                              json={"status": "completed", "summary": "wrapped"})
+                              json={"status": "completed", "summary": "wrapped"},
+                              headers={"X-ATS-Approval-Token": created.headers["X-ATS-Approval-Token"]})
     assert done.status_code == 200
 
     before = await db_session.get(Session, sid)
@@ -249,15 +251,17 @@ async def test_reaper_marks_auto_completed_operator_complete_does_not(client, db
         "developer": "patrick", "agent": "claude-code:r",
         "scope": ["a/**"], "description": "r",
     })).json()["id"]
-    manual_id = (await client.post("/api/sessions", json={
+    manual_created = await client.post("/api/sessions", json={
         "developer": "patrick", "agent": "claude-code:m",
         "scope": ["b/**"], "description": "m",
-    })).json()["id"]
+    })
+    manual_id = manual_created.json()["id"]
 
     await _go_silent(db_session, reaped_id)
     assert await auto_complete_stale_sessions(db_session) == 1
 
-    await client.patch(f"/api/sessions/{manual_id}", json={"status": "completed"})
+    await client.patch(f"/api/sessions/{manual_id}", json={"status": "completed"},
+                       headers={"X-ATS-Approval-Token": manual_created.headers["X-ATS-Approval-Token"]})
 
     reaped = await db_session.get(Session, reaped_id)
     manual = await db_session.get(Session, manual_id)
