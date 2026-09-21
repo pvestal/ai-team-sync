@@ -1257,7 +1257,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                                 adopted += 1
                             else:
                                 adoption_warnings.append(
-                                    f"placeholder {s['id'][:8]} was not completed "
+                                    f"placeholder {s['id']} was not completed "
                                     f"(HTTP {adoption.status_code})")
                 except Exception as exc:  # noqa: BLE001 — start remains best-effort
                     adoption_warnings.append(
