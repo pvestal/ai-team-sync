@@ -292,6 +292,49 @@ def test_fresh_codex_mcp_nudge_and_ack(live_ats, tmp_path):
         mcp.close()
 
 
+def test_mcp_placeholder_adoption_authorizes_and_reports_refusal(
+        live_ats, tmp_path, monkeypatch):
+    """The real stdio caller authenticates the old row and never hides a 403."""
+    url, client, base = live_ats
+
+    def start_from_placeholder(cid, state_name, corrupt_capability=False):
+        state = tmp_path / state_name
+        env = _client_env(base, state, url, cid, agent="claude-code")
+        _hook("ai_team_sync.hooks.session_autostart", env, cid)
+        placeholder = _pointer(state, cid)
+        if corrupt_capability:
+            # Force the real ATS capability door to reject the adoption PATCH.
+            from ai_team_sync import session_pointer as sp
+            monkeypatch.setenv("ATS_STATE_DIR", str(state))
+            sp.save_approval_token(
+                placeholder, "not-the-placeholder-capability", cid=cid)
+
+        mcp = McpClient(env)
+        try:
+            output = mcp.tool("start_session", {
+                "scope": [], "description": "replace SessionStart placeholder",
+            })
+        finally:
+            mcp.close()
+        row = client.get(f"/api/sessions/{placeholder}")
+        assert row.status_code == 200, row.text
+        return placeholder, row.json(), output
+
+    accepted_id, accepted, accepted_output = start_from_placeholder(
+        "abc00001-0000-0000-0000-000000000001", "adopt-accepted")
+    assert accepted["status"] == "completed", (
+        "the real server accepts only the placeholder's own capability")
+    assert "auto-registered placeholder session completed: 1" in accepted_output
+
+    rejected_id, rejected, rejected_output = start_from_placeholder(
+        "abc00002-0000-0000-0000-000000000002", "adopt-rejected",
+        corrupt_capability=True)
+    assert rejected["status"] == "active", "the real server must reject the bad token"
+    assert "HTTP 403" in rejected_output and rejected_id[:8] in rejected_output
+    assert "auto-registered placeholder session completed: 1" not in rejected_output
+    assert "Session ID:" in rejected_output, "best-effort adoption must not block start"
+
+
 def test_fresh_mcp_sender_readdresses_to_new_claude_hook(live_ats, tmp_path):
     url, client, base = live_ats
     sender_cid = "fffffff1-0000-0000-0000-000000000007"

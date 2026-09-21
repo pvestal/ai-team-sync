@@ -39,15 +39,18 @@ from ai_team_sync import launch_spec
 PARENT = "parent-session-0001"
 CHILD = "child-session-0002"
 DELEG = "delegation-0003"
+CHILD_TOKEN = "child-capability-token"
 
 CALLS: list[tuple[str, str, dict]] = []
+PATCH_HEADERS: list[dict] = []
 
 
 class _Resp:
-    def __init__(self, status_code=200, payload=None):
+    def __init__(self, status_code=200, payload=None, headers=None):
         self.status_code = status_code
         self._payload = payload if payload is not None else {}
         self.text = json.dumps(self._payload)
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
@@ -57,6 +60,7 @@ class _RecordingClient:
     """Stands in for the server and records every call the supervisor makes."""
 
     fail_return = False          # make POST /return raise, as an outage would
+    reject_finalization = False  # make the server refuse the child close
 
     def __init__(self, *a, **k):
         pass
@@ -78,14 +82,18 @@ class _RecordingClient:
                 raise OSError("server unreachable during return")
             return _Resp(200, {"state": "returned"})
         if url.endswith("/api/sessions"):
-            return _Resp(201, {"id": CHILD})
+            return _Resp(201, {"id": CHILD},
+                         {"X-ATS-Approval-Token": CHILD_TOKEN})
         if url.endswith("/api/brief"):
             return _Resp(200, {"rendered": "(brief)"})
         return _Resp(200, {})
 
-    def patch(self, url, json=None, **k):
+    def patch(self, url, json=None, headers=None, **k):
         CALLS.append(("PATCH", url, json or {}))
-        return _Resp(200, {})
+        PATCH_HEADERS.append(headers or {})
+        authorized = (headers or {}).get("X-ATS-Approval-Token") == CHILD_TOKEN
+        refused = _RecordingClient.reject_finalization or not authorized
+        return _Resp(403 if refused else 200, {})
 
 
 def _patch_calls():
@@ -105,7 +113,9 @@ def _session_finalizations():
 def supervisor(monkeypatch):
     """The delegate CLI with the server and the spawn both stubbed out."""
     CALLS.clear()
+    PATCH_HEADERS.clear()
     _RecordingClient.fail_return = False
+    _RecordingClient.reject_finalization = False
     monkeypatch.setattr(cli_module.httpx, "Client", _RecordingClient)
     # resolve_binary's `which` default is bound at def time, so patch the
     # module attribute that validate_launchable/build_launch look up at call time.
@@ -177,6 +187,24 @@ def test_8_the_result_is_submitted_as_the_child_not_the_parent(supervisor):
     assert len(returns) == 1
     assert returns[0]["actor_session_id"] == CHILD
     assert "foo.py:12" in returns[0]["result_summary"]
+
+
+def test_child_finalizer_authenticates_and_reports_rejection(supervisor):
+    """The finalizer sends the child's key and makes a refused close loud."""
+    accepted = _run(supervisor, _clean_exit)
+    assert accepted.exit_code == 0, accepted.output
+    assert PATCH_HEADERS == [{"X-ATS-Approval-Token": CHILD_TOKEN}], (
+        "the session server must receive the child capability")
+    assert "WARNING: child session" not in accepted.output
+
+    CALLS.clear()
+    PATCH_HEADERS.clear()
+    _RecordingClient.reject_finalization = True
+    refused = _run(supervisor, _clean_exit)
+    assert refused.exit_code == 0, refused.output
+    assert PATCH_HEADERS == [{"X-ATS-Approval-Token": CHILD_TOKEN}]
+    assert f"WARNING: child session {CHILD} was NOT finalized" in refused.output
+    assert "HTTP 403" in refused.output
 
 
 # ── 9. the parent is untouched ──────────────────────────────────────────────

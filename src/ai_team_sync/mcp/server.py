@@ -1176,6 +1176,17 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 scope = arguments["scope"]
                 description = arguments["description"]
                 exclusive = arguments.get("exclusive", False)
+                # SessionStart may already have registered a placeholder for
+                # this exact client id. Capture its capability before saving
+                # the new session below overwrites the per-client capability
+                # file. A session capability authorizes only its own row.
+                from ai_team_sync import session_pointer as sp
+                placeholder_session_id = (active_session_id
+                                          if identity_source in ("env", "per_session")
+                                          else None)
+                placeholder_approval_token = (
+                    sp.load_approval_token(placeholder_session_id)
+                    if placeholder_session_id else "")
 
                 response = await client.post(
                     f"{SERVER_URL}/api/sessions",
@@ -1209,7 +1220,6 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 save_session_id(data["id"])
                 _IN_PROCESS_SESSION_ID = data["id"]
                 _IN_PROCESS_APPROVAL_TOKEN = response.headers.get("X-ATS-Approval-Token", "")
-                from ai_team_sync import session_pointer as sp
                 sp.save_approval_token(data["id"], _IN_PROCESS_APPROVAL_TOKEN)
 
                 # Adopt-or-complete the SessionStart auto-registration
@@ -1218,6 +1228,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # creates a sibling and the placeholder lingers 'active'
                 # forever (orphan class observed 2x on 2026-07-02).
                 adopted = 0
+                adoption_warnings = []
                 try:
                     sess_resp = await client.get(f"{SERVER_URL}/api/sessions")
                     sess_resp.raise_for_status()
@@ -1235,17 +1246,28 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                                 and s.get("agent") == my_label
                                 and is_autoregistered(s.get("description"))
                                 and not s.get("lock_count")):
-                            await client.patch(
+                            adoption = await client.patch(
                                 f"{SERVER_URL}/api/sessions/{s['id']}",
                                 json={"status": "completed",
-                                      "summary": adopted_summary(data["id"])})
-                            adopted += 1
-                except Exception:
-                    pass  # adoption is best-effort; never block session start
+                                      "summary": adopted_summary(data["id"])},
+                                headers={"X-ATS-Approval-Token": (
+                                    placeholder_approval_token
+                                    if s["id"] == placeholder_session_id else "")})
+                            if 200 <= adoption.status_code < 300:
+                                adopted += 1
+                            else:
+                                adoption_warnings.append(
+                                    f"placeholder {s['id'][:8]} was not completed "
+                                    f"(HTTP {adoption.status_code})")
+                except Exception as exc:  # noqa: BLE001 — start remains best-effort
+                    adoption_warnings.append(
+                        f"placeholder adoption check failed ({type(exc).__name__})")
 
                 msg = f"✅ Session started!\n\n"
                 if adopted:
                     msg += f"(auto-registered placeholder session completed: {adopted})\n"
+                for warning in adoption_warnings:
+                    msg += f"⚠️ {warning}; session start continued.\n"
                 msg += f"Session ID: {data['id']}\n"
                 if data.get("ticket_id") is not None:
                     msg += f"Ticket: #{data['ticket_id']}\n"

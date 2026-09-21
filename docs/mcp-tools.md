@@ -88,8 +88,8 @@ created session claims available ticket mail; an already-active peer has no
 automatic refresh. Reading the inbox is not a receipt: only an authenticated
 acknowledgment persists one logical receipt, and acknowledged mail is never
 released or readdressed. Ticket event copies sent to current active peers are
-direct session notifications, not ticket-pool instructions. The six historical
-event messages addressed to ghost session `93cc6040` remain unchanged, as do
+direct session notifications, not ticket-pool instructions. Historical event
+messages addressed to ghost session `93cc6040` remain unchanged, as do
 other historically stranded direct messages; this repair does not recover the
 old backlog. The Claude hook reports
 a missing capability instead of silently hiding its inbox. No message appears

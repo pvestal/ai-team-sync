@@ -749,6 +749,7 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
             click.echo(f"child session refused: {child.text}", err=True)
             sys.exit(2)
         child_id = child.json()["id"]
+        child_approval_token = child.headers.get("X-ATS-Approval-Token", "")
 
         brief = ""
         try:
@@ -860,9 +861,13 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         except Exception as exc:  # noqa: BLE001
             return_state = f"return_error: {type(exc).__name__}"
         try:
-            c.patch(f"{server}/api/sessions/{child_id}",
-                    json={"status": "completed",
-                          "summary": f"delegated {mode}: {objective[:120]}"})
+            finalized = c.patch(
+                f"{server}/api/sessions/{child_id}",
+                json={"status": "completed",
+                      "summary": f"delegated {mode}: {objective[:120]}"},
+                headers={"X-ATS-Approval-Token": child_approval_token})
+            if finalized.status_code >= 400:
+                raise RuntimeError(f"HTTP {finalized.status_code}")
         except Exception as exc:  # noqa: BLE001
             # Loud, because an unfinalized child IS the orphan condition and must
             # not be discoverable only by reading the board later.
