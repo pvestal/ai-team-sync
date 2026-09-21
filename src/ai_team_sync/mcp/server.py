@@ -1181,11 +1181,12 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # the new session below overwrites the per-client capability
                 # file. A session capability authorizes only its own row.
                 from ai_team_sync import session_pointer as sp
-                placeholder_session_id = (active_session_id
-                                          if identity_source in ("env", "per_session")
-                                          else None)
+                live_cid = sp.claude_session_id()
+                placeholder_session_id = (
+                    sp.resolve_pointer(cid=live_cid, allow_global=False)
+                    if live_cid else None)
                 placeholder_approval_token = (
-                    sp.load_approval_token(placeholder_session_id)
+                    sp.load_approval_token(placeholder_session_id, cid=live_cid)
                     if placeholder_session_id else "")
 
                 response = await client.post(

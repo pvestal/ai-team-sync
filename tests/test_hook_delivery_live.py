@@ -330,9 +330,50 @@ def test_mcp_placeholder_adoption_authorizes_and_reports_refusal(
         "abc00002-0000-0000-0000-000000000002", "adopt-rejected",
         corrupt_capability=True)
     assert rejected["status"] == "active", "the real server must reject the bad token"
-    assert "HTTP 403" in rejected_output and rejected_id[:8] in rejected_output
+    assert "HTTP 403" in rejected_output and rejected_id in rejected_output
     assert "auto-registered placeholder session completed: 1" not in rejected_output
     assert "Session ID:" in rejected_output, "best-effort adoption must not block start"
+
+
+def test_mcp_placeholder_adoption_survives_live_cid_rotation(live_ats, tmp_path):
+    """One long-lived MCP process adopts placeholders across a /clear cid rotation."""
+    url, client, base = live_ats
+    state = tmp_path / "clear-state"
+    first_cid = "abc00003-0000-0000-0000-000000000003"
+    second_cid = "abc00004-0000-0000-0000-000000000004"
+    first_env = _client_env(base, state, url, first_cid, agent="claude-code")
+
+    _hook("ai_team_sync.hooks.session_autostart", first_env, first_cid)
+    first_placeholder = _pointer(state, first_cid)
+    mcp = McpClient(first_env)
+    try:
+        first_output = mcp.tool("start_session", {
+            "scope": [], "description": "first claim before /clear",
+        })
+        assert "Session ID:" in first_output
+        assert client.get(
+            f"/api/sessions/{first_placeholder}").json()["status"] == "completed"
+
+        second_env = dict(first_env, CLAUDE_CODE_SESSION_ID=second_cid)
+        _hook("ai_team_sync.hooks.session_autostart", second_env, second_cid)
+        second_placeholder = _pointer(state, second_cid)
+
+        second_output = mcp.tool("start_session", {
+            "scope": [], "description": "second claim after /clear",
+        })
+        assert "Session ID:" in second_output
+        assert client.get(
+            f"/api/sessions/{second_placeholder}").json()["status"] == "completed"
+
+        sender, sender_token = _new_session(client, "codex:sender")
+        refused = client.post("/api/messages", json={
+            "sender_session_id": sender,
+            "recipient_session_id": second_placeholder,
+            "body": "must not enter the completed placeholder",
+        }, headers={"X-ATS-Approval-Token": sender_token})
+        assert refused.status_code == 409, refused.text
+    finally:
+        mcp.close()
 
 
 def test_fresh_mcp_sender_readdresses_to_new_claude_hook(live_ats, tmp_path):
