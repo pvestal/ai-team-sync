@@ -599,13 +599,19 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
 
 def render(packet: dict[str, Any]) -> str:
     """Text form, for injection straight into a worker's turn."""
+    task_id = packet.get("task_id")
+    context = packet.get("task_context") or {}
+    if task_id is not None and (not isinstance(context, dict) or not context):
+        raise TaskContextUnavailable(
+            task_id, str(packet.get("task_context_status") or
+                         "missing structured task_context"))
+
     lines = [f"TASK BRIEF — {packet['objective']}"]
     if packet.get("repo_root"):
         lines.append(f"repo: {packet['repo_root']}")
     if packet.get("scope"):
         lines.append("scope: " + ", ".join(packet["scope"]))
 
-    context = packet.get("task_context") or {}
     if context and packet.get("render_task_context", True):
         lines += ["", "EXACT TASK-SCOPED CONTEXT — authoritative structured records"]
         lines += render_task_context(context)

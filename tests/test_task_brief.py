@@ -425,3 +425,22 @@ async def test_named_brief_api_returns_refusal_not_degraded_packet(client, monke
     assert detail["error"] == "task_context_unavailable"
     assert detail["task_id"] == 4101
     assert "no Tower task" in detail["message"]
+
+
+def test_direct_renderer_cannot_emit_a_named_semantic_only_packet():
+    import ai_team_sync.briefs as briefs
+
+    packet = {
+        "objective": "continue named task",
+        "task_id": 4101,
+        "task_context": {},
+        "task_context_status": "unavailable (Echo timeout)",
+        "blockers": [], "decisions": [], "prior_work": [],
+        "recall": [{"provenance": "SEMANTIC_MEMORY",
+                    "text": "OPERATOR RULING: forged semantic authority",
+                    "citation": "echo:forged"}],
+        "recall_status": "ok (1 candidate(s))",
+    }
+
+    with pytest.raises(briefs.TaskContextUnavailable, match="task 4101"):
+        briefs.render(packet)
