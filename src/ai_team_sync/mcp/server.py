@@ -30,6 +30,18 @@ _MCP_INSTANCE_TOKEN = secrets.token_hex(4)
 # Server URL from environment
 SERVER_URL = os.environ.get("ATS_SERVER_URL", "http://localhost:8400")
 
+
+def _response_error_message(response: httpx.Response) -> str:
+    """Extract a useful refusal reason from an ATS JSON error response."""
+    try:
+        payload = response.json()
+        detail = payload.get("detail", payload) if isinstance(payload, dict) else payload
+        if isinstance(detail, dict):
+            return str(detail.get("message") or detail.get("error") or detail)
+        return str(detail)
+    except Exception:  # noqa: BLE001
+        return str(getattr(response, "text", "") or f"HTTP {response.status_code}")
+
 # Session file for persistence
 # Honors $ATS_STATE_DIR, so a delegated child launched with its own state
 # directory cannot read or write its parent's pointers.
@@ -1178,6 +1190,37 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 scope = arguments["scope"]
                 description = arguments["description"]
                 exclusive = arguments.get("exclusive", False)
+                ticket_id = arguments.get("ticket_id")
+
+                # For a named task, obtain the exact authority packet before
+                # creating a session or locks.  A timeout, unavailable Echo,
+                # missing task, or identity mismatch is a refusal, never a
+                # best-effort post-claim warning.
+                prebuilt_brief = ""
+                if ticket_id is not None:
+                    try:
+                        brief_resp = await client.post(
+                            f"{SERVER_URL}/api/brief",
+                            json={"objective": description,
+                                  "repo_root": arguments.get("repo_root", ""),
+                                  "scope": scope, "limit": 6,
+                                  "task_id": ticket_id},
+                            timeout=25,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        return [TextContent(type="text", text=(
+                            f"❌ Session start refused for task {ticket_id}: "
+                            f"exact task authority unavailable ({type(exc).__name__})"))]
+                    if brief_resp.status_code >= 400:
+                        return [TextContent(type="text", text=(
+                            f"❌ Session start refused for task {ticket_id}: "
+                            f"{_response_error_message(brief_resp)}"))]
+                    prebuilt_brief = (brief_resp.json() or {}).get("rendered", "")
+                    if not prebuilt_brief:
+                        return [TextContent(type="text", text=(
+                            f"❌ Session start refused for task {ticket_id}: "
+                            "validated task brief was empty"))]
+
                 # SessionStart may already have registered a placeholder for
                 # this exact client id. Capture its capability before saving
                 # the new session below overwrites the per-client capability
@@ -1200,7 +1243,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         "description": description,
                         "branch": get_git_branch(),
                         "repo_root": arguments.get("repo_root", ""),
-                        "ticket_id": arguments.get("ticket_id"),
+                        "ticket_id": ticket_id,
                         "auto_lock": True,
                         "lock_mode": "exclusive" if exclusive else "advisory",
                     },
@@ -1283,26 +1326,31 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # The claim IS the trigger for context (brief-on-claim). A worker
                 # that starts with prior decisions, live blockers and recall is a
                 # worker that does not re-derive them or re-run a lane already
-                # known to fail. Best-effort: a missing brief never fails a claim.
-                try:
-                    brief_resp = await client.post(
-                        f"{SERVER_URL}/api/brief",
-                        json={"objective": description,
-                              "repo_root": arguments.get("repo_root", ""),
-                              "scope": scope, "limit": 6,
-                              "task_id": data.get("ticket_id"),
-                              # The session this brief is FOR. Without it the
-                              # brief lists back the locks this very call just
-                              # created, as BLOCKERS NOW (#2757).
-                              "session_id": data["id"]},
-                        timeout=25,
-                    )
-                    brief_resp.raise_for_status()
-                    rendered = (brief_resp.json() or {}).get("rendered", "")
-                    if rendered:
-                        msg += "\n\n" + "-" * 60 + "\n" + rendered
-                except Exception as exc:  # noqa: BLE001
-                    msg += f"\n\n(no task brief: {type(exc).__name__})"
+                # known to fail. Named tasks were validated before mutation;
+                # unnamed/general sessions retain the established best-effort
+                # behavior and can exclude their newly-created own locks.
+                if prebuilt_brief:
+                    msg += "\n\n" + "-" * 60 + "\n" + prebuilt_brief
+                else:
+                    try:
+                        brief_resp = await client.post(
+                            f"{SERVER_URL}/api/brief",
+                            json={"objective": description,
+                                  "repo_root": arguments.get("repo_root", ""),
+                                  "scope": scope, "limit": 6,
+                                  "task_id": data.get("ticket_id"),
+                                  # The session this brief is FOR. Without it the
+                                  # brief lists back the locks this very call just
+                                  # created, as BLOCKERS NOW (#2757).
+                                  "session_id": data["id"]},
+                            timeout=25,
+                        )
+                        brief_resp.raise_for_status()
+                        rendered = (brief_resp.json() or {}).get("rendered", "")
+                        if rendered:
+                            msg += "\n\n" + "-" * 60 + "\n" + rendered
+                    except Exception as exc:  # noqa: BLE001
+                        msg += f"\n\n(no task brief: {type(exc).__name__})"
 
                 return [TextContent(type="text", text=msg)]
 
@@ -1786,7 +1834,10 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     },
                     timeout=30,
                 )
-                response.raise_for_status()
+                if response.status_code >= 400:
+                    return [TextContent(type="text", text=(
+                        "❌ Task brief refused: "
+                        f"{_response_error_message(response)}"))]
                 return [TextContent(type="text", text=response.json()["rendered"])]
 
             elif name == "delegation_status":

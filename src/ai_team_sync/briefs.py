@@ -54,6 +54,27 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("ATS_BRIEF_EMBED_MODEL", "nomic-embed-text")
 
 
+class TaskContextUnavailable(RuntimeError):
+    """A named task has no validated exact structured authority."""
+
+    def __init__(self, task_id: int, reason: str):
+        self.task_id = task_id
+        self.reason = reason
+        super().__init__(
+            f"exact structured context for task {task_id} unavailable: {reason}")
+
+
+def _canonical_returned_task_id(value: Any) -> int | None:
+    """Accept API integer ids and their unambiguous canonical JSON strings."""
+    if type(value) is int:
+        return value if value > 0 else None
+    if isinstance(value, str) and value.isascii() and value.isdecimal():
+        parsed = int(value)
+        if parsed > 0 and value == str(parsed):
+            return parsed
+    return None
+
+
 def _fetch_tower_task(task_id: str | int, *, timeout: float = 10.0
                       ) -> tuple[dict[str, Any] | None, str | None]:
     """(structured envelope, error) for one Tower task, from Echo Brain."""
@@ -79,10 +100,42 @@ def _fetch_tower_task(task_id: str | int, *, timeout: float = 10.0
         env = r.json()
     except Exception:  # noqa: BLE001
         return None, f"Echo Brain returned a non-JSON envelope for task {tid}"
-    if not isinstance(env, dict) or "description" not in env:
+    if not isinstance(env, dict):
+        return None, (f"task identity mismatch requested={tid} envelope=malformed "
+                      "context=malformed (no structured task_context)")
+
+    envelope_raw = env.get("id", None)
+    envelope_id = _canonical_returned_task_id(envelope_raw)
+    context = env.get("task_context")
+    task = context.get("task") if isinstance(context, dict) else None
+    context_raw = task.get("id", None) if isinstance(task, dict) else None
+    context_id = _canonical_returned_task_id(context_raw)
+
+    def shown(raw: Any, normalized: int | None) -> str:
+        if raw is None:
+            return "missing"
+        if normalized is None:
+            return f"malformed({raw!r})"
+        return str(normalized)
+
+    envelope_label = shown(envelope_raw, envelope_id)
+    if not isinstance(context, dict) or not isinstance(task, dict):
+        context_label = "malformed (no structured task_context)"
+    else:
+        context_label = shown(context_raw, context_id)
+    if envelope_id != tid or context_id != tid:
+        return None, (f"task identity mismatch requested={tid} "
+                      f"envelope={envelope_label} context={context_label}")
+    rulings = context.get("operator_rulings")
+    if (not isinstance(rulings, dict)
+            or not isinstance(rulings.get("current"), list)
+            or not isinstance(rulings.get("history"), list)
+            or not isinstance(context.get("verified_facts"), list)
+            or not isinstance(context.get("requires_live_verification"), list)):
+        return None, (f"malformed structured task_context requested={tid} "
+                      f"envelope={envelope_label} context={context_label}")
+    if "description" not in env:
         return None, f"envelope for task {tid} is missing its description field"
-    if not isinstance(env.get("task_context"), dict):
-        return None, f"envelope for task {tid} has no structured task_context"
     return env, None
 
 
@@ -127,18 +180,18 @@ def render_task_context(context: dict[str, Any]) -> list[str]:
             out.append(f"    [{marker}] {d.get('ruling') or '(text unavailable; follow citation)'}")
             out.append(f"      id={d.get('id')} operator={((d.get('author') or {}).get('name') or '?')} "
                        f"source={((d.get('source') or {}).get('citation') or '?')}")
-    if history:
-        out += ["", "  NON-CURRENT RULING HISTORY (NOT AUTHORITY):"]
-        for d in history:
-            out.append(f"    [{str(d.get('state') or 'historical').upper()}] "
-                       f"{d.get('ruling') or '(text unavailable)'}")
-            out.append(f"      id={d.get('id')} superseded_by={d.get('superseded_by') or []}")
     facts = context.get("verified_facts") or []
     if facts:
         out += ["", "  VERIFIED TASK FACTS:"]
         for fact in facts:
             out.append(f"    [VERIFIED] {json.dumps(fact.get('value'), default=str)}")
             out.append(f"      source={fact.get('citation') or '?'}")
+    if history:
+        out += ["", "  NON-CURRENT RULING HISTORY (NOT AUTHORITY):"]
+        for d in history:
+            out.append(f"    [{str(d.get('state') or 'historical').upper()}] "
+                       f"{d.get('ruling') or '(text unavailable)'}")
+            out.append(f"      id={d.get('id')} superseded_by={d.get('superseded_by') or []}")
     checks = context.get("requires_live_verification") or []
     if checks:
         out += ["", "  requires live verification: " + ", ".join(str(x) for x in checks)]
@@ -418,6 +471,23 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
     same conservative rule pre-commit-check applies."""
     scope = scope or []
 
+    # A named task is an authority claim, not a recall hint. Resolve and
+    # validate it before reading local proposals, locks, or semantic memory so
+    # no partial/degraded packet can be mistaken for task authority.
+    task_context: dict[str, Any] = {}
+    task_context_status = "not requested"
+    if task_id is not None:
+        try:
+            task_context, task_error = await asyncio.to_thread(
+                fetch_tower_task_context, task_id)
+        except Exception as exc:  # noqa: BLE001
+            raise TaskContextUnavailable(
+                task_id, f"task context lookup failed ({type(exc).__name__})") from exc
+        if task_error or not isinstance(task_context, dict) or not task_context:
+            raise TaskContextUnavailable(
+                task_id, task_error or "empty structured task_context")
+        task_context_status = "ok"
+
     # A lock is live while its session is active and it has not expired; there
     # is no released_at column, release is the session completing.
     now = datetime.now(timezone.utc)
@@ -458,13 +528,6 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
         for d in decision_rows
         if d.session and _same_repo(d.session.repo_root, repo_root)
     ]
-
-    task_context: dict[str, Any] = {}
-    task_context_status = "not requested"
-    if task_id is not None:
-        task_context, task_error = await asyncio.to_thread(
-            fetch_tower_task_context, task_id)
-        task_context_status = f"unavailable ({task_error})" if task_error else "ok"
 
     prior_rows = (await db.execute(
         select(Session).options(selectinload(Session.commits))
@@ -553,14 +616,17 @@ def render(packet: dict[str, Any]) -> str:
 
     recall_title = ("TASK-SCOPED SEMANTIC SUPPLEMENT" if packet.get("task_id")
                     else "UNSCOPED SEMANTIC RECALL")
+    prior = packet.get("prior_work") or []
     sections = [
-        ("BLOCKERS NOW", "blockers"),
-        ("PRIOR DECISIONS", "decisions"),
-        ("PRIOR WORK IN THIS SCOPE", "prior_work"),
-        (recall_title, "recall"),
+        ("VERIFIED PRIOR WORK", "prior_work",
+         [i for i in prior if i.get("provenance") == VERIFIED]),
+        ("BLOCKERS NOW", "blockers", packet.get("blockers") or []),
+        ("OBSERVATIONS / INFERENCES FROM PRIOR WORK", "prior_work",
+         [i for i in prior if i.get("provenance") != VERIFIED]),
+        ("WORKER PROPOSALS", "decisions", packet.get("decisions") or []),
+        (recall_title, "recall", packet.get("recall") or []),
     ]
-    for title, key in sections:
-        items = packet.get(key) or []
+    for title, key, items in sections:
         if not items:
             continue
         lines += ["", title]

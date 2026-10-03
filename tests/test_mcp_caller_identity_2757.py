@@ -109,6 +109,65 @@ async def test_start_session_brief_still_shows_a_foreign_blocker(
     assert text.count("'docs/**' is claimed by") == 1, text
 
 
+@pytest.mark.asyncio
+async def test_named_start_session_refuses_before_creating_a_session(
+        db_engine, monkeypatch, tmp_path):
+    from ai_team_sync import briefs
+
+    transport = _wire(monkeypatch, db_engine, tmp_path)
+    monkeypatch.setenv("ATS_AGENT", "claude-code")
+    monkeypatch.setattr(
+        briefs, "fetch_tower_task_context",
+        lambda task_id, **kw: ({}, "Echo Brain unreachable (TimeoutException)"))
+
+    out = await mcp.call_tool("start_session", {
+        "scope": ["docs/**"], "description": "named task", "repo_root": ROOT,
+        "ticket_id": 4101})
+
+    assert "refused" in out[0].text.lower()
+    assert "4101" in out[0].text
+    async with AsyncClient(transport=transport, base_url="http://localhost:8400") as client:
+        sessions = await client.get("/api/sessions")
+    assert sessions.json() == [], "authority failure must precede session creation"
+
+
+@pytest.mark.asyncio
+async def test_named_start_session_succeeds_with_exact_context(
+        db_engine, monkeypatch, tmp_path):
+    from ai_team_sync import briefs
+    from tests.test_task_brief import TASK_CONTEXT
+
+    _wire(monkeypatch, db_engine, tmp_path)
+    monkeypatch.setenv("ATS_AGENT", "claude-code")
+    monkeypatch.setattr(briefs, "fetch_tower_task_context",
+                        lambda task_id, **kw: (TASK_CONTEXT, None))
+    monkeypatch.setattr(briefs, "recall_memories", lambda *a, **kw: [])
+
+    out = await mcp.call_tool("start_session", {
+        "scope": ["docs/**"], "description": "named task", "repo_root": ROOT,
+        "ticket_id": 4101})
+
+    assert "Session ID:" in out[0].text
+    assert "Do not use the legacy video lane" in out[0].text
+
+
+@pytest.mark.asyncio
+async def test_mcp_named_task_brief_refuses_semantic_only_fallback(
+        db_engine, monkeypatch, tmp_path):
+    from ai_team_sync import briefs
+
+    _wire(monkeypatch, db_engine, tmp_path)
+    monkeypatch.setattr(
+        briefs, "fetch_tower_task_context",
+        lambda task_id, **kw: ({}, "task identity mismatch requested=4101 envelope=4102"))
+
+    out = await mcp.call_tool("task_brief", {
+        "objective": "named task", "task_id": 4101})
+
+    assert "refused" in out[0].text.lower()
+    assert "requested=4101" in out[0].text
+
+
 # ── the commit verdict ─────────────────────────────────────────────────────
 
 @pytest.mark.asyncio

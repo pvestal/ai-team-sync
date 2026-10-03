@@ -218,3 +218,74 @@ def test_fetch_returns_no_partial_envelope_on_failure():
     finally:
         briefs.ECHO_URL = original
     assert text == "" and err and "unreachable" in err
+
+
+class _EnvelopeResponse:
+    status_code = 200
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def json(self):
+        return self.payload
+
+
+class _EnvelopeClient:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, url):
+        return _EnvelopeResponse(self.payload)
+
+
+def _identity_envelope(envelope_id=2649, context_id=2649):
+    return dict(ENVELOPE, id=envelope_id, task_context={
+        "version": 1,
+        "task": {"id": context_id, "key": ENVELOPE["task_key"], "project_id": 20},
+        "operator_rulings": {"current": [], "history": []},
+        "verified_facts": [],
+        "requires_live_verification": ["git", "database", "services"],
+    })
+
+
+@pytest.mark.parametrize("payload,error_fragment", [
+    (_identity_envelope(envelope_id=2650), "envelope=2650"),
+    (_identity_envelope(context_id=2650), "context=2650"),
+    ({k: v for k, v in _identity_envelope().items() if k != "id"}, "envelope=missing"),
+    (dict(_identity_envelope(), task_context={"task": {}}), "context=missing"),
+    (dict(_identity_envelope(), task_context=[]), "structured task_context"),
+    (dict(_identity_envelope(), task_context={
+        "task": {"id": 2649}, "operator_rulings": "not structured",
+        "verified_facts": [], "requires_live_verification": []}),
+     "malformed structured task_context"),
+])
+def test_fetch_refuses_missing_malformed_or_conflicting_task_identity(
+        monkeypatch, payload, error_fragment):
+    import httpx
+    from ai_team_sync import briefs
+
+    monkeypatch.setattr(httpx, "Client", lambda **kw: _EnvelopeClient(payload))
+    text, error = briefs.fetch_tower_task_envelope(2649)
+
+    assert text == ""
+    assert error_fragment in error
+    assert "requested=2649" in error
+
+
+@pytest.mark.parametrize("value", [2649, "2649"])
+def test_fetch_accepts_matching_integer_or_canonical_decimal_identity(monkeypatch, value):
+    import httpx
+    from ai_team_sync import briefs
+
+    monkeypatch.setattr(
+        httpx, "Client",
+        lambda **kw: _EnvelopeClient(_identity_envelope(value, value)))
+
+    text, error = briefs.fetch_tower_task_envelope(2649)
+    assert error is None and "TOWER TASK #2649" in text

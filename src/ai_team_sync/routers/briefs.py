@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_team_sync.briefs import build_brief
+from ai_team_sync.briefs import TaskContextUnavailable, build_brief
 from ai_team_sync.caller_session import resolve_caller_session
 from ai_team_sync.database import get_db
 
@@ -31,9 +31,17 @@ async def post_brief(body: BriefRequest, request: Request,
                      db: AsyncSession = Depends(get_db)) -> dict:
     # Same resolver as pre-commit-check: one identity rule for both readers.
     caller = await resolve_caller_session(db, request=request, session_id=body.session_id)
-    return await build_brief(db, objective=body.objective, repo_root=body.repo_root,
-                             scope=body.scope, recall=body.recall, limit=body.limit,
-                             caller_session_id=caller.session_id,
-                             caller_identity_unresolved=caller.unresolved,
-                             task_id=body.task_id,
-                             render_task_context=body.render_task_context)
+    try:
+        return await build_brief(
+            db, objective=body.objective, repo_root=body.repo_root,
+            scope=body.scope, recall=body.recall, limit=body.limit,
+            caller_session_id=caller.session_id,
+            caller_identity_unresolved=caller.unresolved,
+            task_id=body.task_id,
+            render_task_context=body.render_task_context)
+    except TaskContextUnavailable as exc:
+        raise HTTPException(status_code=409, detail={
+            "error": "task_context_unavailable",
+            "task_id": exc.task_id,
+            "message": str(exc),
+        }) from exc

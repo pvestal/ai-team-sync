@@ -266,6 +266,24 @@ def test_the_reported_state_names_the_failure_rather_than_claiming_success(super
     assert payload["parent_still_owns"] == PARENT
 
 
+def test_named_delegation_authority_failure_creates_no_records(supervisor, monkeypatch):
+    from ai_team_sync import briefs
+
+    monkeypatch.setattr(
+        briefs, "fetch_tower_task_envelope",
+        lambda task_id: ("", "task identity mismatch requested=4101 envelope=4102"))
+    result = supervisor.invoke(cli_module.cli, [
+        "delegate", "--task", "4101", "--parent-session", PARENT,
+        "--worker", "claude-code", "--mode", "READ_ONLY",
+        "--repo", "/opt/anime-studio", "--objective", "inspect",
+        "--acceptance", "file:line citations",
+    ])
+
+    assert result.exit_code == 4
+    assert "no task authority" in result.output
+    assert CALLS == [], "task authority is fetched before delegation/session creation"
+
+
 # ── the child is not asked to close itself ──────────────────────────────────
 
 def test_the_child_packet_never_asks_the_child_to_close_its_session(supervisor):
