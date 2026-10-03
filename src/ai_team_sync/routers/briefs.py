@@ -19,6 +19,8 @@ class BriefRequest(BaseModel):
     scope: list[str] = Field(default_factory=list)
     recall: bool = True          # consult Echo Brain; False keeps it ATS-only
     limit: int = 8
+    task_id: int | None = Field(default=None, gt=0)
+    render_task_context: bool = True
     # The session this brief is for, so its own locks are not reported back to
     # it as blockers (#2757). A claim, validated against the caller's account.
     session_id: str = ""
@@ -32,4 +34,6 @@ async def post_brief(body: BriefRequest, request: Request,
     return await build_brief(db, objective=body.objective, repo_root=body.repo_root,
                              scope=body.scope, recall=body.recall, limit=body.limit,
                              caller_session_id=caller.session_id,
-                             caller_identity_unresolved=caller.unresolved)
+                             caller_identity_unresolved=caller.unresolved,
+                             task_id=body.task_id,
+                             render_task_context=body.render_task_context)

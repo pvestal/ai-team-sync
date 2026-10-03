@@ -14,20 +14,20 @@ from __future__ import annotations
 import pytest
 
 from ai_team_sync.briefs import (OBSERVATION, OPERATOR_DECISION, VERIFIED,
-                                 INFERRED, BriefItem, classify_memory,
+                                 INFERRED, SEMANTIC_MEMORY, BriefItem, classify_memory,
                                  compress, rerank_by_similarity)
 
 
-def test_an_operator_trusted_memory_outranks_a_model_written_one():
+def test_semantic_payload_trust_never_promotes_a_hit_to_current_operator_authority():
     op = classify_memory({"payload": {"trust": "operator_memory"}, "content": "x"})
     model = classify_memory({"payload": {"trust": "inferred"}, "content": "x"})
 
-    assert op == OPERATOR_DECISION
-    assert model == INFERRED
+    assert op == SEMANTIC_MEMORY
+    assert model == SEMANTIC_MEMORY
 
 
 def test_a_memory_with_no_trust_marker_is_never_promoted():
-    assert classify_memory({"content": "root cause was X"}) == INFERRED
+    assert classify_memory({"content": "root cause was X"}) == SEMANTIC_MEMORY
 
 
 def test_compression_dedups_and_budgets_without_inventing_text():
@@ -228,3 +228,144 @@ async def test_the_brief_carries_the_hint_fields(client, monkeypatch):
     body = resp.json()
     assert "preflight_recommended" in body and body["preflight_recommended"] is False
     assert "preflight_reason" in body
+
+
+# --- deterministic task context -------------------------------------------
+
+TASK_CONTEXT = {
+    "version": 1,
+    "task": {"id": 4101, "key": "task-a", "project_id": 7,
+             "project_name": "Anime Studio"},
+    "operator_rulings": {
+        "current": [{
+            "id": "rule-b", "category": "OPERATOR_DECISION",
+            "authority": "operator", "effect": "BLOCK", "state": "current",
+            "current": True, "ruling": "Do not use the legacy video lane.",
+            "prohibition": True, "scope": {"tower_task_id": 4101},
+            "author": {"type": "human", "name": "patrick", "authenticated": True},
+            "created_at": "2026-10-02T20:00:00+00:00",
+            "source": {"id": "operator-turn-2", "citation": "operator://turn/2",
+                       "content_sha256": "b" * 64},
+            "supersedes": ["rule-a"], "superseded_by": [],
+        }],
+        "history": [{
+            "id": "rule-a", "category": "OPERATOR_DECISION",
+            "authority": "operator", "effect": "ALLOW", "state": "superseded",
+            "current": False, "ruling": "The legacy video lane may be used.",
+            "prohibition": False, "scope": {"tower_task_id": 4101},
+            "author": {"type": "human", "name": "patrick", "authenticated": True},
+            "created_at": "2026-10-01T20:00:00+00:00",
+            "source": {"id": "operator-turn-1", "citation": "operator://turn/1",
+                       "content_sha256": "a" * 64},
+            "supersedes": [], "superseded_by": ["rule-b"],
+        }],
+    },
+    "prohibitions": ["rule-b"],
+    "verified_facts": [{"category": "VERIFIED", "citation": "tower-task/4101#verified_by",
+                        "value": {"commit": "abc123"}}],
+    "requires_live_verification": ["git", "database", "services"],
+}
+
+
+@pytest.mark.asyncio
+async def test_task_brief_keeps_exact_context_structured_and_filters_ticket_decisions(
+        db_session, monkeypatch):
+    import ai_team_sync.briefs as briefs
+    from ai_team_sync.models import Decision, Session
+    monkeypatch.setattr(briefs, "fetch_tower_task_context",
+                        lambda task_id, **kw: (TASK_CONTEXT, None))
+    monkeypatch.setattr(briefs, "recall_memories", lambda *a, **kw: [])
+
+    for ticket, title in ((4101, "Task A worker proposal"),
+                          (4102, "Task B conflicting decision")):
+        session = Session(developer="patrick", agent="codex", scope="[]",
+                          description=title, repo_root="", ticket_id=ticket)
+        db_session.add(session)
+        await db_session.flush()
+        db_session.add(Decision(session_id=session.id, ticket_id=ticket, title=title,
+                                chosen="Use the legacy video lane.",
+                                reasoning="not authenticated operator provenance"))
+    await db_session.commit()
+
+    body = await briefs.build_brief(
+        db_session, objective="continue task A", repo_root="", scope=[],
+        task_id=4101)
+    assert body["task_context"] == TASK_CONTEXT
+    assert [d["provenance"] for d in body["decisions"]] == ["WORKER_PROPOSAL"]
+    assert body["decisions"][0]["meta"]["ticket_id"] == 4101
+    assert body["decisions"][0]["meta"]["authenticated_operator"] is False
+    text = body["rendered"]
+    assert "Do not use the legacy video lane" in text
+    assert "CURRENT OPERATOR RULINGS / PROHIBITIONS" in text
+    assert "NON-CURRENT RULING HISTORY" in text
+    assert "Task A worker proposal" in text
+    assert "Task B conflicting decision" not in text
+    assert "requires live verification: git, database, services" in text
+
+    # The same rendered authority and brief are what a delegated Claude/Codex
+    # child receives; no parent conversation is inherited.
+    from ai_team_sync.briefs import render_task_envelope
+    from ai_team_sync.delegation_packet import build_child_packet
+    task_envelope = {
+        "id": 4101, "task_key": "task-a", "project_id": 7,
+        "project_name": "Anime Studio", "parent_id": None,
+        "title": "Synthetic task A", "description": "Acceptance: preserve provenance.",
+        "status": "pending", "gate": "decision", "priority": 1,
+        "recommendation": "", "notes": "", "blocked_by": [],
+        "verified_by": {"commit": "abc123"}, "claim": None,
+        "is_closed": False, "task_context": TASK_CONTEXT,
+    }
+    child_brief = briefs.render({**body, "render_task_context": False})
+    packet = build_child_packet(
+        mode="READ_ONLY",
+        delegation={"id": "deleg-a", "parent_task": "4101",
+                    "delegating_worker": "codex",
+                    "prohibitions": ["file_write", "git_commit"]},
+        objective="continue task A", acceptance="report with citations",
+        task_envelope_text=render_task_envelope(task_envelope), brief=child_brief)
+    assert "Acceptance: preserve provenance" in packet
+    assert "Do not use the legacy video lane" in packet
+    assert "Task B conflicting decision" not in packet
+    assert "operator://turn/2" in packet
+    assert packet.count("Do not use the legacy video lane") == 1
+
+
+@pytest.mark.asyncio
+async def test_exact_task_context_survives_semantic_timeout(db_session, monkeypatch):
+    import ai_team_sync.briefs as briefs
+    monkeypatch.setattr(briefs, "fetch_tower_task_context",
+                        lambda task_id, **kw: (TASK_CONTEXT, None))
+
+    def timeout(*args, **kwargs):
+        raise TimeoutError("semantic service timed out")
+
+    monkeypatch.setattr(briefs, "recall_memories", timeout)
+    body = await briefs.build_brief(
+        db_session, objective="continue task A", repo_root="", scope=[],
+        task_id=4101)
+    assert body["task_context"]["operator_rulings"]["current"][0]["id"] == "rule-b"
+    assert body["recall"] == []
+    assert body["recall_status"].startswith("unavailable")
+
+
+@pytest.mark.asyncio
+async def test_stale_high_scoring_semantic_hit_cannot_override_current_ruling(
+        db_session, monkeypatch):
+    import ai_team_sync.briefs as briefs
+    monkeypatch.setattr(briefs, "fetch_tower_task_context",
+                        lambda task_id, **kw: (TASK_CONTEXT, None))
+    monkeypatch.setattr(briefs, "rerank_by_similarity", lambda objective, items: items)
+    monkeypatch.setattr(briefs, "recall_memories", lambda *a, **kw: [{
+        "content": "STALE ARCHITECTURE: the legacy video lane is required",
+        "score": 0.999,
+        "payload": {"task_id": 4101, "trust": "operator_memory",
+                    "citation": "echo:stale/1"},
+    }])
+
+    body = await briefs.build_brief(
+        db_session, objective="continue task A", repo_root="", scope=[],
+        task_id=4101)
+    assert body["recall"][0]["provenance"] == SEMANTIC_MEMORY
+    rendered = body["rendered"]
+    assert rendered.index("Do not use the legacy video lane") < rendered.index(
+        "STALE ARCHITECTURE: the legacy video lane is required")

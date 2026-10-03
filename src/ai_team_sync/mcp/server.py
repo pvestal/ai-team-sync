@@ -587,6 +587,8 @@ async def list_tools() -> list[Tool]:
                               "description": "Path globs you expect to touch."},
                     "recall": {"type": "boolean",
                                "description": "Consult the configured memory service (default true)."},
+                    "task_id": {"type": "integer", "minimum": 1,
+                                "description": "Tower task id for exact rulings and ticket decisions."},
                 },
                 "required": ["objective"],
             },
@@ -1288,6 +1290,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         json={"objective": description,
                               "repo_root": arguments.get("repo_root", ""),
                               "scope": scope, "limit": 6,
+                              "task_id": data.get("ticket_id"),
                               # The session this brief is FOR. Without it the
                               # brief lists back the locks this very call just
                               # created, as BLOCKERS NOW (#2757).
@@ -1778,6 +1781,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         "repo_root": arguments.get("repo_root", ""),
                         "scope": arguments.get("scope", []),
                         "recall": arguments.get("recall", True),
+                        "task_id": arguments.get("task_id"),
                         "session_id": load_session_id() or "",
                     },
                     timeout=30,

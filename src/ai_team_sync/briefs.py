@@ -43,12 +43,59 @@ OBSERVATION = "OBSERVATION"            # raw evidence: a lock, a restart, a comm
 INFERRED = "INFERRED"                  # a model's interpretation, including mine
 VERIFIED = "VERIFIED"                  # backed by an artifact recorded alongside it
 OPERATOR_DECISION = "OPERATOR_DECISION"  # your ruling
+WORKER_PROPOSAL = "WORKER_PROPOSAL"    # a worker-authored ATS decision, never operator auth
+SEMANTIC_MEMORY = "SEMANTIC_MEMORY"    # ranked supplement, never execution authority
 
-_AUTHORITY_RANK = {OPERATOR_DECISION: 0, VERIFIED: 1, OBSERVATION: 2, INFERRED: 3}
+_AUTHORITY_RANK = {OPERATOR_DECISION: 0, VERIFIED: 1, OBSERVATION: 2,
+                   INFERRED: 3, WORKER_PROPOSAL: 3, SEMANTIC_MEMORY: 4}
 
 ECHO_URL = os.environ.get("ECHO_BRAIN_URL", "http://localhost:8309")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 EMBED_MODEL = os.environ.get("ATS_BRIEF_EMBED_MODEL", "nomic-embed-text")
+
+
+def _fetch_tower_task(task_id: str | int, *, timeout: float = 10.0
+                      ) -> tuple[dict[str, Any] | None, str | None]:
+    """(structured envelope, error) for one Tower task, from Echo Brain."""
+    try:
+        tid = int(str(task_id).strip().lstrip("#"))
+    except (TypeError, ValueError):
+        return None, f"task id {task_id!r} is not numeric"
+
+    import httpx  # lazy, matching this module's other network callers
+
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            r = c.get(f"{ECHO_URL}/api/tower-tasks/{tid}")
+    except Exception as exc:  # noqa: BLE001
+        return None, f"Echo Brain unreachable at {ECHO_URL} ({type(exc).__name__})"
+
+    if r.status_code == 404:
+        return None, f"no Tower task with id {tid}"
+    if r.status_code >= 400:
+        return None, f"Echo Brain returned HTTP {r.status_code} for task {tid}"
+
+    try:
+        env = r.json()
+    except Exception:  # noqa: BLE001
+        return None, f"Echo Brain returned a non-JSON envelope for task {tid}"
+    if not isinstance(env, dict) or "description" not in env:
+        return None, f"envelope for task {tid} is missing its description field"
+    if not isinstance(env.get("task_context"), dict):
+        return None, f"envelope for task {tid} has no structured task_context"
+    return env, None
+
+
+def fetch_tower_task_context(task_id: str | int, *, timeout: float = 10.0
+                             ) -> tuple[dict[str, Any], str | None]:
+    """Exact structured context for a Tower task; never semantic reconstruction."""
+    env, error = _fetch_tower_task(task_id, timeout=timeout)
+    if error:
+        return {}, error
+    context = (env or {}).get("task_context")
+    if not isinstance(context, dict):
+        return {}, f"envelope for task {task_id} has no structured task_context"
+    return context, None
 
 
 def fetch_tower_task_envelope(task_id: str | int, *, timeout: float = 10.0
@@ -62,32 +109,40 @@ def fetch_tower_task_envelope(task_id: str | int, *, timeout: float = 10.0
     and never a partial envelope. The caller decides what a missing envelope
     means; for a delegation that named the task explicitly, it means refuse.
     """
-    try:
-        tid = int(str(task_id).strip().lstrip("#"))
-    except (TypeError, ValueError):
-        return "", f"task id {task_id!r} is not numeric"
+    env, error = _fetch_tower_task(task_id, timeout=timeout)
+    return (render_task_envelope(env), None) if env is not None else ("", error)
 
-    import httpx  # lazy, matching this module's other network callers
 
-    try:
-        with httpx.Client(timeout=timeout) as c:
-            r = c.get(f"{ECHO_URL}/api/tower-tasks/{tid}")
-    except Exception as exc:  # noqa: BLE001
-        return "", f"Echo Brain unreachable at {ECHO_URL} ({type(exc).__name__})"
-
-    if r.status_code == 404:
-        return "", f"no Tower task with id {tid}"
-    if r.status_code >= 400:
-        return "", f"Echo Brain returned HTTP {r.status_code} for task {tid}"
-
-    try:
-        env = r.json()
-    except Exception:  # noqa: BLE001
-        return "", f"Echo Brain returned a non-JSON envelope for task {tid}"
-    if not isinstance(env, dict) or "description" not in env:
-        return "", f"envelope for task {tid} is missing its description field"
-
-    return render_task_envelope(env), None
+def render_task_context(context: dict[str, Any]) -> list[str]:
+    """Human rendering of structured authority; records remain intact in JSON."""
+    out: list[str] = []
+    rulings = context.get("operator_rulings") or {}
+    current = rulings.get("current") or []
+    history = rulings.get("history") or []
+    if current:
+        out += ["", "  CURRENT OPERATOR RULINGS / PROHIBITIONS:"]
+        out.append("    These reviewed structured records supersede conflicting legacy prose.")
+        for d in current:
+            marker = "PROHIBITION" if d.get("prohibition") else d.get("effect", "RULING")
+            out.append(f"    [{marker}] {d.get('ruling') or '(text unavailable; follow citation)'}")
+            out.append(f"      id={d.get('id')} operator={((d.get('author') or {}).get('name') or '?')} "
+                       f"source={((d.get('source') or {}).get('citation') or '?')}")
+    if history:
+        out += ["", "  NON-CURRENT RULING HISTORY (NOT AUTHORITY):"]
+        for d in history:
+            out.append(f"    [{str(d.get('state') or 'historical').upper()}] "
+                       f"{d.get('ruling') or '(text unavailable)'}")
+            out.append(f"      id={d.get('id')} superseded_by={d.get('superseded_by') or []}")
+    facts = context.get("verified_facts") or []
+    if facts:
+        out += ["", "  VERIFIED TASK FACTS:"]
+        for fact in facts:
+            out.append(f"    [VERIFIED] {json.dumps(fact.get('value'), default=str)}")
+            out.append(f"      source={fact.get('citation') or '?'}")
+    checks = context.get("requires_live_verification") or []
+    if checks:
+        out += ["", "  requires live verification: " + ", ".join(str(x) for x in checks)]
+    return out
 
 
 def render_task_envelope(env: dict[str, Any]) -> str:
@@ -129,8 +184,11 @@ def render_task_envelope(env: dict[str, Any]) -> str:
     elif env.get("verified_by"):
         out.append(f"  verified_by: {_json.dumps(env['verified_by'], default=str)}")
 
+    if isinstance(env.get("task_context"), dict):
+        out += render_task_context(env["task_context"])
+
     if env.get("recommendation"):
-        out += _lines("RECOMMENDATION / OPERATOR RULING ON THIS TASK:",
+        out += _lines("TASK RECOMMENDATION — LEGACY PROSE; OPERATOR IDENTITY NOT AUTHENTICATED:",
                       env["recommendation"])
 
     out += ["",
@@ -154,24 +212,22 @@ class BriefItem:
 
     def as_dict(self) -> dict[str, Any]:
         return {"provenance": self.provenance, "text": self.text,
-                "citation": self.citation, "score": round(self.score, 4)}
+                "citation": self.citation, "score": round(self.score, 4),
+                "meta": self.meta}
 
 
 def classify_memory(result: dict[str, Any]) -> str:
     """Provenance of one Echo Brain hit, read from the store, never guessed.
 
-    Echo stamps `payload.trust`; 'operator_memory' is the operator's own
-    standing rule. Anything else, including an absent marker, is INFERRED. The
-    asymmetry is deliberate: an unmarked memory must never be promoted by
-    default, because the default is what gets applied silently forever.
+    Semantic retrieval cannot prove current task authority. Even an
+    operator-curated source may be old, revoked, or about another task; exact
+    structured decisions are the only OPERATOR_DECISION path.
     """
-    payload = result.get("payload") or {}
-    trust = str(payload.get("trust") or "").lower()
-    if trust in ("operator_memory", "operator", "operator_decision"):
-        return OPERATOR_DECISION
-    if trust in ("verified", "artifact"):
-        return VERIFIED
-    return INFERRED
+    # A vector payload can report its source standing, but it cannot prove that
+    # a ruling is current, task-bound, human-reviewed, or not superseded. Exact
+    # structured context owns those claims. Keep the trust marker in metadata;
+    # the semantic hit itself remains supplemental.
+    return SEMANTIC_MEMORY
 
 
 def _embed(texts: list[str]) -> list[list[float]]:
@@ -244,13 +300,23 @@ def compress(items: list[BriefItem], max_items: int = 8,
     return out
 
 
-def recall_memories(objective: str, limit: int = 12) -> list[dict[str, Any]]:
+def recall_memories(objective: str, limit: int = 12, *, task_id: int | None = None,
+                    task_key: str | None = None, project_id: int | None = None,
+                    repo_root: str = "") -> list[dict[str, Any]]:
     """Echo Brain hybrid search. Synchronous by design so it can be swapped in
     tests and run off the event loop via a thread."""
     import httpx
 
-    resp = httpx.post(f"{ECHO_URL}/api/echo/memory/search",
-                      json={"query": objective, "limit": limit}, timeout=10)
+    body: dict[str, Any] = {"query": objective, "limit": limit}
+    if task_id is not None:
+        body["task_id"] = task_id
+    if task_key:
+        body["task_key"] = task_key
+    if project_id is not None:
+        body["project_id"] = project_id
+    if repo_root:
+        body["repo_root"] = repo_root
+    resp = httpx.post(f"{ECHO_URL}/api/echo/memory/search", json=body, timeout=10)
     resp.raise_for_status()
     return resp.json().get("results") or []
 
@@ -338,7 +404,9 @@ def preflight_hint(decisions: list[BriefItem], recall: list[BriefItem]
 async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
                       scope: list[str] | None = None, recall: bool = True,
                       limit: int = 8, caller_session_id: str | None = None,
-                      caller_identity_unresolved: bool = False) -> dict[str, Any]:
+                      caller_identity_unresolved: bool = False,
+                      task_id: int | None = None,
+                      render_task_context: bool = True) -> dict[str, Any]:
     """Assemble the packet. ATS state is authoritative and local; Echo Brain
     recall is additive and may be absent.
 
@@ -371,19 +439,32 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
         and not (caller_session_id and lk.session_id == caller_session_id)
     ]
 
+    decision_query = select(Decision).options(selectinload(Decision.session))
+    if task_id is not None:
+        decision_query = decision_query.where(Decision.ticket_id == task_id)
     decision_rows = (await db.execute(
-        select(Decision).options(selectinload(Decision.session))
-        .order_by(Decision.created_at.desc()).limit(60)
+        decision_query.order_by(Decision.created_at.desc()).limit(60)
     )).scalars().all()
     decisions = [
         BriefItem(
-            INFERRED,
+            WORKER_PROPOSAL,
             f"{d.title} — chose: {d.chosen}" + (f" (because {d.reasoning})" if d.reasoning else ""),
             f"ats:decision/{d.id} by {d.session.agent}",
+            meta={"category": WORKER_PROPOSAL, "decision_id": d.id,
+                  "ticket_id": d.ticket_id, "author": d.session.agent,
+                  "authenticated_operator": False,
+                  "created_at": d.created_at.isoformat() if d.created_at else None},
         )
         for d in decision_rows
         if d.session and _same_repo(d.session.repo_root, repo_root)
     ]
+
+    task_context: dict[str, Any] = {}
+    task_context_status = "not requested"
+    if task_id is not None:
+        task_context, task_error = await asyncio.to_thread(
+            fetch_tower_task_context, task_id)
+        task_context_status = f"unavailable ({task_error})" if task_error else "ok"
 
     prior_rows = (await db.execute(
         select(Session).options(selectinload(Session.commits))
@@ -405,10 +486,14 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
     recall_status = "skipped"
     if recall:
         try:
-            results = await asyncio.to_thread(recall_memories, objective, 12)
+            results = await asyncio.to_thread(
+                recall_memories, objective, 12, task_id=task_id,
+                repo_root=repo_root)
             memories = [
                 BriefItem(classify_memory(r), str(r.get("content") or ""),
-                          _memory_citation(r), float(r.get("score") or 0.0))
+                          _memory_citation(r), float(r.get("score") or 0.0),
+                          {"payload": r.get("payload") or r.get("metadata") or {},
+                           "task_scoped": task_id is not None})
                 for r in results
             ]
             recall_status = f"ok ({len(memories)} candidate(s))"
@@ -435,6 +520,10 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
         "scope": scope,
         "caller_session_id": caller_session_id,
         "caller_identity_unresolved": caller_identity_unresolved,
+        "task_id": task_id,
+        "task_context": task_context,
+        "task_context_status": task_context_status,
+        "render_task_context": render_task_context,
         "blockers": [i.as_dict() for i in compress(blockers, max_items=limit)],
         "decisions": [i.as_dict() for i in compress(decisions, max_items=limit)],
         "prior_work": [i.as_dict() for i in compress(prior_work, max_items=limit)],
@@ -453,11 +542,22 @@ def render(packet: dict[str, Any]) -> str:
     if packet.get("scope"):
         lines.append("scope: " + ", ".join(packet["scope"]))
 
+    context = packet.get("task_context") or {}
+    if context and packet.get("render_task_context", True):
+        lines += ["", "EXACT TASK-SCOPED CONTEXT — authoritative structured records"]
+        lines += render_task_context(context)
+    elif packet.get("task_id") and packet.get("render_task_context", True):
+        lines += ["", "EXACT TASK-SCOPED CONTEXT UNAVAILABLE",
+                  f"  {packet.get('task_context_status')}",
+                  "  Do not infer current rulings or prohibitions from semantic recall."]
+
+    recall_title = ("TASK-SCOPED SEMANTIC SUPPLEMENT" if packet.get("task_id")
+                    else "UNSCOPED SEMANTIC RECALL")
     sections = [
         ("BLOCKERS NOW", "blockers"),
         ("PRIOR DECISIONS", "decisions"),
         ("PRIOR WORK IN THIS SCOPE", "prior_work"),
-        ("RECALL", "recall"),
+        (recall_title, "recall"),
     ]
     for title, key in sections:
         items = packet.get(key) or []

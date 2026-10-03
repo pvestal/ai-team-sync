@@ -125,11 +125,39 @@ def test_a_closed_task_warns_before_any_work():
     assert "128483f5" in packet
 
 
-def test_an_operator_ruling_on_the_task_reaches_the_child():
+def test_legacy_task_recommendation_reaches_child_without_false_operator_provenance():
     ruled = dict(ENVELOPE, recommendation="OPERATOR DECISION: do not implement Option D.")
     packet = _packet(task_envelope_text=render_task_envelope(ruled))
-    assert "OPERATOR RULING" in packet
+    assert "LEGACY PROSE; OPERATOR IDENTITY NOT AUTHENTICATED" in packet
     assert "do not implement Option D" in packet
+
+
+def test_structured_current_ruling_and_superseded_history_reach_every_child():
+    context = {
+        "version": 1,
+        "task": {"id": 2649, "key": ENVELOPE["task_key"], "project_id": 20},
+        "operator_rulings": {
+            "current": [{"id": "new", "effect": "BLOCK", "state": "current",
+                         "ruling": "Do not use substring matching.",
+                         "prohibition": True,
+                         "author": {"name": "patrick"},
+                         "source": {"citation": "operator://turn/new"}}],
+            "history": [{"id": "old", "effect": "ALLOW", "state": "superseded",
+                         "ruling": "Substring matching is allowed.",
+                         "superseded_by": ["new"]}],
+        },
+        "prohibitions": ["new"],
+        "verified_facts": [],
+        "requires_live_verification": ["git", "database", "services"],
+    }
+    packet = _packet(task_envelope_text=render_task_envelope(
+        dict(ENVELOPE, task_context=context)))
+    assert "[PROHIBITION] Do not use substring matching" in packet
+    assert "NON-CURRENT RULING HISTORY (NOT AUTHORITY)" in packet
+    assert "[SUPERSEDED] Substring matching is allowed" in packet
+    assert packet.index("Do not use substring matching") < packet.index(
+        "Substring matching is allowed")
+    assert packet.index("TASK AUTHORITY") < packet.index("OBJECTIVE")
 
 
 # ── 2. both workers receive the SAME authority ───────────────────────────────

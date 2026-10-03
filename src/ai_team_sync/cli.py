@@ -755,7 +755,12 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         try:
             b = c.post(f"{server}/api/brief", json={
                 "objective": objective, "repo_root": repo,
-                "scope": list(scope), "limit": 6}, timeout=40)
+                "scope": list(scope), "limit": 6,
+                "task_id": int(parent_task) if parent_task else None,
+                # The authoritative envelope directly above already renders
+                # exact context. Keep it structured in the brief response but
+                # do not repeat it in the child prompt.
+                "render_task_context": not bool(parent_task)}, timeout=40)
             brief = (b.json() or {}).get("rendered", "")
         except Exception as exc:  # noqa: BLE001
             brief = f"(no brief: {type(exc).__name__})"
