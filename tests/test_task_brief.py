@@ -333,6 +333,8 @@ def test_explicit_task_syntax_excludes_incidental_hash_references():
     assert explicit_task_id("continue Tower task #3477") == 3477
     assert explicit_task_id("fix regression from PR #28") is None
     assert explicit_task_id("Linked: #2928") is None
+    assert explicit_task_id("retry the task 3 times") is None
+    assert explicit_task_id("#3477 and #3492") is None
     assert explicit_task_id("compare task #3477 and ticket #3492") is None
 
 
@@ -352,6 +354,9 @@ def test_ats_renderer_preserves_non_current_labels_from_echo_contract():
 
     assert "HISTORICAL / LEGACY NOTES (NOT CURRENT AUTHORITY)" in text
     assert "historical closure evidence (task is currently open)" in text
+    assert "historical closure evidence (task is currently open; " \
+           "not current VERIFIED)" in text
+    assert '  verified_by: {"commit": "abc123"}' not in text
     assert "EXACT SUCCESSOR REFERENCES (NOT STRUCTURED AUTHORITY)" in text
     assert "current_authority=false" in text
 

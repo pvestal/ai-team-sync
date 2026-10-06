@@ -194,7 +194,7 @@ def resolve_tower_task(objective: str, *, timeout: float = 10.0
 
 _EXPLICIT_TASK_PATTERNS = (
     re.compile(r"^\s*#([1-9][0-9]*)\b", re.IGNORECASE),
-    re.compile(r"\b(?:tower\s+)?(?:task|ticket)\s*#?([1-9][0-9]*)\b",
+    re.compile(r"\b(?:tower\s+)?(?:task|ticket)\s*#([1-9][0-9]*)\b",
                re.IGNORECASE),
     re.compile(r"^\s*(?:continue|resume|work\s+on)\s+#([1-9][0-9]*)\b",
                re.IGNORECASE),
@@ -205,6 +205,9 @@ def explicit_task_id(objective: str) -> int | None:
     """One explicit task/ticket identity, excluding incidental ``#`` refs."""
     ids = {int(match.group(1)) for pattern in _EXPLICIT_TASK_PATTERNS
            for match in pattern.finditer(objective or "")}
+    if re.match(r"^\s*#[1-9][0-9]*\b", objective or ""):
+        ids.update(int(value) for value in re.findall(
+            r"#([1-9][0-9]*)\b", objective or ""))
     return next(iter(ids)) if len(ids) == 1 else None
 
 
@@ -332,7 +335,9 @@ def render_task_envelope(env: dict[str, Any]) -> str:
                 "      Verify before doing anything. Closure evidence:",
                 f"      {_json.dumps(env.get('verified_by'), default=str)}"]
     elif env.get("verified_by"):
-        out.append(f"  verified_by: {_json.dumps(env['verified_by'], default=str)}")
+        out.append("  historical closure evidence (task is currently open; "
+                   "not current VERIFIED): "
+                   + _json.dumps(env["verified_by"], default=str))
 
     if isinstance(env.get("task_context"), dict):
         out += render_task_context(env["task_context"])
