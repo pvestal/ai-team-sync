@@ -697,6 +697,17 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
                     return parsed if isinstance(parsed, list) else []
                 except Exception:  # noqa: BLE001
                     return []
+            task_updated_at: datetime | None = None
+            try:
+                raw_updated = task_envelope.get("updated_at")
+                if raw_updated:
+                    task_updated_at = datetime.fromisoformat(
+                        str(raw_updated).replace("Z", "+00:00"))
+            except (TypeError, ValueError):
+                task_updated_at = None
+            handoff_created_at = _aware(handoff.created_at) if handoff.created_at else None
+            superseded = bool(task_updated_at and handoff_created_at
+                              and _aware(task_updated_at) > handoff_created_at)
             latest_handoff = {
                 "id": handoff.id,
                 "ticket_id": handoff.ticket_id,
@@ -707,6 +718,8 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
                 "artifacts": _json_list(handoff.artifacts),
                 "created_at": (handoff.created_at.isoformat()
                                if handoff.created_at else None),
+                "authority_state": "superseded" if superseded else "current",
+                "superseded_by": "tower_task.updated_at" if superseded else None,
             }
 
     packet = {
@@ -772,10 +785,17 @@ def render(packet: dict[str, Any]) -> str:
 
     handoff = packet.get("latest_handoff") or None
     if handoff:
-        lines += ["", "LATEST AUTHORITATIVE TASK HANDOFF",
+        handoff_title = (
+            "LATEST TASK HANDOFF — SUPERSEDED BY NEWER TOWER STATE"
+            if handoff.get("authority_state") == "superseded"
+            else "LATEST AUTHORITATIVE TASK HANDOFF")
+        lines += ["", handoff_title,
                   f"  verdict: {handoff.get('verdict')}",
                   f"  source: ats:handoff/{handoff.get('id')} from session "
                   f"{handoff.get('source_session_id')} at {handoff.get('created_at')}"]
+        if handoff.get("authority_state") == "superseded":
+            lines.append("  Historical continuation context only; current Tower "
+                         "identity/status/scope/relations above take precedence.")
         if handoff.get("blockers"):
             lines.append("  blockers: " + ", ".join(map(str, handoff["blockers"])))
         if handoff.get("next_steps"):

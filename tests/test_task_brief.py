@@ -296,6 +296,7 @@ TASK_ENVELOPE = {
     "verified_by": {"commit": "abc123"},
     "claim": None,
     "is_closed": False,
+    "updated_at": "2026-10-04T20:00:00+00:00",
     "task_context": TASK_CONTEXT,
     "relations": {
         "children": [
@@ -314,11 +315,11 @@ TASK_ENVELOPE = {
 }
 
 
-def _exact_envelope(monkeypatch):
+def _exact_envelope(monkeypatch, envelope=TASK_ENVELOPE):
     import ai_team_sync.briefs as briefs
     monkeypatch.setattr(
         briefs, "fetch_tower_task_data",
-        lambda task_id, **kw: (TASK_ENVELOPE, None),
+        lambda task_id, **kw: (envelope, None),
         raising=False,
     )
     monkeypatch.setattr(briefs, "recall_memories", lambda *a, **kw: [])
@@ -442,6 +443,39 @@ async def test_latest_ticket_handoff_is_current_and_older_handoff_is_not_competi
     assert body["latest_handoff"]["verdict"] == "Phase A deployed"
     assert "Phase A deployed" in body["rendered"]
     assert "Phase A migrations not applied" not in body["rendered"]
+
+
+@pytest.mark.asyncio
+async def test_latest_handoff_predating_newer_tower_state_is_labeled_superseded(
+        db_session, monkeypatch):
+    from copy import deepcopy
+    from datetime import datetime, timezone
+
+    import ai_team_sync.briefs as briefs
+    from ai_team_sync.models import Handoff, Session
+
+    envelope = deepcopy(TASK_ENVELOPE)
+    envelope["updated_at"] = "2026-10-05T23:44:55+00:00"
+    _exact_envelope(monkeypatch, envelope)
+    source = Session(developer="patrick", agent="codex:old", scope="[]",
+                     description="old", repo_root="", ticket_id=4101,
+                     status="completed")
+    db_session.add(source)
+    await db_session.flush()
+    db_session.add(Handoff(
+        ticket_id=4101, source_session_id=source.id,
+        verdict="Retrieval tranche closed except old residuals",
+        blockers="[]", next_steps="[]", artifacts="[]",
+        created_at=datetime(2026, 10, 4, 20, 45, tzinfo=timezone.utc)))
+    await db_session.commit()
+
+    body = await briefs.build_brief(
+        db_session, objective="continue task A", task_id=4101, recall=False)
+
+    assert body["latest_handoff"]["authority_state"] == "superseded"
+    assert body["latest_handoff"]["superseded_by"] == "tower_task.updated_at"
+    assert "LATEST TASK HANDOFF — SUPERSEDED BY NEWER TOWER STATE" in body["rendered"]
+    assert "LATEST AUTHORITATIVE TASK HANDOFF" not in body["rendered"]
 
 
 @pytest.mark.asyncio
