@@ -335,6 +335,7 @@ def test_explicit_task_syntax_excludes_incidental_hash_references():
     assert explicit_task_id("Linked: #2928") is None
     assert explicit_task_id("retry the task 3 times") is None
     assert explicit_task_id("#3477 and #3492") is None
+    assert explicit_task_id("Continue #3477 and #3492") is None
     assert explicit_task_id("compare task #3477 and ticket #3492") is None
 
 

@@ -205,7 +205,7 @@ def explicit_task_id(objective: str) -> int | None:
     """One explicit task/ticket identity, excluding incidental ``#`` refs."""
     ids = {int(match.group(1)) for pattern in _EXPLICIT_TASK_PATTERNS
            for match in pattern.finditer(objective or "")}
-    if re.match(r"^\s*#[1-9][0-9]*\b", objective or ""):
+    if ids:
         ids.update(int(value) for value in re.findall(
             r"#([1-9][0-9]*)\b", objective or ""))
     return next(iter(ids)) if len(ids) == 1 else None
