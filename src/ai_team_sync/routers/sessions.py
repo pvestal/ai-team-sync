@@ -8,6 +8,7 @@ import hmac
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from fnmatch import fnmatch
@@ -19,11 +20,11 @@ from sqlalchemy.orm import selectinload
 
 from ai_team_sync.database import get_db
 from ai_team_sync.background_tasks import replace_lifecycle_marker
-from ai_team_sync.models import AgentMessage, Handoff, ScopeLock, Session
+from ai_team_sync.models import AgentMessage, CommitRecord, Handoff, ScopeLock, Session
 from ai_team_sync.message_lifecycle import append_delivery_event, release_unread_ticket_messages
 from ai_team_sync.git_utils import uncommitted_for_scope
 from ai_team_sync.notifications.dispatcher import dispatch
-from ai_team_sync.schemas import SessionCreate, SessionResponse, SessionUpdate
+from ai_team_sync.schemas import CommitCreate, CommitResponse, SessionCreate, SessionResponse, SessionUpdate
 from ai_team_sync.workers import registry
 from ai_team_sync.delegation import effective_authority
 from ai_team_sync.models import Delegation
@@ -1645,3 +1646,51 @@ async def heartbeat_session(session_id: str, request: Request, db: AsyncSession 
         # write transaction holds the whole-file lock for its duration.
         await dispatch_resurrection(session, restoration)
     return _session_to_response(session, restoration=restoration)
+
+
+_COMMIT_HASH = re.compile(r"[0-9a-f]{40}")
+
+
+@router.post("/{session_id}/commits", response_model=CommitResponse, status_code=201)
+async def record_commit(
+    session_id: str, body: CommitCreate, request: Request, response: Response,
+    db: AsyncSession = Depends(get_db),
+):
+    """Record a commit against a session. Called by hooks/post_commit.py.
+
+    The hook shipped in the initial scaffold posting here, but the route was never
+    written, so every commit 404'd silently and commit_count stayed 0. The reaper
+    also reads max(CommitRecord.created_at) as activity, so a session that only
+    committed looked idle -- which is why this is owner-only, like heartbeat (#2741).
+    """
+    if body.session_id != session_id:
+        raise HTTPException(422, "body session_id does not match the path")
+    commit_hash = body.commit_hash.strip().lower()
+    if not _COMMIT_HASH.fullmatch(commit_hash):
+        raise HTTPException(422, "commit_hash must be a 40-character hex SHA-1")
+
+    session = await db.get(Session, session_id)
+    if not session:
+        raise HTTPException(404, "Session not found")
+
+    from ai_team_sync.routers.locks import cross_account
+    if cross_account(peer_identity.peer_uid_for_request(request), session, any_status=True):
+        raise HTTPException(403, detail={
+            "error": "session_not_yours",
+            "message": f"session {session.id} belongs to another OS account",
+            "session_id": session.id})
+    if session.status not in ("active", "paused"):
+        raise HTTPException(409, f"Session is {session.status}; commit not recorded. "
+                                 "Start a new session.")
+
+    existing = await db.scalar(select(CommitRecord).where(
+        CommitRecord.session_id == session_id, CommitRecord.commit_hash == commit_hash))
+    if existing:
+        response.status_code = 200
+        return existing
+
+    record = CommitRecord(session_id=session_id, commit_hash=commit_hash, message=body.message)
+    db.add(record)
+    await db.commit()
+    await db.refresh(record)
+    return record
