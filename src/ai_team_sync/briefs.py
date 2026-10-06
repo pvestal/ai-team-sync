@@ -192,12 +192,19 @@ def resolve_tower_task(objective: str, *, timeout: float = 10.0
     return result, None
 
 
-_EXPLICIT_TASK = re.compile(r"(?<![A-Za-z0-9_])#([1-9][0-9]*)\b")
+_EXPLICIT_TASK_PATTERNS = (
+    re.compile(r"^\s*#([1-9][0-9]*)\b", re.IGNORECASE),
+    re.compile(r"\b(?:tower\s+)?(?:task|ticket)\s*#?([1-9][0-9]*)\b",
+               re.IGNORECASE),
+    re.compile(r"^\s*(?:continue|resume|work\s+on)\s+#([1-9][0-9]*)\b",
+               re.IGNORECASE),
+)
 
 
 def explicit_task_id(objective: str) -> int | None:
-    """One explicit ``#123`` is identity; multiple ids are ambiguity."""
-    ids = {int(match) for match in _EXPLICIT_TASK.findall(objective or "")}
+    """One explicit task/ticket identity, excluding incidental ``#`` refs."""
+    ids = {int(match.group(1)) for pattern in _EXPLICIT_TASK_PATTERNS
+           for match in pattern.finditer(objective or "")}
     return next(iter(ids)) if len(ids) == 1 else None
 
 
@@ -287,7 +294,10 @@ def render_task_envelope(env: dict[str, Any]) -> str:
                 f"    #{child.get('id')} [{child.get('status')}]"
                 f"{residual} {child.get('title') or child.get('task_key') or ''}")
             if child.get("verified_by"):
-                out.append("      deployed/live evidence: "
+                evidence_label = ("deployed/live evidence" if child.get("status") in {
+                    "completed", "skipped", "cancelled"}
+                    else "historical closure evidence (task is currently open)")
+                out.append(f"      {evidence_label}: "
                            + _json.dumps(child["verified_by"], default=str))
     dependencies = relations.get("dependencies") or []
     if dependencies:
@@ -301,6 +311,14 @@ def render_task_envelope(env: dict[str, Any]) -> str:
         for successor in successors:
             out.append(f"    #{successor.get('id')} [{successor.get('status')}] "
                        f"{successor.get('title') or successor.get('task_key') or ''}")
+    successor_references = relations.get("successor_references") or []
+    if successor_references:
+        out += ["", "  EXACT SUCCESSOR REFERENCES (NOT STRUCTURED AUTHORITY):"]
+        for successor in successor_references:
+            out.append(f"    #{successor.get('id')} [{successor.get('status')}] "
+                       f"{successor.get('title') or successor.get('task_key') or ''}")
+            out.append(f"      source={successor.get('citation')} authority="
+                       "EXACT_TASK_REFERENCE current_authority=false")
 
     claim = env.get("claim") or None
     if claim:
@@ -330,7 +348,8 @@ def render_task_envelope(env: dict[str, Any]) -> str:
     out += [f"    {ln}" for ln in (env.get("description") or "(empty)").splitlines()]
 
     if env.get("notes"):
-        out += _lines("NOTES:", env["notes"])
+        out += _lines("HISTORICAL / LEGACY NOTES (NOT CURRENT AUTHORITY):",
+                      env["notes"])
     return "\n".join(out)
 
 
@@ -788,7 +807,8 @@ def render(packet: dict[str, Any]) -> str:
         handoff_title = (
             "LATEST TASK HANDOFF — SUPERSEDED BY NEWER TOWER STATE"
             if handoff.get("authority_state") == "superseded"
-            else "LATEST AUTHORITATIVE TASK HANDOFF")
+            else ("LATEST CURRENT TASK HANDOFF (WORKER CONTINUATION; BELOW "
+                  "TOWER / OPERATOR AUTHORITY)"))
         lines += ["", handoff_title,
                   f"  verdict: {handoff.get('verdict')}",
                   f"  source: ats:handoff/{handoff.get('id')} from session "

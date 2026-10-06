@@ -325,6 +325,37 @@ def _exact_envelope(monkeypatch, envelope=TASK_ENVELOPE):
     monkeypatch.setattr(briefs, "recall_memories", lambda *a, **kw: [])
 
 
+def test_explicit_task_syntax_excludes_incidental_hash_references():
+    from ai_team_sync.briefs import explicit_task_id
+
+    assert explicit_task_id("#3477 personal-data recovery") == 3477
+    assert explicit_task_id("continue #3477") == 3477
+    assert explicit_task_id("continue Tower task #3477") == 3477
+    assert explicit_task_id("fix regression from PR #28") is None
+    assert explicit_task_id("Linked: #2928") is None
+    assert explicit_task_id("compare task #3477 and ticket #3492") is None
+
+
+def test_ats_renderer_preserves_non_current_labels_from_echo_contract():
+    from copy import deepcopy
+    from ai_team_sync.briefs import render_task_envelope
+
+    envelope = deepcopy(TASK_ENVELOPE)
+    envelope["notes"] = "Phase A migrations not applied."
+    envelope["relations"]["children"][0]["verified_by"] = {"commit": "old-close"}
+    envelope["relations"]["successor_references"] = [{
+        "id": 4200, "task_key": "next", "title": "Next task", "status": "pending",
+        "citation": "tower-task/4101#notes", "current_authority": False,
+    }]
+
+    text = render_task_envelope(envelope)
+
+    assert "HISTORICAL / LEGACY NOTES (NOT CURRENT AUTHORITY)" in text
+    assert "historical closure evidence (task is currently open)" in text
+    assert "EXACT SUCCESSOR REFERENCES (NOT STRUCTURED AUTHORITY)" in text
+    assert "current_authority=false" in text
+
+
 @pytest.mark.asyncio
 async def test_free_text_single_task_resolution_uses_the_exact_ticket_pipeline(
         db_session, monkeypatch):
@@ -490,6 +521,15 @@ async def test_first_resolved_task_brief_binds_session_for_later_handoff(
         raising=False,
     )
     _exact_envelope(monkeypatch)
+    source = await client.post("/api/sessions", json={
+        "developer": "patrick", "agent": "codex:source", "scope": [],
+        "description": "predecessor", "repo_root": "/repo", "ticket_id": 4101})
+    source_token = source.headers["X-ATS-Approval-Token"]
+    handed_off = await client.patch(f"/api/sessions/{source.json()['id']}", json={
+        "status": "completed", "summary": "predecessor complete",
+        "handoff": {"verdict": "Continue exact residual"},
+    }, headers={"X-ATS-Approval-Token": source_token})
+    assert handed_off.status_code == 200, handed_off.text
     started = await client.post("/api/sessions", json={
         "developer": "patrick", "agent": "codex", "scope": [],
         "description": "continue the synthetic task A residual", "repo_root": "/repo"})
@@ -505,6 +545,11 @@ async def test_first_resolved_task_brief_binds_session_for_later_handoff(
 
     session = await client.get(f"/api/sessions/{sid}")
     assert session.json()["ticket_id"] == 4101
+    inbox = await client.get(f"/api/sessions/{sid}/messages",
+                             headers={"X-ATS-Approval-Token": token})
+    assert any(message["kind"] == "handoff"
+               and "Continue exact residual" in message["body"]
+               for message in inbox.json())
     completed = await client.patch(f"/api/sessions/{sid}", json={
         "status": "completed", "summary": "done",
         "handoff": {"verdict": "Continue residual"},

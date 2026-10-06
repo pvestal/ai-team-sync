@@ -70,7 +70,8 @@ async def post_brief(body: BriefRequest, request: Request,
                 # First task resolution may add handoff lineage, but never task
                 # close authority.  The exact session capability is required;
                 # same-account read identity alone is deliberately insufficient.
-                from ai_team_sync.routers.sessions import _require_session_capability
+                from ai_team_sync.routers.sessions import (bind_ticket_lineage,
+                                                            _require_session_capability)
                 try:
                     _require_session_capability(request, session)
                 except HTTPException as exc:
@@ -79,7 +80,7 @@ async def post_brief(body: BriefRequest, request: Request,
                     packet["session_linkage"] = {
                         "status": "authorization_required", "task_id": resolved_task_id}
                 else:
-                    session.ticket_id = resolved_task_id
+                    await bind_ticket_lineage(db, session, resolved_task_id)
                     await db.commit()
                     packet["session_linkage"] = {
                         "status": "bound", "task_id": resolved_task_id}

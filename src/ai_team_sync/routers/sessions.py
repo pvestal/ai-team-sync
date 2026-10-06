@@ -58,6 +58,63 @@ async def _queue_ticket_event(db: AsyncSession, session: Session, body: str) -> 
         db.add(message)
 
 
+async def _claim_deferred_ticket_messages(
+        db: AsyncSession, session: Session, *, claim_before: datetime) -> None:
+    """Assign the ticket mailbox to its first same-account claimant."""
+    if session.ticket_id is None or session.creator_uid is None:
+        return
+    queued = (await db.execute(select(AgentMessage.id).where(
+        AgentMessage.ticket_id == session.ticket_id,
+        AgentMessage.addressing_mode == "ticket",
+        AgentMessage.acknowledged_at.is_(None),
+        AgentMessage.recipient_session_id.is_(None),
+        AgentMessage.sender_session_id != session.id,
+        AgentMessage.created_at <= claim_before,
+        AgentMessage.sender_session_id.in_(select(Session.id).where(
+            Session.creator_uid == session.creator_uid)),
+    ))).scalars().all()
+    for message_id in queued:
+        claimed = await db.execute(update(AgentMessage).where(
+            AgentMessage.id == message_id,
+            AgentMessage.ticket_id == session.ticket_id,
+            AgentMessage.addressing_mode == "ticket",
+            AgentMessage.acknowledged_at.is_(None),
+            AgentMessage.recipient_session_id.is_(None),
+            AgentMessage.sender_session_id.in_(select(Session.id).where(
+                Session.creator_uid == session.creator_uid)),
+        ).values(recipient_session_id=session.id, recipient_agent=session.agent))
+        if claimed.rowcount:
+            message = await db.get(AgentMessage, message_id)
+            if message:
+                message.recipient_session_id = session.id
+                message.recipient_agent = session.agent
+                append_delivery_event(message, "assigned", session.id, "ticket_claim")
+            if message and message.handoff_id:
+                handoff = await db.get(Handoff, message.handoff_id)
+                if handoff is not None:
+                    handoff.recipient_session_id = session.id
+
+
+async def bind_ticket_lineage(db: AsyncSession, session: Session,
+                              ticket_id: int) -> None:
+    """Late-bind handoff lineage only; never grants ``task_id`` close authority.
+
+    Authorization belongs to the caller. This helper preserves the same ticket
+    mailbox and peer-notification lifecycle as creation-time binding.
+    """
+    if session.ticket_id is not None and session.ticket_id != ticket_id:
+        raise ValueError("session already has different ticket lineage")
+    session.ticket_id = ticket_id
+    await db.flush()
+    await _claim_deferred_ticket_messages(
+        db, session, claim_before=datetime.now(timezone.utc))
+    await _queue_ticket_event(
+        db, session,
+        f"Session {session.id} ({session.agent}) resolved and bound to ticket "
+        f"#{ticket_id}: {session.description}",
+    )
+
+
 def _session_liveness(s: Session) -> tuple[float | None, bool]:
     """Idle seconds since the session's most recent activity, and whether it is
     'stale' — silent past the heartbeat window (session_heartbeat_timeout_minutes,
@@ -1153,38 +1210,8 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
     await db.flush()  # Ensure session.id is populated
     # Claim deferred messages atomically for the FIRST later session on this
     # ticket. The ticket is coordination metadata; this grants no task authority.
-    if body.ticket_id is not None and session.creator_uid is not None:
-        queued = (await db.execute(select(AgentMessage.id).where(
-            AgentMessage.ticket_id == body.ticket_id,
-            AgentMessage.addressing_mode == "ticket",
-            AgentMessage.acknowledged_at.is_(None),
-            AgentMessage.recipient_session_id.is_(None),
-            AgentMessage.sender_session_id != session.id,
-            AgentMessage.created_at <= session.started_at,
-            AgentMessage.sender_session_id.in_(select(Session.id).where(
-                Session.creator_uid == session.creator_uid)),
-        ))).scalars().all()
-        for message_id in queued:
-            claimed = await db.execute(update(AgentMessage).where(
-                AgentMessage.id == message_id,
-                AgentMessage.ticket_id == body.ticket_id,
-                AgentMessage.addressing_mode == "ticket",
-                AgentMessage.acknowledged_at.is_(None),
-                AgentMessage.recipient_session_id.is_(None),
-                AgentMessage.sender_session_id.in_(select(Session.id).where(
-                    Session.creator_uid == session.creator_uid)),
-            ).values(recipient_session_id=session.id, recipient_agent=session.agent))
-            if claimed.rowcount:
-                message = await db.get(AgentMessage, message_id)
-                if message:
-                    message.recipient_session_id = session.id
-                    message.recipient_agent = session.agent
-                    append_delivery_event(message, "assigned", session.id,
-                                          "ticket_claim")
-                if message and message.handoff_id:
-                    handoff = await db.get(Handoff, message.handoff_id)
-                    if handoff is not None:
-                        handoff.recipient_session_id = session.id
+    await _claim_deferred_ticket_messages(
+        db, session, claim_before=session.started_at)
     if delegation is not None:
         delegation.child_session_id = session.id
 
