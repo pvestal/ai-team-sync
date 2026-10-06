@@ -1343,6 +1343,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                                   # brief lists back the locks this very call just
                                   # created, as BLOCKERS NOW (#2757).
                                   "session_id": data["id"]},
+                            headers={"X-ATS-Approval-Token": _IN_PROCESS_APPROVAL_TOKEN},
                             timeout=25,
                         )
                         brief_resp.raise_for_status()
@@ -1822,6 +1823,15 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 return [TextContent(type="text", text="\n".join(lines))]
 
             elif name == "task_brief":
+                brief_session_id = load_session_id() or ""
+                brief_headers = {}
+                if brief_session_id:
+                    from ai_team_sync import session_pointer as sp
+                    brief_token = ((_IN_PROCESS_APPROVAL_TOKEN
+                                    if brief_session_id == _IN_PROCESS_SESSION_ID else "")
+                                   or sp.load_approval_token(brief_session_id))
+                    if brief_token:
+                        brief_headers["X-ATS-Approval-Token"] = brief_token
                 response = await client.post(
                     f"{SERVER_URL}/api/brief",
                     json={
@@ -1830,8 +1840,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         "scope": arguments.get("scope", []),
                         "recall": arguments.get("recall", True),
                         "task_id": arguments.get("task_id"),
-                        "session_id": load_session_id() or "",
+                        "session_id": brief_session_id,
                     },
+                    headers=brief_headers,
                     timeout=30,
                 )
                 if response.status_code >= 400:

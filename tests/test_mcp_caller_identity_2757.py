@@ -117,7 +117,7 @@ async def test_named_start_session_refuses_before_creating_a_session(
     transport = _wire(monkeypatch, db_engine, tmp_path)
     monkeypatch.setenv("ATS_AGENT", "claude-code")
     monkeypatch.setattr(
-        briefs, "fetch_tower_task_context",
+        briefs, "fetch_tower_task_data",
         lambda task_id, **kw: ({}, "Echo Brain unreachable (TimeoutException)"))
 
     out = await mcp.call_tool("start_session", {
@@ -135,12 +135,12 @@ async def test_named_start_session_refuses_before_creating_a_session(
 async def test_named_start_session_succeeds_with_exact_context(
         db_engine, monkeypatch, tmp_path):
     from ai_team_sync import briefs
-    from tests.test_task_brief import TASK_CONTEXT
+    from tests.test_task_brief import TASK_ENVELOPE
 
     _wire(monkeypatch, db_engine, tmp_path)
     monkeypatch.setenv("ATS_AGENT", "claude-code")
-    monkeypatch.setattr(briefs, "fetch_tower_task_context",
-                        lambda task_id, **kw: (TASK_CONTEXT, None))
+    monkeypatch.setattr(briefs, "fetch_tower_task_data",
+                        lambda task_id, **kw: (TASK_ENVELOPE, None))
     monkeypatch.setattr(briefs, "recall_memories", lambda *a, **kw: [])
 
     out = await mcp.call_tool("start_session", {
@@ -158,7 +158,7 @@ async def test_mcp_named_task_brief_refuses_semantic_only_fallback(
 
     _wire(monkeypatch, db_engine, tmp_path)
     monkeypatch.setattr(
-        briefs, "fetch_tower_task_context",
+        briefs, "fetch_tower_task_data",
         lambda task_id, **kw: ({}, "task identity mismatch requested=4101 envelope=4102"))
 
     out = await mcp.call_tool("task_brief", {

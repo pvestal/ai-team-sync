@@ -18,6 +18,17 @@ from ai_team_sync.briefs import (OBSERVATION, OPERATOR_DECISION, VERIFIED,
                                  compress, rerank_by_similarity)
 
 
+@pytest.fixture(autouse=True)
+def _default_no_task_resolution(monkeypatch):
+    """Unit tests opt into task resolution explicitly; no live Echo calls."""
+    import ai_team_sync.briefs as briefs
+    monkeypatch.setattr(
+        briefs, "resolve_tower_task",
+        lambda objective, **kw: ({"status": "unresolved", "task_id": None,
+                                  "confidence": 0.0, "candidates": []}, None),
+    )
+
+
 def test_semantic_payload_trust_never_promotes_a_hit_to_current_operator_authority():
     op = classify_memory({"payload": {"trust": "operator_memory"}, "content": "x"})
     model = classify_memory({"payload": {"trust": "inferred"}, "content": "x"})
@@ -267,13 +278,239 @@ TASK_CONTEXT = {
 }
 
 
+TASK_ENVELOPE = {
+    "envelope_version": "3",
+    "id": 4101,
+    "task_key": "task-a",
+    "project_id": 7,
+    "project_name": "Anime Studio",
+    "parent_id": None,
+    "title": "Synthetic task A",
+    "description": "CURRENT SCOPE: preserve provenance.",
+    "status": "in_progress",
+    "gate": "decision",
+    "priority": 1,
+    "recommendation": "Use the reviewed lane.",
+    "notes": "Current reconciliation only.",
+    "blocked_by": [],
+    "verified_by": {"commit": "abc123"},
+    "claim": None,
+    "is_closed": False,
+    "task_context": TASK_CONTEXT,
+    "relations": {
+        "children": [
+            {"id": 4102, "task_key": "task-a-residual", "title": "Residual",
+             "status": "pending", "gate": "none", "parent_id": 4101,
+             "blocked_by": [], "verified_by": None, "updated_at": "2026-10-05T20:00:00+00:00"},
+            {"id": 4103, "task_key": "task-a-shipped", "title": "Phase A",
+             "status": "completed", "gate": "none", "parent_id": 4101,
+             "blocked_by": [], "verified_by": {"commit": "phase-a"},
+             "updated_at": "2026-10-05T19:00:00+00:00"},
+        ],
+        "active_residuals": [4102],
+        "dependencies": [],
+        "successors": [],
+    },
+}
+
+
+def _exact_envelope(monkeypatch):
+    import ai_team_sync.briefs as briefs
+    monkeypatch.setattr(
+        briefs, "fetch_tower_task_data",
+        lambda task_id, **kw: (TASK_ENVELOPE, None),
+        raising=False,
+    )
+    monkeypatch.setattr(briefs, "recall_memories", lambda *a, **kw: [])
+
+
+@pytest.mark.asyncio
+async def test_free_text_single_task_resolution_uses_the_exact_ticket_pipeline(
+        db_session, monkeypatch):
+    import ai_team_sync.briefs as briefs
+
+    monkeypatch.setattr(
+        briefs, "resolve_tower_task",
+        lambda objective, **kw: ({
+            "status": "resolved", "task_id": 4101, "confidence": 0.91,
+            "candidates": [{"id": 4101, "task_key": "task-a",
+                            "title": "Synthetic task A", "score": 0.91}],
+        }, None),
+        raising=False,
+    )
+    _exact_envelope(monkeypatch)
+
+    body = await briefs.build_brief(
+        db_session, objective="continue the synthetic task A residual",
+        repo_root="", scope=[])
+
+    assert body["task_id"] == 4101
+    assert body["task_resolution"]["status"] == "resolved"
+    assert body["task_envelope"]["id"] == 4101
+    text = body["rendered"]
+    assert "TOWER TASK #4101" in text
+    assert "status  : in_progress" in text
+    assert "ACTIVE RESIDUALS" in text
+    assert "#4102" in text
+    assert "Phase A" in text and "completed" in text
+
+
+@pytest.mark.asyncio
+async def test_explicit_ticket_in_objective_uses_exact_context_without_semantic_resolution(
+        db_session, monkeypatch):
+    import ai_team_sync.briefs as briefs
+
+    def resolver_must_not_run(*args, **kwargs):
+        raise AssertionError("#4101 is already exact")
+
+    monkeypatch.setattr(briefs, "resolve_tower_task", resolver_must_not_run,
+                        raising=False)
+    _exact_envelope(monkeypatch)
+
+    body = await briefs.build_brief(
+        db_session, objective="continue #4101", repo_root="", scope=[])
+
+    assert body["task_id"] == 4101
+    assert body["task_resolution"]["method"] == "explicit_objective_id"
+    assert "TOWER TASK #4101" in body["rendered"]
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_free_text_returns_candidates_without_blended_recall(
+        db_session, monkeypatch):
+    import ai_team_sync.briefs as briefs
+
+    candidates = [
+        {"id": 4101, "task_key": "video-lane-a", "title": "Video lane repair", "score": 0.61},
+        {"id": 4102, "task_key": "video-lane-b", "title": "Video lane residual", "score": 0.59},
+    ]
+    monkeypatch.setattr(
+        briefs, "resolve_tower_task",
+        lambda objective, **kw: ({"status": "ambiguous", "task_id": None,
+                                  "confidence": 0.61, "candidates": candidates}, None),
+        raising=False,
+    )
+
+    def recall_must_not_run(*args, **kwargs):
+        raise AssertionError("ambiguous task text must not blend semantic memories")
+
+    monkeypatch.setattr(briefs, "recall_memories", recall_must_not_run)
+
+    body = await briefs.build_brief(
+        db_session, objective="fix the video lane", repo_root="", scope=[])
+
+    assert body["task_id"] is None
+    assert body["task_resolution"]["status"] == "ambiguous"
+    assert body["recall"] == []
+    assert "AMBIGUOUS TOWER TASK" in body["rendered"]
+    assert "#4101" in body["rendered"] and "#4102" in body["rendered"]
+
+
+@pytest.mark.asyncio
+async def test_latest_ticket_handoff_is_current_and_older_handoff_is_not_competing(
+        db_session, monkeypatch):
+    import json
+    from datetime import datetime, timedelta, timezone
+
+    import ai_team_sync.briefs as briefs
+    from ai_team_sync.models import Handoff, Session
+
+    _exact_envelope(monkeypatch)
+    source_a = Session(developer="patrick", agent="codex:old", scope="[]",
+                       description="old", repo_root="", ticket_id=4101,
+                       status="completed")
+    source_b = Session(developer="patrick", agent="claude-code:new", scope="[]",
+                       description="new", repo_root="", ticket_id=4101,
+                       status="completed")
+    db_session.add_all([source_a, source_b])
+    await db_session.flush()
+    now = datetime.now(timezone.utc)
+    db_session.add_all([
+        Handoff(ticket_id=4101, source_session_id=source_a.id,
+                verdict="Phase A migrations not applied", blockers="[]",
+                next_steps="[]", artifacts="[]", created_at=now - timedelta(days=1)),
+        Handoff(ticket_id=4101, source_session_id=source_b.id,
+                verdict="Phase A deployed", blockers=json.dumps(["phone feed"]),
+                next_steps=json.dumps(["continue residual"]), artifacts="[]",
+                created_at=now),
+    ])
+    await db_session.commit()
+
+    body = await briefs.build_brief(
+        db_session, objective="continue task A", task_id=4101, recall=False)
+
+    assert body["latest_handoff"]["verdict"] == "Phase A deployed"
+    assert "Phase A deployed" in body["rendered"]
+    assert "Phase A migrations not applied" not in body["rendered"]
+
+
+@pytest.mark.asyncio
+async def test_first_resolved_task_brief_binds_session_for_later_handoff(
+        client, monkeypatch):
+    import ai_team_sync.briefs as briefs
+
+    monkeypatch.setattr(
+        briefs, "resolve_tower_task",
+        lambda objective, **kw: ({"status": "resolved", "task_id": 4101,
+                                  "confidence": 0.91, "candidates": []}, None),
+        raising=False,
+    )
+    _exact_envelope(monkeypatch)
+    started = await client.post("/api/sessions", json={
+        "developer": "patrick", "agent": "codex", "scope": [],
+        "description": "continue the synthetic task A residual", "repo_root": "/repo"})
+    assert started.status_code == 201, started.text
+    sid = started.json()["id"]
+    token = started.headers["X-ATS-Approval-Token"]
+
+    brief = await client.post("/api/brief", json={
+        "objective": "continue the synthetic task A residual", "session_id": sid,
+    }, headers={"X-ATS-Approval-Token": token})
+    assert brief.status_code == 200, brief.text
+    assert brief.json()["session_linkage"]["status"] == "bound"
+
+    session = await client.get(f"/api/sessions/{sid}")
+    assert session.json()["ticket_id"] == 4101
+    completed = await client.patch(f"/api/sessions/{sid}", json={
+        "status": "completed", "summary": "done",
+        "handoff": {"verdict": "Continue residual"},
+    }, headers={"X-ATS-Approval-Token": token})
+    assert completed.status_code == 200, completed.text
+
+
+@pytest.mark.asyncio
+async def test_resolved_brief_without_session_capability_does_not_mutate_linkage(
+        client, monkeypatch):
+    import ai_team_sync.briefs as briefs
+
+    monkeypatch.setattr(
+        briefs, "resolve_tower_task",
+        lambda objective, **kw: ({"status": "resolved", "task_id": 4101,
+                                  "confidence": 0.91, "candidates": []}, None),
+        raising=False,
+    )
+    _exact_envelope(monkeypatch)
+    started = await client.post("/api/sessions", json={
+        "developer": "patrick", "agent": "codex", "scope": [],
+        "description": "unlinked", "repo_root": "/repo"})
+    sid = started.json()["id"]
+
+    brief = await client.post("/api/brief", json={
+        "objective": "continue the synthetic task A residual", "session_id": sid,
+    })
+    assert brief.status_code == 200, brief.text
+    assert brief.json()["session_linkage"]["status"] == "authorization_required"
+    session = await client.get(f"/api/sessions/{sid}")
+    assert session.json()["ticket_id"] is None
+
+
 @pytest.mark.asyncio
 async def test_task_brief_keeps_exact_context_structured_and_filters_ticket_decisions(
         db_session, monkeypatch):
     import ai_team_sync.briefs as briefs
     from ai_team_sync.models import Decision, Session
-    monkeypatch.setattr(briefs, "fetch_tower_task_context",
-                        lambda task_id, **kw: (TASK_CONTEXT, None))
+    monkeypatch.setattr(briefs, "fetch_tower_task_data",
+                        lambda task_id, **kw: (TASK_ENVELOPE, None))
     monkeypatch.setattr(briefs, "recall_memories", lambda *a, **kw: [])
 
     for ticket, title in ((4101, "Task A worker proposal"),
@@ -333,8 +570,8 @@ async def test_task_brief_keeps_exact_context_structured_and_filters_ticket_deci
 @pytest.mark.asyncio
 async def test_exact_task_context_survives_semantic_timeout(db_session, monkeypatch):
     import ai_team_sync.briefs as briefs
-    monkeypatch.setattr(briefs, "fetch_tower_task_context",
-                        lambda task_id, **kw: (TASK_CONTEXT, None))
+    monkeypatch.setattr(briefs, "fetch_tower_task_data",
+                        lambda task_id, **kw: (TASK_ENVELOPE, None))
 
     def timeout(*args, **kwargs):
         raise TimeoutError("semantic service timed out")
@@ -352,8 +589,8 @@ async def test_exact_task_context_survives_semantic_timeout(db_session, monkeypa
 async def test_stale_high_scoring_semantic_hit_cannot_override_current_ruling(
         db_session, monkeypatch):
     import ai_team_sync.briefs as briefs
-    monkeypatch.setattr(briefs, "fetch_tower_task_context",
-                        lambda task_id, **kw: (TASK_CONTEXT, None))
+    monkeypatch.setattr(briefs, "fetch_tower_task_data",
+                        lambda task_id, **kw: (TASK_ENVELOPE, None))
     monkeypatch.setattr(briefs, "rerank_by_similarity", lambda objective, items: items)
     monkeypatch.setattr(briefs, "recall_memories", lambda *a, **kw: [{
         "content": "STALE ARCHITECTURE: the legacy video lane is required",
@@ -397,7 +634,7 @@ async def test_named_brief_refuses_before_worker_proposals_or_semantic_fallback(
     await db_session.commit()
 
     monkeypatch.setattr(
-        briefs, "fetch_tower_task_context",
+        briefs, "fetch_tower_task_data",
         lambda task_id, **kw: ({}, authority_error))
 
     def semantic_must_not_run(*args, **kwargs):
@@ -415,7 +652,7 @@ async def test_named_brief_api_returns_refusal_not_degraded_packet(client, monke
     import ai_team_sync.briefs as briefs
 
     monkeypatch.setattr(
-        briefs, "fetch_tower_task_context",
+        briefs, "fetch_tower_task_data",
         lambda task_id, **kw: ({}, "no Tower task with id 4101"))
     response = await client.post("/api/brief", json={
         "objective": "continue named task", "task_id": 4101})

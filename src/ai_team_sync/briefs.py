@@ -24,6 +24,7 @@ import json
 import hashlib
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from fnmatch import fnmatch
@@ -33,7 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from ai_team_sync.models import Decision, ScopeLock, Session
+from ai_team_sync.models import Decision, Handoff, ScopeLock, Session
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,55 @@ def fetch_tower_task_context(task_id: str | int, *, timeout: float = 10.0
     return context, None
 
 
+def fetch_tower_task_data(task_id: str | int, *, timeout: float = 10.0
+                          ) -> tuple[dict[str, Any], str | None]:
+    """Validated canonical envelope for one exact Tower task."""
+    env, error = _fetch_tower_task(task_id, timeout=timeout)
+    return (env or {}), error
+
+
+def resolve_tower_task(objective: str, *, timeout: float = 10.0
+                       ) -> tuple[dict[str, Any], str | None]:
+    """Resolve free text through Echo's structured Tower-task resolver.
+
+    ATS never promotes semantic recall into task identity.  The resolver may
+    return one confident task, explicit ambiguity, or no candidates; only the
+    first result is allowed to enter the exact task-context pipeline.
+    """
+    import httpx
+
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            response = c.post(f"{ECHO_URL}/api/tower-tasks/resolve",
+                              json={"objective": objective, "limit": 5})
+    except Exception as exc:  # noqa: BLE001
+        return {}, f"Echo Brain task resolver unavailable ({type(exc).__name__})"
+    if response.status_code >= 400:
+        return {}, f"Echo Brain task resolver returned HTTP {response.status_code}"
+    try:
+        result = response.json()
+    except Exception:  # noqa: BLE001
+        return {}, "Echo Brain task resolver returned non-JSON"
+    if not isinstance(result, dict) or result.get("status") not in {
+            "resolved", "ambiguous", "unresolved"}:
+        return {}, "Echo Brain task resolver returned a malformed result"
+    if result.get("status") == "resolved" and _canonical_returned_task_id(
+            result.get("task_id")) is None:
+        return {}, "Echo Brain task resolver returned a malformed task id"
+    if not isinstance(result.get("candidates", []), list):
+        return {}, "Echo Brain task resolver returned malformed candidates"
+    return result, None
+
+
+_EXPLICIT_TASK = re.compile(r"(?<![A-Za-z0-9_])#([1-9][0-9]*)\b")
+
+
+def explicit_task_id(objective: str) -> int | None:
+    """One explicit ``#123`` is identity; multiple ids are ambiguity."""
+    ids = {int(match) for match in _EXPLICIT_TASK.findall(objective or "")}
+    return next(iter(ids)) if len(ids) == 1 else None
+
+
 def fetch_tower_task_envelope(task_id: str | int, *, timeout: float = 10.0
                               ) -> tuple[str, str | None]:
     """(rendered envelope, error) for one Tower task, from Echo Brain.
@@ -222,6 +272,35 @@ def render_task_envelope(env: dict[str, Any]) -> str:
         out.append(f"  parent  : #{env['parent_id']}")
     if env.get("blocked_by"):
         out.append("  blocked_by: " + ", ".join(str(b) for b in env["blocked_by"]))
+
+    relations = env.get("relations") or {}
+    children = relations.get("children") or []
+    residual_ids = set(relations.get("active_residuals") or [])
+    if residual_ids:
+        out += ["", "  ACTIVE RESIDUALS (from current child status):",
+                "    " + ", ".join(f"#{task_id}" for task_id in sorted(residual_ids))]
+    if children:
+        out += ["", "  LINKED CHILD TASKS (current Tower relations):"]
+        for child in children:
+            residual = " ACTIVE RESIDUAL" if child.get("id") in residual_ids else ""
+            out.append(
+                f"    #{child.get('id')} [{child.get('status')}]"
+                f"{residual} {child.get('title') or child.get('task_key') or ''}")
+            if child.get("verified_by"):
+                out.append("      deployed/live evidence: "
+                           + _json.dumps(child["verified_by"], default=str))
+    dependencies = relations.get("dependencies") or []
+    if dependencies:
+        out += ["", "  LINKED BLOCKERS / DEPENDENCIES:"]
+        for dep in dependencies:
+            out.append(f"    #{dep.get('id')} [{dep.get('status')}] "
+                       f"{dep.get('title') or dep.get('task_key') or ''}")
+    successors = relations.get("successors") or []
+    if successors:
+        out += ["", "  SUCCESSOR TASKS:"]
+        for successor in successors:
+            out.append(f"    #{successor.get('id')} [{successor.get('status')}] "
+                       f"{successor.get('title') or successor.get('task_key') or ''}")
 
     claim = env.get("claim") or None
     if claim:
@@ -474,15 +553,44 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
     # A named task is an authority claim, not a recall hint. Resolve and
     # validate it before reading local proposals, locks, or semantic memory so
     # no partial/degraded packet can be mistaken for task authority.
+    task_resolution: dict[str, Any]
+    explicit_from_objective = explicit_task_id(objective) if task_id is None else None
+    if task_id is not None:
+        task_resolution = {"status": "resolved", "method": "explicit_parameter",
+                           "task_id": task_id, "confidence": 1.0, "candidates": []}
+    elif explicit_from_objective is not None:
+        task_id = explicit_from_objective
+        task_resolution = {"status": "resolved", "method": "explicit_objective_id",
+                           "task_id": task_id, "confidence": 1.0, "candidates": []}
+    else:
+        try:
+            task_resolution, resolution_error = await asyncio.to_thread(
+                resolve_tower_task, objective)
+        except Exception as exc:  # noqa: BLE001
+            task_resolution, resolution_error = {}, (
+                f"task resolution failed ({type(exc).__name__})")
+        if resolution_error:
+            task_resolution = {"status": "unavailable", "method": "structured_resolver",
+                               "task_id": None, "confidence": 0.0, "candidates": [],
+                               "reason": resolution_error}
+        else:
+            task_resolution = {"method": "structured_resolver", **task_resolution}
+            if task_resolution.get("status") == "resolved":
+                task_id = int(task_resolution["task_id"])
+
+    ambiguous = task_resolution.get("status") == "ambiguous"
+    task_envelope: dict[str, Any] = {}
     task_context: dict[str, Any] = {}
     task_context_status = "not requested"
     if task_id is not None:
         try:
-            task_context, task_error = await asyncio.to_thread(
-                fetch_tower_task_context, task_id)
+            task_envelope, task_error = await asyncio.to_thread(
+                fetch_tower_task_data, task_id)
         except Exception as exc:  # noqa: BLE001
             raise TaskContextUnavailable(
                 task_id, f"task context lookup failed ({type(exc).__name__})") from exc
+        task_context = task_envelope.get("task_context", {}) \
+            if isinstance(task_envelope, dict) else {}
         if task_error or not isinstance(task_context, dict) or not task_context:
             raise TaskContextUnavailable(
                 task_id, task_error or "empty structured task_context")
@@ -515,7 +623,7 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
     decision_rows = (await db.execute(
         decision_query.order_by(Decision.created_at.desc()).limit(60)
     )).scalars().all()
-    decisions = [
+    decisions = [] if ambiguous else [
         BriefItem(
             WORKER_PROPOSAL,
             f"{d.title} — chose: {d.chosen}" + (f" (because {d.reasoning})" if d.reasoning else ""),
@@ -532,9 +640,10 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
     prior_rows = (await db.execute(
         select(Session).options(selectinload(Session.commits))
         .where(Session.status == "completed")
+        .where(Session.ticket_id == task_id if task_id is not None else True)
         .order_by(Session.completed_at.desc()).limit(40)
     )).scalars().all()
-    prior_work = [
+    prior_work = [] if ambiguous else [
         BriefItem(
             VERIFIED if s.commits else INFERRED,
             f"{s.agent}: {s.summary}",
@@ -546,8 +655,8 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
     ]
 
     memories: list[BriefItem] = []
-    recall_status = "skipped"
-    if recall:
+    recall_status = "suppressed (ambiguous Tower task)" if ambiguous else "skipped"
+    if recall and not ambiguous:
         try:
             results = await asyncio.to_thread(
                 recall_memories, objective, 12, task_id=task_id,
@@ -575,6 +684,31 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
 
     recommended, why = preflight_hint(decisions, memories)
 
+    latest_handoff: dict[str, Any] | None = None
+    if task_id is not None:
+        handoff = (await db.execute(
+            select(Handoff).where(Handoff.ticket_id == task_id)
+            .order_by(Handoff.created_at.desc(), Handoff.id.desc()).limit(1)
+        )).scalar_one_or_none()
+        if handoff is not None:
+            def _json_list(value: str) -> list[Any]:
+                try:
+                    parsed = json.loads(value or "[]")
+                    return parsed if isinstance(parsed, list) else []
+                except Exception:  # noqa: BLE001
+                    return []
+            latest_handoff = {
+                "id": handoff.id,
+                "ticket_id": handoff.ticket_id,
+                "source_session_id": handoff.source_session_id,
+                "verdict": handoff.verdict,
+                "blockers": _json_list(handoff.blockers),
+                "next_steps": _json_list(handoff.next_steps),
+                "artifacts": _json_list(handoff.artifacts),
+                "created_at": (handoff.created_at.isoformat()
+                               if handoff.created_at else None),
+            }
+
     packet = {
         "preflight_recommended": recommended,
         "preflight_reason": why,
@@ -584,8 +718,11 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
         "caller_session_id": caller_session_id,
         "caller_identity_unresolved": caller_identity_unresolved,
         "task_id": task_id,
+        "task_resolution": task_resolution,
+        "task_envelope": task_envelope,
         "task_context": task_context,
         "task_context_status": task_context_status,
+        "latest_handoff": latest_handoff,
         "render_task_context": render_task_context,
         "blockers": [i.as_dict() for i in compress(blockers, max_items=limit)],
         "decisions": [i.as_dict() for i in compress(decisions, max_items=limit)],
@@ -600,8 +737,10 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
 def render(packet: dict[str, Any]) -> str:
     """Text form, for injection straight into a worker's turn."""
     task_id = packet.get("task_id")
+    envelope = packet.get("task_envelope") or {}
     context = packet.get("task_context") or {}
-    if task_id is not None and (not isinstance(context, dict) or not context):
+    if task_id is not None and (not isinstance(envelope, dict) or not envelope
+                                or not isinstance(context, dict) or not context):
         raise TaskContextUnavailable(
             task_id, str(packet.get("task_context_status") or
                          "missing structured task_context"))
@@ -612,13 +751,37 @@ def render(packet: dict[str, Any]) -> str:
     if packet.get("scope"):
         lines.append("scope: " + ", ".join(packet["scope"]))
 
-    if context and packet.get("render_task_context", True):
-        lines += ["", "EXACT TASK-SCOPED CONTEXT — authoritative structured records"]
-        lines += render_task_context(context)
+    resolution = packet.get("task_resolution") or {}
+    if resolution.get("status") == "ambiguous":
+        lines += ["", "AMBIGUOUS TOWER TASK — no task authority was selected",
+                  "  Name an exact ticket; semantic memories are suppressed until then."]
+        for candidate in resolution.get("candidates") or []:
+            lines.append(f"  #{candidate.get('id')} score={candidate.get('score')} "
+                         f"{candidate.get('title') or candidate.get('task_key') or ''}")
+    elif resolution.get("status") == "unavailable":
+        lines += ["", "TOWER TASK RESOLUTION UNAVAILABLE — no task authority selected",
+                  f"  {resolution.get('reason') or 'structured resolver unavailable'}"]
+
+    if envelope and packet.get("render_task_context", True):
+        lines += ["", "EXACT TASK-SCOPED CONTEXT — authoritative structured records",
+                  render_task_envelope(envelope)]
     elif packet.get("task_id") and packet.get("render_task_context", True):
         lines += ["", "EXACT TASK-SCOPED CONTEXT UNAVAILABLE",
                   f"  {packet.get('task_context_status')}",
                   "  Do not infer current rulings or prohibitions from semantic recall."]
+
+    handoff = packet.get("latest_handoff") or None
+    if handoff:
+        lines += ["", "LATEST AUTHORITATIVE TASK HANDOFF",
+                  f"  verdict: {handoff.get('verdict')}",
+                  f"  source: ats:handoff/{handoff.get('id')} from session "
+                  f"{handoff.get('source_session_id')} at {handoff.get('created_at')}"]
+        if handoff.get("blockers"):
+            lines.append("  blockers: " + ", ".join(map(str, handoff["blockers"])))
+        if handoff.get("next_steps"):
+            lines.append("  next steps: " + ", ".join(map(str, handoff["next_steps"])))
+        if handoff.get("artifacts"):
+            lines.append("  artifacts: " + ", ".join(map(str, handoff["artifacts"])))
 
     recall_title = ("TASK-SCOPED SEMANTIC SUPPLEMENT" if packet.get("task_id")
                     else "UNSCOPED SEMANTIC RECALL")
