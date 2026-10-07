@@ -275,9 +275,10 @@ across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately before starting
   unscoped. A governed prompt is blocked if ATS context cannot be obtained, so
   Echo/Git/DB cannot silently substitute for coordination context. `deploy.sh`
   installs and orders `session_autostart`, `ats_context`, then `override_inbox`
-  automatically in `~/.claude/settings.json`; the existing Echo prompt hook is
-  preserved inside the same hook process and invoked only after ATS succeeds,
-  because Claude otherwise runs sibling hooks concurrently.
+  automatically in `~/.claude/settings.json`; existing Echo startup and prompt
+  hooks are migrated into the same prompt-hook process and invoked only after
+  ATS succeeds, because Claude otherwise runs sibling hooks concurrently and a
+  startup packet would preload supplemental context before governed resolution.
 - **Slack/Telegram**: Edit `.env` with webhook URLs for push notifications
 - **GitHub Action**: Auto-appends session context to PR descriptions
 

@@ -57,6 +57,25 @@ def install(settings_path: Path, python: str) -> None:
     if not isinstance(settings, dict):
         raise ValueError(f"{settings_path} must contain one JSON object")
 
+    start_groups = list(settings.setdefault("hooks", {}).get("SessionStart") or [])
+    startup_echo = ""
+    for group in start_groups:
+        for hook in group.get("hooks", []):
+            command = str(hook.get("command") or "")
+            if "echo-ambient.py" in command and "--mode session-start" in command:
+                startup_echo = command
+                break
+        if startup_echo:
+            break
+    if startup_echo:
+        for group in start_groups:
+            group["hooks"] = [
+                hook
+                for hook in group.get("hooks", [])
+                if str(hook.get("command") or "") != startup_echo
+            ]
+        settings["hooks"]["SessionStart"] = start_groups
+
     _prepend(
         settings,
         "SessionStart",
@@ -94,6 +113,11 @@ def install(settings_path: Path, python: str) -> None:
                 if str(hook.get("command") or "") != supplement_command
             ]
         settings["hooks"]["UserPromptSubmit"] = prompt_groups
+    elif startup_echo:
+        # A startup-only Echo installation must also move behind ATS. Echo's
+        # prompt mode consumes the UserPromptSubmit payload and emits the same
+        # supplemental packet at the correct point in the ordering contract.
+        supplement_command = startup_echo.replace("--mode session-start", "--mode hook")
 
     context_command = f"{python} -m {CONTEXT_MODULE}"
     if supplement_command:

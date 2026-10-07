@@ -24,6 +24,16 @@ def test_installer_puts_ats_context_before_echo_and_is_idempotent(tmp_path):
         json.dumps(
             {
                 "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python echo-ambient.py --mode session-start",
+                                },
+                            ]
+                        }
+                    ],
                     "UserPromptSubmit": [
                         {
                             "hooks": [
@@ -68,3 +78,44 @@ def test_installer_puts_ats_context_before_echo_and_is_idempotent(tmp_path):
         for hook in group.get("hooks", [])
     ]
     assert start_commands[0] == ("/opt/ats/bin/python -m ai_team_sync.hooks.session_autostart")
+    assert all("echo-ambient.py" not in command for command in start_commands)
+
+
+def test_installer_moves_startup_only_echo_behind_ats(tmp_path):
+    module = _module()
+    settings = tmp_path / "settings.json"
+    settings.write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "python echo-ambient.py --mode session-start",
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        )
+    )
+
+    module.install(settings, "/opt/ats/bin/python")
+
+    body = json.loads(settings.read_text())
+    start_commands = [
+        hook["command"]
+        for group in body["hooks"]["SessionStart"]
+        for hook in group.get("hooks", [])
+    ]
+    prompt_commands = [
+        hook["command"]
+        for group in body["hooks"]["UserPromptSubmit"]
+        for hook in group.get("hooks", [])
+    ]
+    assert all("echo-ambient.py" not in command for command in start_commands)
+    assert "--supplement-command" in prompt_commands[0]
+    assert "echo-ambient.py --mode hook" in prompt_commands[0]
