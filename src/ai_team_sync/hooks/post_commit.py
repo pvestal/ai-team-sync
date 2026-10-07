@@ -10,39 +10,40 @@ import sys
 import httpx
 
 SERVER = os.environ.get("ATS_SERVER_URL", "http://localhost:8400")
-# Resolved through session_pointer so $ATS_STATE_DIR isolates a process
-# that was launched with its own state directory (a delegated child). A
-# hardcoded ~ path would reach into the parent's pointers regardless.
-def _session_file() -> str:
-    try:
-        from ai_team_sync import session_pointer as sp
-        return str(sp.global_pointer_path())
-    except Exception:
-        return os.path.expanduser("~/.ats_session")
+
+
+def _session_id() -> str | None:
+    """This agent's own session, or None.
+
+    Recording a commit is a mutation, and commit time counts as liveness for
+    the reaper, so the shared ~/.ats_session is refused like every other
+    mutation refuses it: it names whichever session on the box wrote it last.
+    """
+    from ai_team_sync import session_pointer as sp
+
+    session_id, source = sp.resolve_pointer_source()
+    return session_id if source in ("env", "per_session") else None
+
+
+def _head() -> tuple[str, str]:
+    hash_result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    )
+    msg_result = subprocess.run(
+        ["git", "log", "-1", "--pretty=%s"], capture_output=True, text=True, check=True
+    )
+    return hash_result.stdout.strip(), msg_result.stdout.strip()
 
 
 def main():
-    # Read active session
-    if not os.path.exists(_session_file()):
-        sys.exit(0)
-    with open(_session_file()) as f:
-        session_id = f.read().strip()
+    session_id = _session_id()
     if not session_id:
         sys.exit(0)
 
-    # Get commit info
     try:
-        hash_result = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True
-        )
-        msg_result = subprocess.run(
-            ["git", "log", "-1", "--pretty=%s"], capture_output=True, text=True, check=True
-        )
+        commit_hash, message = _head()
     except subprocess.CalledProcessError:
         sys.exit(0)
-
-    commit_hash = hash_result.stdout.strip()
-    message = msg_result.stdout.strip()
 
     try:
         with httpx.Client(timeout=5) as client:
