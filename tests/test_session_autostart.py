@@ -63,6 +63,22 @@ async def test_autostart_is_idempotent_across_refires(client):
 
 
 @pytest.mark.asyncio
+async def test_autostart_anchors_when_cwd_is_a_governed_repo(
+        client, tmp_path, monkeypatch):
+    repo = tmp_path / "anime-studio"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    monkeypatch.setenv("ATS_COORDINATED_REPOS", str(repo))
+    monkeypatch.chdir(repo)
+
+    sid = await autostart.ensure_session("http://test", client)
+
+    row = (await client.get(f"/api/sessions/{sid}")).json()
+    assert row["repo_root"] == str(repo)
+    assert row["scope"] == []
+
+
+@pytest.mark.asyncio
 async def test_no_claude_session_id_fails_open(client, monkeypatch):
     # Without a session id we can't key a pointer — fall back to manual, never crash.
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)

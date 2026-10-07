@@ -601,6 +601,10 @@ async def list_tools() -> list[Tool]:
                                "description": "Consult the configured memory service (default true)."},
                     "task_id": {"type": "integer", "minimum": 1,
                                 "description": "Tower task id for exact rulings and ticket decisions."},
+                    "resolve_task": {"type": "boolean",
+                                     "description": ("Set false for broad governed "
+                                                     "project/repository status; ATS will "
+                                                     "not guess one ticket.")},
                 },
                 "required": ["objective"],
             },
@@ -1840,6 +1844,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         "scope": arguments.get("scope", []),
                         "recall": arguments.get("recall", True),
                         "task_id": arguments.get("task_id"),
+                        "resolve_task": arguments.get("resolve_task", True),
                         "session_id": brief_session_id,
                     },
                     headers=brief_headers,

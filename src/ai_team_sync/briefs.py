@@ -196,6 +196,8 @@ _EXPLICIT_TASK_PATTERNS = (
     re.compile(r"^\s*#([1-9][0-9]*)\b", re.IGNORECASE),
     re.compile(r"\b(?:tower\s+)?(?:task|ticket)\s*#([1-9][0-9]*)\b",
                re.IGNORECASE),
+    re.compile(r"\b(?:tower\s+)?(?:task|ticket)\s+id\s*#?([1-9][0-9]*)\b",
+               re.IGNORECASE),
     re.compile(r"^\s*(?:continue|resume|work\s+on)\s+#([1-9][0-9]*)\b",
                re.IGNORECASE),
 )
@@ -562,7 +564,8 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
                       limit: int = 8, caller_session_id: str | None = None,
                       caller_identity_unresolved: bool = False,
                       task_id: int | None = None,
-                      render_task_context: bool = True) -> dict[str, Any]:
+                      render_task_context: bool = True,
+                      resolve_task: bool = True) -> dict[str, Any]:
     """Assemble the packet. ATS state is authoritative and local; Echo Brain
     recall is additive and may be absent.
 
@@ -578,7 +581,8 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
     # validate it before reading local proposals, locks, or semantic memory so
     # no partial/degraded packet can be mistaken for task authority.
     task_resolution: dict[str, Any]
-    explicit_from_objective = explicit_task_id(objective) if task_id is None else None
+    explicit_from_objective = (
+        explicit_task_id(objective) if task_id is None and resolve_task else None)
     if task_id is not None:
         task_resolution = {"status": "resolved", "method": "explicit_parameter",
                            "task_id": task_id, "confidence": 1.0, "candidates": []}
@@ -586,7 +590,7 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
         task_id = explicit_from_objective
         task_resolution = {"status": "resolved", "method": "explicit_objective_id",
                            "task_id": task_id, "confidence": 1.0, "candidates": []}
-    else:
+    elif resolve_task:
         try:
             task_resolution, resolution_error = await asyncio.to_thread(
                 resolve_tower_task, objective)
@@ -601,6 +605,11 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
             task_resolution = {"method": "structured_resolver", **task_resolution}
             if task_resolution.get("status") == "resolved":
                 task_id = int(task_resolution["task_id"])
+    else:
+        task_resolution = {
+            "status": "project_scoped", "method": "repo_root",
+            "task_id": None, "confidence": 1.0, "candidates": [],
+        }
 
     ambiguous = task_resolution.get("status") == "ambiguous"
     task_envelope: dict[str, Any] = {}
@@ -709,6 +718,7 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
     recommended, why = preflight_hint(decisions, memories)
 
     latest_handoff: dict[str, Any] | None = None
+    recent_handoffs: list[dict[str, Any]] = []
     if task_id is not None:
         handoff = (await db.execute(
             select(Handoff).where(Handoff.ticket_id == task_id)
@@ -745,6 +755,37 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
                 "authority_state": "superseded" if superseded else "current",
                 "superseded_by": "tower_task.updated_at" if superseded else None,
             }
+    elif not resolve_task and repo_root:
+        # A broad project status has no one authoritative ticket handoff. Carry
+        # the recent repo-scoped continuation records separately and label them
+        # below Tower/operator authority instead of pretending one is current.
+        handoff_rows = (await db.execute(
+            select(Handoff, Session)
+            .join(Session, Handoff.source_session_id == Session.id)
+            .where(Session.repo_root == repo_root.rstrip("/"))
+            .order_by(Handoff.created_at.desc(), Handoff.id.desc())
+            .limit(limit)
+        )).all()
+        for handoff, source in handoff_rows:
+            def _json_list(value: str) -> list[Any]:
+                try:
+                    parsed = json.loads(value or "[]")
+                    return parsed if isinstance(parsed, list) else []
+                except Exception:  # noqa: BLE001
+                    return []
+
+            recent_handoffs.append({
+                "id": handoff.id,
+                "ticket_id": handoff.ticket_id,
+                "source_session_id": handoff.source_session_id,
+                "source_agent": source.agent,
+                "verdict": handoff.verdict,
+                "blockers": _json_list(handoff.blockers),
+                "next_steps": _json_list(handoff.next_steps),
+                "artifacts": _json_list(handoff.artifacts),
+                "created_at": (handoff.created_at.isoformat()
+                               if handoff.created_at else None),
+            })
 
     packet = {
         "preflight_recommended": recommended,
@@ -760,6 +801,7 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
         "task_context": task_context,
         "task_context_status": task_context_status,
         "latest_handoff": latest_handoff,
+        "recent_handoffs": recent_handoffs,
         "render_task_context": render_task_context,
         "blockers": [i.as_dict() for i in compress(blockers, max_items=limit)],
         "decisions": [i.as_dict() for i in compress(decisions, max_items=limit)],
@@ -789,7 +831,11 @@ def render(packet: dict[str, Any]) -> str:
         lines.append("scope: " + ", ".join(packet["scope"]))
 
     resolution = packet.get("task_resolution") or {}
-    if resolution.get("status") == "ambiguous":
+    if resolution.get("status") == "project_scoped":
+        lines += ["", "PROJECT / REPOSITORY CONTEXT — no exact task authority selected",
+                  "  ATS coordination below is repo-scoped. Current task-specific operator "
+                  "rulings require an exact ticket; do not infer them from project history."]
+    elif resolution.get("status") == "ambiguous":
         lines += ["", "AMBIGUOUS TOWER TASK — no task authority was selected",
                   "  Name an exact ticket; semantic memories are suppressed until then."]
         for candidate in resolution.get("candidates") or []:
@@ -827,6 +873,18 @@ def render(packet: dict[str, Any]) -> str:
             lines.append("  next steps: " + ", ".join(map(str, handoff["next_steps"])))
         if handoff.get("artifacts"):
             lines.append("  artifacts: " + ", ".join(map(str, handoff["artifacts"])))
+
+    project_handoffs = packet.get("recent_handoffs") or []
+    if project_handoffs:
+        lines += ["", "RECENT REPOSITORY HANDOFFS — continuation context, not task authority"]
+        for row in project_handoffs:
+            lines.append(f"  [#{row.get('ticket_id')}] {row.get('verdict')}")
+            lines.append(f"      source=ats:handoff/{row.get('id')} from "
+                         f"{row.get('source_agent')} at {row.get('created_at')}")
+            if row.get("blockers"):
+                lines.append("      blockers: " + ", ".join(map(str, row["blockers"])))
+            if row.get("next_steps"):
+                lines.append("      next steps: " + ", ".join(map(str, row["next_steps"])))
 
     recall_title = ("TASK-SCOPED SEMANTIC SUPPLEMENT" if packet.get("task_id")
                     else "UNSCOPED SEMANTIC RECALL")

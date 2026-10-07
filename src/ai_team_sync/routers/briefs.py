@@ -23,6 +23,10 @@ class BriefRequest(BaseModel):
     limit: int = 8
     task_id: int | None = Field(default=None, gt=0)
     render_task_context: bool = True
+    # False is the project/repository status path. It deliberately avoids
+    # guessing one ticket from broad project wording while still returning ATS
+    # locks, decisions, prior work and repo-scoped handoffs.
+    resolve_task: bool = True
     # The session this brief is for, so its own locks are not reported back to
     # it as blockers (#2757). A claim, validated against the caller's account.
     session_id: str = ""
@@ -40,7 +44,8 @@ async def post_brief(body: BriefRequest, request: Request,
             caller_session_id=caller.session_id,
             caller_identity_unresolved=caller.unresolved,
             task_id=body.task_id,
-            render_task_context=body.render_task_context)
+            render_task_context=body.render_task_context,
+            resolve_task=body.resolve_task)
         packet["session_linkage"] = {"status": "not_applicable", "task_id": None}
         resolved_task_id = packet.get("task_id")
         if resolved_task_id is not None and caller.session_id is not None:

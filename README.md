@@ -266,6 +266,18 @@ across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately before starting
       "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.override_inbox" } ] }
   ]
   ```
+- **ATS-first context hook (required for governed work)**: `ats_context.py` is a
+  Claude Code `UserPromptSubmit` hook and must run before supplemental memory
+  hooks. It deterministically recognizes an explicit Tower ticket, a cwd inside
+  `ATS_COORDINATED_REPOS`, or a governed project name such as “Anime Studio”. It
+  anchors the auto-registered session, requests the ATS brief, and injects that
+  packet before the worker receives the prompt. A generic prompt stays
+  unscoped. A governed prompt is blocked if ATS context cannot be obtained, so
+  Echo/Git/DB cannot silently substitute for coordination context. `deploy.sh`
+  installs and orders `session_autostart`, `ats_context`, then `override_inbox`
+  automatically in `~/.claude/settings.json`; the existing Echo prompt hook is
+  preserved inside the same hook process and invoked only after ATS succeeds,
+  because Claude otherwise runs sibling hooks concurrently.
 - **Slack/Telegram**: Edit `.env` with webhook URLs for push notifications
 - **GitHub Action**: Auto-appends session context to PR descriptions
 

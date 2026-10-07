@@ -110,6 +110,10 @@ mandatory for a landing claim.
   registry. See [Delegation](docs/delegation.md).
 
 ## Coordinate while you work
-If an ai-team-sync server is running, use it on yourself:
-`ats lock check <path>` before editing, `ats session start` when you begin,
-`ats decision list --all` to read prior decisions, `ats session complete` at the end.
+For governed project work, ATS context is first, not optional: resolve the exact
+task or governed repository through ATS and read its brief before consulting
+supplemental memory or verifying mutable facts in Git, databases, and services.
+The Claude `UserPromptSubmit` hook enforces this automatically. Use the ATS MCP
+tools for coordination (`check_locks` before editing, `start_session` when you
+claim file scope, decision history while working, and `complete_session` at the
+end); the CLI is only a fallback when MCP is unavailable.

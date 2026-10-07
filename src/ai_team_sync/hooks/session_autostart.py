@@ -30,6 +30,7 @@ import subprocess
 import sys
 
 from ai_team_sync import session_pointer as sp
+from ai_team_sync.context_resolution import governed_roots, resolve_request_target
 from ai_team_sync.session_marker import AUTOREG_DESCRIPTION
 
 
@@ -82,15 +83,19 @@ async def ensure_session(server_url: str, client) -> str | None:
             pass  # fall through to create a fresh row
 
     try:
-        # repo_root deliberately NOT sent: on multi-repo boxes the Claude cwd
-        # (~/Documents) is not the repo the session will lock, and a wrong
-        # anchor turns enforcement OFF for that repo (false negative — worse
-        # than the false positive). Anchoring is opt-in via start_session.
+        target = resolve_request_target(
+            "", cwd=os.getcwd(), governed_roots=governed_roots())
+        repo_root = target.repo_root if target else ""
+        # Do not infer a repo from a generic multi-repo cwd such as ~/Documents.
+        # The deterministic resolver anchors only when cwd is inside an
+        # operator-configured repo (including a linked worktree); otherwise it
+        # remains empty until a governed prompt identifies the project.
         r = await client.post(f"{server_url}/api/sessions", json={
             "developer": _developer(),
             "agent": _agent_label(cid),
             "scope": [],
             "description": AUTOREG_DESCRIPTION,
+            "repo_root": repo_root,
             "auto_lock": False,
         })
         if r.status_code in (200, 201):
@@ -116,7 +121,8 @@ def main() -> None:
         if sid:
             # SessionStart hook stdout is surfaced as session context.
             print(f"[ats] session auto-registered ({sid[:8]}) — visible in team_status; "
-                  f"declare scope with start_session/extend_scope to claim locks")
+                  "ATS-first context resolves on the first governed prompt; "
+                  "declare file scope with start_session/extend_scope before editing")
     except Exception:
         pass
     sys.exit(0)  # always fail-open: never wedge session startup

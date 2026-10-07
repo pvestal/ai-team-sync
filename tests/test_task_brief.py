@@ -331,6 +331,8 @@ def test_explicit_task_syntax_excludes_incidental_hash_references():
     assert explicit_task_id("#3477 personal-data recovery") == 3477
     assert explicit_task_id("continue #3477") == 3477
     assert explicit_task_id("continue Tower task #3477") == 3477
+    assert explicit_task_id("Tower task ID 3477") == 3477
+    assert explicit_task_id("ticket id #3477") == 3477
     assert explicit_task_id("fix regression from PR #28") is None
     assert explicit_task_id("Linked: #2928") is None
     assert explicit_task_id("retry the task 3 times") is None
@@ -442,6 +444,52 @@ async def test_ambiguous_free_text_returns_candidates_without_blended_recall(
     assert body["recall"] == []
     assert "AMBIGUOUS TOWER TASK" in body["rendered"]
     assert "#4101" in body["rendered"] and "#4102" in body["rendered"]
+
+
+@pytest.mark.asyncio
+async def test_project_brief_skips_task_guessing_and_keeps_repo_coordination(
+        db_session, monkeypatch):
+    import json
+
+    import ai_team_sync.briefs as briefs
+    from ai_team_sync.models import Decision, Handoff, Session
+
+    def resolver_must_not_run(*args, **kwargs):
+        raise AssertionError("project status must not guess one Tower task")
+
+    monkeypatch.setattr(briefs, "resolve_tower_task", resolver_must_not_run)
+    monkeypatch.setattr(briefs, "recall_memories", lambda *a, **kw: [])
+    source = Session(
+        developer="patrick", agent="claude-code:prior", scope="[]",
+        description="reviewed Anime Studio", repo_root="/opt/anime-studio",
+        ticket_id=4101, status="completed", summary="Review found a stale-result race")
+    db_session.add(source)
+    await db_session.flush()
+    db_session.add(Decision(
+        session_id=source.id, ticket_id=4101, title="Keep CAS gate",
+        chosen="Reject stale completions", rejected="Last writer wins", reasoning="race"))
+    db_session.add(Handoff(
+        ticket_id=4101, source_session_id=source.id,
+        verdict="BLOCKED on compare-and-swap", blockers=json.dumps(["stale result race"]),
+        next_steps=json.dumps(["land CAS guard"]), artifacts=json.dumps(["commit:abc"])))
+    await db_session.commit()
+
+    body = await briefs.build_brief(
+        db_session,
+        objective="Give me the current Anime Studio status, blockers and recommendations.",
+        repo_root="/opt/anime-studio", scope=[], recall=False,
+        resolve_task=False)
+
+    assert body["task_id"] is None
+    assert body["task_resolution"]["status"] == "project_scoped"
+    assert body["decisions"]
+    assert body["prior_work"]
+    assert body["recent_handoffs"]
+    rendered = body["rendered"]
+    assert "PROJECT / REPOSITORY CONTEXT" in rendered
+    assert "Keep CAS gate" in rendered
+    assert "BLOCKED on compare-and-swap" in rendered
+    assert "no exact task authority" in rendered
 
 
 @pytest.mark.asyncio

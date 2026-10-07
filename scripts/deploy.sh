@@ -19,6 +19,14 @@ PY
 echo "stamped ${COMMIT} (dirty=${DIRTY})"
 
 pipx install --force . >/dev/null
+
+# Harness behavior is part of this deployment, not an optional README step.
+# Order is load-bearing: ATS resolves governed context before the Echo ambient
+# hook contributes supplemental memory.
+ATS_HOOK_PYTHON="${ATS_HOOK_PYTHON:-${HOME}/.local/share/pipx/venvs/ai-team-sync/bin/python}"
+python3 scripts/install-claude-hooks.py \
+  --settings "${ATS_CLAUDE_SETTINGS:-${HOME}/.claude/settings.json}" \
+  --python "${ATS_HOOK_PYTHON}"
 systemctl --user restart ats-server
 sleep 2
 curl -s http://localhost:8400/api/version | python3 -m json.tool
