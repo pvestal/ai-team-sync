@@ -107,6 +107,43 @@ async def test_project_prompt_anchors_placeholder_and_gets_ats_brief(client, tmp
 
 
 @pytest.mark.asyncio
+async def test_project_prompt_resurrects_auto_reaped_session(
+    client, db_session, tmp_path, monkeypatch
+):
+    from ai_team_sync.hooks import ats_context, session_autostart
+    from ai_team_sync.models import Session
+
+    cid = "207985b7-1111-2222-3333-444455556666"
+    monkeypatch.setenv("ATS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", cid)
+    monkeypatch.setenv("ATS_DEVELOPER", "patrick")
+    monkeypatch.setenv("ATS_COORDINATED_REPOS", ANIME_ROOT)
+    monkeypatch.chdir(tmp_path)
+
+    sid = await session_autostart.ensure_session("http://test", client)
+    row = await db_session.get(Session, sid)
+    row.status = "completed"
+    row.auto_completed = True
+    await db_session.commit()
+
+    note = await ats_context.resolve_prompt_context(
+        "http://test",
+        client,
+        {
+            "session_id": cid,
+            "cwd": str(tmp_path),
+            "prompt": "Give me the current Anime Studio status.",
+        },
+    )
+
+    assert "ATS-FIRST CONTEXT RESOLUTION" in note
+    after = (await client.get(f"/api/sessions/{sid}")).json()
+    assert after["status"] == "active"
+    assert after["auto_completed"] is False
+    assert after["repo_root"] == ANIME_ROOT
+
+
+@pytest.mark.asyncio
 async def test_explicit_task_prompt_binds_session_and_injects_exact_authority(
     client, tmp_path, monkeypatch
 ):

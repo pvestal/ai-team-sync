@@ -70,6 +70,18 @@ async def _get_session(client: Any, server_url: str, session_id: str) -> dict[st
             f"HTTP {response.status_code} {_response_error(response)}"
         )
     body = response.json()
+    if body.get("status") == "completed" and body.get("auto_completed") is True:
+        # A live prompt is itself proof that the inactivity reaper guessed
+        # wrong. ATS already has a guarded resurrection path that restores the
+        # same session and any still-available locks. Use it instead of either
+        # blocking the operator's prompt or minting a duplicate identity.
+        heartbeat = await client.post(f"{server_url}/api/sessions/{session_id}/heartbeat")
+        if heartbeat.status_code == 200 and heartbeat.json().get("status") == "active":
+            return heartbeat.json()
+        raise ContextResolutionError(
+            f"ATS could not resurrect auto-reaped session {session_id}: "
+            f"HTTP {heartbeat.status_code} {_response_error(heartbeat)}"
+        )
     if body.get("status") != "active":
         raise ContextResolutionError(
             f"ATS session {session_id} is {body.get('status')}, not active"
