@@ -6,7 +6,11 @@ import pytest
 
 from ai_team_sync import session_pointer as sp
 from ai_team_sync.hooks import ats_context, codex_session_autostart
-from ai_team_sync.hooks.session_registration import RegistrationInput, ensure_session
+from ai_team_sync.hooks.session_registration import (
+    RegistrationInput,
+    ensure_session,
+    lifecycle_session_key,
+)
 
 ANIME_ROOT = "/opt/anime-studio"
 
@@ -64,7 +68,7 @@ async def test_active_codex_session_is_reused(client):
     assert resumed == sid
     row = (await client.get(f"/api/sessions/{sid}")).json()
     assert row["status"] == "active"
-    assert row["agent"] == "codex:codex-li"
+    assert row["agent"] == f"codex:{lifecycle_session_key('codex', 'codex-life-1111')[:8]}"
     assert "model=gpt-5.6-sol" in row["description"]
 
 
@@ -104,12 +108,14 @@ async def test_explicitly_completed_session_stays_terminal_and_gets_replacement(
     assert old["status"] == "completed"
     assert old["auto_completed"] is False
     assert new["status"] == "active"
-    assert sp.resolve_pointer("codex-life-1111", allow_global=False) == replacement
+    key = lifecycle_session_key("codex", "codex-life-1111")
+    assert sp.resolve_pointer(key, allow_global=False) == replacement
 
 
 @pytest.mark.asyncio
 async def test_unknown_session_pointer_creates_replacement(client):
-    sp.save_pointer("missing-session", "codex-life-1111")
+    key = lifecycle_session_key("codex", "codex-life-1111")
+    sp.save_pointer("missing-session", key)
 
     sid = await ensure_session("http://test", client, _input())
 
@@ -124,8 +130,9 @@ async def test_prompt_stage_recovers_sessionstart_rest_race(client, monkeypatch)
             raise OSError("ATS not ready")
 
     data = _input(cid="race-codex-2222")
+    key = lifecycle_session_key("codex", data.lifecycle_session_id)
     assert await ensure_session("http://offline", UnavailableAtStartup(), data) is None
-    assert sp.resolve_pointer(data.lifecycle_session_id, allow_global=False) is None
+    assert sp.resolve_pointer(key, allow_global=False) is None
 
     note = await ats_context.resolve_prompt_context(
         "http://test",
@@ -140,12 +147,12 @@ async def test_prompt_stage_recovers_sessionstart_rest_race(client, monkeypatch)
         agent="codex",
     )
 
-    sid = sp.resolve_pointer(data.lifecycle_session_id, allow_global=False)
+    sid = sp.resolve_pointer(key, allow_global=False)
     assert sid
     assert "ATS-FIRST CONTEXT RESOLUTION" in note
     assert f"session: {sid}" in note
     row = (await client.get(f"/api/sessions/{sid}")).json()
-    assert row["agent"] == "codex:race-cod"
+    assert row["agent"] == f"codex:{key[:8]}"
     assert row["repo_root"] == ANIME_ROOT
 
 
@@ -169,3 +176,23 @@ async def test_generic_codex_session_registers_but_remains_unscoped(client):
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_uuidv7_codex_sessions_with_same_time_prefix_do_not_alias(client):
+    first_cid = "01a1192a-8d4f-7a53-beb0-41e28d890fb7"
+    second_cid = "01a1192a-cbea-7eb0-9693-649573b31e4c"
+
+    first = await ensure_session("http://test", client, _input(cid=first_cid))
+    second = await ensure_session("http://test", client, _input(cid=second_cid))
+
+    assert first != second
+    first_key = lifecycle_session_key("codex", first_cid)
+    second_key = lifecycle_session_key("codex", second_cid)
+    assert first_key[:8] != second_key[:8]
+    assert sp.resolve_pointer(first_key, allow_global=False) == first
+    assert sp.resolve_pointer(second_key, allow_global=False) == second
+    first_row = (await client.get(f"/api/sessions/{first}")).json()
+    second_row = (await client.get(f"/api/sessions/{second}")).json()
+    assert first_row["agent"] == f"codex:{first_key[:8]}"
+    assert second_row["agent"] == f"codex:{second_key[:8]}"

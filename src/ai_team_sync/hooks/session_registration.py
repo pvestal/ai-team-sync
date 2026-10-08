@@ -7,6 +7,7 @@ reuse, resurrection, and replacement behavior cannot drift.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 from dataclasses import dataclass
@@ -29,6 +30,22 @@ class RegistrationInput:
 
 class RegistrationError(RuntimeError):
     """An existing lifecycle row could not be safely reused."""
+
+
+def lifecycle_session_key(agent: str, lifecycle_session_id: str) -> str:
+    """Return the collision-resistant local identity key for one lifecycle.
+
+    Claude session UUIDs historically used their first eight random characters
+    for pointer files and display labels. Codex uses UUIDv7-style thread IDs,
+    whose leading characters are time ordered: processes started close together
+    can share that entire prefix. Hash Codex IDs before passing them into the
+    shared pointer/label machinery so its existing eight-character key remains
+    compact without aliasing concurrent Codex lifecycles.
+    """
+    lifecycle_session_id = lifecycle_session_id.strip()
+    if lifecycle_session_id and agent.strip().lower() == "codex":
+        return hashlib.sha256(lifecycle_session_id.encode("utf-8")).hexdigest()
+    return lifecycle_session_id
 
 
 def developer() -> str:
@@ -107,7 +124,7 @@ async def _reuse_existing(
 
 async def ensure_session(server_url: str, client: Any, data: RegistrationInput) -> str | None:
     """Create, reuse, or safely resurrect one lifecycle's ATS session."""
-    cid = data.lifecycle_session_id.strip()
+    cid = lifecycle_session_key(data.agent, data.lifecycle_session_id)
     if not cid:
         return None
 

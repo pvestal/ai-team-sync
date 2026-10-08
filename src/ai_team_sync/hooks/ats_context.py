@@ -27,7 +27,7 @@ from ai_team_sync.context_resolution import (
     governed_roots,
     resolve_request_target,
 )
-from ai_team_sync.hooks.session_registration import RegistrationInput
+from ai_team_sync.hooks.session_registration import RegistrationInput, lifecycle_session_key
 from ai_team_sync.hooks.session_registration import ensure_session as ensure_registered_session
 from ai_team_sync.session_marker import AUTOREG_DESCRIPTION
 
@@ -180,16 +180,15 @@ async def resolve_prompt_context(
         or os.environ.get("ATS_SESSION")
         or ""
     )
-    session_id = _session_id(cid)
+    base_agent = agent or ("claude-code" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "codex")
+    cid_key = lifecycle_session_key(base_agent, cid)
+    session_id = _session_id(cid_key)
     # SessionStart may run before Codex MCP startup and before local ATS is
     # reachable. A governed turn is the mandatory retry boundary: register via
     # local REST now, before asking ATS for authoritative context. Generic turns
     # return above and remain deliberately unscoped.
     explicit_session = bool((os.environ.get("ATS_SESSION_ID") or "").strip())
     if cid and not explicit_session:
-        base_agent = agent or (
-            "claude-code" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "codex"
-        )
         registered = await ensure_registered_session(
             server_url,
             client,
@@ -208,7 +207,7 @@ async def resolve_prompt_context(
         raise ContextResolutionError(
             "no ATS session identity; SessionStart auto-registration did not complete"
         )
-    token = _token(session_id, cid)
+    token = _token(session_id, cid_key)
     session = await _get_session(client, server_url, session_id)
 
     if target.repo_root:
