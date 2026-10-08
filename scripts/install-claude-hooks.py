@@ -57,6 +57,12 @@ def install(settings_path: Path, python: str) -> None:
     if not isinstance(settings, dict):
         raise ValueError(f"{settings_path} must contain one JSON object")
 
+    # Governed repository paths are machine-local operator policy shared by
+    # every ATS client. Do not duplicate or expose them in Claude settings.
+    environment = settings.get("env")
+    if isinstance(environment, dict):
+        environment.pop("ATS_COORDINATED_REPOS", None)
+
     start_groups = list(settings.setdefault("hooks", {}).get("SessionStart") or [])
     startup_echo = ""
     for group in start_groups:
@@ -119,7 +125,7 @@ def install(settings_path: Path, python: str) -> None:
         # supplemental packet at the correct point in the ordering contract.
         supplement_command = startup_echo.replace("--mode session-start", "--mode hook")
 
-    context_command = f"{python} -m {CONTEXT_MODULE}"
+    context_command = f"{python} -m {CONTEXT_MODULE} --agent claude-code"
     if supplement_command:
         context_command += (
             " --supplement-command " + shlex.quote(supplement_command) + " --supplement-timeout 90"

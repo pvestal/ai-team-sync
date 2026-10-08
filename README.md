@@ -238,7 +238,7 @@ across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately before starting
 - **Git hooks**: `./scripts/install-hooks.sh /path/to/repo` — auto-warns on commits to locked files
 - **Agent file hook**: wire `ats-presence-hook` as a Claude Code `PostToolUse` hook on `Read|Edit|Write|MultiEdit|NotebookEdit`. It records reported reads and edits under the ATS session ID; edits also broadcast short-lived presence. It does not infer which agent changed an uncommitted file, and commands such as `cat` are not observed file reads. Set `ATS_INTENT="..."` once per session for the one-line edit intent. See `src/ai_team_sync/hooks/post_tool_use_presence.py`.
 - **Override grants**: an exclusive lock requires its owner's session capability to approve; words in the request cannot auto-approve it. The approval is valid for the requester, the owner's existing lock pattern, and the request's 15-minute lifetime. A lock created later does not inherit it. Sessions opened before this capability was deployed must be restarted before they can answer override requests.
-- **Agent lock-guard hook** (auto-READ — the other half of coordination): wire `pre_tool_use_lockcheck.py` as a Claude Code `PreToolUse` hook on `Edit|Write|MultiEdit|NotebookEdit`. Before an edit it reads the server's **live locks**. Another session's exclusive lock blocks (exit 2); an advisory lock warns. A declared session scope records intent and neither grants nor blocks an edit. Inside repos named by `ATS_COORDINATED_REPOS`, your own live lock must cover the file. The hook excludes your own session via the payload's `session_id` so you never self-block. Fail-open: server down / bad payload ⇒ the edit proceeds. `ATS_LOCKCHECK_BLOCK=0` downgrades foreign exclusive locks to warnings; `ATS_CLAIMCHECK=0` downgrades a missing own lock to a warning. Without this hook, presence broadcasts edits but does not check the lock holder before an edit.
+- **Agent lock-guard hook** (auto-READ — the other half of coordination): wire `pre_tool_use_lockcheck.py` as a Claude Code `PreToolUse` hook on `Edit|Write|MultiEdit|NotebookEdit`. Before an edit it reads the server's **live locks**. Another session's exclusive lock blocks (exit 2); an advisory lock warns. A declared session scope records intent and neither grants nor blocks an edit. Inside repos named by the shared operator configuration, your own live lock must cover the file. The hook excludes your own session via the payload's `session_id` so you never self-block. Fail-open: server down / bad payload ⇒ the edit proceeds. `ATS_LOCKCHECK_BLOCK=0` downgrades foreign exclusive locks to warnings; `ATS_CLAIMCHECK=0` downgrades a missing own lock to a warning. Without this hook, presence broadcasts edits but does not check the lock holder before an edit.
 
   ```jsonc
   // ~/.claude/settings.json
@@ -267,9 +267,9 @@ across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately before starting
   ]
   ```
 - **ATS-first context hook (required for governed work)**: `ats_context.py` is a
-  Claude Code `UserPromptSubmit` hook and must run before supplemental memory
-  hooks. It deterministically recognizes an explicit Tower ticket, a cwd inside
-  `ATS_COORDINATED_REPOS`, or a governed project name such as “Anime Studio”. It
+  Claude Code and Codex `UserPromptSubmit` hook and must run before supplemental
+  memory hooks. It deterministically recognizes an explicit Tower ticket, a cwd inside
+  the shared operator-governed repositories, or a governed project name. It
   anchors the auto-registered session, requests the ATS brief, and injects that
   packet before the worker receives the prompt. A generic prompt stays
   unscoped. A governed prompt is blocked if ATS context cannot be obtained, so
@@ -277,8 +277,40 @@ across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately before starting
   installs and orders `session_autostart`, `ats_context`, then `override_inbox`
   automatically in `~/.claude/settings.json`; existing Echo startup and prompt
   hooks are migrated into the same prompt-hook process and invoked only after
-  ATS succeeds, because Claude otherwise runs sibling hooks concurrently and a
-  startup packet would preload supplemental context before governed resolution.
+  ATS succeeds, because sibling hooks may run concurrently and a startup packet
+  would preload supplemental context before governed resolution. Codex uses a
+  thin `codex_session_autostart` adapter that reads `session_id`, `cwd`, event,
+  source, and model from the hook payload; it does not read
+  `CLAUDE_CODE_SESSION_ID`. SessionStart talks to local ATS REST so an MCP startup
+  race cannot make ATS permanently optional, and UserPromptSubmit retries direct
+  registration before governed resolution. Install or inspect the exact change:
+
+  ```bash
+  python3 scripts/install-codex-hooks.py \
+    --python "$HOME/.local/share/pipx/venvs/ai-team-sync/bin/python" --dry-run
+  python3 scripts/install-codex-hooks.py \
+    --python "$HOME/.local/share/pipx/venvs/ai-team-sync/bin/python"
+  # rollback only ATS-owned entries; unrelated Codex hooks remain
+  python3 scripts/install-codex-hooks.py \
+    --python "$HOME/.local/share/pipx/venvs/ai-team-sync/bin/python" --uninstall
+  ```
+
+  The installer targets `~/.codex/hooks.json`, preserves unrelated hooks,
+  refuses malformed JSON and an inline `[hooks]` layer, is idempotent, and
+  prints a unified diff. Codex asks the operator to trust newly discovered hook
+  commands; review them with `/hooks` after installation.
+
+  Governed repository paths belong in the private, shared operator file—not in
+  Claude or Codex hook commands. Keep it user-readable only:
+
+  ```toml
+  # ~/.config/ai-team-sync/operator.toml (mode 0600)
+  [governance]
+  repositories = ["/srv/project-a", "/srv/project-b"]
+  ```
+
+  `ATS_OPERATOR_CONFIG` may point every ATS client at a different shared file.
+  `ATS_COORDINATED_REPOS` remains only as a legacy explicit override.
 - **Slack/Telegram**: Edit `.env` with webhook URLs for push notifications
 - **GitHub Action**: Auto-appends session context to PR descriptions
 

@@ -21,6 +21,15 @@ MY_SID = "d1948be4-3d13-42cf-be35-2b02a2718470"
 MY_CID8 = "d8710a6c"
 
 
+def test_coordinated_roots_come_from_shared_operator_config(tmp_path, monkeypatch):
+    config = tmp_path / "operator.toml"
+    config.write_text(f'[governance]\nrepositories = ["{REPO}"]\n')
+    monkeypatch.setenv("ATS_OPERATOR_CONFIG", str(config))
+    monkeypatch.delenv("ATS_COORDINATED_REPOS", raising=False)
+
+    assert guard._coordinated_roots() == [REPO]
+
+
 def _sess(sid=MY_SID, status="active", agent=f"claude-code:{MY_CID8}",
           scope=(), repo_root=REPO):
     return {"id": sid, "status": status, "agent": agent,

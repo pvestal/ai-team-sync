@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+from copy import deepcopy
 
 import pytest
 
@@ -107,6 +107,43 @@ async def test_project_prompt_anchors_placeholder_and_gets_ats_brief(client, tmp
 
 
 @pytest.mark.asyncio
+async def test_project_prompt_resurrects_auto_reaped_session(
+    client, db_session, tmp_path, monkeypatch
+):
+    from ai_team_sync.hooks import ats_context, session_autostart
+    from ai_team_sync.models import Session
+
+    cid = "207985b7-1111-2222-3333-444455556666"
+    monkeypatch.setenv("ATS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", cid)
+    monkeypatch.setenv("ATS_DEVELOPER", "patrick")
+    monkeypatch.setenv("ATS_COORDINATED_REPOS", ANIME_ROOT)
+    monkeypatch.chdir(tmp_path)
+
+    sid = await session_autostart.ensure_session("http://test", client)
+    row = await db_session.get(Session, sid)
+    row.status = "completed"
+    row.auto_completed = True
+    await db_session.commit()
+
+    note = await ats_context.resolve_prompt_context(
+        "http://test",
+        client,
+        {
+            "session_id": cid,
+            "cwd": str(tmp_path),
+            "prompt": "Give me the current Anime Studio status.",
+        },
+    )
+
+    assert "ATS-FIRST CONTEXT RESOLUTION" in note
+    after = (await client.get(f"/api/sessions/{sid}")).json()
+    assert after["status"] == "active"
+    assert after["auto_completed"] is False
+    assert after["repo_root"] == ANIME_ROOT
+
+
+@pytest.mark.asyncio
 async def test_explicit_task_prompt_binds_session_and_injects_exact_authority(
     client, tmp_path, monkeypatch
 ):
@@ -143,6 +180,57 @@ async def test_explicit_task_prompt_binds_session_and_injects_exact_authority(
     row = (await client.get(f"/api/sessions/{sid}")).json()
     assert row["ticket_id"] == 4101
     assert row["repo_root"] == "", "a Tower project display name is not a repository mapping"
+
+
+@pytest.mark.asyncio
+async def test_codex_prompt_for_3522_requires_exact_3522_context(
+    client, tmp_path, monkeypatch
+):
+    import ai_team_sync.briefs as briefs
+    from ai_team_sync import session_pointer as sp
+    from ai_team_sync.hooks import ats_context
+    from ai_team_sync.hooks.session_registration import lifecycle_session_key
+    from tests.test_task_brief import TASK_ENVELOPE
+
+    cid = "35223522-1111-2222-3333-444455556666"
+    envelope = deepcopy(TASK_ENVELOPE)
+    envelope["id"] = 3522
+    envelope["task_context"]["task"]["id"] = 3522
+    for ruling in (
+        envelope["task_context"]["operator_rulings"]["current"]
+        + envelope["task_context"]["operator_rulings"]["history"]
+    ):
+        ruling["scope"]["tower_task_id"] = 3522
+    called = []
+
+    def exact_task(task_id, **kwargs):
+        called.append(task_id)
+        assert task_id == 3522
+        return envelope, None
+
+    monkeypatch.setattr(briefs, "fetch_tower_task_data", exact_task)
+    monkeypatch.setitem(briefs.build_brief.__globals__, "fetch_tower_task_data", exact_task)
+    monkeypatch.setattr(briefs, "recall_memories", lambda *a, **kw: [])
+    monkeypatch.setenv("ATS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("ATS_DEVELOPER", "patrick")
+    monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{ANIME_ROOT}:{ECHO_ROOT}")
+
+    note = await ats_context.resolve_prompt_context(
+        "http://test",
+        client,
+        {
+            "session_id": cid,
+            "cwd": str(tmp_path),
+            "prompt": "Give me the status of #3522.",
+        },
+        agent="codex",
+    )
+
+    assert called == [3522], note
+    assert "EXACT TASK-SCOPED CONTEXT" in note
+    sid = sp.resolve_pointer(lifecycle_session_key("codex", cid), allow_global=False)
+    row = (await client.get(f"/api/sessions/{sid}")).json()
+    assert row["ticket_id"] == 3522
 
 
 @pytest.mark.asyncio

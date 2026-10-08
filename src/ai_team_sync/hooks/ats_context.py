@@ -27,6 +27,8 @@ from ai_team_sync.context_resolution import (
     governed_roots,
     resolve_request_target,
 )
+from ai_team_sync.hooks.session_registration import RegistrationInput, lifecycle_session_key
+from ai_team_sync.hooks.session_registration import ensure_session as ensure_registered_session
 from ai_team_sync.session_marker import AUTOREG_DESCRIPTION
 
 
@@ -70,6 +72,18 @@ async def _get_session(client: Any, server_url: str, session_id: str) -> dict[st
             f"HTTP {response.status_code} {_response_error(response)}"
         )
     body = response.json()
+    if body.get("status") == "completed" and body.get("auto_completed") is True:
+        # A live prompt is itself proof that the inactivity reaper guessed
+        # wrong. ATS already has a guarded resurrection path that restores the
+        # same session and any still-available locks. Use it instead of either
+        # blocking the operator's prompt or minting a duplicate identity.
+        heartbeat = await client.post(f"{server_url}/api/sessions/{session_id}/heartbeat")
+        if heartbeat.status_code == 200 and heartbeat.json().get("status") == "active":
+            return heartbeat.json()
+        raise ContextResolutionError(
+            f"ATS could not resurrect auto-reaped session {session_id}: "
+            f"HTTP {heartbeat.status_code} {_response_error(heartbeat)}"
+        )
     if body.get("status") != "active":
         raise ContextResolutionError(
             f"ATS session {session_id} is {body.get('status')}, not active"
@@ -146,7 +160,11 @@ async def _brief(
 
 
 async def resolve_prompt_context(
-    server_url: str, client: Any, payload: dict[str, Any]
+    server_url: str,
+    client: Any,
+    payload: dict[str, Any],
+    *,
+    agent: str | None = None,
 ) -> str | None:
     """Return injected ATS context, None for a genuinely generic prompt."""
     prompt = str(payload.get("prompt") or "").strip()
@@ -162,12 +180,34 @@ async def resolve_prompt_context(
         or os.environ.get("ATS_SESSION")
         or ""
     )
-    session_id = _session_id(cid)
+    base_agent = agent or ("claude-code" if os.environ.get("CLAUDE_CODE_SESSION_ID") else "codex")
+    cid_key = lifecycle_session_key(base_agent, cid)
+    session_id = _session_id(cid_key)
+    # SessionStart may run before Codex MCP startup and before local ATS is
+    # reachable. A governed turn is the mandatory retry boundary: register via
+    # local REST now, before asking ATS for authoritative context. Generic turns
+    # return above and remain deliberately unscoped.
+    explicit_session = bool((os.environ.get("ATS_SESSION_ID") or "").strip())
+    if cid and not explicit_session:
+        registered = await ensure_registered_session(
+            server_url,
+            client,
+            RegistrationInput(
+                lifecycle_session_id=cid,
+                agent=base_agent,
+                cwd=cwd,
+                hook_event_name=str(payload.get("hook_event_name") or "UserPromptSubmit"),
+                model=str(payload.get("model") or ""),
+                source=str(payload.get("source") or ""),
+            ),
+        )
+        if registered:
+            session_id = registered
     if not session_id:
         raise ContextResolutionError(
             "no ATS session identity; SessionStart auto-registration did not complete"
         )
-    token = _token(session_id, cid)
+    token = _token(session_id, cid_key)
     session = await _get_session(client, server_url, session_id)
 
     if target.repo_root:
@@ -209,6 +249,7 @@ def _run_supplement(command: str, timeout: int, raw_payload: str) -> None:
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--agent", choices=("codex", "claude-code"), default=None)
     parser.add_argument("--supplement-command", default="")
     parser.add_argument("--supplement-timeout", type=int, default=90)
     args = parser.parse_args(argv)
@@ -230,7 +271,7 @@ def main(argv: list[str] | None = None) -> None:
         import httpx
 
         async with httpx.AsyncClient(timeout=25) as client:
-            return await resolve_prompt_context(server, client, payload)
+            return await resolve_prompt_context(server, client, payload, agent=args.agent)
 
     try:
         note = asyncio.run(_run())

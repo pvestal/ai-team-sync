@@ -200,6 +200,10 @@ _EXPLICIT_TASK_PATTERNS = (
                re.IGNORECASE),
     re.compile(r"^\s*(?:continue|resume|work\s+on)\s+#([1-9][0-9]*)\b",
                re.IGNORECASE),
+    re.compile(
+        r"\b(?:status|state|details?|context)\s+(?:of|for)\s+#([1-9][0-9]*)\b",
+        re.IGNORECASE,
+    ),
 )
 
 

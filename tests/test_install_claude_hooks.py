@@ -46,6 +46,10 @@ def test_installer_puts_ats_context_before_echo_and_is_idempotent(tmp_path):
                         }
                     ],
                 },
+                "env": {
+                    "ATS_COORDINATED_REPOS": "/private/repo-a:/private/repo-b",
+                    "ATS_AGENT": "claude-code",
+                },
                 "unrelated": {"preserved": True},
             }
         )
@@ -59,6 +63,7 @@ def test_installer_puts_ats_context_before_echo_and_is_idempotent(tmp_path):
     assert first == second
     body = json.loads(second)
     assert body["unrelated"] == {"preserved": True}
+    assert body["env"] == {"ATS_AGENT": "claude-code"}
     prompt_commands = [
         hook["command"]
         for group in body["hooks"]["UserPromptSubmit"]
