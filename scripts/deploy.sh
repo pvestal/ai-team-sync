@@ -33,7 +33,6 @@ python3 scripts/install-claude-hooks.py \
 python3 scripts/install-codex-hooks.py \
   --hooks "${ATS_CODEX_HOOKS:-${HOME}/.codex/hooks.json}" \
   --config "${ATS_CODEX_CONFIG:-${HOME}/.codex/config.toml}" \
-  --governed-repos "${ATS_COORDINATED_REPOS:-}" \
   --python "${ATS_HOOK_PYTHON}"
 systemctl --user restart ats-server
 sleep 2

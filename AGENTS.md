@@ -116,6 +116,9 @@ supplemental memory or verifying mutable facts in Git, databases, and services.
 Claude and Codex `UserPromptSubmit` hooks enforce this automatically. Codex
 `SessionStart` registers directly through local ATS REST because its MCP client
 may not be ready yet; the prompt hook retries registration for governed work.
+Machine-local governed repository paths live in
+`~/.config/ai-team-sync/operator.toml`, shared by both clients; do not embed them
+in Claude/Codex hook commands or settings.
 Use the ATS MCP tools for coordination (`check_locks` before editing,
 `start_session` when you claim file scope, decision history while working, and
 `complete_session` at the end); the CLI is only a fallback when MCP is
