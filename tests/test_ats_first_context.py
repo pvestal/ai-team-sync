@@ -189,6 +189,7 @@ async def test_codex_prompt_for_3522_requires_exact_3522_context(
     import ai_team_sync.briefs as briefs
     from ai_team_sync import session_pointer as sp
     from ai_team_sync.hooks import ats_context
+    from ai_team_sync.hooks.session_registration import lifecycle_session_key
     from tests.test_task_brief import TASK_ENVELOPE
 
     cid = "35223522-1111-2222-3333-444455556666"
@@ -227,7 +228,7 @@ async def test_codex_prompt_for_3522_requires_exact_3522_context(
 
     assert called == [3522], note
     assert "EXACT TASK-SCOPED CONTEXT" in note
-    sid = sp.resolve_pointer(cid, allow_global=False)
+    sid = sp.resolve_pointer(lifecycle_session_key("codex", cid), allow_global=False)
     row = (await client.get(f"/api/sessions/{sid}")).json()
     assert row["ticket_id"] == 3522
 
