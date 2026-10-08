@@ -267,8 +267,8 @@ across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately before starting
   ]
   ```
 - **ATS-first context hook (required for governed work)**: `ats_context.py` is a
-  Claude Code `UserPromptSubmit` hook and must run before supplemental memory
-  hooks. It deterministically recognizes an explicit Tower ticket, a cwd inside
+  Claude Code and Codex `UserPromptSubmit` hook and must run before supplemental
+  memory hooks. It deterministically recognizes an explicit Tower ticket, a cwd inside
   `ATS_COORDINATED_REPOS`, or a governed project name such as “Anime Studio”. It
   anchors the auto-registered session, requests the ATS brief, and injects that
   packet before the worker receives the prompt. A generic prompt stays
@@ -277,8 +277,30 @@ across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately before starting
   installs and orders `session_autostart`, `ats_context`, then `override_inbox`
   automatically in `~/.claude/settings.json`; existing Echo startup and prompt
   hooks are migrated into the same prompt-hook process and invoked only after
-  ATS succeeds, because Claude otherwise runs sibling hooks concurrently and a
-  startup packet would preload supplemental context before governed resolution.
+  ATS succeeds, because sibling hooks may run concurrently and a startup packet
+  would preload supplemental context before governed resolution. Codex uses a
+  thin `codex_session_autostart` adapter that reads `session_id`, `cwd`, event,
+  source, and model from the hook payload; it does not read
+  `CLAUDE_CODE_SESSION_ID`. SessionStart talks to local ATS REST so an MCP startup
+  race cannot make ATS permanently optional, and UserPromptSubmit retries direct
+  registration before governed resolution. Install or inspect the exact change:
+
+  ```bash
+  python3 scripts/install-codex-hooks.py \
+    --python "$HOME/.local/share/pipx/venvs/ai-team-sync/bin/python" \
+    --governed-repos "/opt/anime-studio:/opt/tower-echo-brain" --dry-run
+  python3 scripts/install-codex-hooks.py \
+    --python "$HOME/.local/share/pipx/venvs/ai-team-sync/bin/python" \
+    --governed-repos "/opt/anime-studio:/opt/tower-echo-brain"
+  # rollback only ATS-owned entries; unrelated Codex hooks remain
+  python3 scripts/install-codex-hooks.py \
+    --python "$HOME/.local/share/pipx/venvs/ai-team-sync/bin/python" --uninstall
+  ```
+
+  The installer targets `~/.codex/hooks.json`, preserves unrelated hooks,
+  refuses malformed JSON and an inline `[hooks]` layer, is idempotent, and
+  prints a unified diff. Codex asks the operator to trust newly discovered hook
+  commands; review them with `/hooks` after installation.
 - **Slack/Telegram**: Edit `.env` with webhook URLs for push notifications
 - **GitHub Action**: Auto-appends session context to PR descriptions
 

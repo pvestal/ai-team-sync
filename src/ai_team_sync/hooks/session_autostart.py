@@ -26,30 +26,15 @@ from __future__ import annotations
 
 import asyncio
 import os
-import subprocess
 import sys
 
 from ai_team_sync import session_pointer as sp
-from ai_team_sync.context_resolution import governed_roots, resolve_request_target
-from ai_team_sync.session_marker import AUTOREG_DESCRIPTION
-
-
-def _developer() -> str:
-    if os.environ.get("ATS_DEVELOPER"):
-        return os.environ["ATS_DEVELOPER"]
-    try:
-        name = subprocess.run(["git", "config", "user.name"], capture_output=True,
-                              text=True, timeout=2).stdout.strip()
-        if name:
-            return name
-    except Exception:
-        pass
-    return os.environ.get("USER", "unknown")
+from ai_team_sync.hooks.session_registration import RegistrationInput
+from ai_team_sync.hooks.session_registration import ensure_session as ensure_registered_session
 
 
 def _agent_label(cid: str) -> str:
-    # One label for every registrar (#2517). cid passed EXPLICITLY: this hook is
-    # the publisher of the live cid and its environment is the authority (#2003).
+    """Backward-compatible Claude label helper; the SSOT remains session_pointer."""
     return sp.agent_label("claude-code", cid)
 
 
@@ -69,43 +54,16 @@ async def ensure_session(server_url: str, client) -> str | None:
     # CLAUDE_CODE_SESSION_ID froze at spawn time and cannot see the rotation.
     sp.publish_live_cid(cid)
 
-    # Idempotent reuse: a pointer we still recognize as active on the server.
-    # allow_global=False: the legacy shared pointer names the last session to
-    # write it, so reusing it makes THIS session inherit that row's identity.
-    existing = sp.resolve_pointer(cid, allow_global=False)
-    if existing:
-        try:
-            r = await client.get(f"{server_url}/api/sessions/{existing}")
-            if r.status_code == 200 and r.json().get("status") == "active":
-                sp.save_pointer(existing, cid)
-                return existing
-        except Exception:
-            pass  # fall through to create a fresh row
-
-    try:
-        target = resolve_request_target(
-            "", cwd=os.getcwd(), governed_roots=governed_roots())
-        repo_root = target.repo_root if target else ""
-        # Do not infer a repo from a generic multi-repo cwd such as ~/Documents.
-        # The deterministic resolver anchors only when cwd is inside an
-        # operator-configured repo (including a linked worktree); otherwise it
-        # remains empty until a governed prompt identifies the project.
-        r = await client.post(f"{server_url}/api/sessions", json={
-            "developer": _developer(),
-            "agent": _agent_label(cid),
-            "scope": [],
-            "description": AUTOREG_DESCRIPTION,
-            "repo_root": repo_root,
-            "auto_lock": False,
-        })
-        if r.status_code in (200, 201):
-            sid = r.json()["id"]
-            sp.save_pointer(sid, cid)
-            sp.save_approval_token(sid, r.headers.get("X-ATS-Approval-Token", ""), cid)
-            return sid
-    except Exception:
-        pass
-    return None
+    return await ensure_registered_session(
+        server_url,
+        client,
+        RegistrationInput(
+            lifecycle_session_id=cid,
+            agent="claude-code",
+            cwd=os.getcwd(),
+            hook_event_name="SessionStart",
+        ),
+    )
 
 
 def main() -> None:

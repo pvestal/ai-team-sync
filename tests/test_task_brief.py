@@ -330,6 +330,7 @@ def test_explicit_task_syntax_excludes_incidental_hash_references():
 
     assert explicit_task_id("#3477 personal-data recovery") == 3477
     assert explicit_task_id("continue #3477") == 3477
+    assert explicit_task_id("Give me the status of #3522.") == 3522
     assert explicit_task_id("continue Tower task #3477") == 3477
     assert explicit_task_id("Tower task ID 3477") == 3477
     assert explicit_task_id("ticket id #3477") == 3477

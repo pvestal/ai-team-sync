@@ -27,6 +27,11 @@ ATS_HOOK_PYTHON="${ATS_HOOK_PYTHON:-${HOME}/.local/share/pipx/venvs/ai-team-sync
 python3 scripts/install-claude-hooks.py \
   --settings "${ATS_CLAUDE_SETTINGS:-${HOME}/.claude/settings.json}" \
   --python "${ATS_HOOK_PYTHON}"
+python3 scripts/install-codex-hooks.py \
+  --hooks "${ATS_CODEX_HOOKS:-${HOME}/.codex/hooks.json}" \
+  --config "${ATS_CODEX_CONFIG:-${HOME}/.codex/config.toml}" \
+  --governed-repos "${ATS_COORDINATED_REPOS:-}" \
+  --python "${ATS_HOOK_PYTHON}"
 systemctl --user restart ats-server
 sleep 2
 curl -s http://localhost:8400/api/version | python3 -m json.tool

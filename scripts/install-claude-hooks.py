@@ -119,7 +119,7 @@ def install(settings_path: Path, python: str) -> None:
         # supplemental packet at the correct point in the ordering contract.
         supplement_command = startup_echo.replace("--mode session-start", "--mode hook")
 
-    context_command = f"{python} -m {CONTEXT_MODULE}"
+    context_command = f"{python} -m {CONTEXT_MODULE} --agent claude-code"
     if supplement_command:
         context_command += (
             " --supplement-command " + shlex.quote(supplement_command) + " --supplement-timeout 90"
