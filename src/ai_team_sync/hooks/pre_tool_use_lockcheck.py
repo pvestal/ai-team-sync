@@ -23,6 +23,7 @@ import os
 import sys
 
 from ai_team_sync.git_utils import resolve_repo_roots as _roots
+from ai_team_sync.operator_config import governed_repositories
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 _SKIP_SUBSTR = ("/.git/", "/node_modules/", "/__pycache__/", "/.venv/",
@@ -132,10 +133,9 @@ def _coordinated_roots() -> list[str]:
     # EMPTY by default. The claim guard fails CLOSED inside a coordinated repo,
     # so shipping someone else's repo paths as the default would either enforce
     # nothing (the paths do not exist) or enforce it somewhere unexpected.
-    # Opt in per machine:
-    #   export ATS_COORDINATED_REPOS=/srv/my-repo:/srv/other-repo
-    raw = os.environ.get("ATS_COORDINATED_REPOS", "")
-    return [r.rstrip("/") for r in raw.split(":") if r.strip()]
+    # Opt in per machine through the shared operator config. The legacy env
+    # remains an explicit override inside governed_repositories().
+    return governed_repositories()
 
 
 def claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,

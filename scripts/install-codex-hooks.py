@@ -41,10 +41,17 @@ def _refuse_inline_hooks(config_path: Path) -> None:
         config = tomllib.loads(config_path.read_text())
     except tomllib.TOMLDecodeError as exc:
         raise ValueError(f"cannot inspect malformed {config_path}: {exc}") from exc
-    if "hooks" in config:
+    hooks = config.get("hooks")
+    if hooks is not None and not isinstance(hooks, dict):
+        raise ValueError(f"cannot inspect malformed [hooks] in {config_path}")
+    # Codex persists /hooks approvals under [hooks.state]. That metadata is not
+    # an inline hook definition and must coexist with hooks.json. Any other key
+    # is an actual second hook layer and remains a refusal.
+    inline_keys = set(hooks or {}) - {"state"}
+    if inline_keys:
         raise ValueError(
-            f"refusing mixed Codex hook layers: remove [hooks] from {config_path} "
-            "or uninstall hooks.json first"
+            f"refusing mixed Codex hook layers {sorted(inline_keys)} in {config_path}; "
+            "remove inline hook definitions or uninstall hooks.json first"
         )
 
 
@@ -88,13 +95,11 @@ def _install_event(config: dict[str, Any], event: str, hook: dict[str, Any]) -> 
     events[event] = groups
 
 
-def _command(python: str, module: str, module_root: Path | None, governed_repos: str) -> str:
+def _command(python: str, module: str, module_root: Path | None) -> str:
     parts: list[str] = []
     environment: list[str] = []
     if module_root is not None:
         environment.append(f"PYTHONPATH={module_root}")
-    if governed_repos:
-        environment.append(f"ATS_COORDINATED_REPOS={governed_repos}")
     if environment:
         parts.extend(["env", *environment])
     parts.extend([python, "-m", module])
@@ -106,7 +111,6 @@ def render(
     python: str,
     *,
     module_root: Path | None = None,
-    governed_repos: str = "",
     supplement_command: str = "",
     uninstall: bool = False,
 ) -> str:
@@ -131,12 +135,12 @@ def render(
         "SessionStart",
         {
             "type": "command",
-            "command": _command(python, AUTOSTART_MODULE, module_root, governed_repos),
+            "command": _command(python, AUTOSTART_MODULE, module_root),
             "timeout": 8,
             "statusMessage": "Registering Codex lifecycle with ai-team-sync...",
         },
     )
-    context = _command(python, CONTEXT_MODULE, module_root, governed_repos) + " --agent codex"
+    context = _command(python, CONTEXT_MODULE, module_root) + " --agent codex"
     if supplement_command:
         context += " --supplement-command " + shlex.quote(supplement_command)
         context += " --supplement-timeout 90"
@@ -167,7 +171,6 @@ def apply(
     *,
     config_path: Path,
     module_root: Path | None = None,
-    governed_repos: str = "",
     supplement_command: str = "",
     uninstall: bool = False,
     dry_run: bool = False,
@@ -180,7 +183,6 @@ def apply(
         existing,
         python,
         module_root=module_root,
-        governed_repos=governed_repos,
         supplement_command=supplement_command,
         uninstall=uninstall,
     )
@@ -208,7 +210,6 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=Path.home() / ".codex" / "config.toml")
     parser.add_argument("--python", required=True)
     parser.add_argument("--module-root", type=Path)
-    parser.add_argument("--governed-repos", default=os.environ.get("ATS_COORDINATED_REPOS", ""))
     parser.add_argument("--supplement-command", default="")
     parser.add_argument("--uninstall", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -219,7 +220,6 @@ def main() -> None:
             args.python,
             config_path=args.config,
             module_root=args.module_root,
-            governed_repos=args.governed_repos,
             supplement_command=args.supplement_command,
             uninstall=args.uninstall,
             dry_run=args.dry_run,

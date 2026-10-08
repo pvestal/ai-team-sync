@@ -41,7 +41,6 @@ def test_install_is_idempotent_preserves_unrelated_hooks_and_shows_exact_diff(tm
         "/opt/ats/bin/python",
         config_path=config,
         module_root=Path("/candidate/src"),
-        governed_repos="/opt/anime-studio:/opt/tower-echo-brain",
     )
     first = hooks.read_text()
     second_diff = module.apply(
@@ -49,7 +48,6 @@ def test_install_is_idempotent_preserves_unrelated_hooks_and_shows_exact_diff(tm
         "/opt/ats/bin/python",
         config_path=config,
         module_root=Path("/candidate/src"),
-        governed_repos="/opt/anime-studio:/opt/tower-echo-brain",
     )
 
     assert first_diff.startswith(f"--- {hooks}")
@@ -62,16 +60,12 @@ def test_install_is_idempotent_preserves_unrelated_hooks_and_shows_exact_diff(tm
     start = _commands(body, "SessionStart")
     prompt = _commands(body, "UserPromptSubmit")
     assert start[0] == (
-        "env PYTHONPATH=/candidate/src "
-        "ATS_COORDINATED_REPOS=/opt/anime-studio:/opt/tower-echo-brain "
-        "/opt/ats/bin/python -m "
+        "env PYTHONPATH=/candidate/src /opt/ats/bin/python -m "
         "ai_team_sync.hooks.codex_session_autostart"
     )
     assert start[1] == "notify-start"
     assert prompt == [
-        "env PYTHONPATH=/candidate/src "
-        "ATS_COORDINATED_REPOS=/opt/anime-studio:/opt/tower-echo-brain "
-        "/opt/ats/bin/python -m "
+        "env PYTHONPATH=/candidate/src /opt/ats/bin/python -m "
         "ai_team_sync.hooks.ats_context --agent codex"
     ]
 
@@ -116,12 +110,25 @@ def test_inline_config_hooks_are_refused_without_overwrite(tmp_path):
     hooks = tmp_path / "hooks.json"
     config = tmp_path / "config.toml"
     hooks.write_text('{"unrelated": true}\n')
-    config.write_text("[hooks]\n")
+    config.write_text("[hooks]\nSessionStart = []\n")
 
     with pytest.raises(ValueError, match="mixed Codex hook layers"):
         module.apply(hooks, "python", config_path=config)
 
     assert hooks.read_text() == '{"unrelated": true}\n'
+
+
+def test_persisted_hook_trust_state_is_not_an_inline_hook_layer(tmp_path):
+    module = _module()
+    hooks = tmp_path / "hooks.json"
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[hooks.state."hooks.json:session_start:0:0"]\n' 'trusted_hash = "sha256:abc"\n'
+    )
+
+    diff = module.apply(hooks, "python", config_path=config, dry_run=True)
+
+    assert "codex_session_autostart" in diff
 
 
 def test_dry_run_returns_diff_but_does_not_create_file(tmp_path):

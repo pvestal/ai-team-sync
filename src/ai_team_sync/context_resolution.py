@@ -3,7 +3,7 @@
 This module decides only whether a prompt names a context ATS must resolve.  It
 does not guess task authority: exact ticket syntax is parsed by the same helper
 the brief builder uses, while project context is limited to repositories the
-operator explicitly listed in ``ATS_COORDINATED_REPOS``.
+operator explicitly listed in the shared ATS operator configuration.
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from ai_team_sync.briefs import explicit_task_id
 from ai_team_sync.git_utils import resolve_repo_roots
+from ai_team_sync.operator_config import governed_repositories
 
 
 @dataclass(frozen=True)
@@ -24,16 +25,8 @@ class RequestTarget:
 
 
 def governed_roots() -> list[str]:
-    """Operator-configured repositories, canonicalized without requiring them."""
-    raw = os.environ.get("ATS_COORDINATED_REPOS", "")
-    roots: list[str] = []
-    for value in raw.split(":"):
-        value = value.strip()
-        if value:
-            root = os.path.realpath(value).rstrip("/") or "/"
-            if root not in roots:
-                roots.append(root)
-    return roots
+    """Machine-local operator-governed repositories shared by all clients."""
+    return governed_repositories()
 
 
 def _normal_words(value: str) -> str:
