@@ -7,7 +7,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from ai_team_sync.config import settings
 
-
 # Idempotent lightweight column additions for existing DBs (init_db uses create_all,
 # which creates missing TABLES but never alters existing ones). Each entry is applied
 # inside a savepoint so a re-run / already-present column is a harmless no-op even
@@ -16,7 +15,11 @@ from ai_team_sync.config import settings
 _COLUMN_MIGRATIONS = [
     ("scope_locks", "reason", "TEXT DEFAULT ''"),
     ("sessions", "last_heartbeat", "TIMESTAMP"),  # nullable liveness signal (Gap 1)
-    ("sessions", "repo_root", "TEXT DEFAULT ''"),  # repo anchoring (ats-lockcheck-repo-anchoring-p01)
+    (
+        "sessions",
+        "repo_root",
+        "TEXT DEFAULT ''",
+    ),  # repo anchoring (ats-lockcheck-repo-anchoring-p01)
     # Reaper-vs-operator completion. Existing rows backfill to 0 (= operator),
     # which is the conservative direction: a historical auto-completion will not
     # resurrect, it just behaves as it does today.
@@ -56,11 +59,45 @@ _COLUMN_MIGRATIONS = [
     ("agent_messages", "delivery_history", "TEXT DEFAULT '[]'"),
 ]
 
+# Existing databases need the composite lifecycle indexes declared in models.py;
+# create_all only creates them for new tables. These are projections indexes,
+# not a new event store or source of truth.
+_INDEX_MIGRATIONS = [
+    ("ix_sessions_started_at_id", "sessions", "started_at, id"),
+    ("ix_sessions_completed_at_id", "sessions", "completed_at, id"),
+    ("ix_agent_messages_created_at_id", "agent_messages", "created_at, id"),
+    ("ix_agent_messages_acknowledged_at_id", "agent_messages", "acknowledged_at, id"),
+    ("ix_handoffs_created_at_id", "handoffs", "created_at, id"),
+    ("ix_delegations_created_at_id", "delegations", "created_at, id"),
+    ("ix_delegations_closed_at_id", "delegations", "closed_at, id"),
+    (
+        "ix_delegations_parent_session_created_at",
+        "delegations",
+        "parent_session_id, created_at",
+    ),
+    (
+        "ix_delegations_child_session_created_at",
+        "delegations",
+        "child_session_id, created_at",
+    ),
+    ("ix_decisions_created_at_id", "decisions", "created_at, id"),
+    ("ix_authority_checks_created_at_id", "authority_checks", "created_at, id"),
+    ("ix_file_activities_created_at_id", "file_activities", "created_at, id"),
+    ("ix_override_requests_created_at_id", "override_requests", "created_at, id"),
+    ("ix_override_requests_responded_at_id", "override_requests", "responded_at, id"),
+    ("ix_service_restarts_created_at_id", "service_restarts", "created_at, id"),
+    ("ix_commit_records_created_at_id", "commit_records", "created_at, id"),
+]
+
 engine = create_async_engine(
     settings.database_url,
     echo=False,
     # SQLite needs this for async
-    **({} if "postgresql" in settings.database_url else {"connect_args": {"check_same_thread": False}}),
+    **(
+        {}
+        if "postgresql" in settings.database_url
+        else {"connect_args": {"check_same_thread": False}}
+    ),
 )
 
 async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
@@ -101,3 +138,22 @@ async def init_db():
               AND EXISTS (SELECT 1 FROM sessions
                           WHERE sessions.id = agent_messages.recipient_session_id)
         """))
+
+    # PostgreSQL's ordinary CREATE INDEX holds a writer-blocking lock until the
+    # surrounding startup transaction commits. Build these read-side indexes
+    # concurrently and in AUTOCOMMIT instead; SQLite has no concurrent form.
+    if engine.dialect.name == "postgresql":
+        async with engine.connect() as raw_conn:
+            conn = await raw_conn.execution_options(isolation_level="AUTOCOMMIT")
+            for name, table, columns in _INDEX_MIGRATIONS:
+                await conn.execute(
+                    text(
+                        f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} " f"ON {table} ({columns})"
+                    )
+                )
+    else:
+        async with engine.begin() as conn:
+            for name, table, columns in _INDEX_MIGRATIONS:
+                await conn.execute(
+                    text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})")
+                )

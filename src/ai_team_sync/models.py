@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from ai_team_sync.config import settings
@@ -62,7 +62,8 @@ class Session(Base):
     # Before this flag the only marker was a substring in `summary`, which is not
     # something a security-relevant branch should read.
     auto_completed: Mapped[bool] = mapped_column(
-        Boolean, default=False, nullable=False, server_default="0")
+        Boolean, default=False, nullable=False, server_default="0"
+    )
     # Caller identity, recorded once at creation and never re-derived (#2741).
     # creator_uid: the kernel's owner of the creating connection; NULL = not
     #   identifiable (legacy rows, in-process test transports).
@@ -107,9 +108,15 @@ class Session(Base):
     # actually held, so a real lock always wins over this record of its absence.
     locks_not_restored: Mapped[str] = mapped_column(Text, default="")
 
-    locks: Mapped[list[ScopeLock]] = relationship(back_populates="session", cascade="all, delete-orphan")
-    decisions: Mapped[list[Decision]] = relationship(back_populates="session", cascade="all, delete-orphan")
-    commits: Mapped[list[CommitRecord]] = relationship(back_populates="session", cascade="all, delete-orphan")
+    locks: Mapped[list[ScopeLock]] = relationship(
+        back_populates="session", cascade="all, delete-orphan"
+    )
+    decisions: Mapped[list[Decision]] = relationship(
+        back_populates="session", cascade="all, delete-orphan"
+    )
+    commits: Mapped[list[CommitRecord]] = relationship(
+        back_populates="session", cascade="all, delete-orphan"
+    )
     override_requests_sent: Mapped[list[OverrideRequest]] = relationship(
         back_populates="requester_session", foreign_keys="OverrideRequest.requester_session_id"
     )
@@ -139,7 +146,8 @@ class ScopeLock(Base):
     # else, so a lock added later through POST /api/locks — by anyone, including
     # the session itself — can coordinate but can never confer authority.
     authority_bearing: Mapped[bool] = mapped_column(
-        Boolean, default=False, nullable=False, server_default="0")
+        Boolean, default=False, nullable=False, server_default="0"
+    )
 
     session: Mapped[Session] = relationship(back_populates="locks")
 
@@ -254,7 +262,8 @@ class ServiceRestart(Base):
     # must survive that. NULL also covers the most important case -- the operator
     # restarting something by hand, with no session at all.
     session_id: Mapped[str | None] = mapped_column(
-        ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True)
+        ForeignKey("sessions.id", ondelete="SET NULL"), nullable=True
+    )
     developer: Mapped[str] = mapped_column(String(255), default="")
     reason: Mapped[str] = mapped_column(Text, default="")
     outcome: Mapped[str] = mapped_column(String(20), default="completed")
@@ -291,12 +300,12 @@ class AuthorityCheck(Base):
     peer_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     action: Mapped[str] = mapped_column(String(40), default="")
     repo_root: Mapped[str] = mapped_column(String(1024), default="")
-    paths: Mapped[str] = mapped_column(Text, default="[]")          # JSON list
+    paths: Mapped[str] = mapped_column(Text, default="[]")  # JSON list
     task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     delegation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     evidence_keys: Mapped[str] = mapped_column(Text, default="[]")  # JSON list
     allowed: Mapped[bool] = mapped_column(Boolean, default=False)
-    reasons: Mapped[str] = mapped_column(Text, default="[]")        # JSON list
+    reasons: Mapped[str] = mapped_column(Text, default="[]")  # JSON list
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
@@ -325,13 +334,16 @@ class OverrideRequest(Base):
     owner_session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
     conflicting_pattern: Mapped[str] = mapped_column(String(500))  # The pattern that conflicts
     justification: Mapped[str] = mapped_column(Text, default="")  # Why override is needed
-    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|approved|denied|expired
+    status: Mapped[str] = mapped_column(
+        String(20), default="pending"
+    )  # pending|approved|denied|expired
     response_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expires_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
-        default=lambda: datetime.now(timezone.utc) + timedelta(minutes=15)  # 15-min response window
+        default=lambda: datetime.now(timezone.utc)
+        + timedelta(minutes=15),  # 15-min response window
     )
 
     requester_session: Mapped[Session] = relationship(
@@ -356,8 +368,7 @@ class Delegation(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     # The parent keeps ownership. Named for the invariant so a reader of this
     # row cannot mistake a returned child for a transfer.
-    parent_session_id: Mapped[str] = mapped_column(
-        ForeignKey("sessions.id", ondelete="CASCADE"))
+    parent_session_id: Mapped[str] = mapped_column(ForeignKey("sessions.id", ondelete="CASCADE"))
     parent_task: Mapped[str] = mapped_column(String(120), default="")
     delegating_worker: Mapped[str] = mapped_column(String(100), default="")
     # The worker that was REQUESTED. Kept under its original name because every
@@ -375,18 +386,46 @@ class Delegation(Base):
     launch_spec_version: Mapped[str] = mapped_column(String(20), default="")
     mode: Mapped[str] = mapped_column(String(20), default="READ_ONLY")
     repo_root: Mapped[str] = mapped_column(String(1024), default="")
-    scope: Mapped[str] = mapped_column(Text, default="[]")        # JSON list
+    scope: Mapped[str] = mapped_column(Text, default="[]")  # JSON list
     objective: Mapped[str] = mapped_column(Text, default="")
     acceptance: Mapped[str] = mapped_column(Text, default="")
     prohibitions: Mapped[str] = mapped_column(Text, default="[]")  # JSON list
     child_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),
-                                                       default=_utcnow)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     # open -> returned -> closed | rejected | expired
     state: Mapped[str] = mapped_column(String(20), default="open")
     result_summary: Mapped[str] = mapped_column(Text, default="")
-    evidence: Mapped[str] = mapped_column(Text, default="{}")      # JSON object
+    evidence: Mapped[str] = mapped_column(Text, default="{}")  # JSON object
     verdict: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
-    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True),
-                                                       nullable=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+# Read-only operator projections page by (lifecycle timestamp, primary key).
+# Composite indexes make the query work bounded too, rather than applying LIMIT
+# only after a full-table scan/sort. Existing installations receive the same
+# indexes through database._INDEX_MIGRATIONS.
+Index("ix_sessions_started_at_id", Session.started_at, Session.id)
+Index("ix_sessions_completed_at_id", Session.completed_at, Session.id)
+Index("ix_agent_messages_created_at_id", AgentMessage.created_at, AgentMessage.id)
+Index("ix_agent_messages_acknowledged_at_id", AgentMessage.acknowledged_at, AgentMessage.id)
+Index("ix_handoffs_created_at_id", Handoff.created_at, Handoff.id)
+Index("ix_delegations_created_at_id", Delegation.created_at, Delegation.id)
+Index("ix_delegations_closed_at_id", Delegation.closed_at, Delegation.id)
+Index(
+    "ix_delegations_parent_session_created_at",
+    Delegation.parent_session_id,
+    Delegation.created_at,
+)
+Index(
+    "ix_delegations_child_session_created_at",
+    Delegation.child_session_id,
+    Delegation.created_at,
+)
+Index("ix_decisions_created_at_id", Decision.created_at, Decision.id)
+Index("ix_authority_checks_created_at_id", AuthorityCheck.created_at, AuthorityCheck.id)
+Index("ix_file_activities_created_at_id", FileActivity.created_at, FileActivity.id)
+Index("ix_override_requests_created_at_id", OverrideRequest.created_at, OverrideRequest.id)
+Index("ix_override_requests_responded_at_id", OverrideRequest.responded_at, OverrideRequest.id)
+Index("ix_service_restarts_created_at_id", ServiceRestart.created_at, ServiceRestart.id)
+Index("ix_commit_records_created_at_id", CommitRecord.created_at, CommitRecord.id)
