@@ -18,7 +18,10 @@ BUILT_AT = "$(date -Is)"
 PY
 echo "stamped ${COMMIT} (dirty=${DIRTY})"
 
-pipx install --force . >/dev/null
+# The operator command is part of this deployment, so install its optional
+# Textual runtime as well as the core ATS package. Snapshot mode deliberately
+# does not import Textual and therefore cannot prove the interactive TUI works.
+pipx install --force '.[console]' >/dev/null
 
 # Harness behavior is part of this deployment, not an optional README step.
 # Order is load-bearing: ATS resolves governed context before the Echo ambient

@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import httpx
 import pytest
 
 from ai_team_sync.console.sanitize import safe_text, safe_value
-from ai_team_sync.console.sources import ConsoleConfig, ReadOnlySources, _probe_summary
+from ai_team_sync.console.sources import (
+    ConsoleConfig,
+    ReadOnlySources,
+    _local_probes,
+    _probe_summary,
+)
 
 
 def test_sanitizer_removes_terminal_controls_and_common_secrets():
@@ -32,6 +38,21 @@ def test_local_probe_summaries_do_not_expose_raw_git_paths():
         "amd", "GPU[0] : GPU use (%): 94\nGPU[0] : GPU Memory Allocated (VRAM%): 61"
     )
     assert amd == "gpu0: util=94%; vram=61%"
+
+
+def test_local_probes_use_the_deployed_user_service_name():
+    probes = _local_probes("/repo")
+    assert probes["ats-service"] == ["systemctl", "--user", "is-active", "ats-server"]
+    assert probes["echo-service"] == [
+        "systemctl",
+        "is-active",
+        "tower-echo-brain.service",
+    ]
+
+
+def test_deploy_installs_the_console_extra():
+    deploy = (Path(__file__).resolve().parents[1] / "scripts" / "deploy.sh").read_text()
+    assert "pipx install --force '.[console]'" in deploy
 
 
 @pytest.mark.asyncio

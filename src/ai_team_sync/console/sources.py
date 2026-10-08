@@ -174,19 +174,7 @@ class ReadOnlySources:
 
     async def local_status(self) -> dict:
         repo = str(Path(self.config.repo_root).resolve())
-        probes = {
-            "git": ["git", "-C", repo, "status", "--short", "--branch"],
-            "ats-service": ["systemctl", "is-active", "ai-team-sync.service"],
-            "echo-service": ["systemctl", "is-active", "tower-echo-brain.service"],
-            "comfyui-3060": ["systemctl", "is-active", "comfyui.service"],
-            "comfyui-rocm": ["systemctl", "is-active", "comfyui-rocm.service"],
-            "nvidia": [
-                "nvidia-smi",
-                "--query-gpu=name,utilization.gpu,memory.used,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            "amd": ["rocm-smi", "--showuse", "--showmemuse"],
-        }
+        probes = _local_probes(repo)
         results = await asyncio.gather(*(_run_probe(name, argv) for name, argv in probes.items()))
         return {name: result for name, result in results}
 
@@ -222,6 +210,29 @@ class ReadOnlySources:
                 }
             )
         return events
+
+
+def _local_probes(repo: str) -> dict[str, list[str]]:
+    """Fixed read-only argv for local status.
+
+    ATS is installed as a user service named ``ats-server``. The remaining
+    Tower services are system services. Keeping the distinction here prevents
+    a healthy ATS process from being rendered as unavailable merely because a
+    different, nonexistent system unit was queried.
+    """
+    return {
+        "git": ["git", "-C", repo, "status", "--short", "--branch"],
+        "ats-service": ["systemctl", "--user", "is-active", "ats-server"],
+        "echo-service": ["systemctl", "is-active", "tower-echo-brain.service"],
+        "comfyui-3060": ["systemctl", "is-active", "comfyui.service"],
+        "comfyui-rocm": ["systemctl", "is-active", "comfyui-rocm.service"],
+        "nvidia": [
+            "nvidia-smi",
+            "--query-gpu=name,utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+        "amd": ["rocm-smi", "--showuse", "--showmemuse"],
+    }
 
 
 async def _run_probe(name: str, argv: list[str]) -> tuple[str, dict]:
