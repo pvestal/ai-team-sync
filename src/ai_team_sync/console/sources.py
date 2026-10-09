@@ -12,6 +12,7 @@ from typing import Any
 
 import httpx
 
+from . import runtime as runtime_proof
 from .sanitize import safe_text, safe_value
 
 
@@ -171,6 +172,13 @@ class ReadOnlySources:
             ],
             "content": "WITHHELD_BY_DEFAULT",
         }
+
+    async def runtime(self, sessions: list[dict]) -> dict:
+        """Process-level proof of which runtime backs each session (read-only /proc)."""
+        try:
+            return await asyncio.to_thread(runtime_proof.runtime_snapshot, sessions)
+        except Exception as exc:  # noqa: BLE001 - a probe failure must not take the console down
+            return {"state": "UNAVAILABLE", "error": type(exc).__name__, "tree": [], "verdicts": {}}
 
     async def local_status(self) -> dict:
         repo = str(Path(self.config.repo_root).resolve())

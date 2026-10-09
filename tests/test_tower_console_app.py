@@ -57,6 +57,31 @@ class FakeSources:
     async def ats_event_detail(self, event_id):
         return {"events": []}
 
+    async def runtime(self, sessions):
+        return {
+            "state": "OBSERVED",
+            "tree": [
+                {
+                    "pid": 10,
+                    "runtime": "codex",
+                    "argv": "codex exec",
+                    "via": ["bash", "subagent:adversarial-reviewer"],
+                    "subagent": None,
+                    "session": {
+                        "id": "session-one",
+                        "agent": "codex:test",
+                        "task_id": 3522,
+                        "mode": "READ_ONLY",
+                        "parent": None,
+                        "verdict": "VERIFIED",
+                    },
+                    "children": [],
+                }
+            ],
+            "verdicts": {"session-one": {"state": "VERIFIED", "pid": 10}},
+            "lineage_gaps": [],
+        }
+
     async def echo_summary(self):
         return {
             "health": {"state": "OBSERVED", "data": {"status": "ok"}},
@@ -132,3 +157,16 @@ async def test_app_uses_compact_layout_on_narrow_terminal():
     app = TowerConsole(ConsoleConfig(), sources=FakeSources())
     async with app.run_test(size=(90, 30)):
         assert app.has_class("narrow")
+
+
+@pytest.mark.asyncio
+async def test_app_shows_runtime_chain_and_marks_verified_agents():
+    app = TowerConsole(ConsoleConfig(), sources=FakeSources())
+    async with app.run_test(size=(160, 50)):
+        runtime = str(app.query_one("#runtime", Static).render())
+        assert "via Claude subagent:adversarial-reviewer" in runtime
+        assert "CODEX pid 10" in runtime and "codex:test" in runtime
+        assert app.query_one("#runtime", Static).markup is False
+        assert app.connectivity["Proc"] == "OBSERVED"
+        row = app.query_one("#agent-list", ListView).children[0]
+        assert "pid✓" in str(row.query_one("Label").render())

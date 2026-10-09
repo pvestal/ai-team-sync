@@ -33,7 +33,7 @@ async def _snapshot(config: ConsoleConfig) -> int:
             return_exceptions=True,
         )
         labels = ("sessions", "events", "coverage", "echo", "system")
-        snapshot = {
+        snapshot: dict = {
             label: (
                 {"state": "DISCONNECTED", "error": type(value).__name__}
                 if isinstance(value, Exception)
@@ -41,6 +41,8 @@ async def _snapshot(config: ConsoleConfig) -> int:
             )
             for label, value in zip(labels, values, strict=True)
         }
+        sessions = snapshot["sessions"].get("sessions", [])
+        snapshot["runtime"] = await sources.runtime(sessions if isinstance(sessions, list) else [])
         print(json.dumps(snapshot, indent=2, default=str))
         return 0
     finally:

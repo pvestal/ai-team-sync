@@ -13,6 +13,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header, Input, Label, ListItem, ListView, Static
 
+from .runtime import render_lines
 from .sanitize import safe_text
 from .sources import ConsoleConfig, ReadOnlySources
 
@@ -37,6 +38,11 @@ STATE_COLORS = {
     "UNINSTRUMENTED": "bright_black",
     "DISCONNECTED": "red",
 }
+RUNTIME_MARKS = {
+    "VERIFIED": ("pid✓", "green"),
+    "MISMATCH": ("LABEL≠PID", "bold red"),
+    "NO_PROCESS": ("no pid", "bright_black"),
+}
 
 
 class TowerConsole(App):
@@ -55,14 +61,16 @@ class TowerConsole(App):
     #agents-pane { width: 31; min-width: 24; }
     #exchange-pane { width: 1fr; }
     #task-pane { width: 2fr; }
+    #runtime-pane { width: 3fr; }
     #detail-pane { width: 3fr; }
     #tools-pane { width: 3fr; }
     #system-pane { width: 2fr; }
     #agent-list, #exchange, #tool-table { height: 1fr; }
-    #task, #detail, #system { height: 1fr; overflow-y: auto; }
+    #task, #detail, #system, #runtime { height: 1fr; overflow-y: auto; }
     #filter { display: none; dock: bottom; height: 3; border: round #5c91d1; }
     #filter.visible { display: block; }
-    Screen.narrow #agents-pane, Screen.narrow #task-pane, Screen.narrow #tools-pane {
+    Screen.narrow #agents-pane, Screen.narrow #task-pane, Screen.narrow #tools-pane,
+    Screen.narrow #detail-pane {
         display: none;
     }
     Screen.narrow #middle { height: 2fr; }
@@ -99,11 +107,12 @@ class TowerConsole(App):
         self.follow = True
         self.filters = {"search": "", "task": "", "agent": "", "session": "", "type": ""}
         self.filter_kind = "search"
-        self.connectivity = {"ATS": "DISCONNECTED", "Echo": "DISCONNECTED"}
+        self.connectivity = {"ATS": "DISCONNECTED", "Echo": "DISCONNECTED", "Proc": "DISCONNECTED"}
         self.selected_task_id: int | None = None
         self.selected_session_id: str | None = None
         self.task_snapshot: dict[str, Any] | None = None
         self.lineage_truncated = False
+        self.runtime_view: dict[str, Any] = {"tree": [], "verdicts": {}}
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -120,6 +129,9 @@ class TowerConsole(App):
                 with Vertical(classes="pane", id="task-pane"):
                     yield Label("TASK / AUTHORITY", classes="pane-title")
                     yield Static("Select a session or task.", id="task", markup=False)
+                with Vertical(classes="pane", id="runtime-pane"):
+                    yield Label("RUNTIME CHAIN / PROCESS PROOF", classes="pane-title")
+                    yield Static("Scanning processes…", id="runtime", markup=False)
                 with Vertical(classes="pane", id="detail-pane"):
                     yield Label("DETAIL / EXPANDED EVENT", classes="pane-title")
                     yield Static("No event selected.", id="detail", markup=False)
@@ -156,6 +168,22 @@ class TowerConsole(App):
     async def poll_live(self) -> None:
         if not self.paused:
             await self.refresh_events()
+            await self.refresh_runtime()
+
+    async def refresh_runtime(self) -> None:
+        self.runtime_view = await self.sources.runtime(self.sessions)
+        self.connectivity["Proc"] = (
+            "OBSERVED" if self.runtime_view.get("state") == "OBSERVED" else "UNAVAILABLE"
+        )
+        self.render_runtime()
+
+    def render_runtime(self) -> None:
+        rendered = Text()
+        for text, style in render_lines(self.runtime_view, self.selected_session_id):
+            if rendered:
+                rendered.append("\n")
+            rendered.append(text, style=style)
+        self.query_one("#runtime", Static).update(rendered)
 
     async def refresh_slow(self) -> None:
         if self.paused:
@@ -176,6 +204,7 @@ class TowerConsole(App):
         except Exception:
             self.connectivity["ATS"] = "DISCONNECTED"
             return
+        await self.refresh_runtime()
         view = self.query_one("#agent-list", ListView)
         await view.clear()
         for row in self.sessions:
@@ -189,6 +218,11 @@ class TowerConsole(App):
             label.append(parent)
             agent = safe_text(row.get("agent"), 22)
             label.append(agent, style=self._agent_color(agent))
+            # On the name line: the pane is narrow and truncates the status line.
+            verdict = self.runtime_view.get("verdicts", {}).get(row.get("id"), {})
+            mark = RUNTIME_MARKS.get(verdict.get("state", ""))
+            if mark:
+                label.append(f" {mark[0]}", style=mark[1])
             label.append(f"\n  {row.get('status')} {marks}{task} {row.get('effective_mode')}")
             item = ListItem(Label(label), name=row.get("id"))
             item.id = f"session-{row.get('id')}"
@@ -369,7 +403,9 @@ class TowerConsole(App):
             }
             if self.selected_task_id:
                 authority["tower"] = await self.refresh_task(self.selected_task_id)
+            authority["runtime"] = self.runtime_view.get("verdicts", {}).get(session_id)
             self.query_one("#task", Static).update(json.dumps(authority, indent=2, default=str))
+        self.render_runtime()
         self.render_events()
         self.render_connectivity()
 
