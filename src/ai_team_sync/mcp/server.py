@@ -1844,8 +1844,18 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 import sys as _sys
                 from pathlib import Path as _Path
 
+                # Delegating creates a child bound to a parent: a mutation, and
+                # the parent must be THIS caller. Left to itself the `ats`
+                # subprocess fell back to the shared pointer and recorded a
+                # Codex controller's delegation under a Claude session
+                # (74960483, 2026-10-08).
+                refusal = await deny_mutation(client)
+                if refusal:
+                    return [TextContent(type="text", text=f"❌ {refusal}")]
+
                 ats_bin = str(_Path(_sys.executable).parent / "ats")
                 argv = [ats_bin, "delegate",
+                        "--parent-session", active_session_id,
                         "--objective", arguments["objective"],
                         "--acceptance", arguments["acceptance"],
                         "--mode", arguments.get("mode", "READ_ONLY"),
