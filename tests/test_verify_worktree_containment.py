@@ -462,6 +462,24 @@ def test_the_reported_result_names_the_worktree_and_the_reviewed_revision(superv
     assert payload["parent_still_owns"] == PARENT
 
 
+@pytest.mark.parametrize("worker", ["claude-code", "codex"])
+def test_the_child_gets_its_delegation_token_in_env_never_in_argv(supervisor, spy, worker):
+    """verify-child needs the child's own token; Codex's -c overrides are argv,
+    which any local process can read with `ps`, so the token must not ride there."""
+    from tests.test_child_session_lifecycle import CHILD_TOKEN
+
+    captured = {}
+
+    def capture(argv, *a, **k):
+        captured["argv"], captured["env"] = argv, k["env"]
+        return _clean_exit(argv, *a, **k)
+
+    _run_verify(supervisor, capture, worker=worker)
+
+    assert captured["env"]["ATS_DELEGATION_TOKEN"] == CHILD_TOKEN
+    assert not any(CHILD_TOKEN in str(a) for a in captured["argv"])
+
+
 def test_the_child_packet_carries_the_manifest_through_the_real_launcher(supervisor, spy):
     """End of the chain: the manifest the module builds must actually reach the
     packet the child is launched with."""

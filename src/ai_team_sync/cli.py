@@ -794,6 +794,9 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
 
     launch = build_launch(worker, mode, packet, repo=repo, child_env=env)
     argv = launch.argv
+    # The child's proof that it IS this delegation's child (verify-child), set
+    # only after the argv is built: never a -c override, where `ps` shows it.
+    env["ATS_DELEGATION_TOKEN"] = child_approval_token
     click.echo(f"launching {worker} via {launch.resolved_binary} "
                f"({mode}, lease {lease_minutes}m)...", err=True)
     launch_error = verify_error

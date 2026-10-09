@@ -228,31 +228,33 @@ async def _delegated_child_context(
     The parent rendered the authoritative task envelope into the child's
     packet. Re-resolving here tried to anchor/bind a session the child may not
     mutate (VERIFY/READ_ONLY) or that the packet's text pointed at another
-    governed project, and the blocked prompt left the child with no task. The
-    env var alone is not trusted: ATS must confirm an open delegation whose
-    child is this exact session.
+    governed project, and the blocked prompt left the child with no task.
+    Delegation and session ids are public, so the proof is the child's own
+    approval token, which only the launching parent saw; ATS also checks the
+    delegation is open, its lease unexpired and the child session active.
     """
     child = (os.environ.get("ATS_SESSION_ID") or "").strip()
-    response = await client.get(f"{server_url}/api/delegations/{delegation_id}")
+    token = (os.environ.get("ATS_DELEGATION_TOKEN") or "").strip()
+    if not child or not token:
+        raise ContextResolutionError(
+            f"ATS_DELEGATION={delegation_id} is set without this child's session "
+            "token; refusing to skip ATS-first resolution on ids alone"
+        )
+    response = await client.post(
+        f"{server_url}/api/delegations/{delegation_id}/verify-child",
+        json={"child_session_id": child},
+        headers={"X-ATS-Approval-Token": token},
+    )
     if response.status_code != 200:
         raise ContextResolutionError(
-            f"ATS could not confirm delegation {delegation_id}: "
-            f"HTTP {response.status_code} {_response_error(response)}"
+            f"ATS did not confirm this process as the live child of delegation "
+            f"{delegation_id}: HTTP {response.status_code} {_response_error(response)}"
         )
     body = response.json()
-    if body.get("state") != "open":
-        raise ContextResolutionError(
-            f"delegation {delegation_id} is {body.get('state')}, not open"
-        )
-    if not child or body.get("child_session_id") != child:
-        raise ContextResolutionError(
-            f"delegation {delegation_id} belongs to child session "
-            f"{body.get('child_session_id')}, not {child or '(none)'}"
-        )
     return (
         "ATS-FIRST CONTEXT RESOLUTION (delegated child)\n"
         f"session: {child}\n"
-        f"delegation: {delegation_id} ({body.get('mode') or '?'}), confirmed open by ATS\n"
+        f"delegation: {delegation_id} ({body.get('mode') or '?'}), confirmed live by ATS\n"
         "Your authoritative task context, acceptance criteria and prohibitions "
         "are in the delegation packet below; ATS does not re-resolve them."
     )

@@ -510,15 +510,15 @@ def test_governed_failure_is_a_blocking_hook_result(monkeypatch, capsys):
     assert "ATS-FIRST context resolution failed" in capsys.readouterr().err
 
 
-class _DelegationOnlyClient:
-    """Answers GET /api/delegations/{id}; any other call fails the test."""
+class _VerifyChildOnlyClient:
+    """Answers POST .../verify-child; any other call fails the test."""
 
     def __init__(self, status_code, body):
-        self.status_code, self.body, self.urls = status_code, body, []
+        self.status_code, self.body, self.calls = status_code, body, []
 
-    async def get(self, url):
-        self.urls.append(url)
-        assert "/api/delegations/" in url, f"delegated child re-resolved via {url}"
+    async def post(self, url, json=None, headers=None):
+        self.calls.append((url, json, headers))
+        assert url.endswith("/verify-child"), f"delegated child re-resolved via {url}"
         body, code = self.body, self.status_code
 
         class Response:
@@ -535,10 +535,15 @@ class _DelegationOnlyClient:
         raise AssertionError(f"delegated child must not call client.{name}")
 
 
-def _delegated_child_env(monkeypatch, *, child="child-sid", delegation="deleg-1"):
+def _delegated_child_env(monkeypatch, *, child="child-sid", delegation="deleg-1",
+                         token="child-token"):
     monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{ANIME_ROOT}:{ECHO_ROOT}")
     monkeypatch.setenv("ATS_SESSION_ID", child)
     monkeypatch.setenv("ATS_DELEGATION", delegation)
+    if token:
+        monkeypatch.setenv("ATS_DELEGATION_TOKEN", token)
+    else:
+        monkeypatch.delenv("ATS_DELEGATION_TOKEN", raising=False)
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
 
 
@@ -558,32 +563,46 @@ async def test_live_delegated_child_uses_its_packet_without_re_resolving(monkeyp
     from ai_team_sync.hooks import ats_context
 
     _delegated_child_env(monkeypatch)
-    client = _DelegationOnlyClient(200, {"id": "deleg-1", "state": "open",
-                                         "child_session_id": "child-sid", "mode": "VERIFY"})
+    client = _VerifyChildOnlyClient(200, {"delegation_id": "deleg-1",
+                                          "child_session_id": "child-sid", "mode": "VERIFY"})
 
     note = await ats_context.resolve_prompt_context("http://test", client, _CHILD_PROMPT,
                                                     agent="codex")
 
-    assert client.urls == ["http://test/api/delegations/deleg-1"]
+    assert client.calls == [("http://test/api/delegations/deleg-1/verify-child",
+                             {"child_session_id": "child-sid"},
+                             {"X-ATS-Approval-Token": "child-token"})]
     assert "deleg-1" in note and "VERIFY" in note
 
 
 @pytest.mark.parametrize("status_code, body, reason", [
-    (200, {"id": "deleg-1", "state": "returned", "child_session_id": "child-sid"}, "returned"),
-    (200, {"id": "deleg-1", "state": "open", "child_session_id": "someone-else"}, "child"),
+    (403, {"detail": {"error": "not_this_child"}}, "403"),
+    (409, {"detail": {"error": "lease_expired"}}, "409"),
     (404, {"detail": {"error": "no_such_delegation"}}, "404"),
 ])
-async def test_unverifiable_delegation_claim_still_blocks(monkeypatch, status_code, body, reason):
-    # ATS_DELEGATION alone is not trusted: the server must confirm a live
-    # delegation whose child is this very session, or the prompt stays blocked.
+async def test_unverified_delegation_claim_still_blocks(monkeypatch, status_code, body, reason):
+    # Ids are readable by anyone, so ATS must confirm the child's own token,
+    # an open delegation, an unexpired lease and an active child session.
     from ai_team_sync.hooks import ats_context
 
     _delegated_child_env(monkeypatch)
-    client = _DelegationOnlyClient(status_code, body)
+    client = _VerifyChildOnlyClient(status_code, body)
 
     with pytest.raises(ats_context.ContextResolutionError, match=reason):
         await ats_context.resolve_prompt_context("http://test", client, _CHILD_PROMPT,
                                                  agent="codex")
+
+
+async def test_a_delegation_claim_without_the_child_token_blocks_without_asking(monkeypatch):
+    from ai_team_sync.hooks import ats_context
+
+    _delegated_child_env(monkeypatch, token="")
+    client = _VerifyChildOnlyClient(200, {})
+
+    with pytest.raises(ats_context.ContextResolutionError, match="token"):
+        await ats_context.resolve_prompt_context("http://test", client, _CHILD_PROMPT,
+                                                 agent="codex")
+    assert client.calls == []
 
 
 def test_malformed_operator_config_blocks_instead_of_failing_open(monkeypatch, capsys):

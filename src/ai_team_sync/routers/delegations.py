@@ -261,6 +261,39 @@ async def get_delegation(delegation_id: str, db: AsyncSession = Depends(get_db))
     return _as_dict(d)
 
 
+class ChildProof(BaseModel):
+    child_session_id: str
+
+
+@router.post("/{delegation_id}/verify-child")
+async def verify_child(delegation_id: str, body: ChildProof, request: Request,
+                       db: AsyncSession = Depends(get_db)):
+    """Prove the caller IS this delegation's live child. Read-only.
+
+    Ids are readable by anyone (GET above), so the credential is the child
+    session's approval token, which only the launching parent ever saw. And
+    'open' is not liveness: expiry is applied only on /return, so the lease and
+    the child session's status are checked here as well.
+    """
+    d = await db.get(Delegation, delegation_id)
+    if d is None:
+        raise HTTPException(404, detail={"error": "no_such_delegation"})
+    child = await db.get(Session, d.child_session_id) if d.child_session_id else None
+    token = request.headers.get("X-ATS-Approval-Token", "")
+    expected = (child.approval_token_hash or "") if child is not None else ""
+    if (body.child_session_id != d.child_session_id or not token or not expected
+            or not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(), expected)):
+        raise HTTPException(403, detail={"error": "not_this_child"})
+    if d.state != "open":
+        raise HTTPException(409, detail={"error": "not_open", "state": d.state})
+    if _aware(d.lease_expires_at) <= datetime.now(timezone.utc):
+        raise HTTPException(409, detail={"error": "lease_expired"})
+    if child.status != "active":
+        raise HTTPException(409, detail={"error": "child_not_active", "status": child.status})
+    return {"delegation_id": d.id, "child_session_id": child.id, "mode": d.mode,
+            "lease_expires_at": _aware(d.lease_expires_at).isoformat()}
+
+
 @router.post("/{delegation_id}/return")
 async def return_delegation(delegation_id: str, body: DelegationReturn, request: Request,
                             db: AsyncSession = Depends(get_db)):
