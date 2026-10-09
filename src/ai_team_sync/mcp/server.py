@@ -1225,6 +1225,34 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                             f"❌ Session start refused for task {ticket_id}: "
                             "validated task brief was empty"))]
 
+                # A delegated child already HAS its session: the wrapper registered
+                # it against the delegation before spawning this process, and
+                # ATS_SESSION_ID names it. Posting a new row here created an
+                # unbound twin on every delegated Codex run (10 of 10 on
+                # 2026-10-09). Codex children reach this tool because their
+                # sandbox restricts files, not MCP calls.
+                if (os.environ.get("ATS_DELEGATION") or "").strip():
+                    bound = await _delegation_child(client)
+                    env_sid = (os.environ.get("ATS_SESSION_ID") or "").strip()
+                    if not bound or bound != env_sid:
+                        return [TextContent(type="text", text=(
+                            "❌ Session start refused: this process is a delegated "
+                            f"child (delegation {os.environ['ATS_DELEGATION']}) but "
+                            "ATS could not confirm it is bound to session "
+                            f"{env_sid or '(none)'}. A delegated child never opens a "
+                            "second session; return to your parent."))]
+                    msg = (f"✅ Delegated session already open: {bound}\n"
+                           f"Delegation: {os.environ['ATS_DELEGATION']}\n"
+                           "No new session was created; this process acts as the "
+                           "session its delegation registered.\n")
+                    if scope:
+                        msg += ("Requested scope was NOT claimed. A delegated child's "
+                                "authority comes from its delegation; use extend_scope, "
+                                "which applies that authority.\n")
+                    if prebuilt_brief:
+                        msg += "\n" + "-" * 60 + "\n" + prebuilt_brief
+                    return [TextContent(type="text", text=msg)]
+
                 # SessionStart may already have registered a placeholder for
                 # this exact client id. Capture its capability before saving
                 # the new session below overwrites the per-client capability
