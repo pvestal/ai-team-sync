@@ -247,7 +247,7 @@ def test_11_codex_read_only_behaviour_is_unchanged():
     assert argv[argv.index("--sandbox") + 1] == "read-only"
     assert "approval_policy=never" in argv
     assert argv[argv.index("-C") + 1] == REPO
-    assert argv[-1] == PACKET
+    assert argv[-1] == "-"
     # Claude's flags must never leak into Codex, where they mean nothing.
     for flag in ("--tools", "--permission-prompts", "--allowedTools",
                  "--disallowedTools", "--permission-mode"):
@@ -280,7 +280,7 @@ def test_claude_implement_still_writes_inside_its_claimed_scope():
     argv = build_launch("claude-code", IMPLEMENT, PACKET, repo=REPO,
                         which=_FOUND).argv
 
-    assert argv == ["/usr/local/bin/claude", "-p", PACKET]
+    assert argv == ["/usr/local/bin/claude", "-p"]
 
 
 @pytest.mark.parametrize("worker,mode", [

@@ -173,10 +173,10 @@ def test_every_worker_is_launched_with_the_same_task_authority(worker, binary):
     launch = build_launch(worker, READ_ONLY, packet, repo=REPO, which=which)
 
     assert launch.resolved_binary == binary
-    delivered = [a for a in launch.argv if "TOWER TASK #2649" in a]
-    assert len(delivered) == 1, "the packet must reach the child exactly once"
-    assert "ACCEPTANCE:" in delivered[0]
-    assert "Do not change MAX_TARGETED_TEST_FILES" in delivered[0]
+    assert launch.stdin == packet, "the packet must reach the child, on stdin"
+    assert not [a for a in launch.argv if "TOWER TASK #2649" in a]
+    assert "ACCEPTANCE:" in launch.stdin
+    assert "Do not change MAX_TARGETED_TEST_FILES" in launch.stdin
 
 
 def test_claude_and_codex_receive_byte_identical_packets():
@@ -185,9 +185,8 @@ def test_claude_and_codex_receive_byte_identical_packets():
     c = build_launch("claude-code", VERIFY, packet, repo=REPO, which=which)
     x = build_launch("codex", VERIFY, packet, repo=REPO, which=which)
 
-    c_packet = [a for a in c.argv if a.startswith("DELEGATED TASK")]
-    x_packet = [a for a in x.argv if a.startswith("DELEGATED TASK")]
-    assert c_packet == x_packet != []
+    assert c.stdin == x.stdin == packet
+    assert c.stdin.startswith("DELEGATED TASK")
 
 
 # ── 3. no authority means no launch ──────────────────────────────────────────

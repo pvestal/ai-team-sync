@@ -468,7 +468,7 @@ def test_the_child_packet_carries_the_manifest_through_the_real_launcher(supervi
     captured = {}
 
     def capture(argv, *a, **k):
-        captured["packet"] = argv[argv.index("-p") + 1]
+        captured["packet"] = k["input"]   # packet rides on stdin (launch spec 2)
         return _clean_exit(argv, *a, **k)
 
     _run_verify(supervisor, capture)

@@ -50,7 +50,8 @@ def test_1_read_only_policy_is_byte_for_byte_what_d685142_shipped():
     what a regression looks like from the inside."""
     argv = build_launch("claude-code", READ_ONLY, PACKET, repo=REPO, which=_FOUND).argv
 
-    assert argv[3:] == [
+    # [binary, "-p"]; the packet rides on stdin since launch spec 2.
+    assert argv[2:] == [
         "--tools", "Read,Grep,Glob",
         "--permission-prompts", "none",
         "--allowedTools",
@@ -99,7 +100,7 @@ def test_2_verify_launches_the_claude_executable():
     assert launch.resolved_binary == "/usr/local/bin/claude"
     assert launch.argv[0] == "/usr/local/bin/claude"
     assert launch.argv[1] == "-p"
-    assert launch.argv[2] == PACKET
+    assert launch.stdin == PACKET and PACKET not in launch.argv
 
 
 # ── 3, 4, 5. the coordination reads VERIFY must have ────────────────────────
@@ -249,7 +250,7 @@ def test_15_codex_read_only_behaviour_is_unchanged():
     assert argv[argv.index("--sandbox") + 1] == "read-only"
     assert "approval_policy=never" in argv
     assert argv[argv.index("-C") + 1] == REPO
-    assert argv[-1] == PACKET
+    assert argv[-1] == "-"
     for flag in ("--tools", "--permission-prompts", "--allowedTools",
                  "--disallowedTools", "--settings", "--permission-mode"):
         assert flag not in argv, f"Claude's {flag} must never reach Codex"
@@ -267,7 +268,7 @@ def test_codex_verify_is_unchanged_and_keeps_its_own_runtime_sandbox():
 def test_claude_implement_is_unchanged_and_still_writes_in_its_scope():
     argv = build_launch("claude-code", IMPLEMENT, PACKET, repo=REPO, which=_FOUND).argv
 
-    assert argv == ["/usr/local/bin/claude", "-p", PACKET]
+    assert argv == ["/usr/local/bin/claude", "-p"]
 
 
 @pytest.mark.parametrize("worker,mode", [

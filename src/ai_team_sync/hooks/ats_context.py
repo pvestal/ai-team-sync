@@ -220,6 +220,44 @@ async def _brief(
     return packet
 
 
+async def _delegated_child_context(
+    client: Any, server_url: str, delegation_id: str
+) -> str:
+    """Context for a delegated child, whose packet already carries it.
+
+    The parent rendered the authoritative task envelope into the child's
+    packet. Re-resolving here tried to anchor/bind a session the child may not
+    mutate (VERIFY/READ_ONLY) or that the packet's text pointed at another
+    governed project, and the blocked prompt left the child with no task. The
+    env var alone is not trusted: ATS must confirm an open delegation whose
+    child is this exact session.
+    """
+    child = (os.environ.get("ATS_SESSION_ID") or "").strip()
+    response = await client.get(f"{server_url}/api/delegations/{delegation_id}")
+    if response.status_code != 200:
+        raise ContextResolutionError(
+            f"ATS could not confirm delegation {delegation_id}: "
+            f"HTTP {response.status_code} {_response_error(response)}"
+        )
+    body = response.json()
+    if body.get("state") != "open":
+        raise ContextResolutionError(
+            f"delegation {delegation_id} is {body.get('state')}, not open"
+        )
+    if not child or body.get("child_session_id") != child:
+        raise ContextResolutionError(
+            f"delegation {delegation_id} belongs to child session "
+            f"{body.get('child_session_id')}, not {child or '(none)'}"
+        )
+    return (
+        "ATS-FIRST CONTEXT RESOLUTION (delegated child)\n"
+        f"session: {child}\n"
+        f"delegation: {delegation_id} ({body.get('mode') or '?'}), confirmed open by ATS\n"
+        "Your authoritative task context, acceptance criteria and prohibitions "
+        "are in the delegation packet below; ATS does not re-resolve them."
+    )
+
+
 async def resolve_prompt_context(
     server_url: str,
     client: Any,
@@ -234,6 +272,10 @@ async def resolve_prompt_context(
     target = resolve_request_target(prompt, cwd=cwd, governed_roots=roots)
     if target is None:
         return None
+
+    delegation_id = (os.environ.get("ATS_DELEGATION") or "").strip()
+    if delegation_id:
+        return await _delegated_child_context(client, server_url, delegation_id)
 
     cid = str(
         payload.get("session_id")

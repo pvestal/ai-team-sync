@@ -510,6 +510,82 @@ def test_governed_failure_is_a_blocking_hook_result(monkeypatch, capsys):
     assert "ATS-FIRST context resolution failed" in capsys.readouterr().err
 
 
+class _DelegationOnlyClient:
+    """Answers GET /api/delegations/{id}; any other call fails the test."""
+
+    def __init__(self, status_code, body):
+        self.status_code, self.body, self.urls = status_code, body, []
+
+    async def get(self, url):
+        self.urls.append(url)
+        assert "/api/delegations/" in url, f"delegated child re-resolved via {url}"
+        body, code = self.body, self.status_code
+
+        class Response:
+            status_code = code
+
+            def json(self):
+                return body
+
+            text = ""
+
+        return Response()
+
+    def __getattr__(self, name):
+        raise AssertionError(f"delegated child must not call client.{name}")
+
+
+def _delegated_child_env(monkeypatch, *, child="child-sid", delegation="deleg-1"):
+    monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{ANIME_ROOT}:{ECHO_ROOT}")
+    monkeypatch.setenv("ATS_SESSION_ID", child)
+    monkeypatch.setenv("ATS_DELEGATION", delegation)
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+
+
+_CHILD_PROMPT = {
+    "session_id": "019a0000-0000-7000-8000-00000000abcd",
+    "cwd": f"{ANIME_ROOT}/.worktrees/some-fix",
+    # The packet names a second governed project, which made the old path try
+    # to re-anchor the child's session and block the whole delegation.
+    "prompt": "DELEGATED TASK (VERIFY) review #2899 in anime-studio; Echo Brain notes attached",
+}
+
+
+async def test_live_delegated_child_uses_its_packet_without_re_resolving(monkeypatch):
+    # The parent built the authoritative task envelope into the packet. Re-running
+    # resolution in the child tried to anchor/bind a session a VERIFY child may
+    # not mutate, and the blocked prompt left the child with no task at all.
+    from ai_team_sync.hooks import ats_context
+
+    _delegated_child_env(monkeypatch)
+    client = _DelegationOnlyClient(200, {"id": "deleg-1", "state": "open",
+                                         "child_session_id": "child-sid", "mode": "VERIFY"})
+
+    note = await ats_context.resolve_prompt_context("http://test", client, _CHILD_PROMPT,
+                                                    agent="codex")
+
+    assert client.urls == ["http://test/api/delegations/deleg-1"]
+    assert "deleg-1" in note and "VERIFY" in note
+
+
+@pytest.mark.parametrize("status_code, body, reason", [
+    (200, {"id": "deleg-1", "state": "returned", "child_session_id": "child-sid"}, "returned"),
+    (200, {"id": "deleg-1", "state": "open", "child_session_id": "someone-else"}, "child"),
+    (404, {"detail": {"error": "no_such_delegation"}}, "404"),
+])
+async def test_unverifiable_delegation_claim_still_blocks(monkeypatch, status_code, body, reason):
+    # ATS_DELEGATION alone is not trusted: the server must confirm a live
+    # delegation whose child is this very session, or the prompt stays blocked.
+    from ai_team_sync.hooks import ats_context
+
+    _delegated_child_env(monkeypatch)
+    client = _DelegationOnlyClient(status_code, body)
+
+    with pytest.raises(ats_context.ContextResolutionError, match=reason):
+        await ats_context.resolve_prompt_context("http://test", client, _CHILD_PROMPT,
+                                                 agent="codex")
+
+
 def test_malformed_operator_config_blocks_instead_of_failing_open(monkeypatch, capsys):
     # Exit 1 is a non-blocking hook error to Claude Code: an uncaught config
     # error would let every governed prompt through with no ATS context.

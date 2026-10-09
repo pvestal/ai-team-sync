@@ -69,8 +69,20 @@ def test_every_registered_worker_and_mode_is_mapped_or_fails_closed(worker, mode
     assert mode in supported_modes(worker)
     assert launch.resolved_binary.startswith("/"), "binary must be absolute"
     assert launch.argv[0] == launch.resolved_binary
-    assert PACKET in launch.argv, "the child must actually receive its packet"
+    assert launch.stdin == PACKET, "the child must actually receive its packet"
+    assert PACKET not in launch.argv, "a packet in argv hits the 128 KiB per-arg limit"
     assert launch.spec_version == SPEC_VERSION
+
+
+@pytest.mark.parametrize("worker", ["codex", "claude-code"])
+def test_a_large_packet_never_rides_in_argv(worker):
+    """Delegation 0631b915 (#2899): a ~140K-char packet as one argument failed
+    with OSError E2BIG before the child ran. Linux caps one argv string at
+    128 KiB, so the packet goes on stdin for every worker."""
+    big = "x" * 300_000
+    launch = build_launch(worker, READ_ONLY, big, repo=REPO, which=FOUND_BOTH)
+    assert launch.stdin == big
+    assert max(len(a) for a in launch.argv) < 131_072
 
 
 def test_registry_workers_without_a_launcher_fail_closed():
@@ -100,9 +112,9 @@ def test_claude_verify_gets_a_shell_and_an_os_sandbox_not_plan_mode():
     worktree. Full coverage in tests/test_verify_mode_capability.py.
     """
     argv = build_launch("claude-code", VERIFY, PACKET, repo=REPO, which=FOUND_BOTH).argv
-    assert argv[:3] == ["/usr/local/bin/claude", "-p", PACKET]
+    assert argv[:2] == ["/usr/local/bin/claude", "-p"]
 
-    tail = argv[3:]
+    tail = argv[2:]
     assert "--permission-mode" not in tail, "plan mode was the defect"
     assert tail[tail.index("--tools") + 1] == "Read,Grep,Glob,Bash"
     assert tail[tail.index("--permission-prompts") + 1] == "none"
@@ -131,9 +143,9 @@ def test_claude_read_only_is_at_least_as_strong_as_plan_mode_was():
     """
     argv = build_launch("claude-code", READ_ONLY, PACKET, repo=REPO,
                         which=FOUND_BOTH).argv
-    assert argv[:3] == ["/usr/local/bin/claude", "-p", PACKET]
+    assert argv[:2] == ["/usr/local/bin/claude", "-p"]
 
-    tail = argv[3:]
+    tail = argv[2:]
     # Still denied, exactly as plan mode denied them.
     for writer in ("Edit", "Write", "NotebookEdit"):
         assert writer in tail
@@ -146,7 +158,7 @@ def test_claude_read_only_is_at_least_as_strong_as_plan_mode_was():
 
 def test_claude_implement_mode_keeps_write_access():
     argv = build_launch("claude-code", IMPLEMENT, PACKET, repo=REPO, which=FOUND_BOTH).argv
-    assert argv == ["/usr/local/bin/claude", "-p", PACKET]
+    assert argv == ["/usr/local/bin/claude", "-p"]
 
 
 # ── 3. Codex is actually Codex, and actually sandboxed ───────────────────────
@@ -165,8 +177,9 @@ def test_codex_read_only_uses_a_real_sandbox_not_an_instruction():
     # Codex refuses to run outside a trusted directory; the repo must be passed.
     assert "-C" in launch.argv
     assert launch.argv[launch.argv.index("-C") + 1] == REPO
-    # The packet is positional for `codex exec`, and must be last.
-    assert launch.argv[-1] == PACKET
+    # `-` (read the prompt from stdin) is positional for `codex exec`, and last.
+    assert launch.argv[-1] == "-"
+    assert launch.stdin == PACKET
 
 
 def test_codex_verify_mode_is_also_read_only():
@@ -284,12 +297,12 @@ def test_only_the_isolation_keys_are_forwarded():
     assert "HOME=" not in joined
 
 
-def test_the_packet_stays_last_even_with_env_overrides():
+def test_the_stdin_marker_stays_last_even_with_env_overrides():
     """`codex exec [OPTIONS] [PROMPT]`: an option appended after the positional
-    would be swallowed as part of the prompt."""
+    would be swallowed as part of the prompt. `-` = read the prompt from stdin."""
     argv = build_launch("codex", READ_ONLY, PACKET, repo=REPO,
                         child_env=CHILD_ENV, which=FOUND_BOTH).argv
-    assert argv[-1] == PACKET
+    assert argv[-1] == "-"
     assert argv[-2] == REPO and argv[-3] == "-C"
 
 
@@ -301,12 +314,12 @@ def test_claude_needs_no_env_overrides_because_it_inherits():
                         child_env=CHILD_ENV, which=FOUND_BOTH).argv
     assert "-c" not in argv
     assert "ATS_SESSION_ID" not in " ".join(argv)
-    assert argv[:3] == ["/usr/local/bin/claude", "-p", PACKET]
+    assert argv[:2] == ["/usr/local/bin/claude", "-p"]
 
 
 def test_no_child_env_is_not_a_crash():
     """Callers that spawn nothing (dry-run, tooling) still build an argv."""
     argv = build_launch("codex", READ_ONLY, PACKET, repo=REPO,
                         child_env=None, which=FOUND_BOTH).argv
-    assert argv[-1] == PACKET
+    assert argv[-1] == "-"
     assert "mcp_servers" not in " ".join(argv)

@@ -805,14 +805,15 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         # read. It exists only while the child runs: written here, removed in
         # the finally below on every exit, KeyboardInterrupt included.
         _sp.save_delegated_capability(capability_dir, child_id, child_approval_token)
-        # stdin closed: the child is not interactive, and left open the harness
-        # waits on it before starting.
+        # The packet goes on stdin (never argv: E2BIG at 128 KiB per string),
+        # and `input=` closes stdin after writing, so the non-interactive child
+        # never waits on it.
         # cwd is the verification worktree for a Claude VERIFY child, and the
         # parent's cwd otherwise. It is what makes the sandbox's writable root
         # the disposable tree rather than the lead's.
         proc = subprocess.run(argv, capture_output=True, text=True,
                               timeout=lease_minutes * 60, env=env,
-                              stdin=subprocess.DEVNULL,
+                              input=launch.stdin,
                               cwd=(str(verify_env.path) if verify_env else None))
         output, failure = proc.stdout.strip(), (proc.returncode != 0)
     except _SpawnRefused:

@@ -65,7 +65,7 @@ from ai_team_sync.delegation import IMPLEMENT, MODES, READ_ONLY, VERIFY
 # Bump when a spec's binary, prompt convention or enforcement flags change, so a
 # stored delegation says which contract it was launched under. A record that
 # cannot name its launcher contract cannot be audited after the contract moves.
-SPEC_VERSION = "1"
+SPEC_VERSION = "2"   # 2: packet on stdin, not argv (E2BIG at 128 KiB)
 
 
 class RoutingFailure(RuntimeError):
@@ -310,6 +310,10 @@ class ResolvedLaunch:
     mode: str
     resolved_binary: str      # absolute path, resolved in the parent
     argv: list[str]
+    # The packet, fed on stdin. Never in argv: one argv string is capped at
+    # 128 KiB, and a task-carrying packet (~140K chars for #2899, delegation
+    # 0631b915) failed with E2BIG before the child ran.
+    stdin: str = ""
     spec_version: str = SPEC_VERSION
 
 
@@ -416,15 +420,15 @@ def build_launch(worker: str, mode: str, prompt: str, *, repo: str = "",
     argv: list[str] = [binary, *spec.subcommand]
     argv += mcp_env_argv(spec, child_env)
     if spec.prompt_flag:
-        argv += [spec.prompt_flag, prompt]
+        argv.append(spec.prompt_flag)      # `claude -p` reads a piped prompt
     argv += list(enforcement)
     if spec.repo_flag and repo:
         argv += [spec.repo_flag, repo]
     if not spec.prompt_flag:
-        argv.append(prompt)
+        argv.append("-")                   # `codex exec -` reads stdin
 
     return ResolvedLaunch(requested_worker=worker, mode=mode,
-                          resolved_binary=binary, argv=argv)
+                          resolved_binary=binary, argv=argv, stdin=prompt)
 
 
 def validate_resolution(worker: str, resolved_binary: str) -> None:
