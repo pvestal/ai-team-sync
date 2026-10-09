@@ -30,7 +30,7 @@ from ai_team_sync.context_resolution import (
 from ai_team_sync.hooks.session_registration import RegistrationInput, lifecycle_session_key
 from ai_team_sync.hooks.session_registration import ensure_session as ensure_registered_session
 from ai_team_sync.operator_config import OperatorConfigError
-from ai_team_sync.session_marker import AUTOREG_DESCRIPTION
+from ai_team_sync.session_marker import AUTOREG_DESCRIPTION, is_autoregistered
 
 
 class ContextResolutionError(RuntimeError):
@@ -62,6 +62,28 @@ def _context_description(repo_root: str) -> str:
     # adopts this identity/context placeholder instead of leaving an orphan.
     return (
         f"{AUTOREG_DESCRIPTION}; context resolved to {repo_root}; " "file scope remains unclaimed"
+    )
+
+
+def _is_context_only_placeholder(session: dict[str, Any]) -> bool:
+    """True when changing the anchor cannot move any claimed work.
+
+    A prompt may mention one governed project and then correct itself to name
+    another before the worker has claimed scope or recorded work.  The
+    UserPromptSubmit hook must be able to follow that correction: telling the
+    worker to start a new session while blocking the prompt prevents the worker
+    from doing so.  Once the row carries any authority or durable work, its
+    repository remains fixed and the existing fail-closed path applies.
+    """
+    count_fields = ("lock_count", "decision_count", "commit_count")
+    return (
+        is_autoregistered(str(session.get("description") or ""))
+        and not list(session.get("scope") or [])
+        # These server-authored fields are mandatory evidence.  Treat an older
+        # or partial response as unsafe instead of silently assuming zero work.
+        and all(field in session for field in count_fields)
+        and all(int(session[field]) == 0 for field in count_fields)
+        and session.get("ticket_id") is None
     )
 
 
@@ -99,7 +121,7 @@ async def _anchor_session(
     requested = repo_root.rstrip("/")
     if current == requested:
         return session
-    if current:
+    if current and not _is_context_only_placeholder(session):
         raise ContextResolutionError(
             f"ATS session {session['id']} is already anchored to {current}; "
             f"start a new session before switching governed project to {requested}"

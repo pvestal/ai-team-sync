@@ -69,6 +69,39 @@ def test_request_target_leaves_generic_conversation_unscoped():
     )
 
 
+def test_context_only_placeholder_requires_every_no_work_signal():
+    from ai_team_sync.hooks import ats_context
+    from ai_team_sync.session_marker import AUTOREG_DESCRIPTION
+
+    placeholder = {
+        "description": AUTOREG_DESCRIPTION,
+        "scope": [],
+        "lock_count": 0,
+        "decision_count": 0,
+        "commit_count": 0,
+        "ticket_id": None,
+    }
+    assert ats_context._is_context_only_placeholder(placeholder)
+
+    disqualifiers = {
+        "description": "Working session",
+        "scope": ["src/**"],
+        "lock_count": 1,
+        "decision_count": 1,
+        "commit_count": 1,
+        "ticket_id": 4101,
+    }
+    for field, value in disqualifiers.items():
+        assert not ats_context._is_context_only_placeholder(
+            {**placeholder, field: value}
+        ), field
+
+    for required_count in ("lock_count", "decision_count", "commit_count"):
+        partial = dict(placeholder)
+        del partial[required_count]
+        assert not ats_context._is_context_only_placeholder(partial), required_count
+
+
 @pytest.mark.asyncio
 async def test_project_prompt_anchors_placeholder_and_gets_ats_brief(client, tmp_path, monkeypatch):
     from ai_team_sync import session_pointer as sp
@@ -104,6 +137,92 @@ async def test_project_prompt_anchors_placeholder_and_gets_ats_brief(client, tmp
     assert after["repo_root"] == ANIME_ROOT
     assert after["scope"] == []  # project context is not a file-lock claim
     assert sp.resolve_pointer(cid, allow_global=False) == sid
+
+
+@pytest.mark.asyncio
+async def test_project_correction_reanchors_context_only_placeholder(
+    client, tmp_path, monkeypatch
+):
+    from ai_team_sync.hooks import ats_context, session_autostart
+
+    cid = "facefeed-1111-2222-3333-444455556666"
+    monkeypatch.setenv("ATS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", cid)
+    monkeypatch.setenv("ATS_DEVELOPER", "patrick")
+    monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{ANIME_ROOT}:{ECHO_ROOT}")
+    monkeypatch.chdir(tmp_path)
+
+    sid = await session_autostart.ensure_session("http://test", client)
+    first = await ats_context.resolve_prompt_context(
+        "http://test",
+        client,
+        {
+            "session_id": cid,
+            "cwd": str(tmp_path),
+            "prompt": "Give me the current Anime Studio status.",
+        },
+    )
+    assert f"resolved repo: {ANIME_ROOT}" in first
+
+    corrected = await ats_context.resolve_prompt_context(
+        "http://test",
+        client,
+        {
+            "session_id": cid,
+            "cwd": str(tmp_path),
+            "prompt": "Correction. Ask Echo Brain to find and render.",
+        },
+    )
+
+    assert f"resolved repo: {ECHO_ROOT}" in corrected
+    row = (await client.get(f"/api/sessions/{sid}")).json()
+    assert row["repo_root"] == ECHO_ROOT
+    assert row["scope"] == []
+    assert row["lock_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_project_correction_refuses_to_move_claimed_session(
+    client, tmp_path, monkeypatch
+):
+    from ai_team_sync.hooks import ats_context, session_autostart
+
+    cid = "c0ffee00-1111-2222-3333-444455556666"
+    monkeypatch.setenv("ATS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", cid)
+    monkeypatch.setenv("ATS_DEVELOPER", "patrick")
+    monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{ANIME_ROOT}:{ECHO_ROOT}")
+    monkeypatch.chdir(tmp_path)
+
+    sid = await session_autostart.ensure_session("http://test", client)
+    await ats_context.resolve_prompt_context(
+        "http://test",
+        client,
+        {
+            "session_id": cid,
+            "cwd": str(tmp_path),
+            "prompt": "Give me the current Anime Studio status.",
+        },
+    )
+    response = await client.patch(
+        f"/api/sessions/{sid}",
+        json={"scope": ["src/**"]},
+    )
+    assert response.status_code == 200
+
+    with pytest.raises(ats_context.ContextResolutionError, match="start a new session"):
+        await ats_context.resolve_prompt_context(
+            "http://test",
+            client,
+            {
+                "session_id": cid,
+                "cwd": str(tmp_path),
+                "prompt": "Correction. Ask Echo Brain to find and render.",
+            },
+        )
+
+    row = (await client.get(f"/api/sessions/{sid}")).json()
+    assert row["repo_root"] == ANIME_ROOT
 
 
 @pytest.mark.asyncio
