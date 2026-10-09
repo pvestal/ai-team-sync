@@ -57,6 +57,20 @@ def _token(session_id: str, cid: str) -> str:
     return sp.load_approval_token(session_id, cid=cid) or ""
 
 
+_HANDBACK_PREFIX = '<agent-message from="'
+_HANDBACK_MARKER = "[Subagent hand-back]"
+
+
+def _is_subagent_handback(prompt: str) -> bool:
+    """True when the harness delivered a subagent's report as the prompt.
+
+    The report names whatever repos the subagent touched; that is not the
+    operator switching projects. Only a prompt that opens with the harness
+    frame counts, so an operator pasting a report still resolves by its text.
+    """
+    return prompt.startswith(_HANDBACK_PREFIX) and _HANDBACK_MARKER in prompt[:500]
+
+
 def _context_description(repo_root: str) -> str:
     # Keep the marker prefix so a later start_session still recognizes and
     # adopts this identity/context placeholder instead of leaving an orphan.
@@ -232,6 +246,10 @@ async def resolve_prompt_context(
         )
     token = _token(session_id, cid_key)
     session = await _get_session(client, server_url, session_id)
+
+    anchored = str(session.get("repo_root") or "").rstrip("/")
+    if anchored and _is_subagent_handback(prompt):
+        target = RequestTarget(None, anchored, "subagent_handback")
 
     if target.repo_root:
         session = await _anchor_session(client, server_url, session, target.repo_root, token)

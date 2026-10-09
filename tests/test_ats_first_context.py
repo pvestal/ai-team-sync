@@ -225,6 +225,78 @@ async def test_project_correction_refuses_to_move_claimed_session(
     assert row["repo_root"] == ANIME_ROOT
 
 
+HANDBACK = (
+    '<agent-message from="ac4a6a93173617cc7">\n'
+    "[Subagent hand-back] The text below is the final report of a subagent.\n"
+    "  Codex reviewed task 3537 in /opt/tower-echo-brain/.worktrees/fix-3537 "
+    "for Echo Brain.\n"
+    "</agent-message>"
+)
+
+
+async def _claimed_anime_session(client, tmp_path, monkeypatch, cid):
+    from ai_team_sync.hooks import ats_context, session_autostart
+
+    monkeypatch.setenv("ATS_STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", cid)
+    monkeypatch.setenv("ATS_DEVELOPER", "patrick")
+    monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{ANIME_ROOT}:{ECHO_ROOT}")
+    monkeypatch.chdir(tmp_path)
+    sid = await session_autostart.ensure_session("http://test", client)
+    await ats_context.resolve_prompt_context(
+        "http://test",
+        client,
+        {"session_id": cid, "cwd": str(tmp_path), "prompt": "Anime Studio status."},
+    )
+    response = await client.patch(f"/api/sessions/{sid}", json={"scope": ["src/**"]})
+    assert response.status_code == 200
+    return sid
+
+
+@pytest.mark.asyncio
+async def test_subagent_handback_resolves_to_the_sessions_own_repo(
+    client, tmp_path, monkeypatch
+):
+    from ai_team_sync.hooks import ats_context
+
+    cid = "0ddba11a-1111-2222-3333-444455556666"
+    sid = await _claimed_anime_session(client, tmp_path, monkeypatch, cid)
+
+    note = await ats_context.resolve_prompt_context(
+        "http://test",
+        client,
+        {"session_id": cid, "cwd": str(tmp_path), "prompt": HANDBACK},
+    )
+
+    assert "trigger: subagent_handback" in note
+    assert f"resolved repo: {ANIME_ROOT}" in note
+    row = (await client.get(f"/api/sessions/{sid}")).json()
+    assert row["repo_root"] == ANIME_ROOT
+    assert row["ticket_id"] is None  # the report's "task 3537" binds nothing
+
+
+@pytest.mark.asyncio
+async def test_pasted_handback_still_resolves_by_its_text(client, tmp_path, monkeypatch):
+    from ai_team_sync.hooks import ats_context
+
+    cid = "5eed5eed-1111-2222-3333-444455556666"
+    sid = await _claimed_anime_session(client, tmp_path, monkeypatch, cid)
+
+    with pytest.raises(ats_context.ContextResolutionError, match="start a new session"):
+        await ats_context.resolve_prompt_context(
+            "http://test",
+            client,
+            {
+                "session_id": cid,
+                "cwd": str(tmp_path),
+                "prompt": "why is the terminal showing:\n" + HANDBACK,
+            },
+        )
+
+    row = (await client.get(f"/api/sessions/{sid}")).json()
+    assert row["repo_root"] == ANIME_ROOT
+
+
 @pytest.mark.asyncio
 async def test_project_prompt_resurrects_auto_reaped_session(
     client, db_session, tmp_path, monkeypatch
