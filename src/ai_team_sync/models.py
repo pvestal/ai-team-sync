@@ -217,6 +217,35 @@ class Handoff(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
 
 
+class CompletionOutbox(Base):
+    """A session-completion event awaiting (or past) delivery to Echo (#3537).
+
+    Written in the completion's own transaction; delivered after commit and
+    retried with the same event_id until Echo acknowledges it. Exactly one of
+    delivered_at / rejected_at / suppressed_reason ends a row's life; until then
+    it is pending and visible in completion_events.health().
+    """
+
+    __tablename__ = "completion_outbox"
+
+    event_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(36), index=True)
+    completion_reason: Mapped[str] = mapped_column(String(32))
+    has_handoff: Mapped[bool] = mapped_column(Boolean, default=False)
+    payload: Mapped[str] = mapped_column(Text)
+    payload_sha256: Mapped[str] = mapped_column(String(64))
+    replayed: Mapped[bool] = mapped_column(Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow,
+                                                      index=True)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    suppressed_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class CommitRecord(Base):
     """A commit made during a session, auto-logged by post-commit hook."""
 

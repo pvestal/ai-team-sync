@@ -59,6 +59,36 @@ def pytest_sessionfinish(session, exitstatus):
 
 
 @pytest.fixture(autouse=True)
+def _no_live_completion_delivery(monkeypatch, request):
+    """In-process layer: replace the single send in completion_events with a
+    recorder. A test that did not ask for completion_capture and still sent
+    something fails. Spawned servers are covered by the tripwire above."""
+    from ai_team_sync import completion_events
+
+    sent: list[tuple[str, dict]] = []
+
+    async def recorder(url, payload):
+        sent.append((url, payload))
+        return 202
+
+    monkeypatch.setattr(completion_events, "_post", recorder)
+    yield sent
+    if "completion_capture" not in request.fixturenames:
+        assert not sent, f"ATS test sent {len(sent)} completion event(s) toward Echo"
+
+
+@pytest.fixture
+def completion_capture(_no_live_completion_delivery, monkeypatch):
+    """Opt in to delivery: transport on, the in-memory guard lifted, and every
+    send captured in-process instead of leaving it."""
+    from ai_team_sync import completion_events
+
+    monkeypatch.setenv("ATS_EMIT_COMPLETION", "1")
+    monkeypatch.setattr(completion_events, "ephemeral_database", lambda: False)
+    return _no_live_completion_delivery
+
+
+@pytest.fixture(autouse=True)
 def _identified_local_caller(monkeypatch):
     """Every real ATS client reaches it over loopback TCP, where the kernel names
     the caller's OS account (#2741). The in-process ASGI transport has no socket,

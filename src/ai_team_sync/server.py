@@ -11,7 +11,9 @@ from fastapi.staticfiles import StaticFiles
 
 from fastapi import Depends
 
-from ai_team_sync.database import init_db
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from ai_team_sync.database import get_db, init_db
 from ai_team_sync.config import settings
 from ai_team_sync.liveness import liveness_from_request
 from ai_team_sync.routers import restart_leases  # registers restart_leases on Base (#3580)
@@ -75,6 +77,12 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "ok", "service": "ai-team-sync"}
+
+    @app.get("/api/completion-events/health")
+    async def completion_events_health(db: AsyncSession = Depends(get_db)):
+        """Outbox counters for completion events sent to Echo (#3537)."""
+        from ai_team_sync import completion_events
+        return await completion_events.health(db)
 
     return app
 

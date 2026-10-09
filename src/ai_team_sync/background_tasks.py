@@ -4,18 +4,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ai_team_sync import completion_events
 from ai_team_sync.config import settings
 from ai_team_sync.database import get_db
 from ai_team_sync.git_utils import uncommitted_for_scope
 from ai_team_sync.models import CommitRecord, Decision, OverrideRequest, ScopeLock, Session
 from ai_team_sync.scope_paths import canonical_root
 from ai_team_sync.events import broadcast_event
+
+logger = logging.getLogger(__name__)
 
 # Lifecycle bookkeeping the reaper/resurrect pair writes into `summary`. Matched so a
 # NEW marker can REPLACE the previous one instead of appending to it (#2445).
@@ -239,6 +243,9 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
                 note += (f" [STRANDED {len(stranded)} uncommitted file(s) in scope: "
                          + ", ".join(stranded) + "]")
             sess.summary = replace_lifecycle_marker(sess.summary, note)
+            # A reaped session is a completed session: same v1 event, same
+            # outbox, reason 'reaped' (#3537). It used to emit nothing.
+            await completion_events.record_completion(db, sess, completion_events.REAPED)
             await broadcast_event(sess.id, "session.auto_completed", {
                 "session_id": sess.id, "last_activity": last_activity.isoformat(),
                 "reason": reason, "uncommitted_in_scope": stranded,
@@ -246,6 +253,7 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
             completed += 1
     if completed:
         await db.commit()
+        completion_events.kick()
     return completed
 
 
@@ -286,7 +294,27 @@ async def cleanup_task_loop():
         await asyncio.sleep(60)
 
 
+async def completion_delivery_loop():
+    """Background loop: deliver due completion events to Echo (#3537).
+
+    Each pass sends what is due and reschedules failures with backoff, so Echo
+    being down only delays events; the outbox keeps them.
+    """
+    while True:
+        try:
+            async for db in get_db():
+                await completion_events.deliver_pending(db)
+        except Exception as e:
+            logger.warning("completion delivery pass failed: %s", e)
+        await asyncio.sleep(30)
+
+
+_LOOPS: set[asyncio.Task] = set()
+
+
 async def start_background_tasks():
-    """Run an immediate startup sweep, then start the periodic cleanup loop."""
+    """Run an immediate startup sweep, then start the periodic loops."""
     await run_startup_cleanup()
-    asyncio.create_task(cleanup_task_loop())
+    for loop in (cleanup_task_loop, completion_delivery_loop):
+        task = asyncio.create_task(loop())
+        _LOOPS.add(task)

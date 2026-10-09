@@ -21,6 +21,7 @@ from sqlalchemy.orm import selectinload
 
 from ai_team_sync.database import get_db
 from ai_team_sync.background_tasks import replace_lifecycle_marker
+from ai_team_sync import completion_events
 from ai_team_sync.models import AgentMessage, CommitRecord, Handoff, ScopeLock, Session
 from ai_team_sync.message_lifecycle import append_delivery_event, release_unread_ticket_messages
 from ai_team_sync.git_utils import uncommitted_for_scope
@@ -1103,37 +1104,6 @@ def _authority_gate(body: SessionCreate, active_for_worker: int, worker=None,
         )
 
 
-def emit_session_completed(session: Session) -> None:
-    """Tell Echo Brain a session finished. Fire and forget, by design.
-
-    ATS owns current work state; it does not own a queue and gets no Redis
-    client. It announces the completion over HTTP and stops caring. Every
-    failure mode here — Echo Brain down, slow, refusing — must be invisible to
-    the caller, because the alternative is a completed session whose locks are
-    still held while an unrelated support service is unreachable. Memory
-    ingestion is asynchronous support work; session completion is authoritative.
-    """
-    url = os.environ.get("ECHO_BRAIN_URL", "http://localhost:8309")
-    if os.environ.get("ATS_EMIT_COMPLETION", "1") == "0":
-        return
-    payload = {"session_id": session.id, "agent": session.agent,
-               "repo_root": session.repo_root or "", "summary": session.summary or ""}
-
-    async def _send() -> None:
-        try:
-            import httpx
-            async with httpx.AsyncClient(timeout=5) as client:
-                await client.post(f"{url}/api/ats/session-completed", json=payload)
-        except Exception as exc:  # noqa: BLE001 — never surfaces to the caller
-            logger.info("session-completed event not delivered for %s: %s",
-                        session.id, exc)
-
-    try:
-        asyncio.get_running_loop().create_task(_send())
-    except Exception:  # noqa: BLE001 — no loop, no event; still never fatal
-        pass
-
-
 @router.post("", response_model=SessionResponse, status_code=201)
 async def create_session(body: SessionCreate, request: Request, response: Response,
                          db: AsyncSession = Depends(get_db)):
@@ -1620,6 +1590,10 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
                 f"Session {session.id} ({session.agent}) completed on ticket "
                 f"#{session.ticket_id}. Summary: {session.summary or ''}",
             )
+            # The Echo event joins this transaction (#3537): it is durable exactly
+            # when the completion and its handoff are, and is delivered afterwards.
+            await completion_events.record_completion(
+                db, session, completion_events.OWNER_COMPLETED)
 
         await _write_or_ticket_owned(db, session.ticket_id, session.creator_uid, commit=True)
     if body.status == "completed" and session.ticket_id is not None:
@@ -1635,7 +1609,8 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
     if body.status == "completed":
         # Support-staff intake, alongside the human-facing notification. Both
         # are after the commit, so neither can describe a state that did not land.
-        emit_session_completed(session)
+        # kick() only hurries the outbox; the background loop retries regardless.
+        completion_events.kick()
         await dispatch("session.completed", {
             "developer": session.developer,
             "agent": session.agent,

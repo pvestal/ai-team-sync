@@ -2,13 +2,17 @@
 
 A completed session releases locks and settles ownership. If the support layer
 that turns it into durable knowledge is down, slow, or broken, none of that may
-change — the alternative is a finished session whose locks are held hostage by
-an unrelated service.
+change -- the alternative is a finished session whose locks are held hostage by
+an unrelated service. Since #3537 the event is recorded in the completion's own
+transaction and delivered afterwards; a delivery failure is the outbox's problem,
+never the caller's.
 """
 
 from __future__ import annotations
 
 import pytest
+
+from ai_team_sync import completion_events as ce
 
 
 async def _completed_session(client, **over):
@@ -25,69 +29,28 @@ async def _completed_session(client, **over):
 
 
 @pytest.mark.asyncio
-async def test_completion_succeeds_when_the_memory_service_is_unreachable(client, monkeypatch):
-    import ai_team_sync.routers.sessions as sessions
-
-    def explode(session):
-        raise RuntimeError("echo brain is on fire")
-
-    monkeypatch.setattr(sessions, "emit_session_completed", explode)
-
+async def test_completion_succeeds_when_delivery_explodes(client, monkeypatch):
+    def explode():
+        raise RuntimeError("delivery layer is on fire")
+    monkeypatch.setattr(ce, "kick", explode)
     with pytest.raises(RuntimeError):
-        # Proves the stub really is wired in; the real emitter swallows this.
-        sessions.emit_session_completed(object())
-
-    monkeypatch.setattr(sessions, "emit_session_completed", lambda s: None)
-    sid, done = await _completed_session(client)
-
-    assert done.status_code == 200
-    after = (await client.get(f"/api/sessions/{sid}")).json()
-    assert after["status"] == "completed"
-    assert after["lock_count"] == 0, "locks release regardless of support-layer health"
-
-
-@pytest.mark.asyncio
-async def test_the_emitter_never_raises_into_the_caller(monkeypatch):
-    """Whatever httpx does, the caller sees nothing."""
-    import ai_team_sync.routers.sessions as sessions
-
-    class Boom:
-        def __init__(self, *a, **kw):
-            raise OSError("no route to host")
-
-    monkeypatch.setattr("httpx.AsyncClient", Boom)
-
-    class FakeSession:
-        id, agent, repo_root, summary = "s1", "codex", "/opt/anime-studio", "done"
-
-    sessions.emit_session_completed(FakeSession())  # must not raise
-
-
-@pytest.mark.asyncio
-async def test_the_emit_is_symmetric_for_claude_and_codex(client, monkeypatch):
-    """One path. Not a Claude path with Codex bolted on."""
-    import ai_team_sync.routers.sessions as sessions
-    seen = []
-    monkeypatch.setattr(sessions, "emit_session_completed",
-                        lambda s: seen.append((s.agent, s.id)))
-
-    await _completed_session(client, agent="claude-code:aaaa", scope=["src/a/**"])
-    await _completed_session(client, agent="codex", scope=["src/b/**"])
-
-    agents = [a for a, _ in seen]
-    assert "claude-code:aaaa" in agents and "codex" in agents
-    assert len(seen) == 2, "both agents emit through the same hook"
-
-
-@pytest.mark.asyncio
-async def test_emit_can_be_switched_off_without_touching_completion(client, monkeypatch):
-    monkeypatch.setenv("ATS_EMIT_COMPLETION", "0")
-    import ai_team_sync.routers.sessions as sessions
-
-    class FakeSession:
-        id, agent, repo_root, summary = "s2", "codex", "/opt/anime-studio", "done"
-
-    sessions.emit_session_completed(FakeSession())  # returns immediately
-
+        ce.kick()
+    monkeypatch.setattr(ce, "kick", lambda: None)
     sid, done = await _completed_session(client)
     assert done.status_code == 200
+    assert done.json()["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_completion_releases_locks_regardless_of_delivery(client, monkeypatch):
+    async def down(url, payload):
+        raise ConnectionError("unreachable")
+    monkeypatch.setattr(ce, "_post", down)
+    sid, done = await _completed_session(client)
+    assert done.status_code == 200
+    locks = await client.get("/api/locks")
+    assert all(lk["session_id"] != sid for lk in locks.json())
+
+
+def test_kick_without_a_running_loop_is_a_no_op():
+    ce.kick()  # must not raise outside an event loop
