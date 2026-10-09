@@ -382,3 +382,43 @@ def test_capability_is_removed_even_when_the_child_crashes(supervisor, monkeypat
     monkeypatch.setenv("HOME", str(tmp_path))
     _run(supervisor, _crash, mode="VERIFY", worker="codex")
     assert not os.path.exists(child_state_dir(DELEG) / DELEGATED_CAPABILITY_FILE)
+
+
+def test_capability_is_removed_on_keyboard_interrupt(supervisor, monkeypatch, tmp_path):
+    """Codex review round 2: Ctrl-C is not an Exception, so cleanup must sit in
+    a finally rather than after the except chain."""
+    import os
+
+    from ai_team_sync.delegation import child_state_dir
+    from ai_team_sync.session_pointer import DELEGATED_CAPABILITY_FILE
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    path = child_state_dir(DELEG) / DELEGATED_CAPABILITY_FILE
+    seen = {}
+
+    def interrupted(argv, *a, **k):
+        seen["existed"] = path.exists()
+        raise KeyboardInterrupt
+
+    result = _run(supervisor, interrupted, mode="VERIFY", worker="codex")
+
+    assert isinstance(result.exception, KeyboardInterrupt) or result.exit_code != 0
+    assert seen["existed"] is True
+    assert not os.path.exists(path)
+
+
+def test_capability_is_never_written_when_launch_build_fails(supervisor, monkeypatch, tmp_path):
+    import os
+
+    from ai_team_sync.delegation import child_state_dir
+    from ai_team_sync.session_pointer import DELEGATED_CAPABILITY_FILE
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    def broken_build(*a, **k):
+        raise RuntimeError("launch spec exploded")
+
+    monkeypatch.setattr(launch_spec, "build_launch", broken_build)
+    _run(supervisor, _clean_exit, mode="VERIFY", worker="codex")
+
+    assert not os.path.exists(child_state_dir(DELEG) / DELEGATED_CAPABILITY_FILE)

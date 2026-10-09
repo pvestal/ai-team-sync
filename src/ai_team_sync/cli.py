@@ -810,11 +810,9 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
     from ai_team_sync.delegation import child_env as _child_env
     env = _child_env(dict(os.environ), delegation_id=d["id"],
                      child_session_id=child_id, worker=worker)
-    # The child acts as child_id; without this capability it could only read.
     from pathlib import Path as _Path
     from ai_team_sync import session_pointer as _sp
-    _sp.save_delegated_capability(_Path(env["ATS_STATE_DIR"]), child_id,
-                                  child_approval_token)
+    capability_dir = _Path(env["ATS_STATE_DIR"])
 
     launch = build_launch(worker, mode, packet, repo=repo, child_env=env)
     argv = launch.argv
@@ -825,6 +823,10 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
     try:
         if verify_error:
             raise _SpawnRefused(verify_error)
+        # The child acts as child_id; without this capability it could only
+        # read. It exists only while the child runs: written here, removed in
+        # the finally below on every exit, KeyboardInterrupt included.
+        _sp.save_delegated_capability(capability_dir, child_id, child_approval_token)
         # stdin closed: the child is not interactive, and left open the harness
         # waits on it before starting.
         # cwd is the verification worktree for a Claude VERIFY child, and the
@@ -849,6 +851,8 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         output, failure = "", True
         launch_error = f"{type(exc).__name__}: {exc}"
         click.echo(f"child did not run: {launch_error}", err=True)
+    finally:
+        _sp.delete_delegated_capability(capability_dir)
 
     # FINALIZATION IS THE SUPERVISOR'S DUTY, on every terminal outcome.
     # The child is never required to close itself for the delegation to be
@@ -885,7 +889,6 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
                        f"({type(exc).__name__}: {exc}) — it will be reaped on "
                        f"inactivity rather than closed by its supervisor.",
                        err=True)
-    _sp.delete_delegated_capability(_Path(env["ATS_STATE_DIR"]))
 
     # Teardown belongs to the supervisor for the same reason finalization does:
     # it must happen on every terminal outcome, including the ones where the
