@@ -1231,16 +1231,37 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # unbound twin on every delegated Codex run (10 of 10 on
                 # 2026-10-09). Codex children reach this tool because their
                 # sandbox restricts files, not MCP calls.
+                #
+                # The delegation/session pair is public (GET /api/delegations), so
+                # it names the child but proves nothing. Possession of the row's
+                # capability, which only the supervisor received and handed to
+                # this child privately, is the proof, and the server checks it.
                 if (os.environ.get("ATS_DELEGATION") or "").strip():
+                    from ai_team_sync import session_pointer as sp
                     bound = await _delegation_child(client)
                     env_sid = (os.environ.get("ATS_SESSION_ID") or "").strip()
-                    if not bound or bound != env_sid:
+                    capability = sp.load_delegated_capability()
+                    proven = False
+                    if bound and bound == env_sid and capability \
+                            and capability[0] == bound:
+                        try:
+                            probe = await client.get(
+                                f"{SERVER_URL}/api/sessions/{bound}/messages",
+                                params={"limit": 1},
+                                headers={"X-ATS-Approval-Token": capability[1]})
+                            proven = probe.status_code == 200
+                        except Exception:  # noqa: BLE001 — unproven means refused
+                            proven = False
+                    if not proven:
                         return [TextContent(type="text", text=(
                             "❌ Session start refused: this process is a delegated "
                             f"child (delegation {os.environ['ATS_DELEGATION']}) but "
-                            "ATS could not confirm it is bound to session "
-                            f"{env_sid or '(none)'}. A delegated child never opens a "
-                            "second session; return to your parent."))]
+                            "could not prove it holds session "
+                            f"{env_sid or '(none)'} (binding or capability missing). "
+                            "A delegated child never opens a second session; return "
+                            "to your parent."))]
+                    _IN_PROCESS_SESSION_ID = bound
+                    _IN_PROCESS_APPROVAL_TOKEN = capability[1]
                     msg = (f"✅ Delegated session already open: {bound}\n"
                            f"Delegation: {os.environ['ATS_DELEGATION']}\n"
                            "No new session was created; this process acts as the "

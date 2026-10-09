@@ -339,3 +339,46 @@ async def test_completing_the_child_leaves_the_parent_active(client):
 
     assert (await client.get(f"/api/sessions/{child['id']}")).json()["status"] == "completed"
     assert (await client.get(f"/api/sessions/{parent['id']}")).json()["status"] == "active"
+
+
+# ── the child's capability: handed over privately, removed afterwards ───────
+
+def test_supervisor_hands_the_child_its_capability_privately(supervisor, monkeypatch, tmp_path):
+    """Adoption of the child's row needs its capability. It goes in a 0600 file
+    in the child's private state dir, never in env or argv: Codex forwards its
+    MCP env as `-c` arguments and /proc/<pid>/cmdline is world-readable."""
+    import os
+    import stat
+
+    from ai_team_sync.session_pointer import DELEGATED_CAPABILITY_FILE
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    seen = {}
+
+    def spawn(argv, *a, **k):
+        env = k["env"]
+        path = os.path.join(env["ATS_STATE_DIR"], DELEGATED_CAPABILITY_FILE)
+        seen["path"] = path
+        seen["mode"] = stat.S_IMODE(os.stat(path).st_mode)
+        seen["record"] = json.loads(open(path, encoding="utf-8").read())
+        seen["leaked"] = CHILD_TOKEN in json.dumps(env) or CHILD_TOKEN in " ".join(argv)
+        return _clean_exit(argv)
+
+    result = _run(supervisor, spawn, mode="VERIFY", worker="codex")
+
+    assert result.exit_code == 0, result.output
+    assert seen["record"] == {"session_id": CHILD, "token": CHILD_TOKEN}
+    assert seen["mode"] == 0o600
+    assert seen["leaked"] is False
+    assert not os.path.exists(seen["path"]), "removed after finalization"
+
+
+def test_capability_is_removed_even_when_the_child_crashes(supervisor, monkeypatch, tmp_path):
+    import os
+
+    from ai_team_sync.delegation import child_state_dir
+    from ai_team_sync.session_pointer import DELEGATED_CAPABILITY_FILE
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    _run(supervisor, _crash, mode="VERIFY", worker="codex")
+    assert not os.path.exists(child_state_dir(DELEG) / DELEGATED_CAPABILITY_FILE)

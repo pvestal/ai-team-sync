@@ -223,14 +223,59 @@ def save_approval_token(session_id: str, token: str, cid: str | None = None) -> 
 
 def load_approval_token(session_id: str, cid: str | None = None) -> str:
     cid = cid or claude_session_id()
-    if not cid or not session_id:
+    if not session_id:
         return ""
+    if cid:
+        try:
+            path = _state_dir() / f"{APPROVAL_TOKEN_PREFIX}{cid[:8]}"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("session_id") == session_id and data.get("token"):
+                return str(data["token"])
+        except Exception:
+            pass
+    delegated = load_delegated_capability()
+    return delegated[1] if delegated and delegated[0] == session_id else ""
+
+
+# A delegated child's capability for the row its supervisor registered. It is a
+# file in the child's private ATS_STATE_DIR, not an environment variable,
+# because Codex forwards its MCP env as `-c` argv and /proc/<pid>/cmdline is
+# world-readable. The supervisor writes it before spawn and deletes it after
+# finalization.
+DELEGATED_CAPABILITY_FILE = ".ats_delegated_capability"
+
+
+def save_delegated_capability(state_dir: Path, session_id: str, token: str) -> None:
+    if not session_id or not token:
+        return
     try:
-        path = _state_dir() / f"{APPROVAL_TOKEN_PREFIX}{cid[:8]}"
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return str(data.get("token") or "") if data.get("session_id") == session_id else ""
+        state_dir.mkdir(parents=True, exist_ok=True)
+        fd = os.open(state_dir / DELEGATED_CAPABILITY_FILE,
+                     os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"session_id": session_id, "token": token}, stream)
     except Exception:
-        return ""
+        pass  # a missing capability fails closed in the child
+
+
+def load_delegated_capability() -> tuple[str, str] | None:
+    """(session_id, token) handed to this delegated child, or None."""
+    if not (os.environ.get("ATS_DELEGATION") or "").strip():
+        return None
+    try:
+        data = json.loads((_state_dir() / DELEGATED_CAPABILITY_FILE).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    sid, token = str(data.get("session_id") or ""), str(data.get("token") or "")
+    return (sid, token) if sid and token else None
+
+
+def delete_delegated_capability(state_dir: Path) -> None:
+    try:
+        (state_dir / DELEGATED_CAPABILITY_FILE).unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def save_pointer(session_id: str, cid: str | None = None) -> None:

@@ -9,11 +9,14 @@ so provenance pointed at a session no delegation accounts for.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 import ai_team_sync.mcp.server as mcp
+from ai_team_sync import session_pointer as sp
 from ai_team_sync.database import get_db
 from ai_team_sync.server import create_app
 
@@ -97,7 +100,7 @@ async def _bound_child(transport, mode="VERIFY"):
             },
         )
         assert child.status_code == 201, child.text
-        return deleg.json()["id"], child.json()["id"]
+        return deleg.json()["id"], child.json()["id"], child.headers["X-ATS-Approval-Token"]
 
 
 async def _rows(transport):
@@ -107,11 +110,14 @@ async def _rows(transport):
         return r.json()
 
 
-def _as_child(monkeypatch, delegation_id, session_id):
-    """The environment delegation.child_env gives the spawned worker."""
+def _as_child(monkeypatch, tmp_path, delegation_id, session_id, token=None):
+    """What the supervisor gives the spawned worker: child_env's variables and,
+    when it holds one, the row capability in the private state dir."""
     monkeypatch.setenv("ATS_DELEGATION", delegation_id)
     monkeypatch.setenv("ATS_SESSION_ID", session_id)
     monkeypatch.setenv("ATS_AGENT", "codex:delegate")
+    if token:
+        sp.save_delegated_capability(Path(tmp_path), session_id, token)
 
 
 async def _start(scope=(), description="Independent read-only adversarial VERIFY"):
@@ -124,9 +130,9 @@ async def _start(scope=(), description="Independent read-only adversarial VERIFY
 @pytest.mark.asyncio
 async def test_delegated_child_adopts_its_bound_session(db_engine, monkeypatch, tmp_path):
     transport = _wire(monkeypatch, db_engine, tmp_path)
-    delegation_id, child = await _bound_child(transport)
+    delegation_id, child, token = await _bound_child(transport)
     before = {row["id"] for row in await _rows(transport)}
-    _as_child(monkeypatch, delegation_id, child)
+    _as_child(monkeypatch, tmp_path, delegation_id, child, token)
 
     text = await _start()
 
@@ -137,8 +143,8 @@ async def test_delegated_child_adopts_its_bound_session(db_engine, monkeypatch, 
 @pytest.mark.asyncio
 async def test_delegated_child_scope_request_claims_nothing(db_engine, monkeypatch, tmp_path):
     transport = _wire(monkeypatch, db_engine, tmp_path)
-    delegation_id, child = await _bound_child(transport)
-    _as_child(monkeypatch, delegation_id, child)
+    delegation_id, child, token = await _bound_child(transport)
+    _as_child(monkeypatch, tmp_path, delegation_id, child, token)
 
     text = await _start(scope=["src/**"])
 
@@ -151,9 +157,9 @@ async def test_delegated_child_scope_request_claims_nothing(db_engine, monkeypat
 @pytest.mark.asyncio
 async def test_unproven_delegation_binding_refuses(db_engine, monkeypatch, tmp_path):
     transport = _wire(monkeypatch, db_engine, tmp_path)
-    delegation_id, _ = await _bound_child(transport)
+    delegation_id, _, token = await _bound_child(transport)
     before = {row["id"] for row in await _rows(transport)}
-    _as_child(monkeypatch, delegation_id, "00000000-0000-0000-0000-000000000000")
+    _as_child(monkeypatch, tmp_path, delegation_id, "00000000-0000-0000-0000-000000000000", token)
 
     text = await _start()
 
@@ -172,3 +178,63 @@ async def test_non_delegated_start_session_still_creates(db_engine, monkeypatch,
 
     assert "✅ Session started!" in text
     assert len(await _rows(transport)) == before + 1
+
+
+@pytest.mark.asyncio
+async def test_adopted_child_can_use_token_protected_tools(db_engine, monkeypatch, tmp_path):
+    """Codex review BLOCK 1: adoption must carry the row's capability, or the
+    child cannot message or close (the twin used to supply its own)."""
+    transport = _wire(monkeypatch, db_engine, tmp_path)
+    delegation_id, child, token = await _bound_child(transport)
+    _as_child(monkeypatch, tmp_path, delegation_id, child, token)
+
+    await _start()
+    inbox = (await mcp._call_tool_impl("message_inbox", {}))[0].text
+
+    assert "capability missing" not in inbox
+    assert "No pending ATS messages" in inbox
+
+
+@pytest.mark.asyncio
+async def test_child_messages_without_ever_calling_start_session(db_engine, monkeypatch, tmp_path):
+    transport = _wire(monkeypatch, db_engine, tmp_path)
+    delegation_id, child, token = await _bound_child(transport)
+    _as_child(monkeypatch, tmp_path, delegation_id, child, token)
+
+    inbox = (await mcp._call_tool_impl("message_inbox", {}))[0].text
+
+    assert "No pending ATS messages" in inbox
+
+
+@pytest.mark.asyncio
+async def test_public_pair_without_capability_is_refused(db_engine, monkeypatch, tmp_path):
+    """Codex review BLOCK 2: the delegation/session pair is world-readable via
+    GET /api/delegations, so it alone must not adopt the row."""
+    transport = _wire(monkeypatch, db_engine, tmp_path)
+    delegation_id, child, _ = await _bound_child(transport)
+    _as_child(monkeypatch, tmp_path, delegation_id, child)  # no capability
+
+    text = await _start()
+
+    assert text.startswith("❌ Session start refused")
+    assert mcp._IN_PROCESS_SESSION_ID is None
+
+
+@pytest.mark.asyncio
+async def test_wrong_capability_is_refused_by_the_server(db_engine, monkeypatch, tmp_path):
+    transport = _wire(monkeypatch, db_engine, tmp_path)
+    delegation_id, child, _ = await _bound_child(transport)
+    _as_child(monkeypatch, tmp_path, delegation_id, child, "forged-token")
+
+    text = await _start()
+
+    assert text.startswith("❌ Session start refused")
+    assert mcp._IN_PROCESS_SESSION_ID is None
+
+
+def test_capability_is_ignored_outside_a_delegated_process(monkeypatch, tmp_path):
+    monkeypatch.setenv("ATS_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("ATS_DELEGATION", raising=False)
+    sp.save_delegated_capability(Path(tmp_path), "sid-1", "tok-1")
+    assert sp.load_delegated_capability() is None
+    assert sp.load_approval_token("sid-1", cid="") == ""

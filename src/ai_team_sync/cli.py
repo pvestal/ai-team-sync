@@ -810,6 +810,11 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
     from ai_team_sync.delegation import child_env as _child_env
     env = _child_env(dict(os.environ), delegation_id=d["id"],
                      child_session_id=child_id, worker=worker)
+    # The child acts as child_id; without this capability it could only read.
+    from pathlib import Path as _Path
+    from ai_team_sync import session_pointer as _sp
+    _sp.save_delegated_capability(_Path(env["ATS_STATE_DIR"]), child_id,
+                                  child_approval_token)
 
     launch = build_launch(worker, mode, packet, repo=repo, child_env=env)
     argv = launch.argv
@@ -880,6 +885,7 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
                        f"({type(exc).__name__}: {exc}) — it will be reaped on "
                        f"inactivity rather than closed by its supervisor.",
                        err=True)
+    _sp.delete_delegated_capability(_Path(env["ATS_STATE_DIR"]))
 
     # Teardown belongs to the supervisor for the same reason finalization does:
     # it must happen on every terminal outcome, including the ones where the
