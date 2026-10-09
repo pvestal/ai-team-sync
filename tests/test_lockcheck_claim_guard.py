@@ -233,10 +233,14 @@ def _invoke_edit_hook(monkeypatch, capsys, *, sessions, locks, sid=MY_SID,
         def get(self, url):
             return Response(locks if url.endswith("/api/locks") else sessions)
 
+    def coordinated_roots():
+        if isinstance(coordinated, Exception):
+            raise coordinated
+        return [REPO] if coordinated else []
+
     monkeypatch.setattr(httpx, "Client", Client)
     monkeypatch.setattr(guard, "_roots", lambda _path: (REPO, REPO))
-    monkeypatch.setattr(guard, "_coordinated_roots",
-                        lambda: [REPO] if coordinated else [])
+    monkeypatch.setattr(guard, "_coordinated_roots", coordinated_roots)
     monkeypatch.setattr(session_pointer, "resolve_pointer", lambda *_a, **_kw: sid)
     monkeypatch.delenv("ATS_CLAIMCHECK", raising=False)
     if block is None:
@@ -263,6 +267,20 @@ def _agent_warning(stdout):
     assert specific["hookEventName"] == "PreToolUse"
     assert "permissionDecision" not in specific
     return specific["additionalContext"]
+
+
+def test_main_malformed_operator_config_blocks_instead_of_failing_open(monkeypatch, capsys):
+    # An uncaught error exits 1, which Claude Code treats as "allow": one typo
+    # in operator.toml would skip both the claim guard and the exclusive guard.
+    from ai_team_sync.operator_config import OperatorConfigError
+
+    sessions = [_sess(), _sess(sid="other", agent="claude-code:other111")]
+    locks = [dict(_lock(sid="other"), mode="exclusive")]
+    code, _stdout, stderr = _invoke_edit_hook(
+        monkeypatch, capsys, sessions=sessions, locks=locks,
+        coordinated=OperatorConfigError("bad operator.toml"))
+    assert code == 2
+    assert "bad operator.toml" in stderr
 
 
 def test_main_advisory_warning_reaches_agent_and_lists_all_holders(monkeypatch, capsys):

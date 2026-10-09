@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shlex
@@ -14,6 +15,24 @@ from typing import Any
 AUTOSTART_MODULE = "ai_team_sync.hooks.session_autostart"
 CONTEXT_MODULE = "ai_team_sync.hooks.ats_context"
 INBOX_MODULE = "ai_team_sync.hooks.override_inbox"
+
+
+def _operator_config_declares_repositories() -> bool:
+    # The installer runs under system python3 without ai_team_sync installed;
+    # load the stdlib-only parser from source so there is one strict reading.
+    source = Path(__file__).resolve().parents[1] / "src" / "ai_team_sync" / "operator_config.py"
+    spec = importlib.util.spec_from_file_location("_ats_operator_config", source)
+    module = importlib.util.module_from_spec(spec)
+    assert spec and spec.loader
+    spec.loader.exec_module(module)
+    previous = os.environ.pop("ATS_COORDINATED_REPOS", None)
+    try:
+        return bool(module.governed_repositories())
+    except module.OperatorConfigError:
+        return False
+    finally:
+        if previous is not None:
+            os.environ["ATS_COORDINATED_REPOS"] = previous
 
 
 def _without_modules(groups: list[dict[str, Any]], modules: set[str]) -> list[dict[str, Any]]:
@@ -58,10 +77,18 @@ def install(settings_path: Path, python: str) -> None:
         raise ValueError(f"{settings_path} must contain one JSON object")
 
     # Governed repository paths are machine-local operator policy shared by
-    # every ATS client. Do not duplicate or expose them in Claude settings.
+    # every ATS client. Do not duplicate or expose them in Claude settings --
+    # but drop the legacy copy only once operator.toml declares repos, or the
+    # claim guard silently turns off on this deploy.
     environment = settings.get("env")
-    if isinstance(environment, dict):
-        environment.pop("ATS_COORDINATED_REPOS", None)
+    if isinstance(environment, dict) and "ATS_COORDINATED_REPOS" in environment:
+        if not _operator_config_declares_repositories():
+            raise ValueError(
+                f"{settings_path} still sets ATS_COORDINATED_REPOS and no valid operator "
+                "config declares governed repositories; move them to "
+                "~/.config/ai-team-sync/operator.toml ([governance] repositories) first"
+            )
+        environment.pop("ATS_COORDINATED_REPOS")
 
     start_groups = list(settings.setdefault("hooks", {}).get("SessionStart") or [])
     startup_echo = ""

@@ -29,6 +29,7 @@ from ai_team_sync.context_resolution import (
 )
 from ai_team_sync.hooks.session_registration import RegistrationInput, lifecycle_session_key
 from ai_team_sync.hooks.session_registration import ensure_session as ensure_registered_session
+from ai_team_sync.operator_config import OperatorConfigError
 from ai_team_sync.session_marker import AUTOREG_DESCRIPTION
 
 
@@ -261,7 +262,13 @@ def main(argv: list[str] | None = None) -> None:
     prompt = str(payload.get("prompt") or "")
     cwd = str(payload.get("cwd") or os.getcwd())
     # Decide before opening a socket. Generic conversation must remain generic.
-    if resolve_request_target(prompt, cwd=cwd) is None:
+    # A bad operator config must block (exit 2): exit 1 lets the prompt through.
+    try:
+        target = resolve_request_target(prompt, cwd=cwd)
+    except OperatorConfigError as exc:
+        print(f"ATS-FIRST blocked: operator config is invalid: {exc}", file=sys.stderr)
+        raise SystemExit(2)
+    if target is None:
         _run_supplement(args.supplement_command, args.supplement_timeout, raw_payload)
         raise SystemExit(0)
 

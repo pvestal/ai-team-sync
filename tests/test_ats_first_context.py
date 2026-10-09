@@ -280,6 +280,27 @@ def test_governed_failure_is_a_blocking_hook_result(monkeypatch, capsys):
     assert "ATS-FIRST context resolution failed" in capsys.readouterr().err
 
 
+def test_malformed_operator_config_blocks_instead_of_failing_open(monkeypatch, capsys):
+    # Exit 1 is a non-blocking hook error to Claude Code: an uncaught config
+    # error would let every governed prompt through with no ATS context.
+    from ai_team_sync.hooks import ats_context
+
+    monkeypatch.setenv("ATS_COORDINATED_REPOS", "relative/path")
+    monkeypatch.setattr(
+        ats_context.sys,
+        "stdin",
+        __import__("io").StringIO(
+            '{"session_id":"fresh","cwd":"/tmp","prompt":"continue #2003"}'
+        ),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        ats_context.main([])
+
+    assert exc.value.code == 2
+    assert "operator config" in capsys.readouterr().err
+
+
 def test_governed_prompt_runs_ats_before_supplement(monkeypatch, capsys):
     from ai_team_sync.hooks import ats_context
 

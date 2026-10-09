@@ -23,7 +23,7 @@ import os
 import sys
 
 from ai_team_sync.git_utils import resolve_repo_roots as _roots
-from ai_team_sync.operator_config import governed_repositories
+from ai_team_sync.operator_config import OperatorConfigError, governed_repositories
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
 _SKIP_SUBSTR = ("/.git/", "/node_modules/", "/__pycache__/", "/.venv/",
@@ -287,7 +287,14 @@ def main() -> None:
 
     # In coordinated repos, explain a lost #2760 lane before a foreign lock's
     # diagnostic can hide it. The same claim guard still decides edit authority.
-    if froot in _coordinated_roots():
+    # A bad operator config must block (exit 2): exit 1 lets the edit through
+    # and would skip the exclusive-lock guard below as well.
+    try:
+        coordinated = _coordinated_roots()
+    except OperatorConfigError as exc:
+        print(f"ATS CLAIM GUARD: operator config is invalid: {exc}", file=sys.stderr)
+        sys.exit(2)
+    if froot in coordinated:
         my_cid8 = str(payload.get("session_id", ""))[:8]
         ok, reason = claim_check(rel, froot, my_sid, my_cid8, sessions, locks)
         if not ok:

@@ -6,6 +6,8 @@ import importlib.util
 import json
 from pathlib import Path
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "install-claude-hooks.py"
 
 
@@ -17,8 +19,26 @@ def _module():
     return module
 
 
-def test_installer_puts_ats_context_before_echo_and_is_idempotent(tmp_path):
+def test_installer_refuses_to_drop_legacy_repos_without_operator_config(tmp_path, monkeypatch):
+    # Popping ATS_COORDINATED_REPOS with nowhere else declaring the governed
+    # repos would silently turn the claim guard off on the next deploy.
     module = _module()
+    monkeypatch.setenv("ATS_OPERATOR_CONFIG", str(tmp_path / "missing.toml"))
+    settings = tmp_path / "settings.json"
+    original = json.dumps({"env": {"ATS_COORDINATED_REPOS": "/private/repo-a"}})
+    settings.write_text(original)
+
+    with pytest.raises(ValueError, match="operator"):
+        module.install(settings, "/opt/ats/bin/python")
+
+    assert settings.read_text() == original
+
+
+def test_installer_puts_ats_context_before_echo_and_is_idempotent(tmp_path, monkeypatch):
+    module = _module()
+    operator = tmp_path / "operator.toml"
+    operator.write_text('[governance]\nrepositories = ["/private/repo-a", "/private/repo-b"]\n')
+    monkeypatch.setenv("ATS_OPERATOR_CONFIG", str(operator))
     settings = tmp_path / "settings.json"
     settings.write_text(
         json.dumps(
