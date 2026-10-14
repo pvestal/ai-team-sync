@@ -214,6 +214,15 @@ Restoration is not inside `acquisition_guard`. Outside governed repositories the
 old refusal rule stands: advisory locks share, and only an exclusive lock or an
 exclusive request refuses an overlap.
 
+**Before deploying.** Because live locks are not re-judged, a lock taken under
+the old rules keeps acting under the new placement. `ats lock preflight-deploy
+[--db PATH]` opens the server's SQLite database read-only and lists live locks
+that placement makes `repo_wide` (an absolute `<worktree>/**` places as `**`) or
+`broad` (over `ATS_BROAD_CLAIM_LIMIT`), that point into `other_repository` than
+their session's anchor (never honoured by the edit guard, yet now conflicting),
+that are `unplaceable`, or that match no file. It changes nothing and exits 1
+when it finds any; clearing them is the holders' decision.
+
 **Ownership report.** `GET /api/locks/ownership?repo_root=R&paths=a,b&session_id=S`
 (MCP `lock_ownership`) lists, per path, every live session whose lock covers it
 with its mode, and `conflict: true` when one of them is not `S`, after the same

@@ -393,3 +393,69 @@ class RepoContext:
                     f"wide blocks every other session there. Narrow it to the files you "
                     f"will edit")
         return None
+
+
+# ── deploy preflight (#3581) ──────────────────────────────────────────────
+
+def live_lock_rows(db_path: str) -> list[dict]:
+    """Live locks from an ATS SQLite database, opened READ-ONLY. Same liveness
+    as the server, approximately: owner active or paused, and the lock unexpired
+    or exclusive."""
+    import sqlite3
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT l.session_id, s.agent, COALESCE(s.repo_root, ''), l.pattern, l.mode "
+            "FROM scope_locks l JOIN sessions s ON s.id = l.session_id "
+            "WHERE s.status IN ('active', 'paused') AND (l.expires_at > ? OR l.mode = 'exclusive') "
+            "ORDER BY s.id, l.pattern", (now,)).fetchall()
+    finally:
+        conn.close()
+    keys = ("session_id", "agent", "repo_root", "pattern", "mode")
+    return [dict(zip(keys, row)) for row in rows]
+
+
+def placement_hazards(rows: list[dict], ctx: RepoContext | None = None) -> list[dict]:
+    """Live locks that #3581 placement makes repo-wide or broad, or that no edit
+    guard can honour. Each row: session_id, agent, repo_root, pattern, mode.
+    Reads git and the filesystem only; nothing is changed."""
+    ctx = ctx or RepoContext()
+    limit = broad_claim_limit()
+    out: list[dict] = []
+    for row in rows:
+        def add(hazard: str, detail: str) -> None:
+            out.append({**row, "hazard": hazard, "detail": detail})
+
+        root = (row["repo_root"] or "").rstrip("/")
+        pattern = row["pattern"] or ""
+        placed = ctx.place(pattern, root)
+        if placed is None:
+            add("unplaceable", "absolute pattern inside no git checkout: compared lexically, "
+                "so it conflicts with anything sharing its literal prefix")
+            continue
+        ident, rel = placed
+        if pattern.strip().startswith("/") and root and ident != ctx.identity(root):
+            add("other_repository",
+                f"points into {ident} as '{rel or '.'}' while the session is anchored at "
+                f"{root}: the edit guard never honours it, and acquisitions in {ident} now "
+                f"conflict with it")
+        index = ctx.index(ident) if ident else None
+        if index is None:
+            continue
+        covered = ctx.covered(ident, rel)
+        total = len(set(index.names.values()))
+        governed = ctx.governed_root(ident)
+        blocking = (f"; {ident} is governed, so every new overlapping acquisition there is "
+                    f"refused while this lock is live" if governed else "")
+        if total and len(covered) >= total:
+            add("repo_wide", f"covers all {total} files of {ident} as '{rel}'{blocking}")
+        elif limit > 0 and len(covered) > limit:
+            add("broad", f"covers {len(covered)} of {total} files of {ident} as '{rel}', over "
+                f"ATS_BROAD_CLAIM_LIMIT={limit}{blocking}")
+        elif not covered and not literal_target(rel, ident):
+            add("matches_no_file", f"'{rel or '.'}' matches no file of {ident}: it protects "
+                f"nothing")
+    return out

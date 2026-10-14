@@ -309,6 +309,35 @@ def lock_list():
         click.echo(f"  {l['pattern']} ({l['mode']}) — {l.get('developer', '?')}  expires: {l['expires_at']}{why}")
 
 
+def _default_db_path() -> str:
+    url = os.environ.get("DATABASE_URL", "")
+    if url.startswith("sqlite") and ":///" in url:
+        return url.split(":///", 1)[1]
+    return os.path.expanduser("~/.local/share/ai-team-sync/ats.db")
+
+
+@lock.command("preflight-deploy")
+@click.option("--db", "db_path", default=None,
+              help="ATS SQLite database, opened read-only (default: $DATABASE_URL, "
+                   "else ~/.local/share/ai-team-sync/ats.db)")
+def lock_preflight_deploy(db_path):
+    """Before deploying #3581: list live locks its placement makes repo-wide or
+    broad, or that no edit guard can honour. Reads only; changes no lock.
+    Exits 1 when any is found."""
+    from ai_team_sync.repo_files import live_lock_rows, placement_hazards
+
+    path = db_path or _default_db_path()
+    rows = live_lock_rows(path)
+    hazards = placement_hazards(rows)
+    click.echo(f"{len(rows)} live lock(s) in {path} (read-only); {len(hazards)} hazard(s).")
+    for h in hazards:
+        click.echo(f"  [{h['hazard']}] session {h['session_id']} ({h['agent']}) "
+                   f"{h['mode']} '{h['pattern']}' anchored {h['repo_root'] or '<unanchored>'}")
+        click.echo(f"      {h['detail']}")
+    if hazards:
+        raise SystemExit(1)
+
+
 # --- Decision commands ---
 
 @cli.group()
