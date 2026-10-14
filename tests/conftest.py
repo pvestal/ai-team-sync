@@ -28,6 +28,16 @@ def _identified_local_caller(monkeypatch):
     monkeypatch.setattr(peer_identity, "peer_uid_for_request", lambda request: os.getuid())
 
 
+@pytest.fixture(autouse=True)
+def _no_workstation_governance(monkeypatch, tmp_path_factory):
+    """The workstation's ~/.config/ai-team-sync/operator.toml must not govern
+    test repo roots such as /opt/anime-studio (#3581 runs git there). Tests that
+    need governance set ATS_OPERATOR_CONFIG or ATS_COORDINATED_REPOS themselves."""
+    monkeypatch.setenv("ATS_OPERATOR_CONFIG",
+                       str(tmp_path_factory.getbasetemp() / "no-operator.toml"))
+    monkeypatch.delenv("ATS_COORDINATED_REPOS", raising=False)
+
+
 @pytest_asyncio.fixture
 async def db_engine():
     engine = create_async_engine("sqlite+aiosqlite://", echo=False)

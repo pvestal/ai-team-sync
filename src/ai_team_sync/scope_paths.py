@@ -294,3 +294,78 @@ def reader_covers(query: ReaderQuery, lock: ReaderLock) -> bool:
             return False  # another repository's lock: the one answer the old rule gets wrong
     # Placement adds coverage; it never removes what the old rule reported.
     return _placed_covers(query, lock) or _pre_2761_covers(query, lock)
+
+
+# ── pattern-vs-pattern ownership (#3581) ──────────────────────────────────
+# Whether two lock patterns can name a common file. A file "matches" a lock when
+# EITHER enforcement reader says so: the edit hook's scope_matches (prefix '/**',
+# one-level '/*', fnmatch otherwise) or reader_covers (/api/locks/check). Their
+# union, so an overlap either surface would act on is seen here.
+
+def lock_file_matcher(pattern: str, root: str = ""):
+    """A predicate for repo-relative files `rel` under `root` that `pattern` covers."""
+    from ai_team_sync.hooks.pre_tool_use_lockcheck import scope_matches
+
+    lock = reader_lock(pattern, root)
+
+    def matches(rel: str) -> bool:
+        return (scope_matches(rel, pattern, root)
+                or reader_covers(reader_query(rel, root), lock))
+    return matches
+
+
+def matching_files(pattern: str, files, root: str = "") -> frozenset[str]:
+    """The members of `files` (repo-relative) that `pattern` covers."""
+    matches = lock_file_matcher(pattern, root)
+    return frozenset(f for f in files if matches(f))
+
+
+def literal_target(pattern: str, root: str = "") -> str:
+    """The one repo-relative path a glob-free pattern names; '' for a glob, the
+    whole repository, or an absolute path outside `root`."""
+    canon = canonical_pattern(pattern, root)
+    if not canon or canon.startswith("/") or GLOB_META & set(canon):
+        return ""
+    return canon
+
+
+def _algebraic_overlap(a: str, b: str) -> bool:
+    """No file set to consult: compatible literal prefixes are overlap."""
+    if not a or not b:
+        return True
+    if a.startswith("/") != b.startswith("/"):
+        return True
+    a_lit, a_glob = literal_prefix(a.split("/"))
+    b_lit, b_glob = literal_prefix(b.split("/"))
+    if not a_glob:
+        return may_overlap(a, b)
+    if not b_glob:
+        return may_overlap(b, a)
+    n = min(len(a_lit), len(b_lit))
+    return a_lit[:n] == b_lit[:n]
+
+
+def patterns_overlap(a: str, b: str, files=None, root: str = "",
+                     a_matches: frozenset[str] | None = None) -> bool:
+    """Can lock patterns `a` and `b` name a common file?
+
+    With `files`, the repository's real file set: yes when a file matches both,
+    or when either is a literal path not in the set (a file not created yet)
+    that the other covers. Without it: a conservative literal-prefix test where
+    uncertainty is overlap. Neither form is ever narrower than the legacy
+    two-way fnmatch. `a_matches` is `matching_files(a, files, root)` when the
+    caller already has it.
+    """
+    if a == b or fnmatch.fnmatch(a, b) or fnmatch.fnmatch(b, a):
+        return True
+    if files is None:
+        return _algebraic_overlap(canonical_pattern(a, root), canonical_pattern(b, root))
+    if a_matches is None:
+        a_matches = matching_files(a, files, root)
+    b_covers = lock_file_matcher(b, root)
+    if any(b_covers(f) for f in a_matches):
+        return True
+    for literal, other in ((literal_target(a, root), b), (literal_target(b, root), a)):
+        if literal and literal not in files and lock_file_matcher(other, root)(literal):
+            return True
+    return False

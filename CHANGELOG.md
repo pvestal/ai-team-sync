@@ -3,6 +3,20 @@
 ## [Unreleased]
 
 ### Fixed
+- **Governed repositories refuse conflicting live ownership (#3581).** Overlap was
+  `fnmatch(a, b) or fnmatch(b, a)`, which called `frontend/*/X.vue` and
+  `frontend/src/**` disjoint, and advisory locks shared, so two live sessions held
+  `frontend/**` and `frontend/components/OperatorPromptEditor.vue` and both edited
+  the file. Overlap is now decided on the repository's real files (union of the
+  edit hook's and `locks/check`'s readers; conservative literal-prefix algebra when
+  there is no checkout). In repositories listed in `operator.toml`, with worktrees
+  resolved to their main checkout, session creation, `POST /api/locks` and
+  `extend_scope` answer 409 on any overlap with another live session's lock,
+  advisory included (approved overrides and a session's own locks still pass), and
+  422 for a glob matching no file, a new file whose directory does not exist, a bare
+  directory, or a pattern over `ATS_BROAD_CLAIM_LIMIT` (default 200) files. Existing
+  live locks are not revoked. New read-only `GET /api/locks/ownership` and MCP
+  `lock_ownership` report who holds each path. Details: `docs/lock-readers.md`.
 - **Lock readers compare where a path actually is (#2761).** `POST /api/locks/check`
   and `POST /api/git/pre-commit-check` matched the raw path against the raw
   repo-relative pattern and skipped locks by a string compare of roots, so an

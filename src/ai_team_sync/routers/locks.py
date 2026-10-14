@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -12,7 +13,9 @@ from ai_team_sync import peer_identity
 from ai_team_sync.database import get_db
 from ai_team_sync.models import ScopeLock, Session
 from ai_team_sync.notifications.dispatcher import dispatch
-from ai_team_sync.scope_paths import reader_covers, reader_lock, reader_query
+from ai_team_sync.repo_files import RepoContext
+from ai_team_sync.scope_paths import (canonical_pattern, lock_file_matcher, reader_covers,
+                                      reader_lock, reader_query)
 from ai_team_sync.schemas import (
     LockCheckRequest,
     LockCheckResult,
@@ -102,13 +105,19 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
                         f"locks are attached to a session by the account that owns it"),
             "session_id": session.id})
 
-    # Session creation's overlap rule, applied to every lock (#2756).
+    # Session creation's overlap rule, applied to every lock (#2756), and its
+    # governed-repository pattern validation (#3581).
     from ai_team_sync.routers.sessions import (
-        _check_scope_conflicts, blocking_conflict, scope_conflict_detail)
+        _check_scope_conflicts, blocking_conflict, refuse_unbacked_patterns,
+        scope_conflict_detail)
 
+    repo_ctx = RepoContext()
+    await asyncio.to_thread(refuse_unbacked_patterns, [body.pattern],
+                            session.repo_root or "", repo_ctx)
     conflicts = await _check_scope_conflicts(
         db, [body.pattern], session.developer, repo_root=session.repo_root or "",
-        exclude_session_id=session.id, requester_session_id=session.id)
+        exclude_session_id=session.id, requester_session_id=session.id,
+        repo_ctx=repo_ctx)
     conflict = blocking_conflict(conflicts, body.mode)
     if conflict is not None:
         raise HTTPException(409, detail=scope_conflict_detail("lock", conflict, conflicts))
@@ -242,6 +251,52 @@ def cross_account(peer_uid: int | None, owner: Session, *, any_status: bool = Fa
     from ai_team_sync.workers import registry
 
     return peer_uid is None or peer_uid in registry().bound_account_uids()
+
+
+@router.get("/ownership")
+async def lock_ownership(repo_root: str = "", paths: str = "", session_id: str = "",
+                         db: AsyncSession = Depends(get_db)):
+    """The final integration ownership/conflict check (#3581).
+
+    For each comma-separated path, the live sessions whose locks cover it, and
+    `conflict` when one of them is not `session_id`. Coverage is the union of
+    the edit hook's reader and /api/locks/check's, and a worktree root is the
+    same repository as its main checkout. Read-only.
+    """
+    wanted = [p.strip() for p in paths.split(",") if p.strip()]
+    if not wanted:
+        raise HTTPException(422, "paths is required (comma-separated repo-relative paths)")
+    ctx = RepoContext()
+    active_locks = await _get_active_locks(db)
+
+    def _identities():
+        roots = {repo_root} | {root for _lock, _owner, root in active_locks}
+        return {root: ctx.identity(root) if root else "" for root in roots}
+
+    identity = await asyncio.to_thread(_identities)
+    caller = identity[repo_root]
+    matchers = {}
+    results = []
+    for path in wanted:
+        rel = canonical_pattern(path, repo_root)
+        if rel.startswith("/") and caller:
+            rel = canonical_pattern(path, caller)
+        holders = []
+        for lock, owner, lock_root in active_locks:
+            if caller and identity[lock_root] and identity[lock_root] != caller:
+                continue  # another repository's lock
+            if lock.id not in matchers:
+                matchers[lock.id] = lock_file_matcher(lock.pattern, lock_root or repo_root)
+            if matchers[lock.id](rel):
+                holders.append({
+                    "session_id": lock.session_id, "agent": owner.agent,
+                    "developer": owner.developer, "pattern": lock.pattern,
+                    "mode": lock.mode, "lock_id": lock.id, "repo_root": lock_root or ""})
+        results.append({
+            "path": path, "relative": rel, "holders": holders,
+            "conflict": any(h["session_id"] != session_id for h in holders)})
+    return {"repo_root": repo_root, "session_id": session_id,
+            "conflict": any(r["conflict"] for r in results), "paths": results}
 
 
 @router.delete("/{lock_id}", status_code=204)

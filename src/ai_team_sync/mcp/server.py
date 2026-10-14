@@ -348,6 +348,27 @@ async def list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="lock_ownership",
+            description="Final integration ownership/conflict check: for each path, every live "
+                        "session whose lock covers it (with mode), and whether a session other "
+                        "than yours holds it. Worktrees count as their main checkout. Read-only.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Repo-relative (or absolute) file paths to report on.",
+                    },
+                    "repo_root": {
+                        "type": "string",
+                        "description": "Absolute git root the paths belong to.",
+                    },
+                },
+                "required": ["paths", "repo_root"],
+            },
+        ),
+        Tool(
             name="whos_editing",
             description="Before editing, check who else is ACTIVELY editing these files right now (live presence + their intent). Use to self-coordinate: if someone is already in a file, pick another, wait, or coordinate. Distinct from check_locks (declared scope locks) — this is real-time 'who has hands on it now'.",
             inputSchema={
@@ -1407,6 +1428,29 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         msg += f"\n\n(no task brief: {type(exc).__name__})"
 
                 return [TextContent(type="text", text=msg)]
+
+            elif name == "lock_ownership":
+                response = await client.get(
+                    f"{SERVER_URL}/api/locks/ownership",
+                    params={"paths": ",".join(arguments["paths"]),
+                            "repo_root": arguments.get("repo_root", ""),
+                            "session_id": active_session_id or ""},
+                )
+                response.raise_for_status()
+                report = response.json()
+                lines = [f"Ownership in {report['repo_root'] or '(no repo_root)'}:"]
+                for r in report["paths"]:
+                    flag = "CONFLICT" if r["conflict"] else "ok"
+                    lines.append(f"{r['path']} [{flag}]")
+                    for h in r["holders"]:
+                        own = " (YOUR SESSION)" if h["session_id"] == active_session_id else ""
+                        lines.append(f"   {h['mode']} — {h['agent']} (session {h['session_id']})"
+                                     f"{own}; pattern {h['pattern']}")
+                    if not r["holders"]:
+                        lines.append("   no live lock covers it")
+                lines.append("Another session holds at least one path." if report["conflict"]
+                             else "No path is held by another session.")
+                return [TextContent(type="text", text="\n".join(lines))]
 
             elif name == "check_locks":
                 paths = arguments["paths"]

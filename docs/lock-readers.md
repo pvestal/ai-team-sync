@@ -8,7 +8,8 @@ request path. Whether a file currently exists does not change the answer.
 
 Mutation grants (`routers/authority.py`) and the Claude edit hook have their own
 comparisons and are not governed by this document. Session-creation and
-`POST /api/locks` conflict checks (Gap 4) are pattern-vs-pattern and unchanged.
+`POST /api/locks` conflict checks (Gap 4) are pattern-vs-pattern; see
+*Acquiring a lock* below.
 
 ## Terms
 
@@ -139,3 +140,57 @@ matching loop is O(paths x locks) `fnmatch` calls, at most four per pair, with
 compiled patterns cached by `fnmatch`. An unanchored lock matches every
 `/`-boundary suffix through one extra pattern, `*/` + pattern, rather than one
 call per suffix.
+
+## Acquiring a lock (#3581)
+
+Session creation with `auto_lock`, `POST /api/locks` and MCP `extend_scope`
+(which calls `POST /api/locks`) share one acquisition check
+(`routers/sessions.py`: `refuse_unbacked_patterns`, `_check_scope_conflicts`,
+`blocking_conflict`). Unlike the readers above, it consults the filesystem.
+
+**Overlap.** Two patterns overlap when they can name a common file
+(`scope_paths.patterns_overlap`). A file is covered by a pattern when either
+enforcement reader says so: the edit hook's `scope_matches` (prefix for `/**`,
+one level for `/*`, `fnmatch` otherwise) or `reader_covers` above. When the
+session's `repo_root` is a git checkout, overlap is decided on its real files,
+`git ls-files -co --exclude-standard` over the main checkout and every linked
+worktree: a file matching both patterns, or a glob-free path not yet created
+that the other pattern covers. Without a usable checkout the test is algebraic
+and conservative: compatible literal prefixes are overlap. Both are never
+narrower than the old two-way `fnmatch`, so `frontend/*/X.vue` and
+`frontend/src/**` overlap exactly when a file such as `frontend/src/X.vue`
+exists.
+
+**Governed repositories** are those in `~/.config/ai-team-sync/operator.toml`
+`[governance].repositories` (or `ATS_COORDINATED_REPOS`). A `repo_root` that is
+a linked worktree resolves through `git rev-parse --git-common-dir` to its main
+checkout, so a worktree and its main checkout are one repository. There:
+
+| Request | Answer |
+|---------|--------|
+| overlaps another live session's lock, advisory or exclusive | 409 `scope_conflict` naming the holder's session, agent and pattern |
+| overlaps only the requesting session's own locks | allowed |
+| the requester holds an approved override for that lock | allowed |
+| a glob that matches no file | 422 `pattern_matches_no_file`, naming the nearest existing directory and same-named files |
+| a glob-free path to a file that does not exist, parent directory exists | allowed (a new file) |
+| a glob-free path whose parent directory does not exist | 422 `pattern_parent_missing` |
+| a glob-free path naming a directory | 422 `pattern_names_a_directory` (use `dir/**`) |
+| a pattern matching more files than `ATS_BROAD_CLAIM_LIMIT` (default 200; 0 or less disables) | 422 `pattern_too_broad` |
+
+These rules apply to every lock mode and to new acquisitions only. A lock that
+was already live when they shipped, or when a repository became governed, is not
+revoked or re-judged: agents holding broad or unbacked locks keep them until
+they complete, are reaped, or the lock expires. Lane restoration after a reap
+goes through the same overlap rule, so it does not re-grant a lane another
+session now holds in a governed repository. Outside governed repositories the
+old refusal rule stands: advisory locks share, and only an exclusive lock or an
+exclusive request refuses an overlap.
+
+**Ownership report.** `GET /api/locks/ownership?repo_root=R&paths=a,b&session_id=S`
+(MCP `lock_ownership`) lists, per path, every live session whose lock covers it
+with its mode, and `conflict: true` when one of them is not `S`. It is the final
+integration check before merging work that touched those paths.
+
+What this does not do: a lock is a claim, not a filesystem permission. Only the
+PreToolUse guard (Edit/Write/MultiEdit/NotebookEdit) consults it before a write;
+a shell write, `git apply` or merge is checked, if at all, at commit time.

@@ -11,7 +11,6 @@ import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from fnmatch import fnmatch
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from sqlalchemy import select, update
@@ -30,8 +29,10 @@ from ai_team_sync.delegation import effective_authority
 from ai_team_sync.models import Delegation
 from ai_team_sync.config import settings
 from ai_team_sync import peer_identity
+from ai_team_sync.repo_files import RepoContext, broad_claim_limit
 from ai_team_sync.scope_paths import (UnsafePath, canonical_claim, canonical_pattern,
-                                      canonical_root)
+                                      canonical_root, literal_target, matching_files,
+                                      patterns_overlap)
 
 logger = logging.getLogger(__name__)
 
@@ -350,6 +351,7 @@ async def _check_scope_conflicts(
     repo_root: str = "",
     exclude_session_id: str = "",
     requester_session_id: str = "",
+    repo_ctx: RepoContext | None = None,
 ) -> list[dict]:
     """Check if new scope patterns conflict with existing active locks.
 
@@ -358,27 +360,45 @@ async def _check_scope_conflicts(
     with this session's patterns ('' on either side = legacy match-everywhere).
     `exclude_session_id` leaves out the requester's own locks: a session
     extending its own scope does not conflict with itself.
+
+    Overlap is decided on the repository's real files when `repo_root` is a git
+    checkout, else by a conservative literal-prefix test (#3581). In a governed
+    repository a worktree root is the same repository as its main checkout, and
+    each conflict carries `governed_repo`, which makes any overlap blocking.
     """
     from ai_team_sync.routers.locks import _cross_repo, _get_active_locks
     from ai_team_sync.routers.override_requests import approved_override_for_lock
 
+    ctx = repo_ctx or RepoContext()
     # Same notion of a live lock as the board and the grant check (#2741).
     active_locks = await _get_active_locks(db)
 
+    def _prepare():
+        governed = ctx.governed_root(repo_root)
+        same_repo = {}
+        for _lock, _owner, lock_root in active_locks:
+            if lock_root not in same_repo:
+                same_repo[lock_root] = (
+                    not _cross_repo(repo_root, lock_root) if not governed
+                    else not lock_root or ctx.governed_root(lock_root) == governed)
+        return governed, same_repo, ctx.files(repo_root)
+
+    governed, same_repo, files = await asyncio.to_thread(_prepare)
+    root = repo_root  # file sets are repo-relative in a worktree and its main checkout alike
+
     conflicts = []
     for new_pattern in new_patterns:
+        new_matches = None
         for lock, owner, lock_repo_root in active_locks:
             if exclude_session_id and lock.session_id == exclude_session_id:
                 continue
-            if _cross_repo(repo_root, lock_repo_root):
+            if not same_repo[lock_repo_root]:
                 continue  # other repo's patterns can't collide with ours
             if await approved_override_for_lock(db, requester_session_id, lock):
                 continue
-            # Check if patterns overlap using bidirectional matching
-            # Pattern A matches Pattern B, or Pattern B matches Pattern A
-            if (fnmatch(new_pattern, lock.pattern) or
-                fnmatch(lock.pattern, new_pattern) or
-                new_pattern == lock.pattern):
+            if files is not None and new_matches is None:
+                new_matches = await asyncio.to_thread(matching_files, new_pattern, files, root)
+            if patterns_overlap(new_pattern, lock.pattern, files, root, a_matches=new_matches):
                 conflicts.append({
                     "new_pattern": new_pattern,
                     "existing_pattern": lock.pattern,
@@ -386,9 +406,61 @@ async def _check_scope_conflicts(
                     "existing_agent": owner.agent,
                     "lock_mode": lock.mode,
                     "session_id": lock.session_id,
+                    "governed_repo": governed,
                 })
 
     return conflicts
+
+
+def refuse_unbacked_patterns(patterns: list[str], repo_root: str, ctx: RepoContext) -> None:
+    """In a governed repository, refuse (422) a new lock pattern that names no
+    real file, or that names more files than ATS_BROAD_CLAIM_LIMIT (#3581).
+
+    A glob must match an existing file. A literal path may name a file not yet
+    created only when its parent directory exists. Synchronous: it runs git, so
+    callers run it off the event loop. Existing locks are never re-judged.
+    """
+    governed = ctx.governed_root(repo_root)
+    if not governed:
+        return
+    files = ctx.files(repo_root)
+    if files is None:
+        return  # no file set to judge against; the overlap check stays conservative
+    root = repo_root
+    limit = broad_claim_limit()
+    for pattern in patterns:
+        canon = canonical_pattern(pattern, root)
+        literal = literal_target(pattern, root)
+        matched = matching_files(pattern, files, root)
+        if literal and not matched:
+            if ctx.is_directory(root, literal):
+                _refuse_pattern("pattern_names_a_directory", pattern, governed, (
+                    f"'{pattern}' names a directory, which a lock does not cover; "
+                    f"lock '{literal}/**' or the exact files"))
+            parent = literal.rsplit("/", 1)[0] if "/" in literal else ""
+            if not ctx.is_directory(root, parent):
+                nearest = ctx.nearest_directory(root, literal)
+                _refuse_pattern("pattern_parent_missing", pattern, governed, (
+                    f"'{pattern}' is a new file whose directory '{parent}' does not exist "
+                    f"in {governed}; nearest existing directory: '{nearest or '.'}'"))
+            continue  # a new file in an existing directory
+        if not matched:
+            nearest = ctx.nearest_directory(root, canon) if not canon.startswith("/") else ""
+            hint = ctx.same_basename(root, canon) if not canon.startswith("/") else []
+            _refuse_pattern("pattern_matches_no_file", pattern, governed, (
+                f"'{pattern}' matches no file in {governed}, so it would protect nothing; "
+                f"nearest existing directory: '{nearest or '.'}'"
+                + (f"; files with that name: {', '.join(hint)}" if hint else "")))
+        if limit > 0 and len(matched) > limit:
+            _refuse_pattern("pattern_too_broad", pattern, governed, (
+                f"'{pattern}' matches {len(matched)} files in {governed}, over the "
+                f"broad-claim limit of {limit} (ATS_BROAD_CLAIM_LIMIT); a claim that wide "
+                f"blocks every other session there. Narrow it to the files you will edit"))
+
+
+def _refuse_pattern(error: str, pattern: str, repo_root: str, message: str) -> None:
+    raise HTTPException(422, detail={
+        "error": error, "message": message, "pattern": pattern, "repo_root": repo_root})
 
 
 # Restoration outcome STATES. Every one of these used to render to a caller as
@@ -948,29 +1020,37 @@ def blocking_conflict(conflicts: list[dict], requested_mode: str) -> dict | None
 
     Refused when an overlapping lock is exclusive, or when the request itself is
     exclusive and anything overlaps. Session creation and POST /api/locks apply
-    this one rule (#2756).
+    this one rule (#2756). In a governed repository any overlap with another
+    live session refuses, advisory included (#3581).
     """
     exclusive = [c for c in conflicts if c["lock_mode"] == "exclusive"]
     if exclusive:
         return exclusive[0]
     if requested_mode == "exclusive" and conflicts:
         return conflicts[0]
+    governed = [c for c in conflicts if c.get("governed_repo")]
+    if governed:
+        return governed[0]
     return None
 
 
 def scope_conflict_detail(what: str, conflict: dict, conflicts: list[dict]) -> dict:
     """The 409 body for a refused claim; `what` names the refused object."""
-    mode_msg = (
-        f"exclusive lock '{conflict['existing_pattern']}'"
-        if conflict["lock_mode"] == "exclusive"
-        else f"existing lock '{conflict['existing_pattern']}' (you requested exclusive mode)"
-    )
+    if conflict["lock_mode"] == "exclusive":
+        mode_msg = f"exclusive lock '{conflict['existing_pattern']}'"
+    elif conflict.get("governed_repo"):
+        mode_msg = (f"advisory lock '{conflict['existing_pattern']}' (overlapping live "
+                    f"ownership is refused in governed repo {conflict['governed_repo']})")
+    else:
+        mode_msg = f"existing lock '{conflict['existing_pattern']}' (you requested exclusive mode)"
+    message = (f"Cannot create {what}: scope '{conflict['new_pattern']}' conflicts "
+               f"with {mode_msg} held by {conflict['existing_developer']}")
+    if conflict.get("governed_repo"):
+        message += (f" in session {conflict['session_id']} ({conflict['existing_agent']}). "
+                    f"Coordinate with that session or request_override")
     return {
         "error": "scope_conflict",
-        "message": (
-            f"Cannot create {what}: scope '{conflict['new_pattern']}' conflicts "
-            f"with {mode_msg} held by {conflict['existing_developer']}"
-        ),
+        "message": message,
         "conflicts": conflicts,
     }
 
@@ -1167,8 +1247,10 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
 
     # Check for scope conflicts BEFORE creating the session
     if body.auto_lock and scope:
+        repo_ctx = RepoContext()
+        await asyncio.to_thread(refuse_unbacked_patterns, scope, repo_root, repo_ctx)
         conflicts = await _check_scope_conflicts(
-            db, scope, body.developer, repo_root=repo_root)
+            db, scope, body.developer, repo_root=repo_root, repo_ctx=repo_ctx)
 
         if conflicts:
             new_lock_mode = getattr(body, 'lock_mode', settings.lock_default_mode)
