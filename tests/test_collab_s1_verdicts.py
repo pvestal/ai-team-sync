@@ -134,19 +134,69 @@ def _verify(client, parent, worker="codex", mode="VERIFY"):
     return made
 
 
+def _child(client, delegation, agent="codex:delegate", ticket_id=None):
+    made = client.post("/api/sessions", json={
+        "developer": "pvestal", "agent": agent, "scope": [], "delegation_id": delegation,
+        "ticket_id": ticket_id})
+    assert made.status_code == 201, made.text
+    return made.json()["id"], made.headers["X-ATS-Approval-Token"], made.json()
+
+
+def _return(client, delegation, child, token, structured, summary="see verdict"):
+    return client.post(f"/api/delegations/{delegation}/return", json={
+        "result_summary": summary, "actor_session_id": child,
+        "structured_verdict": structured}, headers={"X-ATS-Approval-Token": token})
+
+
 def test_a_verify_return_without_a_verdict_is_refused_and_stays_open(live_ats):
     url, client, _ = live_ats
     parent, _ = _session(client, "claude-code:aaaa1111")
     delegation = _verify(client, parent).json()["id"]
+    child, child_tok, _ = _child(client, delegation)
     bare = client.post(f"/api/delegations/{delegation}/return", json={
-        "result_summary": "LGTM"})
+        "result_summary": "LGTM", "actor_session_id": child},
+        headers={"X-ATS-Approval-Token": child_tok})
     assert bare.status_code == 422 and bare.json()["detail"]["error"] == "verdict_required"
     assert client.get(f"/api/delegations/{delegation}").json()["state"] == "open"
-    bad = client.post(f"/api/delegations/{delegation}/return", json={
-        "result_summary": "x", "structured_verdict": verdict(BLOCK, item(
-            "6", severity="nonmaterial", category="authorization"))})
+    bad = _return(client, delegation, child, child_tok, verdict(BLOCK, item(
+        "6", severity="nonmaterial", category="authorization")))
     assert bad.status_code == 422 and bad.json()["detail"]["error"] == "invalid_verdict"
     assert client.get(f"/api/delegations/{delegation}").json()["state"] == "open"
+
+
+def test_only_the_reviewer_child_with_its_own_capability_records_a_verdict(live_ats):
+    url, client, _ = live_ats
+    parent, parent_tok = _session(client, "claude-code:aaaa1111")
+    bystander, bystander_tok = _session(client, "codex:eeee5555")
+    delegation = _verify(client, parent).json()["id"]
+    pre_empt = verdict(PASS, item("1", status=PASS, severity="nonmaterial",
+                                  category="other", citation=""))
+    # Before any child exists, nobody can record a verdict.
+    assert _return(client, delegation, parent, parent_tok, pre_empt).status_code == 403
+    child, child_tok, _ = _child(client, delegation)
+    for actor, token in ((bystander, bystander_tok), (parent, parent_tok),
+                         (child, bystander_tok), (child, "")):
+        refused = _return(client, delegation, actor, token, pre_empt)
+        assert refused.status_code == 403, refused.text
+        # A wrong actor meets the existing child-identity guard first; a right
+        # actor without its own capability meets the reviewer check.
+        assert refused.json()["detail"]["error"] in ("not_the_child", "not_the_reviewer")
+    assert client.get(f"/api/delegations/{delegation}").json()["state"] == "open"
+    real = _return(client, delegation, child, child_tok,
+                   verdict(BLOCK, item("1", severity="material_safety", category="security")))
+    assert real.status_code == 200 and real.json()["effective_verdict"] == BLOCK
+
+
+def test_a_non_verify_delegation_cannot_carry_a_review_verdict(live_ats):
+    url, client, _ = live_ats
+    parent, _ = _session(client, "claude-code:aaaa1111")
+    delegation = _verify(client, parent, worker="claude-code", mode="READ_ONLY").json()["id"]
+    child, child_tok, _ = _child(client, delegation, agent="claude-code:delegate")
+    passing = verdict(PASS, item("1", status=PASS, severity="nonmaterial", category="other",
+                                 citation=""))
+    refused = _return(client, delegation, child, child_tok, passing)
+    assert refused.status_code == 422, refused.text
+    assert refused.json()["detail"]["error"] == "verdict_not_a_review"
 
 
 def test_structured_verdicts_are_stored_with_the_derived_verdict(live_ats):
@@ -161,8 +211,8 @@ def test_structured_verdicts_are_stored_with_the_derived_verdict(live_ats):
     ]
     for submitted, effective, mismatch in cases:
         delegation = _verify(client, parent).json()["id"]
-        ret = client.post(f"/api/delegations/{delegation}/return", json={
-            "result_summary": "see verdict", "structured_verdict": submitted})
+        child, child_tok, _ = _child(client, delegation)
+        ret = _return(client, delegation, child, child_tok, submitted)
         assert ret.status_code == 200, ret.text
         row = client.get(f"/api/delegations/{delegation}").json()
         assert row["state"] == "returned"
@@ -185,6 +235,11 @@ def test_a_reviewer_of_the_same_worker_class_is_refused(live_ats):
     assert _verify(client, codex, worker="claude-code").status_code == 201
     # Only VERIFY is a review; a same-class READ_ONLY investigation is allowed.
     assert _verify(client, claude, worker="claude-code", mode="READ_ONLY").status_code == 201
+    # Independence cannot be shown for an unregistered requester: fail closed.
+    stranger, _ = _session(client, "canary-owner:ffff6666")
+    unknown = _verify(client, stranger, worker="codex")
+    assert unknown.status_code == 409, unknown.text
+    assert unknown.json()["detail"]["error"] == "review_not_independent"
 
 
 # --- the real `ats delegate` supervisor -----------------------------------------------
@@ -231,7 +286,12 @@ def test_the_real_supervisor_records_the_childs_structured_verdict(
     answer_file.write_text(answer)
     repo = tmp_path / "repo"
     repo.mkdir()
-    parent, _ = _session(client, "claude-code:aaaa1111")
+    # The implementer owns ticket 3585; its reviewer works the same ticket.
+    made = client.post("/api/sessions", json={
+        "developer": "pvestal", "agent": "claude-code:aaaa1111", "scope": [],
+        "ticket_id": 3585, "ticket_role": "owner"})
+    assert made.status_code == 201, made.text
+    parent = made.json()["id"]
 
     out = _delegate(url, server_env, bin_dir, parent, repo, tmp_path)
 
@@ -242,3 +302,24 @@ def test_the_real_supervisor_records_the_childs_structured_verdict(
     assert row["mode"] == "VERIFY" and row["state"] == "returned"
     child = client.get(f"/api/sessions/{out['child_session_id']}").json()
     assert child["status"] == "completed"
+    # The real supervisor's child carried the parent's ticket, as a reviewer.
+    assert child["ticket_id"] == 3585 and child["ticket_role"] == "reviewer"
+
+
+def test_an_implement_child_on_a_ticket_must_name_its_files(live_ats):
+    url, client, _ = live_ats
+    made = client.post("/api/sessions", json={
+        "developer": "pvestal", "agent": "claude-code:aaaa1111", "scope": [],
+        "ticket_id": 3585, "ticket_role": "owner"})
+    parent = made.json()["id"]
+    delegation = _verify(client, parent, mode="IMPLEMENT").json()["id"]
+    unscoped = client.post("/api/sessions", json={
+        "developer": "pvestal", "agent": "codex:delegate", "scope": [],
+        "delegation_id": delegation})
+    assert unscoped.status_code == 422, unscoped.text
+    assert unscoped.json()["detail"]["error"] == "contributor_needs_scope"
+    other_ticket = client.post("/api/sessions", json={
+        "developer": "pvestal", "agent": "codex:delegate", "scope": [],
+        "delegation_id": delegation, "ticket_id": 9999})
+    assert other_ticket.status_code == 409
+    assert other_ticket.json()["detail"]["error"] == "delegation_ticket_mismatch"

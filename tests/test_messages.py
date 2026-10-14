@@ -193,8 +193,10 @@ async def test_reaper_keeps_unread_ticket_with_revivable_owner(client, db_sessio
     assert (await db_session.get(Session, old)).status == "completed"
     locks = (await db_session.execute(select(ScopeLock))).scalars().all()
     assert [lock.session_id for lock in locks] == [live]
+    # #3585: joins without taking ownership, so the reaped owner it would
+    # otherwise replace keeps both ownership and its claimed mail on revival.
     successor, successor_token = await _session(client, "claude-code:successor",
-                                                ticket_id=2907)
+                                                ticket_id=2907, role="reviewer")
     inbox = await client.get(f"/api/sessions/{successor}/messages", headers={
         "X-ATS-Approval-Token": successor_token})
     assert message_id not in [row["id"] for row in inbox.json()]

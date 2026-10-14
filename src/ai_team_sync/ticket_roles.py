@@ -26,6 +26,8 @@ exact addressee whatever that addressee's role (operator refinement,
 
 from __future__ import annotations
 
+import json
+
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -47,6 +49,26 @@ class RoleRefused(Exception):
         super().__init__(message)
         self.status = status
         self.detail = {"error": error, "message": message, **extra}
+
+
+def is_owner_conflict(exc: Exception) -> bool:
+    """True when an IntegrityError came from the one-live-owner index.
+
+    PostgreSQL names the index; SQLite names only the columns
+    ("UNIQUE constraint failed: sessions.ticket_id, sessions.creator_uid").
+    """
+    text = str(getattr(exc, "orig", exc))
+    return OWNER_INDEX in text or (
+        "UNIQUE" in text.upper()
+        and "sessions.ticket_id" in text and "sessions.creator_uid" in text)
+
+
+def owner_conflict_detail(ticket_id: int | None) -> dict:
+    return {"error": "ticket_owned",
+            "message": (f"ticket #{ticket_id} gained a live owner while this request ran; "
+                        f"retry (a returning owner then comes back as a non-owner) or start "
+                        f"as a scoped contributor or a reviewer"),
+            "ticket_id": ticket_id}
 
 
 def role_for_child(mode: str) -> str:
@@ -106,17 +128,21 @@ async def resolve_role(db: AsyncSession, *, ticket_id: int | None, requested: st
         role = requested
     elif requested:
         raise RoleRefused(422, "bad_ticket_role", f"ticket_role must be one of {ROLES}")
+    elif owner is None:
+        # Compatibility for callers that predate roles: the first live session owns.
+        role = OWNER
     else:
-        # Compatibility for callers that predate roles: the first live session
-        # owns; later ones join as contributors and are told who owns.
-        role = OWNER if owner is None else CONTRIBUTOR
+        # Later ones join under their declared files, or, claiming nothing, as
+        # reviewers; either way they are told who owns. Every contributor is scoped.
+        role = CONTRIBUTOR if scope else REVIEWER
 
     if role == REVIEWER and scope:
         raise RoleRefused(422, "reviewer_claims_nothing",
                           "a reviewer claims no files; start without scope")
-    if requested == CONTRIBUTOR and not scope:
+    if role == CONTRIBUTOR and not scope:
         raise RoleRefused(422, "contributor_needs_scope",
-                          "a contributor works under an explicit file scope; name the files")
+                          "a contributor works under an explicit file scope; name the files "
+                          "(for an IMPLEMENT delegation: --scope)")
     return role, owner_id
 
 
@@ -131,7 +157,13 @@ async def yield_ownership_if_taken(db: AsyncSession, session: Session) -> bool:
     if await live_owner(db, session.ticket_id, session.creator_uid,
                         exclude_id=session.id) is None:
         return False
-    session.ticket_role = CONTRIBUTOR
+    # Scoped -> contributor, unscoped -> reviewer, as at creation.
+    session.ticket_role = CONTRIBUTOR if json.loads(session.scope or "[]") else REVIEWER
+    await db.flush()
+    # The general mail it still holds belongs to the live owner (operator
+    # refinement 1: contributors and reviewers never hold it).
+    await reconcile_ticket_mail(db, session.ticket_id, session.creator_uid,
+                                holder_id=session.id)
     return True
 
 
@@ -157,6 +189,68 @@ async def route_ticket_message(db: AsyncSession, message: AgentMessage,
         if handoff is not None:
             handoff.recipient_session_id = owner.id
     return owner
+
+
+async def reconcile_ticket_mail(db: AsyncSession, ticket_id: int | None,
+                                account_uid: int | None, *,
+                                holder_id: str | None = None) -> int:
+    """Move unread general ticket mail off sessions that may not hold it.
+
+    Holders that may not: a live contributor or reviewer (e.g. a demoted
+    owner), and an explicitly completed session (a send that raced the owner's
+    completion was addressed to it after its release ran). The mail goes to the
+    live owner of the sender's account, or back to the pool. Reaped sessions
+    keep theirs (reaping is reversible; releasing it is a later slice), and rows
+    that predate roles (ticket_role NULL) are left as they were.
+
+    Called after commits on both sides of every race: ticket-mode send,
+    owner completion, and in-transaction on demotion, where `holder_id` names
+    the demoted session (it is still marked reaped at that moment).
+    Returns the rows moved.
+    """
+    if ticket_id is None or account_uid is None:
+        return 0
+    same_account = select(Session.id).where(Session.creator_uid == account_uid)
+    may_not_hold = ((Session.status.in_(LIVE_STATUSES)
+                     & Session.ticket_role.in_((CONTRIBUTOR, REVIEWER)))
+                    | ((Session.status == "completed") & ~Session.auto_completed
+                       & Session.ticket_role.is_not(None)))
+    if holder_id:
+        may_not_hold = may_not_hold | (Session.id == holder_id)
+    rows = (await db.execute(
+        select(AgentMessage, Session).join(Session, Session.id == AgentMessage.recipient_session_id)
+        .where(AgentMessage.ticket_id == ticket_id,
+               AgentMessage.addressing_mode == "ticket",
+               AgentMessage.acknowledged_at.is_(None),
+               AgentMessage.sender_session_id.in_(same_account),
+               may_not_hold)
+    )).all()
+    owner = await live_owner(db, ticket_id, account_uid)
+    moved = 0
+    for message, holder in rows:
+        target = owner.id if owner is not None and owner.id != message.sender_session_id else None
+        result = await db.execute(update(AgentMessage).where(
+            AgentMessage.id == message.id,
+            AgentMessage.recipient_session_id == holder.id,
+            AgentMessage.acknowledged_at.is_(None),
+        ).values(recipient_session_id=target,
+                 recipient_agent=owner.agent if target else "")
+          .execution_options(synchronize_session=False))
+        if not result.rowcount:
+            continue
+        reason = ("not_owner" if holder.id == holder_id or holder.status != "completed"
+                  else "recipient_completed")
+        append_delivery_event(message, "released", holder.id, reason)
+        if target:
+            append_delivery_event(message, "assigned", target, "owner_route")
+        message.recipient_session_id = target
+        message.recipient_agent = owner.agent if target else ""
+        if message.handoff_id:
+            handoff = await db.get(Handoff, message.handoff_id)
+            if handoff is not None:
+                handoff.recipient_session_id = target
+        moved += 1
+    return moved
 
 
 async def claim_pool(db: AsyncSession, session: Session) -> int:

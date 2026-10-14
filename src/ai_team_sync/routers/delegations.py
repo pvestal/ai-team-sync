@@ -6,6 +6,8 @@ and a mode narrows authority rather than decorating a record.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -193,8 +195,14 @@ async def create_delegation(body: DelegationCreate, request: Request,
     if body.mode == VERIFY:
         parent_class = registry().registered(parent.agent)
         reviewer_class = registry().registered(body.delegated_worker)
-        if (parent_class is not None and reviewer_class is not None
-                and parent_class.name == reviewer_class.name):
+        if parent_class is None or reviewer_class is None:
+            # Fail closed: independence cannot be shown for an unknown class.
+            raise HTTPException(409, detail={
+                "error": "review_not_independent",
+                "message": (f"a VERIFY review needs both worker classes registered to prove "
+                            f"they differ; requesting session {parent.agent!r} or reviewer "
+                            f"{body.delegated_worker!r} is not a registered class")})
+        if parent_class.name == reviewer_class.name:
             raise HTTPException(409, detail={
                 "error": "review_not_independent",
                 "message": (f"a VERIFY review of {parent_class.name} work must be done by "
@@ -290,17 +298,38 @@ async def return_delegation(delegation_id: str, body: DelegationReturn, request:
     # A VERIFY result is a structured verdict or it is not a result (#3585).
     # Validated before any field changes, so a refusal leaves the row open.
     stored_verdict = None
-    if body.structured_verdict is not None:
+    if d.mode != VERIFY:
+        if body.structured_verdict is not None:
+            raise HTTPException(422, detail={
+                "error": "verdict_not_a_review",
+                "message": (f"only a VERIFY delegation carries a review verdict; this one "
+                            f"is {d.mode}")})
+    else:
+        if body.structured_verdict is None:
+            raise HTTPException(422, detail={
+                "error": "verdict_required",
+                "message": ("a VERIFY return must carry structured_verdict; a run with no "
+                            "usable verdict is returned as verdict_code NO_RESULT, never as "
+                            "success")})
+        # Only the reviewer itself records the verdict: the exact child session,
+        # proven by that session's own capability (an OS-account check alone
+        # would let any same-account caller pre-empt the review with a PASS).
+        child = await db.get(Session, d.child_session_id) if d.child_session_id else None
+        token = request.headers.get("X-ATS-Approval-Token", "")
+        if (child is None or body.actor_session_id != child.id or not token
+                or not child.approval_token_hash
+                or not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(),
+                                           child.approval_token_hash)):
+            raise HTTPException(403, detail={
+                "error": "not_the_reviewer",
+                "message": ("a VERIFY verdict is recorded only by the delegation's child "
+                            "session, with its own capability (X-ATS-Approval-Token)"),
+                "child_session_id": d.child_session_id})
         try:
             stored_verdict = verdicts.normalize(body.structured_verdict)
         except verdicts.VerdictError as exc:
             raise HTTPException(422, detail={"error": "invalid_verdict",
                                              "message": str(exc)}) from exc
-    elif d.mode == VERIFY:
-        raise HTTPException(422, detail={
-            "error": "verdict_required",
-            "message": ("a VERIFY return must carry structured_verdict; a run with no usable "
-                        "verdict is returned as verdict_code NO_RESULT, never as success")})
 
     d.state = "returned"
     d.result_summary = body.result_summary

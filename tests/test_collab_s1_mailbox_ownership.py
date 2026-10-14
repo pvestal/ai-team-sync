@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 
-from ai_team_sync import peer_identity
+from ai_team_sync import peer_identity, ticket_roles
 from ai_team_sync.background_tasks import auto_complete_stale_sessions
 from ai_team_sync.config import settings
 from ai_team_sync.models import Session
@@ -304,7 +304,8 @@ def test_concurrent_role_less_starts_elect_exactly_one_owner(live_ats):
         results = list(pool.map(request, range(8)))
     assert all(r.status_code == 201 for r in results), [r.text for r in results]
     roles = sorted(r.json()["ticket_role"] for r in results)
-    assert roles == ["contributor"] * 7 + ["owner"]
+    # Unscoped joiners claim nothing, so they join as reviewers.
+    assert roles == ["owner"] + ["reviewer"] * 7
     owner = next(r.json()["id"] for r in results if r.json()["ticket_role"] == "owner")
     assert all(r.json()["ticket_owner_session_id"] == owner for r in results)
 
@@ -332,14 +333,18 @@ def test_concurrent_owner_requests_from_separate_processes_have_one_winner(live_
 
 # --- (f) callers without a role, and role validation ----------------------------------
 
-def test_callers_that_send_no_role_keep_working(live_ats):
+def test_callers_that_send_no_role_keep_working(live_ats, repo):
     url, client, _ = live_ats
     first, first_tok, first_row = start(client, "claude-code:aaaa1111")
     second, second_tok, second_row = start(client, "claude-code:bbbb2222")
+    third, third_tok, third_row = start(client, "claude-code:cccc4444", scope=["b.txt"],
+                                        repo_root=repo)
     assert first_row["ticket_role"] == "owner"
     assert first_row["ticket_owner_session_id"] == first
-    assert second_row["ticket_role"] == "contributor"
-    assert second_row["ticket_owner_session_id"] == first
+    # Every contributor is scoped: unscoped joiners are reviewers.
+    assert second_row["ticket_role"] == "reviewer"
+    assert third_row["ticket_role"] == "contributor"
+    assert second_row["ticket_owner_session_id"] == third_row["ticket_owner_session_id"] == first
     unbound = client.post("/api/sessions", json={
         "developer": "pvestal", "agent": "claude-code:cccc3333", "scope": []})
     assert unbound.status_code == 201 and unbound.json()["ticket_role"] is None
@@ -385,18 +390,33 @@ async def _reap(db_session, sid):
 
 
 @pytest.mark.asyncio
-async def test_a_revived_owner_returns_as_contributor_when_the_ticket_was_taken(client, db_session):
-    old, _ = await _new(client, "claude-code:aaaa1111", ticket_role="owner")
+async def test_a_revived_owner_loses_ownership_and_its_general_mail_when_the_ticket_was_taken(
+        client, db_session):
+    old, old_tok = await _new(client, "claude-code:aaaa1111", ticket_role="owner")
+    sender, sender_tok = await _new(client, "codex:cccc3333", ticket_role="reviewer")
+    note = (await client.post("/api/messages", json={
+        "sender_session_id": sender["id"], "ticket_id": TICKET, "body": "for the owner"},
+        headers=auth(sender_tok))).json()
+    assert note["recipient_session_id"] == old["id"]
     await _reap(db_session, old["id"])
-    new, _ = await _new(client, "claude-code:bbbb2222", ticket_role="owner")
+    new, new_tok = await _new(client, "claude-code:bbbb2222", ticket_role="owner")
     revived = await client.post(f"/api/sessions/{old['id']}/heartbeat")
     assert revived.status_code == 200, revived.text
     assert revived.json()["status"] == "active"
-    assert revived.json()["ticket_role"] == "contributor"
+    assert revived.json()["ticket_role"] == "reviewer"  # it claims no files
     owners = [s for s in (await client.get("/api/sessions")).json()
               if s.get("ticket_id") == TICKET and s.get("ticket_role") == "owner"
               and s["status"] in ("active", "paused")]
     assert [s["id"] for s in owners] == [new["id"]]
+    # Operator refinement 1: a non-owner never holds general ticket mail.
+    old_inbox = (await client.get(f"/api/sessions/{old['id']}/messages",
+                                  headers=auth(old_tok))).json()
+    new_inbox = (await client.get(f"/api/sessions/{new['id']}/messages",
+                                  headers=auth(new_tok))).json()
+    assert note["id"] not in {m["id"] for m in old_inbox}
+    moved = next(m for m in new_inbox if m["id"] == note["id"])
+    assert [(e["action"], e["reason"]) for e in moved["delivery_history"]][-2:] == [
+        ("released", "not_owner"), ("assigned", "owner_route")]
 
 
 @pytest.mark.asyncio
@@ -408,14 +428,88 @@ async def test_a_revived_owner_keeps_ownership_when_nobody_took_it(client, db_se
 
 
 @pytest.mark.asyncio
-async def test_a_reaped_owner_reopened_by_patch_returns_as_contributor(client, db_session):
+async def test_a_reaped_owner_reopened_by_patch_returns_as_a_non_owner(client, db_session):
     old, old_tok = await _new(client, "claude-code:aaaa1111", ticket_role="owner")
     await _reap(db_session, old["id"])
     await _new(client, "claude-code:bbbb2222", ticket_role="owner")
     reopened = await client.patch(f"/api/sessions/{old['id']}", json={"status": "active"},
                                   headers=auth(old_tok))
     assert reopened.status_code == 200, reopened.text
-    assert reopened.json()["ticket_role"] == "contributor"
+    assert reopened.json()["ticket_role"] == "reviewer"
+
+
+@pytest.mark.asyncio
+async def test_a_reopen_that_races_a_new_owner_is_409_not_500(client, db_session, monkeypatch):
+    # Force the race: the demotion check reads "no other owner", then the
+    # unique index meets the owner that exists. Must be a clean 409.
+    old, old_tok = await _new(client, "claude-code:aaaa1111", ticket_role="owner")
+    await _reap(db_session, old["id"])
+    await _new(client, "claude-code:bbbb2222", ticket_role="owner")
+
+    async def stale_check(db, session):
+        return False
+
+    real_yield = ticket_roles.yield_ownership_if_taken
+    monkeypatch.setattr(ticket_roles, "yield_ownership_if_taken", stale_check)
+    reopened = await client.patch(f"/api/sessions/{old['id']}", json={"status": "active"},
+                                  headers=auth(old_tok))
+    assert reopened.status_code == 409, reopened.text
+    assert reopened.json()["detail"]["error"] == "ticket_owned"
+    # Restore only this patch: undo() would also drop conftest's identity patch.
+    monkeypatch.setattr(ticket_roles, "yield_ownership_if_taken", real_yield)
+    retried = await client.patch(f"/api/sessions/{old['id']}", json={"status": "active"},
+                                 headers=auth(old_tok))
+    assert retried.status_code == 200 and retried.json()["ticket_role"] == "reviewer"
+
+
+@pytest.mark.asyncio
+async def test_an_owner_start_that_races_past_the_guard_is_409_not_500(client, monkeypatch):
+    await _new(client, "claude-code:aaaa1111", ticket_role="owner")
+
+    async def nobody(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(ticket_roles, "live_owner", nobody)
+    raced = await client.post("/api/sessions", json={
+        "developer": "pvestal", "agent": "claude-code:bbbb2222", "scope": [],
+        "ticket_id": TICKET, "ticket_role": "owner"})
+    assert raced.status_code == 409, raced.text
+    assert raced.json()["detail"]["error"] == "ticket_owned"
+
+
+# --- a send that races the owner's completion never strands mail ---------------------
+
+@pytest.mark.asyncio
+async def test_mail_routed_to_an_owner_that_completed_meanwhile_returns_to_the_pool(
+        client, monkeypatch):
+    owner, owner_tok = await _new(client, "claude-code:aaaa1111", ticket_role="owner")
+    sender, sender_tok = await _new(client, "codex:cccc3333", ticket_role="reviewer")
+    done = await client.patch(f"/api/sessions/{owner['id']}", json={"status": "completed"},
+                              headers=auth(owner_tok))
+    assert done.status_code == 200, done.text
+    # The send read the owner before its completion landed (forced stale read).
+    real_live_owner = ticket_roles.live_owner
+    calls = {"n": 0}
+
+    async def stale_then_real(db, ticket_id, creator_uid, *, exclude_id=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return await db.get(Session, owner["id"])
+        return await real_live_owner(db, ticket_id, creator_uid, exclude_id=exclude_id)
+
+    monkeypatch.setattr(ticket_roles, "live_owner", stale_then_real)
+    sent = await client.post("/api/messages", json={
+        "sender_session_id": sender["id"], "ticket_id": TICKET, "body": "raced"},
+        headers=auth(sender_tok))
+    assert sent.status_code == 201, sent.text
+    assert sent.json()["recipient_session_id"] is None
+    assert [(e["action"], e["reason"]) for e in sent.json()["delivery_history"]] == [
+        ("assigned", "owner_route"), ("released", "recipient_completed")]
+    monkeypatch.setattr(ticket_roles, "live_owner", real_live_owner)
+    successor, successor_tok = await _new(client, "claude-code:bbbb2222")
+    inbox_rows = (await client.get(f"/api/sessions/{successor['id']}/messages",
+                                   headers=auth(successor_tok))).json()
+    assert sent.json()["id"] in {m["id"] for m in inbox_rows}
 
 
 # --- ownership is per OS account (ATS's trust boundary, #2741) ---------------------------

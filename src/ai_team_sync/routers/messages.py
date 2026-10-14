@@ -113,12 +113,21 @@ async def send_message(body: MessageCreate, request: Request,
         # ticket role (#3585): never rerouted to the owner, never pooled.
         append_delivery_event(row, "assigned", recipient.id, "direct_send")
     db.add(row)
-    if not recipient:
+    ticket_mode = not recipient
+    if ticket_mode:
         # Ticket-mode mail goes to the ticket's live owner now, or waits in the
         # pool for the next owner. Contributors and reviewers never receive it.
         recipient = await ticket_roles.route_ticket_message(db, row, sender)
     await db.commit()
+    if ticket_mode and await ticket_roles.reconcile_ticket_mail(
+            db, row.ticket_id, sender.creator_uid):
+        # The owner this send read completed (or lost ownership) before the
+        # send committed: the message moved to the live owner or the pool.
+        await db.commit()
     await db.refresh(row)
+    if ticket_mode:
+        recipient = await db.get(Session, row.recipient_session_id) \
+            if row.recipient_session_id else None
     if recipient:
         await broadcast_event(recipient.id, "message.received", {"message_id": row.id})
     return row

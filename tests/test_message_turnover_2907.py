@@ -145,13 +145,17 @@ async def test_reap_then_late_heartbeat_preserves_only_original_mail_owner(clien
     assert message_id not in [m["id"] for m in await inbox(client, successor, successor_token)]
     resurrected = await client.post(f"/api/sessions/{owner}/heartbeat")
     assert resurrected.status_code == 200 and resurrected.json()["status"] == "active"
-    assert message_id in [m["id"] for m in await inbox(client, owner, owner_token)]
+    # #3585 (operator refinement 1): the successor owns the ticket now, so the
+    # revived session returns as a non-owner and its general mail moves to the
+    # successor; a non-owner never holds it.
+    assert resurrected.json()["ticket_role"] != "owner"
+    assert message_id not in [m["id"] for m in await inbox(client, owner, owner_token)]
+    assert message_id in [m["id"] for m in await inbox(client, successor, successor_token)]
     assert (await client.patch(f"/api/sessions/{owner}", json={
         "status": "completed"}, headers=auth(owner_token))).status_code == 200
     assert (await client.post(f"/api/sessions/{owner}/heartbeat")).status_code == 409
-    # #3585: the successor took ownership while the old owner was reaped (the
-    # revived session came back as a contributor), so the released ticket mail
-    # goes to that live owner, and a later session joins as a contributor.
+    # #3585: the message moved to the successor at revival and stays with it;
+    # a later session joins as a non-owner and receives nothing.
     assert message_id in [m["id"] for m in await inbox(client, successor, successor_token)]
     later, later_token = await new_session(client, "claude-code:later")
     assert message_id not in [m["id"] for m in await inbox(client, later, later_token)]

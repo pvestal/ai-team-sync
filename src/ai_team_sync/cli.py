@@ -858,7 +858,9 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
             }
             if structured_verdict is not None:
                 payload["structured_verdict"] = structured_verdict
-            ret = c.post(f"{server}/api/delegations/{d['id']}/return", json=payload)
+            # The child's own capability: only the reviewer records a verdict.
+            ret = c.post(f"{server}/api/delegations/{d['id']}/return", json=payload,
+                         headers={"X-ATS-Approval-Token": child_approval_token})
             return_state = (ret.json().get("state") if ret.status_code < 400
                             else "return_refused")
             if ret.status_code < 400:

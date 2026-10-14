@@ -74,6 +74,23 @@ async def _claim_deferred_ticket_messages(
     await ticket_roles.claim_pool(db, session)
 
 
+async def _write_or_ticket_owned(db: AsyncSession, ticket_id: int | None, *,
+                                 commit: bool) -> None:
+    """Flush or commit; the one-live-owner index refusing it is a 409 (#3585).
+
+    The index can refuse at any flush, so every write that can make a session a
+    live owner goes through here. `ticket_id` is captured by the caller: after
+    the rollback, reading it from the row would reload it outside the event loop.
+    """
+    try:
+        await (db.commit() if commit else db.flush())
+    except IntegrityError as exc:
+        if not ticket_roles.is_owner_conflict(exc):
+            raise
+        await db.rollback()
+        raise HTTPException(409, detail=ticket_roles.owner_conflict_detail(ticket_id)) from exc
+
+
 async def bind_ticket_lineage(db: AsyncSession, session: Session,
                               ticket_id: int) -> None:
     """Late-bind handoff lineage only; never grants ``task_id`` close authority.
@@ -1213,6 +1230,18 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
                             f"parent session may open its child"),
             })
 
+    # A delegation child works its parent's ticket (#3585): it inherits the
+    # parent's ticket, may not name another, and takes the role its mode fixes.
+    ticket_id = body.ticket_id
+    if delegation is not None and parent.ticket_id is not None:
+        if ticket_id is not None and ticket_id != parent.ticket_id:
+            raise HTTPException(409, detail={
+                "error": "delegation_ticket_mismatch",
+                "message": (f"delegation {delegation.id}'s parent works ticket "
+                            f"#{parent.ticket_id}; its child cannot bind #{ticket_id}"),
+                "parent_ticket_id": parent.ticket_id})
+        ticket_id = parent.ticket_id
+
     # Check for scope conflicts BEFORE creating the session. Validation runs git
     # and reads no rows, so it precedes the acquisition guard; the conflict check
     # through the commit is one serialized step (#3581).
@@ -1226,7 +1255,7 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
     # The ticket-role decision reads who owns the ticket, so it shares the
     # acquisition guard with the insert: two sessions asking to own one ticket
     # get one owner and one 409 (#3585). The partial unique index is the backstop.
-    guarded = locking or body.ticket_id is not None
+    guarded = locking or ticket_id is not None
     async with (acquisition_guard(db) if guarded else contextlib.nullcontext()):
         if locking:
             conflicts = await _check_scope_conflicts(
@@ -1240,7 +1269,7 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
                 )
         try:
             ticket_role, ticket_owner_id = await ticket_roles.resolve_role(
-                db, ticket_id=body.ticket_id, requested=body.ticket_role,
+                db, ticket_id=ticket_id, requested=body.ticket_role,
                 delegation_mode=delegation.mode if delegation is not None else None,
                 scope=scope, creator_uid=peer_uid)
         except ticket_roles.RoleRefused as exc:
@@ -1261,12 +1290,13 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
             bound_worker=worker.name if bound else "",
             bound_uid=bound_uid,
             task_id=body.task_id,
-            ticket_id=body.ticket_id,
+            ticket_id=ticket_id,
             ticket_role=ticket_role,
             delegation_id=delegation.id if delegation is not None else None,
         )
         db.add(session)
-        await db.flush()  # Ensure session.id is populated
+        # Ensure session.id is populated; the owner index can refuse here.
+        await _write_or_ticket_owned(db, ticket_id, commit=False)
         # Claim deferred messages atomically for the FIRST later session on this
         # ticket. The ticket is coordination metadata; this grants no task authority.
         await _claim_deferred_ticket_messages(
@@ -1289,18 +1319,8 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
             f"{session.description}",
         )
 
-        try:
-            await db.commit()
-        except IntegrityError as exc:
-            # Backstop for a second writer the in-process guard cannot see.
-            if ticket_roles.OWNER_INDEX not in str(exc.orig):
-                raise
-            await db.rollback()
-            raise HTTPException(409, detail={
-                "error": "ticket_owned",
-                "message": (f"ticket #{body.ticket_id} gained a live owner while this session "
-                            f"was being created; start as a scoped contributor or a reviewer"),
-                "ticket_id": body.ticket_id}) from exc
+        # Backstop for a second writer the in-process guard cannot see.
+        await _write_or_ticket_owned(db, ticket_id, commit=True)
 
     # Advisory conflicts: warn via notification but allow
     for conflict in conflicts:
@@ -1528,8 +1548,12 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
             session.reaped_locks = ""
         elif session.status == "completed":
             # A reaped session reopened by PATCH: if its ticket gained another
-            # owner meanwhile, it comes back as a contributor (#3585).
+            # owner meanwhile, it comes back as a non-owner (#3585). An owner
+            # that appears between this check and the write is a 409, not a 500.
             await ticket_roles.yield_ownership_if_taken(db, session)
+            reopened_ticket = session.ticket_id
+            session.status = body.status
+            await _write_or_ticket_owned(db, reopened_ticket, commit=False)
         session.status = body.status
         if body.status == "completed":
             session.completed_at = datetime.now(timezone.utc)
@@ -1583,7 +1607,14 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
             f"#{session.ticket_id}. Summary: {session.summary or ''}",
         )
 
-    await db.commit()
+    await _write_or_ticket_owned(db, session.ticket_id, commit=True)
+    if body.status == "completed" and session.ticket_id is not None:
+        # After the commit: ticket mail a racing send addressed to this session
+        # (or to an owner completing at the same moment) moves to the live
+        # owner or back to the pool (#3585).
+        if await ticket_roles.reconcile_ticket_mail(db, session.ticket_id,
+                                                    session.creator_uid):
+            await db.commit()
     await db.refresh(session)
     await db.refresh(session, ["locks"])
 

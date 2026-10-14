@@ -83,9 +83,10 @@ the ticket for a new session to claim; it keeps the same ID and assignment
 history. Reaping leaves unread ticket mail assigned because a late heartbeat can
 resurrect the original session. A paused session keeps its locks and mail but
 cannot read or acknowledge until resumed; it is not reaped. An explicit
-completion is terminal and releases locks and unread ticket claims. Only a newly
-created session claims available ticket mail; an already-active peer has no
-automatic refresh. Reading the inbox is not a receipt: only an authenticated
+completion is terminal and releases locks and unread ticket claims. General
+ticket mail belongs to the ticket's owner (#3585): it is addressed to the live
+owner when sent, an owner claims what waited in the pool when it starts and
+whenever it reads its inbox, and contributors and reviewers never claim it. Reading the inbox is not a receipt: only an authenticated
 acknowledgment persists one logical receipt, and acknowledged mail is never
 released or readdressed. Ticket event copies sent to current active peers are
 direct session notifications, not ticket-pool instructions. Historical event
