@@ -25,6 +25,9 @@ async def lifespan(app: FastAPI):
     # Start background tasks
     from ai_team_sync.background_tasks import start_background_tasks
     await start_background_tasks()
+    # #3580: settle expired restart leases eagerly ('unknown' outcome + drain
+    # release), so a SIGKILLed `ats safe-restart` still leaves an outcome row.
+    restart_leases.start_sweeper()
 
     yield
 

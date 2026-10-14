@@ -927,7 +927,10 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
 @click.argument("unit")
 @click.option("--reason", required=True, help="Why this governed unit must restart now")
 @click.option("--session-id", default="", help="ATS session to attribute (default: your current one)")
-def safe_restart_cmd(unit, reason, session_id):
+@click.option("--bootstrap", is_flag=True, help=(
+    "FIRST load of the in-flight middleware only: gate on GPU queues, active jobs and "
+    "established connections instead of the (not yet loaded) drain"))
+def safe_restart_cmd(unit, reason, session_id, bootstrap):
     """Restart a GOVERNED unit under a lease: refuse while requests, jobs or GPU
     queues are in flight; drain; restart; verify; record attempt and outcome (#3580)."""
     from ai_team_sync.safe_restart import run_safe_restart
@@ -935,7 +938,7 @@ def safe_restart_cmd(unit, reason, session_id):
     raise SystemExit(run_safe_restart(
         unit, reason, server=_server_url(),
         session_id=session_id or _load_active_session(),
-        developer=_get_developer(), out=click.echo))
+        developer=_get_developer(), bootstrap=bootstrap, out=click.echo))
 
 
 if __name__ == "__main__":

@@ -41,7 +41,11 @@ class RestartLease(Base):
     session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     developer: Mapped[str] = mapped_column(String(255), default="")
     reason: Mapped[str] = mapped_column(Text, default="")
-    ttl_s: Mapped[int] = mapped_column(Integer, default=180)
+    ttl_s: Mapped[int] = mapped_column(Integer, default=360)
+    # 'normal' (drained) or 'bootstrap' (first load of the middleware; no drain).
+    mode: Mapped[str] = mapped_column(String(20), default="normal")
+    # JSON object class -> reason: the evidence this unit's gate does NOT check.
+    waivers: Mapped[str] = mapped_column(Text, default="{}")
     refusal: Mapped[str] = mapped_column(Text, default="")
     # JSON list of the most recent probe results (ProbeResult.as_dict()).
     probes: Mapped[str] = mapped_column(Text, default="[]")

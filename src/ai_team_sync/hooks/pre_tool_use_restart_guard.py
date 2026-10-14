@@ -352,7 +352,9 @@ def main() -> None:
         sys.exit(0)
     governed, config_error = _governed()
     warnings = []
-    if config_error:
+    # The config warning only accompanies commands that could control a service;
+    # repeating it on every `ls` would train agents to ignore the guard.
+    if config_error and re.search(r"\b(systemctl|service|kill|pkill|killall)\b", command):
         warnings.append(f"ATS RESTART GUARD: restart_gate config unreadable ({config_error}); "
                         f"guarding the default governed units {sorted(governed)}")
     try:

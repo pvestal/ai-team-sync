@@ -94,9 +94,23 @@ def test_unresolvable_pids_warn_rather_than_guess():
     assert not v.blocked and v.warnings
 
 
+COMPLETE_CONFIG = """
+[restart_gate]
+governed_units = ["anime-studio"]
+
+[restart_gate.units."anime-studio"]
+drain_url = "http://127.0.0.1:8401/api/system/drain"
+release_url = "http://127.0.0.1:8401/api/system/drain/release"
+probes = [
+  { kind = "inflight", url = "http://127.0.0.1:8401/api/system/inflight" },
+  { kind = "comfyui", url = "http://127.0.0.1:8188/queue" },
+]
+"""
+
+
 def _run_hook(payload: dict, tmp_path) -> subprocess.CompletedProcess:
     cfg = tmp_path / "operator.toml"
-    cfg.write_text('[restart_gate]\ngoverned_units = ["anime-studio"]\n')
+    cfg.write_text(COMPLETE_CONFIG)
     env = {**os.environ, "ATS_OPERATOR_CONFIG": str(cfg),
            "PYTHONPATH": os.pathsep.join(sys.path)}
     return subprocess.run([sys.executable, "-m", "ai_team_sync.hooks.pre_tool_use_restart_guard"],
@@ -123,6 +137,22 @@ def test_hook_process_warns_on_unparseable(tmp_path):
     assert proc.returncode == 0
     ctx = json.loads(proc.stdout)["hookSpecificOutput"]["additionalContext"]
     assert "could not parse" in ctx
+
+
+def test_a_config_warning_is_shown_only_on_service_control_commands(tmp_path):
+    env = {**os.environ, "ATS_OPERATOR_CONFIG": str(tmp_path / "absent.toml"),
+           "PYTHONPATH": os.pathsep.join(sys.path)}
+
+    def run(cmd):
+        return subprocess.run(
+            [sys.executable, "-m", "ai_team_sync.hooks.pre_tool_use_restart_guard"],
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}}),
+            capture_output=True, text=True, env=env, timeout=30)
+
+    quiet = run("ls -la")
+    assert quiet.returncode == 0 and quiet.stdout == ""
+    noisy = run("systemctl status anime-studio")
+    assert noisy.returncode == 0 and "config unreadable" in noisy.stdout
 
 
 def test_hook_process_guards_the_defaults_when_config_is_broken(tmp_path):
