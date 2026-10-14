@@ -426,7 +426,9 @@ async def list_tools() -> list[Tool]:
                 "renders and deploys whatever is on disk, and it is invisible to every "
                 "other session unless it is recorded here — team_status shows only a "
                 "decision COUNT, never the content. Capture before/after numbers when "
-                "you have them so 'did it help' is answerable later."
+                "you have them so 'did it help' is answerable later. GOVERNED units "
+                "(restart_gate in operator.toml) are restarted with `ats safe-restart "
+                "<unit> --reason ...`, which gates, drains and records on its own (#3580)."
             ),
             inputSchema={
                 "type": "object",
@@ -1009,6 +1011,10 @@ async def _recent_restarts_block(client: httpx.AsyncClient) -> str:
             line += "  \u274c FAILED"
         elif r.get("outcome") == "in_progress":
             line += "  \u23f3 IN PROGRESS"
+        elif r.get("outcome") and r.get("outcome") != "completed":
+            # #3580 lease records: refused / authorized / aborted / timeout / unknown.
+            # A 'refused' row is an attempt that did NOT restart anything.
+            line += f"  [{r['outcome'].upper()}]"
         out += line + "\n"
         if r.get("reason"):
             out += f"  {r['reason'][:150]}\n"

@@ -14,6 +14,7 @@ from fastapi import Depends
 from ai_team_sync.database import init_db
 from ai_team_sync.config import settings
 from ai_team_sync.liveness import liveness_from_request
+from ai_team_sync.routers import restart_leases  # registers restart_leases on Base (#3580)
 from ai_team_sync.routers import sessions, locks, decisions, override_requests, git_status, websocket, dashboard, presence_ws, presence_http, restarts, workers, briefs, delegations, version, authority, file_activities, messages, observability
 
 
@@ -45,6 +46,9 @@ def create_app() -> FastAPI:
     app.include_router(decisions.session_scoped, prefix="/api")  # nested alias (#2517)
     app.include_router(override_requests.router, prefix="/api")
     app.include_router(git_status.router, prefix="/api")
+    # Restart leases (#3580) BEFORE the record router, so /restarts/leases is never
+    # read as a /restarts/{restart_id}.
+    app.include_router(restart_leases.router, prefix="/api")
     app.include_router(restarts.router, prefix="/api")  # shared-service restarts (#2559)
     app.include_router(workers.router, prefix="/api")  # worker capability/authority registry
     app.include_router(briefs.router, prefix="/api")   # task-claim context packet

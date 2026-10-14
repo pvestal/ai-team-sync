@@ -923,6 +923,20 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
     }, indent=2))
 
 
+@cli.command("safe-restart")
+@click.argument("unit")
+@click.option("--reason", required=True, help="Why this governed unit must restart now")
+@click.option("--session-id", default="", help="ATS session to attribute (default: your current one)")
+def safe_restart_cmd(unit, reason, session_id):
+    """Restart a GOVERNED unit under a lease: refuse while requests, jobs or GPU
+    queues are in flight; drain; restart; verify; record attempt and outcome (#3580)."""
+    from ai_team_sync.safe_restart import run_safe_restart
+
+    raise SystemExit(run_safe_restart(
+        unit, reason, server=_server_url(),
+        session_id=session_id or _load_active_session(),
+        developer=_get_developer(), out=click.echo))
+
 
 if __name__ == "__main__":
     cli()
