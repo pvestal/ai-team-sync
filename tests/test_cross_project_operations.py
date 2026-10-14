@@ -54,7 +54,9 @@ def cross(world):  # noqa: F811
 
 
 def _edit_guard(tool, path, env, cid):
-    payload = {"tool_name": tool, "session_id": cid, "tool_input": {"file_path": str(path)}}
+    # Each tool's real input shape: NotebookEdit names its file notebook_path.
+    key = "notebook_path" if tool == "NotebookEdit" else "file_path"
+    payload = {"tool_name": tool, "session_id": cid, "tool_input": {key: str(path)}}
     return subprocess.run([sys.executable, "-m", "ai_team_sync.hooks.pre_tool_use_lockcheck"],
                           input=json.dumps(payload), env=env, capture_output=True, text=True,
                           timeout=30)
@@ -131,15 +133,50 @@ def test_merge_touching_another_sessions_file_is_refused(cross):
     _git(gov, "merge", "--abort", env=cross["env_x"], check=False)
 
 
-def test_commit_of_an_unclaimed_file_is_not_claim_checked_residual(cross):
-    """RESIDUAL: the commit/merge guard refuses other sessions' locks only; it does
-    not require the committer to hold its own claim. The file had to get there
-    through a guarded write first (refused above), or through an unguarded path."""
+def test_commit_of_an_unclaimed_file_is_refused_for_an_identified_session(cross):
+    """Codex review fc2efd12: a commit must need the committer's own claim."""
     gov, env_x = cross["gov"], cross["env_x"]
     (gov / "new.txt").write_text("unclaimed\n")
     _git(gov, "add", "new.txt", env=env_x)
     c = _git(gov, "commit", "-m", "unclaimed", env=env_x, check=False)
+    assert c.returncode != 0, c.stdout + c.stderr
+    assert "REFUSED (pre-commit)" in c.stderr and "no live lock" in c.stderr, c.stderr
+
+
+def test_commit_allowed_for_the_session_that_holds_the_claim(cross):
+    gov, env_y = cross["gov"], cross["env_y"]
+    _git(gov, "add", "h.txt", env=env_y)
+    c = _git(gov, "commit", "-m", "y commits its own file", env=env_y, check=False)
     assert c.returncode == 0, c.stderr
+
+
+def test_unidentified_committer_rule_is_unchanged(cross):
+    """A human (no ATS identity) is still refused only by EXCLUSIVE locks."""
+    gov = cross["gov"]
+    human = cross["env"](None)
+    (gov / "new.txt").write_text("human\n")
+    _git(gov, "add", "new.txt", env=human)
+    c = _git(gov, "commit", "-m", "human", env=human, check=False)
+    assert c.returncode == 0, c.stderr
+
+
+def test_merge_of_unclaimed_incoming_files_is_refused_for_an_identified_session(cross):
+    gov = cross["gov"]
+    setup = cross["env"](None, ATS_COMMIT_GUARD_OVERRIDE="test setup")
+    _git(gov, "checkout", "-qb", "side2", env=setup)
+    (gov / "u.txt").write_text("nobody holds this\n")
+    _git(gov, "add", "u.txt", env=setup)
+    _git(gov, "commit", "-qm", "side2 adds u", env=setup)
+    _git(gov, "checkout", "-q", "main", env=setup)
+    (gov / "g.txt").write_text("main moved\n")
+    _git(gov, "commit", "-qam", "main moves", env=setup)
+    head = _git(gov, "rev-parse", "HEAD", env=setup).stdout.strip()
+
+    m = _git(gov, "merge", "--no-edit", "side2", env=cross["env_x"], check=False)
+    assert m.returncode != 0 and "REFUSED (pre-merge-commit)" in m.stderr, m.stderr
+    assert "no live lock" in m.stderr, m.stderr
+    assert _git(gov, "rev-parse", "HEAD", env=setup).stdout.strip() == head
+    _git(gov, "merge", "--abort", env=setup, check=False)
 
 
 # --- governed service control -----------------------------------------------------

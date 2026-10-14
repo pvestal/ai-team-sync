@@ -18,7 +18,9 @@ THE RULE, per resolved path inside a GOVERNED repository
 (operator_config.governed_repositories):
 
 * the committing session is identified  -> another live session's lock of ANY
-  mode covering the path refuses;
+  mode covering the path refuses, and so does a path the committing session
+  holds no live lock on (its own claim, the edit guard's claim_check; operator
+  ruling 2026-10-14: a commit or merge needs the committer's own authority);
 * no session can be identified (a human) -> only another session's EXCLUSIVE
   lock refuses; advisory holders are printed;
 * ATS unreachable                        -> refuse (fail closed).
@@ -287,6 +289,35 @@ def foreign_holders(results: list[dict], my_session_id: str | None,
     return out
 
 
+def own_claim_gaps(paths: list[str], repo_root: str, session_id: str,
+                   timeout: float = 5.0) -> list[tuple[str, str]]:
+    """(path, reason) for each path `session_id` holds no live lock on.
+
+    The same decision the edit guard makes (claim_check over GET /api/sessions
+    and GET /api/locks). Raises GuardUnavailable on any read failure."""
+    from ai_team_sync.hooks.pre_tool_use_lockcheck import claim_check
+
+    try:
+        import httpx
+
+        with httpx.Client(timeout=timeout) as client:
+            s = client.get(f"{server_url()}/api/sessions")
+            s.raise_for_status()
+            lk = client.get(f"{server_url()}/api/locks")
+            lk.raise_for_status()
+            sessions, locks = s.json(), lk.json()
+    except Exception as exc:  # transport, HTTP status, JSON
+        raise GuardUnavailable(f"{type(exc).__name__}: {exc}") from exc
+    sessions = sessions if isinstance(sessions, list) else sessions.get("sessions", [])
+    locks = locks if isinstance(locks, list) else locks.get("locks", [])
+    gaps = []
+    for path in paths:
+        ok, reason = claim_check(path, repo_root, session_id, "", sessions, locks)
+        if not ok:
+            gaps.append((path, reason))
+    return gaps
+
+
 def verdict(holders: list[Holder], *, governed_repo: bool, identified: bool) -> Verdict:
     """Apply the rule in the module docstring to foreign holders."""
     v = Verdict()
@@ -414,6 +445,22 @@ def run_git_guard(hook: str, paths: list[str], cwd: str | None = None) -> int:
              f"advisory lock:")
         for h in v.advisory:
             _err(h.line())
+    if v.ok and is_governed and sid:
+        try:
+            gaps = own_claim_gaps(paths, root, sid)
+        except GuardUnavailable as exc:
+            _err(f"\n{TAG} REFUSED ({hook}): could not read ATS sessions/locks to check "
+                 f"session {sid}'s own claim in {root} ({exc}). This guard fails closed.")
+            return 1
+        if gaps:
+            _err(f"\n{TAG} REFUSED ({hook}) for session {sid} in {root}: it holds no "
+                 f"claim on {len(gaps)} path(s):")
+            for path, reason in gaps:
+                _err(f"  {path} -- {reason}")
+            _err("Work in this repository through a session anchored here that holds "
+                 "locks on these files (start_session with repo_root and scope), or "
+                 f"bypass with {OVERRIDE_ENV}=<reason> (printed and audited).")
+            return 1
     if v.ok:
         return 0
     who = (f"session {sid}" if sid else

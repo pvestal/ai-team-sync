@@ -26,12 +26,19 @@
   placeholder), and the worker gets an advisory naming the structured switch,
   `start_session` with `repo_root`. Only a cwd inside a different governed
   repository still refuses a session that holds work. Which prompts reach ATS
-  at all is unchanged. Cross-project authority stays with the operation guards,
-  which are unchanged; `docs/commit-guard.md` now tabulates, per operation, what
-  checks it and what is partial or documented only (the edit guard fails open
-  when ATS is down; commits are checked against other sessions' locks, not the
-  committer's own claim), and `tests/test_cross_project_operations.py` exercises
-  each one against a real ATS and real git hooks.
+  at all is unchanged. Cross-project authority is enforced by the operation
+  guards; `docs/commit-guard.md` tabulates, per operation, what checks it and
+  what is partial or documented only (for example, the edit guard fails open
+  when ATS is down), and `tests/test_cross_project_operations.py` exercises each
+  one against a real ATS and real git hooks.
+- **The edit guard now checks NotebookEdit.** It read only `tool_input.file_path`,
+  but NotebookEdit names its file `notebook_path`, so every notebook edit passed
+  unchecked.
+- **Commits and merges need the committer's own claim.** In a governed
+  repository, the pre-commit and pre-merge-commit guards now also refuse a path
+  the identified committing session holds no live lock on (the edit guard's
+  `claim_check`), failing closed if ATS cannot be read. Unidentified committers
+  keep the old rule (exclusive locks only); the audited override still applies.
 - **Reading a task brief no longer claims the ticket (D3, operator ruling
   2026-10-14).** `POST /api/brief` (and the MCP `task_brief` tool and the
   ATS-first prompt hook, which call it) used to bind the caller's session to the

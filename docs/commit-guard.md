@@ -32,6 +32,7 @@ legacy `ATS_COORDINATED_REPOS`:
 | Situation | Result |
 |-----------|--------|
 | The committing ATS session is identified, and another live session holds a lock of **any** mode covering a staged path | refused |
+| The committing ATS session is identified, and it holds no live lock of its own covering a staged (or, for a merge, incoming) path | refused (since 2026-10-14) |
 | No ATS session can be identified (a human at a terminal) | refused only on another session's **exclusive** lock. Advisory holders are printed |
 | ATS unreachable | **refused** (fail closed) |
 | The operator config cannot be read | refused |
@@ -209,8 +210,11 @@ on stderr, except where noted:
 
 Prompt text does not decide which project a session may change. The ATS-first
 prompt hook (`hooks/ats_context.py`) is context routing: a governed project named
-in a prompt never blocks or re-anchors a session that already has an anchor; the
-worker gets an advisory line instead. On 2026-10-14 the previous keyword rule
+in a prompt never blocks or re-anchors a session that already has an anchor.
+When the prompt reaches ATS, the worker gets an advisory line naming the other
+project; a prompt that names several governed projects and nothing else
+governed (no ticket, no governed cwd) stays generic, so it gets no ATS context
+and no advisory, exactly as before. On 2026-10-14 the previous keyword rule
 blocked the operator's Stage 1 GO because it said "Do not change anime-studio".
 
 Switching projects is a structured action: `start_session` with `repo_root` set
@@ -225,12 +229,14 @@ repository B, per operation. "Partial" and "documented only" are not enforcement
 
 | Operation in B | Checked by | Against | ATS down | Status |
 |---|---|---|---|---|
-| Edit / Write / MultiEdit / NotebookEdit | layer 1 | own live lock anchored to B, and others' locks | **fails open** (exit 0) | enforced while ATS is up |
-| Bash write naming a path (redirect, sed -i, cp/mv, tee, rm, ...) | layer 2 | own lock (claim check) and others' locks | fails closed | enforced for the forms layer 2 resolves; best effort |
+| Edit / Write / MultiEdit (`file_path`), NotebookEdit (`notebook_path`) | layer 1 | own live lock anchored to B, and others' locks | **fails open** (exit 0) | checked while ATS is up; nothing while it is down. Before 2026-10-14 NotebookEdit was not checked at all (the guard read only `file_path`) |
+| Bash write naming a path (redirect, sed -i, cp/mv, tee, rm, ...) | layer 2 | own lock (claim check) and others' locks | fails closed | checked for the forms layer 2 resolves; best effort |
+| Bash git writes to the working tree (`git apply`, `checkout -- f`, `stash pop`, `merge`, ...) | layer 2 | **others'** live locks only; no own-claim check | fails closed | partial |
 | Bash write the parser cannot place (interpreters, programs, scripts) | none | -- | -- | documented only |
-| `git commit`, non-ff `git merge` | layers 3 and 4 | **others'** live locks only; the committer's own claim is not required | fails closed | partial |
-| `git commit` typed in Claude's Bash tool | layer 3 (git hook), not layer 2 | as above | as above | partial |
-| ff merge, cherry-pick, revert, rebase, `--no-verify` | none (layer 2 checks some of them in Claude's Bash tool) | -- | -- | documented only |
+| `git commit`, non-ff `git merge` by an identified session | layers 3 and 4 | own live lock on every committed or incoming path, and others' locks | fails closed | checked only where the ATS git hooks are installed; skipped by `--no-verify` |
+| `git commit`, non-ff `git merge` by an unidentified committer (human, unhooked agent) | layers 3 and 4 | others' EXCLUSIVE locks only | fails closed | partial |
+| `git commit` typed in Claude's Bash tool | layer 3 (git hook), not layer 2 | as above | as above | as above |
+| ff merge, cherry-pick, revert, rebase, `git am` | none (layer 2 checks some of them in Claude's Bash tool, against others' locks) | -- | -- | documented only |
 | systemctl / service / kill / pkill of a governed unit | `pre_tool_use_restart_guard.py` | refused for every agent; `ats safe-restart` is the gated path | n/a (local) | enforced for the Bash tool only |
 | other MCP servers' tools, terminals, cron, timers, other agents without these hooks | none | -- | -- | documented only |
 
@@ -260,8 +266,10 @@ and fail-open rows so a change to them is visible. The prompt side:
   edit guard (layer 1) fails open **everywhere**, governed repositories
   included (exit 0 when ATS cannot be reached); an internal error in the Bash
   parser also fails open (all by design)
-- the committer's own claim: layers 3 and 4 refuse other sessions' locks, but
-  do not require the committing session to hold a lock on what it commits
+- the committer's own claim when the committer is unidentified: layers 3 and 4
+  require it only of an identified ATS session; a human or an agent without an
+  ATS identity is refused only by exclusive locks. Session identity itself is
+  cooperative (see below)
 - the override variable and the override log. Both are trusted, local, and
   editable by the user they protect against
 - session identity. It is cooperative, not authenticated (see "Identity"

@@ -207,6 +207,8 @@ def _no_live_echo(monkeypatch):
 
 
 def _env(monkeypatch, tmp_path, cid):
+    # A delegated worker's ambient identity must not leak into the in-process ATS.
+    monkeypatch.delenv("ATS_SESSION_ID", raising=False)
     monkeypatch.setenv("ATS_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", cid)
     monkeypatch.setenv("ATS_DEVELOPER", "patrick")

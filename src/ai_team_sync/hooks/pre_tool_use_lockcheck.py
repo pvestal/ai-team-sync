@@ -241,7 +241,10 @@ def main() -> None:
         sys.exit(0)  # unparseable — never block
     if payload.get("tool_name") not in EDIT_TOOLS:
         sys.exit(0)
-    fp = (payload.get("tool_input") or {}).get("file_path")
+    tool_input = payload.get("tool_input") or {}
+    # NotebookEdit names its target notebook_path; reading only file_path let
+    # every notebook edit through unchecked (Codex review fc2efd12).
+    fp = tool_input.get("file_path") or tool_input.get("notebook_path")
     if not fp or _is_noise(fp):
         sys.exit(0)
     wt_root, repo_root = _roots(fp)
