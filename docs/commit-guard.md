@@ -268,13 +268,13 @@ key, and one guard silently disappears.
   "hooks": {
     "PreToolUse": [
       { "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-        "hooks": [{ "type": "command",
+        "hooks": [{ "type": "command", "timeout": 30, "onFailure": "block",
           "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.pre_tool_use_lockcheck" }] },
       { "matcher": "Bash",
         "hooks": [
-          { "type": "command",
+          { "type": "command", "timeout": 30, "onFailure": "block",
             "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.pre_tool_use_bashguard" },
-          { "type": "command",
+          { "type": "command", "timeout": 30, "onFailure": "block",
             "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.pre_tool_use_restart_guard" }
         ] }
     ]
@@ -284,3 +284,12 @@ key, and one guard silently disappears.
 
 Merge this into the existing `PreToolUse` array; keep every other matcher already
 there (for example the edit guard and any curate hooks).
+
+Claude Code runs all matching hooks in parallel and an exit 2 blocks the call. By
+default a hook that crashes, cannot start or times out does NOT block: the call
+goes ahead. `"onFailure": "block"` (Claude Code v2.1.295 or later) makes those
+failures block, so a broken guard refuses instead of waving the call through. The
+cost: if the ATS install itself is broken, every Bash call and edit is refused
+until `settings.json` is fixed by hand. The documentation does not state how an
+exit 2 from one parallel hook combines with an exit 0 from another; the deployment
+rehearsal checks it empirically.
