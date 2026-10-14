@@ -446,56 +446,196 @@ def _perl(ctx, args, a):
             a.add(p, True, "perl -i")
 
 
+# Options that consume a value, per command (#3581 review finding 2). A value
+# mistaken for an operand moves the destination, so these lists matter.
+_SHORT_VALUED = {"cp": "tS", "mv": "tS", "ln": "tS", "install": "tSmog", "rsync": "efTBM"}
+_LONG_VALUED = {
+    "cp": {"--target-directory", "--suffix"},
+    "mv": {"--target-directory", "--suffix"},
+    "ln": {"--target-directory", "--suffix"},
+    "install": {"--target-directory", "--suffix", "--mode", "--owner", "--group",
+                "--strip-program"},
+    "rsync": {"--rsh", "--exclude", "--include", "--filter", "--exclude-from",
+              "--include-from", "--files-from", "--log-file", "--log-file-format",
+              "--rsync-path", "--chmod", "--chown", "--temp-dir", "--partial-dir",
+              "--backup-dir", "--suffix", "--compare-dest", "--copy-dest", "--link-dest",
+              "--port", "--password-file", "--out-format", "--max-size", "--min-size",
+              "--timeout", "--contimeout", "--bwlimit", "--modify-window", "--max-delete",
+              "--usermap", "--groupmap", "--info", "--debug", "--iconv", "--protocol",
+              "--address", "--sockopts", "--outbuf", "--remote-option", "--skip-compress",
+              "--block-size", "--checksum-choice", "--compress-choice", "--compress-level",
+              "--write-batch", "--only-write-batch", "--read-batch", "--max-alloc"},
+}
+
+
+def _parse_dest_opts(name: str, args: list[Word]):
+    """(flags, target_dir Word | None, operands) for cp/mv/ln/install/rsync.
+
+    Handles clusters (`-rt DIR`), attached values (`-tDIR`, `--target-directory=DIR`)
+    and `--`. rsync has no target-directory option (its -t is --times)."""
+    short_valued = _SHORT_VALUED[name]
+    long_valued = _LONG_VALUED[name]
+    flags: set[str] = set()
+    target: Word | None = None
+    ops: list[Word] = []
+    i, dashdash = 0, False
+    while i < len(args):
+        w = args[i]
+        t = w.text
+        if dashdash or not t.startswith("-") or t == "-":
+            ops.append(w)
+            i += 1
+            continue
+        if t == "--":
+            dashdash = True
+            i += 1
+            continue
+        if t.startswith("--"):
+            opt, eq, val = t.partition("=")
+            if opt in long_valued:
+                if eq:
+                    value = Word(val, w.dynamic, w.glob)
+                    i += 1
+                else:
+                    value = args[i + 1] if i + 1 < len(args) else None
+                    i += 2
+                if opt == "--target-directory":
+                    target = value
+                continue
+            flags.add(opt)
+            i += 1
+            continue
+        body, j, consumed = t[1:], 0, 1
+        while j < len(body):
+            ch = body[j]
+            if ch in short_valued:
+                rest = body[j + 1:]
+                if rest:
+                    value = Word(rest, w.dynamic, w.glob)
+                else:
+                    value = args[i + 1] if i + 1 < len(args) else None
+                    consumed = 2
+                if ch == "t" and name != "rsync":
+                    target = value
+                break
+            flags.add("-" + ch)
+            j += 1
+        i += consumed
+    return flags, target, ops
+
+
+def _spelling(ctx: Ctx, w: Word, p: str) -> str:
+    """How the shell would hand path `p` (an expansion of word `w`) to the
+    program -- what --parents / --relative replicate under the destination."""
+    if w.glob:
+        return p if os.path.isabs(os.path.expanduser(w.text)) else os.path.relpath(p, ctx.cwd)
+    return os.path.expanduser(w.text) if w.text.startswith("~") else w.text
+
+
 def _dest_cmd(ctx, name, args, a):
-    with_value = {"install": {"-m", "--mode", "-o", "--owner", "-g", "--group", "-S",
-                              "--suffix", "-t", "--target-directory"},
-                  "rsync": {"-e", "--rsh", "--exclude", "--include", "--filter", "-f",
-                            "--exclude-from", "--include-from", "--files-from",
-                            "--log-file", "--rsync-path", "--chmod", "--temp-dir", "-T",
-                            "--partial-dir", "--backup-dir", "--suffix", "--compare-dest",
-                            "--copy-dest", "--link-dest", "--port", "--password-file"},
-                  }.get(name, {"-t", "--target-directory", "-S", "--suffix"})
-    texts = [w.text for w in args]
-    target_dir = None
-    for k, t in enumerate(texts):
-        if t in ("-t", "--target-directory") and k + 1 < len(args) and name != "rsync":
-            target_dir = args[k + 1]
-        elif t.startswith("--target-directory="):
-            target_dir = Word(t.split("=", 1)[1], args[k].dynamic, args[k].glob)
-    if name == "install" and ("-d" in texts or "--directory" in texts):
+    """Destinations of cp / mv / install / rsync / ln.
+
+    Forms resolved: DEST as a file or directory; -t/--target-directory (also
+    in clusters and attached); -T/--no-target-directory; cp --parents and
+    rsync -R/--relative (the source path as spelled is replicated under the
+    destination; rsync's '/./' marker is honoured); install -D (destination is
+    the file path, leading directories created). Anything that cannot be placed
+    with certainty is reported as unresolved instead of being guessed (#3581
+    review finding 2: `cp --parents src/x backup/` writes backup/src/x, which
+    the first version resolved to backup/x)."""
+    flags, target_dir, ops = _parse_dest_opts(name, args)
+    if name == "install" and ({"-d", "--directory"} & flags):
         return  # creates directories only
-    ops = _nonopts(args, with_value)
-    if target_dir is None:
+    if name == "rsync" and "--files-from" in {t.text.partition("=")[0] for t in args}:
+        a.miss("rsync --files-from: the file list is not resolved")
+        return
+    if target_dir is not None:
+        sources, dest = ops, target_dir
+    else:
         if len(ops) < 2:
+            if ops:
+                a.miss(f"{name}: could not identify a destination")
             return
         sources, dest = ops[:-1], ops[-1]
-    else:
-        sources, dest = ops, target_dir
     if name == "rsync" and re.match(r"^[^/]*:", dest.text):
         return  # remote destination
+    if name == "rsync" and any(re.match(r"^[^/]*:", s.text) for s in sources):
+        a.miss("rsync from a remote source: the files written are not resolved")
+        return
     dest_paths = _expand(ctx, dest, a, name)
     if not dest_paths:
         return
+    if len(dest_paths) > 1:
+        a.miss(f"{name}: destination '{dest.text}' is a glob with several matches")
+        return
     dest_p = dest_paths[0]
-    recursive = name in ("rsync", "mv") or any(
-        t in ("-r", "-R", "-a", "--recursive", "--archive") or
-        (t.startswith("-") and not t.startswith("--") and set(t[1:]) & {"r", "R", "a"})
-        for t in texts)
-    into_dir = (target_dir is not None or os.path.isdir(dest_p) or dest.text.endswith("/")
-                or len(sources) > 1)
-    remove_sources = name == "mv" or (name == "rsync" and "--remove-source-files" in texts)
+
+    no_target = bool({"-T", "--no-target-directory"} & flags) and name != "rsync"
+    parents = name == "cp" and "--parents" in flags
+    relative = name == "rsync" and bool({"-R", "--relative"} & flags) \
+        and "--no-relative" not in flags
+    install_d = name == "install" and "-D" in flags
+    if name == "rsync":
+        recursive = bool({"-r", "-a", "--recursive", "--archive"} & flags)
+    elif name == "cp":
+        recursive = bool({"-r", "-R", "-a", "--recursive", "--archive"} & flags)
+    else:
+        recursive = name == "mv"
+
+    if no_target and target_dir is not None:
+        a.miss(f"{name}: both -t and -T given")
+        return
+    if (parents or relative) and no_target:
+        a.miss(f"{name}: --parents/--relative with -T is not resolved")
+        return
+    if install_d and target_dir is None:
+        if len(sources) > 1 or os.path.isdir(dest_p) or dest.text.endswith("/"):
+            a.miss("install -D into a directory: the placement is not resolved with certainty")
+            return
+    if parents or relative:
+        into_dir = True
+    elif no_target or install_d and target_dir is None:
+        into_dir = False
+    else:
+        into_dir = (target_dir is not None or os.path.isdir(dest_p)
+                    or dest.text.endswith("/") or len(sources) > 1)
+    remove_sources = name == "mv" or (name == "rsync" and "--remove-source-files" in flags)
+
+    def base_for(src_word: Word, sp: str) -> str | None:
+        if parents or relative:
+            spelled = _spelling(ctx, src_word, sp)
+            if relative and "/./" in spelled:
+                spelled = spelled.split("/./", 1)[1]
+            spelled = spelled.lstrip("/") if spelled.startswith("/") else spelled
+            norm = os.path.normpath(spelled)
+            if norm in (".", "") or norm.startswith("..") or "/../" in f"/{spelled}/":
+                a.miss(f"{name} {'--parents' if parents else '-R'}: source "
+                       f"'{src_word.text}' contains '..'; placement not resolved")
+                return None
+            return os.path.join(dest_p, norm)
+        if name == "rsync" and os.path.isdir(sp):
+            # rsync treats a directory source's destination as a directory;
+            # a trailing slash copies the CONTENTS.
+            return dest_p if src_word.text.endswith("/") else \
+                os.path.join(dest_p, os.path.basename(sp.rstrip("/")))
+        if into_dir:
+            return os.path.join(dest_p, os.path.basename(sp.rstrip("/")))
+        return dest_p
+
     for src in sources:
         for sp in _expand(ctx, src, a, f"{name} source"):
-            if os.path.isdir(sp) and recursive:
-                base = sp if (name == "rsync" and src.text.endswith("/")) else os.path.dirname(sp.rstrip("/"))
+            base = base_for(src, sp)
+            if base is None:
+                continue
+            if os.path.isdir(sp):
+                if not recursive:
+                    continue  # cp/rsync without -r skip a directory
                 for f in _files_under(sp):
-                    rel = os.path.relpath(f, base)
-                    a.add(os.path.join(dest_p, rel) if into_dir or name == "rsync" else
-                          os.path.join(dest_p, os.path.relpath(f, sp)), False, name)
+                    a.add(os.path.join(base, os.path.relpath(f, sp)), False, name)
                     if remove_sources:
                         a.add(f, False, f"{name} source")
                 continue
-            a.add(os.path.join(dest_p, os.path.basename(sp)) if into_dir else dest_p, True, name)
+            a.add(base, True, name)
             if remove_sources:
                 a.add(sp, True, f"{name} source")
 
@@ -1085,7 +1225,6 @@ class Decision:
 
 def decide(command: str, cwd: str | None, claude_sid: str) -> Decision:
     """The verdict for one Bash command."""
-    from ai_team_sync import session_pointer as sp
     from ai_team_sync.hooks import commit_guard as cg
     from ai_team_sync.hooks.pre_tool_use_lockcheck import claim_check
     from ai_team_sync.operator_config import OperatorConfigError
@@ -1098,7 +1237,16 @@ def decide(command: str, cwd: str | None, claude_sid: str) -> Decision:
     if not groups:
         return result
 
-    my_sid = sp.resolve_pointer(claude_sid or None, allow_global=False)
+    # Same resolution as the git hooks (#3581 review finding 1): this Claude
+    # session's pointer wins; a contradicting $ATS_SESSION_ID is refused; an
+    # env-only identity is trusted only once ATS confirms it (identity_problem).
+    ident = cg.resolve_identity(claude_sid or None)
+    if ident.conflict:
+        result.code = 2
+        result.blocks.append(f"ATS BASH GUARD: {ident.conflict}")
+        return result
+    my_sid = ident.session_id
+    problem: str | None = None  # None = not yet validated
     cid8 = (claude_sid or "")[:8]
     blocks: list[str] = []
     claim_ctx: tuple[list, list] | None = None
@@ -1115,6 +1263,16 @@ def decide(command: str, cwd: str | None, claude_sid: str) -> Decision:
         rels = [r for r, _ in items]
         try:
             results = cg.check_paths(rels, root, my_sid, timeout=3)
+            if my_sid and problem is None:
+                problem = cg.identity_problem(ident, results, timeout=3)
+            if my_sid and problem:
+                if ident.self_asserted and is_governed:
+                    blocks.append(
+                        f"ATS BASH GUARD: the acting identity came from $ATS_SESSION_ID "
+                        f"(no pointer for this Claude session) and is not valid: {problem}. "
+                        f"Refusing writes in the governed repository {root}.")
+                    continue
+                results = cg.check_paths(rels, root, None, timeout=3)
         except cg.GuardUnavailable as exc:
             if is_governed:
                 blocks.append(
@@ -1122,7 +1280,8 @@ def decide(command: str, cwd: str | None, claude_sid: str) -> Decision:
                     f"repository {root} (e.g. '{rels[0]}') and ATS at {cg.server_url()} could "
                     f"not be asked ({exc}). Failing closed.")
             continue
-        holders = cg.foreign_holders(results, my_sid, cid8)
+        eff_sid = None if problem else my_sid
+        holders = cg.foreign_holders(results, eff_sid, cid8)
         by_path = {}
         for h in holders:
             by_path.setdefault(h.path, []).append(h)
@@ -1152,7 +1311,7 @@ def decide(command: str, cwd: str | None, claude_sid: str) -> Decision:
                         continue
                 sessions, locks = claim_ctx
                 for rel in direct:
-                    ok, reason = claim_check(rel, root, my_sid, cid8, sessions, locks)
+                    ok, reason = claim_check(rel, root, eff_sid, cid8, sessions, locks)
                     if not ok:
                         (blocks if block_claims else warnings).append(
                             f"ATS CLAIM GUARD (bash `{origin.get(rel)}`): {reason}")

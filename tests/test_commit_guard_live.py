@@ -65,11 +65,19 @@ def world(live_ats, tmp_path):  # noqa: F811
         base_env.update(ATS_SERVER_URL=url, ATS_OPERATOR_CONFIG=str(config),
                         ATS_STATE_DIR=str(state), ATS_COMMIT_GUARD_AUDIT_LOG=str(audit))
 
+        tokens = {}
+
         def session(agent, repo_root):
             made = client.post("/api/sessions", json={
                 "developer": "pvestal", "agent": agent, "scope": [], "repo_root": repo_root})
             assert made.status_code == 201, made.text
+            tokens[made.json()["id"]] = made.headers["X-ATS-Approval-Token"]
             return made.json()["id"]
+
+        def complete(sid):
+            done = client.patch(f"/api/sessions/{sid}", json={"status": "completed"},
+                                headers={"X-ATS-Approval-Token": tokens[sid]})
+            assert done.status_code == 200, done.text
 
         def lock(sid, pattern, mode):
             made = client.post("/api/locks", json={"session_id": sid, "pattern": pattern,
@@ -91,8 +99,15 @@ def world(live_ats, tmp_path):  # noqa: F811
             e.update(extra)
             return e
 
+        def claude_env(cid, pointer_sid, **extra):
+            """B's environment as a Claude Bash tool gives it: the Claude session
+            id, and that session's per-session ATS pointer on disk."""
+            (state / f".ats_session_{cid[:8]}").write_text(pointer_sid)
+            return env(None, CLAUDE_CODE_SESSION_ID=cid, **extra)
+
         yield {"gov": gov, "free": free, "a": a, "b": b, "env": env, "audit": audit,
-               "url": url}
+               "url": url, "session": session, "complete": complete, "lock": lock,
+               "claude_env": claude_env, "gov_real": gov_real}
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
@@ -338,3 +353,77 @@ def test_j_python_c_write_is_allowed_with_residual_warning(world):
     r = _bash_guard(cmd, world["gov"], world["env"](world["b"]))
     assert r.returncode == 0, r.stderr
     assert "not checked" in r.stderr and "python3" in r.stderr
+
+
+# review finding 1: session identity spoof / inheritance ----------------------------
+
+def test_spoof_holder_id_in_env_is_refused_when_claude_pointer_names_b(world):
+    """B runs `ATS_SESSION_ID=<A> git commit` from its Claude Bash tool. Before
+    the fix $ATS_SESSION_ID won, A's lock became 'own', and the commit passed."""
+    a, b = world["a"], world["b"]
+    spoof = world["claude_env"](CID_B, b, ATS_SESSION_ID=a)
+    r = _commit(world["gov"], spoof)
+    assert r.returncode != 0
+    assert "REFUSED (pre-commit)" in r.stderr and "contradicts" in r.stderr
+    assert a in r.stderr and b in r.stderr
+
+    g = _bash_guard("sed -i s/v1/v2/ f.txt", world["gov"], spoof, cid=CID_B)
+    assert g.returncode == 2 and "contradicts" in g.stderr
+    assert a in g.stderr and b in g.stderr
+
+    # Same Claude session without the borrowed id: B is B, and A's lock refuses.
+    plain = _git(world["gov"], "commit", "-m", "b", env=world["claude_env"](CID_B, b),
+                 check=False)
+    assert plain.returncode != 0 and "contradicts" not in plain.stderr
+    assert "REFUSED (pre-commit) for session " + b in plain.stderr
+
+
+def test_pointer_and_matching_env_identity_is_accepted(world):
+    b = world["b"]
+    r = _commit(world["gov"], world["claude_env"](CID_B, b, ATS_SESSION_ID=b), path="g.txt")
+    assert r.returncode == 0, r.stderr
+
+
+def test_env_only_unknown_session_refused_in_governed_repo(world):
+    env = world["env"]("00000000-dead-beef-0000-000000000000")
+    r = _commit(world["gov"], env, path="g.txt")
+    assert r.returncode != 0
+    assert "is not valid" in r.stderr and "00000000-dead-beef" in r.stderr
+    g = _bash_guard("echo x >> g.txt", world["gov"], env)
+    assert g.returncode == 2 and "is not valid" in g.stderr
+
+
+def test_env_only_completed_session_refused_in_governed_repo(world):
+    c = world["session"]("claude-code:cccccccc", world["gov_real"])
+    world["complete"](c)
+    r = _commit(world["gov"], world["env"](c), path="g.txt")
+    assert r.returncode != 0
+    assert "'completed', not active" in r.stderr
+
+
+def test_env_only_invalid_identity_in_ungoverned_repo_is_judged_unidentified(world):
+    env = world["env"]("00000000-dead-beef-0000-000000000000")
+    ok = _commit(world["free"], env, path="g.txt")
+    assert ok.returncode == 0, ok.stderr
+    assert "judging as an unidentified committer" in ok.stderr
+    excl = _commit(world["free"], env, path="f.txt")  # a_free's exclusive lock
+    assert excl.returncode != 0 and "unidentified committer" in excl.stderr
+
+
+def test_residual_same_account_env_identity_is_cooperative_not_authenticated(world):
+    """DOCUMENTED RESIDUAL, not a feature: with no Claude pointer behind it, a
+    process of the SAME OS account may name any ACTIVE session that account owns
+    -- including the lock holder's -- and be treated as it. ATS identity is
+    cooperative; docs/commit-guard.md says so. This test pins the behaviour so a
+    change to it is deliberate."""
+    r = _commit(world["gov"], world["env"](world["a"]))
+    assert r.returncode == 0, r.stderr
+
+
+# review finding 2 end to end ------------------------------------------------------
+
+def test_cp_parents_target_is_resolved_under_the_replicated_path(world):
+    world["lock"](world["a"], "mirror/sub/x.txt", "exclusive")
+    r = _bash_guard("cp --parents sub/x.txt mirror/", world["gov"], world["env"](world["b"]))
+    assert r.returncode == 2, r.stderr
+    assert "'mirror/sub/x.txt'" in r.stderr and world["a"] in r.stderr

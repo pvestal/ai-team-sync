@@ -87,6 +87,65 @@ def test_cp_into_directory_and_recursive_copy(tmp_path):
     assert got == {"dst/a.txt", "dst/b.txt"}
 
 
+@pytest.mark.parametrize("command,expected", [
+    # review finding 2: cp --parents replicates the source path under DEST
+    ("cp --parents src/locked.txt backup/", {"backup/src/locked.txt"}),
+    ("cp --parents -t backup src/locked.txt", {"backup/src/locked.txt"}),
+    ("cp -t backup a.txt b.txt", {"backup/a.txt", "backup/b.txt"}),
+    ("cp --target-directory=backup a.txt", {"backup/a.txt"}),
+    ("cp --target-directory backup a.txt", {"backup/a.txt"}),
+    ("cp -tbackup a.txt", {"backup/a.txt"}),
+    ("cp -T a.txt existing", {"existing"}),
+    ("mv -t backup a.txt", {"backup/a.txt", "a.txt"}),
+    ("mv --target-directory=backup a.txt", {"backup/a.txt", "a.txt"}),
+    ("install -t backup a.txt", {"backup/a.txt"}),
+    ("install -m 644 -t backup a.txt", {"backup/a.txt"}),
+    ("install -D a.txt out/x/y.txt", {"out/x/y.txt"}),
+    ("install -D -m 0644 a.txt out/y.txt", {"out/y.txt"}),
+    ("install -D -t out/x a.txt", {"out/x/a.txt"}),
+    ("rsync -R src/locked.txt backup/", {"backup/src/locked.txt"}),
+    ("rsync -aR src/locked.txt backup", {"backup/src/locked.txt"}),
+    ("rsync --relative src/locked.txt backup/", {"backup/src/locked.txt"}),
+    ("rsync -R /abs/./src/locked.txt backup/", {"backup/src/locked.txt"}),
+    ("rsync -t a.txt backup/", {"backup/a.txt"}),  # rsync -t is --times
+    ("rsync -e ssh a.txt f.txt", {"f.txt"}),
+])
+def test_destination_forms(tmp_path, command, expected):
+    (tmp_path / "existing").mkdir()
+    got, unresolved = paths(command, tmp_path)
+    assert got == expected, unresolved
+    assert unresolved == []
+
+
+def test_recursive_parents_and_relative_copies(tmp_path):
+    (tmp_path / "src" / "deep").mkdir(parents=True)
+    (tmp_path / "src" / "deep" / "x.txt").write_text("x")
+    assert paths("cp -r --parents src/deep backup", tmp_path)[0] == {"backup/src/deep/x.txt"}
+    assert paths("rsync -aR src/deep/ backup", tmp_path)[0] == {"backup/src/deep/x.txt"}
+    assert paths("rsync -a src/deep/ backup", tmp_path)[0] == {"backup/x.txt"}
+    assert paths("rsync -a src/deep backup", tmp_path)[0] == {"backup/deep/x.txt"}
+    assert paths("cp -rt backup src", tmp_path)[0] == {"backup/src/deep/x.txt"}
+
+
+@pytest.mark.parametrize("command,needle", [
+    ("cp --parents ../up.txt backup/", ".."),
+    ("cp --parents src/../x.txt backup/", ".."),
+    ("rsync -R ../up.txt backup/", ".."),
+    ("install -D a.txt existing", "install -D"),
+    ("install -D a.txt b.txt out/", "install -D"),
+    ("cp -T -t backup a.txt", "-t and -T"),
+    ("cp --parents -T a.txt b", "--parents"),
+    ("rsync -a --files-from=list.txt . backup/", "--files-from"),
+    ("rsync -a host:/srv/x backup/", "remote source"),
+    ("cp onlyone.txt", "destination"),
+])
+def test_uncertain_destination_forms_are_unresolved_not_misplaced(tmp_path, command, needle):
+    (tmp_path / "existing").mkdir()
+    got, unresolved = paths(command, tmp_path)
+    assert got == set(), got
+    assert any(needle in u for u in unresolved), unresolved
+
+
 @pytest.fixture
 def repo(tmp_path):
     r = tmp_path / "r"

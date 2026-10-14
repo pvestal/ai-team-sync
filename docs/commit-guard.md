@@ -39,18 +39,59 @@ legacy `ATS_COORDINATED_REPOS`:
 Outside governed repositories the earlier behavior stays. An exclusive lock
 refuses, an advisory lock warns, and an unreachable ATS allows the commit.
 
-The committing session is identified the same way `post_commit.py` does it.
-Sources are tried in this order:
+### Identity: cooperative, not authenticated
 
-1. `$ATS_SESSION_ID`.
-2. The per-Claude-session pointer `~/.ats_session_<cid8>`, keyed by
-   `$CLAUDE_CODE_SESSION_ID`. The Claude Bash tool's environment carries this
-   variable, so a `git commit` run by an agent is attributed to that agent.
-3. A delegated child's capability file.
+An identity matters because it **removes that session's locks from the
+verdict**. A process that borrows the lock holder's id would pass the guard.
+The Bash guard and both git hooks share one resolver,
+`commit_guard.resolve_identity`:
 
-The shared `~/.ats_session` file is never used, because it names whichever
-session on the machine wrote it last. A session's own locks never refuse its
-own commit. An approved override clears only the lock it was granted for.
+1. If a Claude session id is known, and that session's per-session pointer
+   `~/.ats_session_<cid8>` exists, **the pointer wins**. The id comes from the
+   hook payload, or else from `$CLAUDE_CODE_SESSION_ID` or the live-cid record.
+   The Claude Bash tool's environment carries that variable, so a `git commit`
+   run by an agent resolves to the agent's own pointer. A different
+   `$ATS_SESSION_ID` is a **conflict**. The guard refuses and names both ids:
+   the git hooks exit 1 and the Bash guard exits 2.
+2. Otherwise `$ATS_SESSION_ID` is used, then a delegated child's capability
+   file. Both are *self-asserted*. They are trusted only after ATS confirms two
+   things:
+   - **Ownership.** `/api/locks/check` is asked with that id and must not set
+     `caller_identity_unresolved`. That is the server's #2741 check: the
+     kernel's uid for the loopback socket against the session's `creator_uid`.
+   - **Liveness.** `GET /api/sessions/<id>` must report `status: active`.
+
+   If an env identity fails either check, a governed repository **refuses**. An
+   ungoverned repository judges the commit as unidentified (the
+   exclusive-only rule).
+3. The shared `~/.ats_session` file is never used, because it names whichever
+   session on the machine wrote it last.
+
+A session's own locks never refuse its own commit. An approved override clears
+only the lock it was granted for.
+
+**What this does not establish.** Every source above is a value that a process
+of the same OS account can set. Identity is cooperative:
+
+- A shell with no Claude pointer behind it, for example a human terminal, a
+  script, or another agent without Claude's environment, can set
+  `ATS_SESSION_ID` to **any active session its own account owns**, including the
+  lock holder's. The guard then treats it as that session. The test
+  `test_residual_same_account_env_identity_is_cooperative_not_authenticated`
+  pins this behavior.
+- A same-account process can write or overwrite a pointer file
+  `~/.ats_session_<cid8>`, or set `CLAUDE_CODE_SESSION_ID` to another Claude
+  session's id.
+- The ownership check is the server's `cross_account`. It accepts a legacy
+  session row whose `creator_uid` is NULL (created before #2741) for an ordinary
+  account. The session API does not expose `creator_uid`, so this client cannot
+  tell such a row from one this account created.
+- A **pointer-backed** identity that fails the same two checks, for example
+  because its session was completed or reaped, is not refused. It is judged as
+  unidentified. Only self-asserted identities are refused on failure.
+- The edit guard (`pre_tool_use_lockcheck.py`) still resolves
+  `$ATS_SESSION_ID` first, through `session_pointer.resolve_pointer`. It was not
+  changed in this fix.
 
 **Paths checked.** pre-commit checks `git diff --cached --name-only --no-renames`,
 where a rename counts as both its deleted and its added path. When `MERGE_HEAD`
@@ -102,7 +143,7 @@ extracts every path it can show the command writes:
 | `sed -i` (`-i.bak`, `-Ei`, `--in-place`), `perl -i` | the files operated on |
 | `tee [-a]` | its files |
 | `>`, `>>`, `>|`, `&>`, `&>>`, `<>`, `>&file` | the redirect target (fd duplication such as `2>&1` is ignored) |
-| `cp`, `mv`, `install`, `rsync`, `ln` | the destination, or destination/basename when the destination is a directory; files under a recursively copied directory; `mv` sources and `rsync --remove-source-files` sources |
+| `cp`, `mv`, `install`, `rsync`, `ln` | the destination, or destination/basename when the destination is a directory; `-t DIR` / `--target-directory[=]DIR` (also clustered `-rt DIR` and attached `-tDIR`); `-T` (the destination is the file itself); `cp --parents` and `rsync -R` / `--relative`, which put the source path **as spelled** under the destination (rsync's `/./` marker is honored); `install -D SRC FILE`; files under a recursively copied directory; `mv` sources and `rsync --remove-source-files` sources. Forms it cannot place with certainty are reported as unresolved, not guessed: a source containing `..` with `--parents` / `-R`, `install -D` into an existing directory or with several sources, `-t` together with `-T`, `rsync --files-from`, remote rsync sources |
 | `truncate`, `rm` (`-r` expands the directory), `unlink`, `shred` | the operands |
 | `git apply`, `git am` | `git apply --numstat -z` on the patch file or on a `<` redirect |
 | `git checkout [<rev>] -- <paths>`, `git restore` | pathspecs expanded with `git ls-files` / `git ls-tree` |
@@ -178,6 +219,13 @@ on stderr, except where noted:
   internal error in the Bash parser (fail open by design)
 - the override variable and the override log. Both are trusted, local, and
   editable by the user they protect against
+- session identity. It is cooperative, not authenticated (see "Identity"
+  above). A same-account process without a Claude pointer can name the lock
+  holder's active session in `ATS_SESSION_ID` and be treated as that session.
+  A same-account process can also write pointer files
+- the option tables the Bash guard uses for cp/mv/ln/install/rsync. An option
+  that takes a value and is missing from them would be read as an operand
+
 
 ## Installing
 
