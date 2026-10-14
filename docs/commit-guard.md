@@ -272,7 +272,7 @@ key, and one guard silently disappears.
           "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.pre_tool_use_lockcheck" }] },
       { "matcher": "Bash",
         "hooks": [
-          { "type": "command", "timeout": 30, "onFailure": "block",
+          { "type": "command", "timeout": 180, "onFailure": "block",
             "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.pre_tool_use_bashguard" },
           { "type": "command", "timeout": 30, "onFailure": "block",
             "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.pre_tool_use_restart_guard" }
@@ -290,6 +290,13 @@ default a hook that crashes, cannot start or times out does NOT block: the call
 goes ahead. `"onFailure": "block"` (Claude Code v2.1.295 or later) makes those
 failures block, so a broken guard refuses instead of waving the call through. The
 cost: if the ATS install itself is broken, every Bash call and edit is refused
-until `settings.json` is fixed by hand. The documentation does not state how an
+until `settings.json` is fixed by hand, and a guard that runs past its timeout
+refuses a valid command. Timeouts are sized to each guard's own budget: the edit
+guard and the restart guard make a few 2-3 s ATS calls (30 s is ample); the Bash
+guard runs git for analysis (10 s to find the repository, up to 20 s per ref
+check, diff or `git apply --numstat`, 3 s per ATS call), so one `git merge` can
+legitimately take ~55 s and a compound command with several git steps longer.
+180 s covers several such steps; a command whose analysis needs more is refused
+and must be split. The documentation does not state how an
 exit 2 from one parallel hook combines with an exit 0 from another; the deployment
 rehearsal checks it empirically.

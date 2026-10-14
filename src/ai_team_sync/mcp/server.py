@@ -2619,7 +2619,11 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
             elif name == "delete_lock":
                 lock_id = arguments["lock_id"]
 
-                response = await client.delete(f"{SERVER_URL}/api/locks/{lock_id}")
+                # Name this session as the actor: the server lets a live session
+                # drop its OWN lock only when the caller says who it is (#3581).
+                response = await client.delete(
+                    f"{SERVER_URL}/api/locks/{lock_id}",
+                    params={"actor_session_id": active_session_id or ""})
                 response.raise_for_status()
 
                 msg = f"🗑️ Lock deleted!\n\n"
