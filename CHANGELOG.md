@@ -17,6 +17,14 @@
   not an OS boundary: see `docs/restart-gate.md`.
 
 ### Fixed
+- **Reading a task brief no longer claims the ticket (D3, operator ruling
+  2026-10-14).** `POST /api/brief` (and the MCP `task_brief` tool and the
+  ATS-first prompt hook, which call it) used to bind the caller's session to the
+  resolved ticket, including a ticket guessed from prose, and take that ticket's
+  queued handoffs. A brief is now a read: `session_linkage` reports `not_bound`
+  (with `claim_with`), `already_bound` or `bound_to_other_ticket` and changes
+  nothing; a session bound to another ticket can read without a 409. Claiming a
+  ticket and its mailbox happens only through `start_session(ticket_id=...)`.
 - **Governed repositories refuse conflicting live ownership (#3581).** Overlap was
   `fnmatch(a, b) or fnmatch(b, a)`, which called `frontend/*/X.vue` and
   `frontend/src/**` disjoint, and advisory locks shared, so two live sessions held

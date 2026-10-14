@@ -59,36 +59,25 @@ async def post_brief(body: BriefRequest, request: Request,
                 packet["session_linkage"] = {
                     "status": "already_bound", "task_id": resolved_task_id}
             elif session.ticket_id is not None:
-                raise HTTPException(status_code=409, detail={
-                    "error": "task_linkage_conflict",
-                    "message": (f"session {session.id} is already linked to ticket "
-                                f"#{session.ticket_id}; it cannot be silently rebound to "
-                                f"#{resolved_task_id}"),
-                    "session_id": session.id,
-                    "existing_ticket_id": session.ticket_id,
-                    "resolved_ticket_id": resolved_task_id,
-                })
+                packet["session_linkage"] = {
+                    "status": "bound_to_other_ticket", "task_id": resolved_task_id,
+                    "session_ticket_id": session.ticket_id}
             elif session.status != "active":
                 packet["session_linkage"] = {
                     "status": "session_not_active", "task_id": resolved_task_id}
             else:
-                # First task resolution may add handoff lineage, but never task
-                # close authority.  The exact session capability is required;
-                # same-account read identity alone is deliberately insufficient.
-                from ai_team_sync.routers.sessions import (bind_ticket_lineage,
-                                                            _require_session_capability)
-                try:
-                    _require_session_capability(request, session)
-                except HTTPException as exc:
-                    if exc.status_code != 403:
-                        raise
-                    packet["session_linkage"] = {
-                        "status": "authorization_required", "task_id": resolved_task_id}
-                else:
-                    await bind_ticket_lineage(db, session, resolved_task_id)
-                    await db.commit()
-                    packet["session_linkage"] = {
-                        "status": "bound", "task_id": resolved_task_id}
+                # A brief is a read (D3, operator ruling 2026-10-14): it never
+                # binds ticket lineage or claims the ticket mailbox. Claiming is
+                # explicit, through start_session(ticket_id=...).
+                packet["session_linkage"] = {
+                    "status": "not_bound", "task_id": resolved_task_id,
+                    "claim_with": f"start_session(ticket_id={resolved_task_id})"}
+                packet["rendered"] = (
+                    f"{packet.get('rendered', '').rstrip()}\n\n"
+                    f"TICKET NOT CLAIMED: this session is not bound to #{resolved_task_id}; "
+                    f"reading this brief claimed nothing. To own #{resolved_task_id} and "
+                    f"receive its queued handoffs, call "
+                    f"start_session(ticket_id={resolved_task_id}).\n")
         return packet
     except TaskContextUnavailable as exc:
         raise HTTPException(status_code=409, detail={

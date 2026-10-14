@@ -335,7 +335,7 @@ async def test_project_prompt_resurrects_auto_reaped_session(
 
 
 @pytest.mark.asyncio
-async def test_explicit_task_prompt_binds_session_and_injects_exact_authority(
+async def test_explicit_task_prompt_injects_exact_authority_without_claiming_ticket(
     client, tmp_path, monkeypatch
 ):
     import ai_team_sync.briefs as briefs
@@ -368,8 +368,10 @@ async def test_explicit_task_prompt_binds_session_and_injects_exact_authority(
 
     assert "EXACT TASK-SCOPED CONTEXT" in note
     assert "CURRENT OPERATOR RULINGS / PROHIBITIONS" in note
+    assert "TICKET NOT CLAIMED" in note
+    assert "start_session(ticket_id=4101)" in note
     row = (await client.get(f"/api/sessions/{sid}")).json()
-    assert row["ticket_id"] == 4101
+    assert row["ticket_id"] is None, "naming a ticket in a prompt is a read, not a claim (D3)"
     assert row["repo_root"] == "", "a Tower project display name is not a repository mapping"
 
 
@@ -421,7 +423,7 @@ async def test_codex_prompt_for_3522_requires_exact_3522_context(
     assert "EXACT TASK-SCOPED CONTEXT" in note
     sid = sp.resolve_pointer(lifecycle_session_key("codex", cid), allow_global=False)
     row = (await client.get(f"/api/sessions/{sid}")).json()
-    assert row["ticket_id"] == 3522
+    assert row["ticket_id"] is None, "a status read must not claim #3522 (D3)"
 
 
 @pytest.mark.asyncio

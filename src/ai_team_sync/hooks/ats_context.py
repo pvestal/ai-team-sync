@@ -186,13 +186,8 @@ async def _brief(
     packet = response.json()
     if not str(packet.get("rendered") or "").strip():
         raise ContextResolutionError("ATS returned an empty context brief")
-    if target.task_id is not None:
-        linkage = (packet.get("session_linkage") or {}).get("status")
-        if linkage not in {"bound", "already_bound"}:
-            raise ContextResolutionError(
-                f"ATS resolved task #{target.task_id} but did not attach it to "
-                f"session {session_id} (linkage={linkage or 'missing'})"
-            )
+    # Naming a ticket in a prompt is a read, not a claim (D3): the brief never
+    # binds the session, and an unbound session still receives the context.
     return packet
 
 

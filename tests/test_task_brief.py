@@ -565,7 +565,7 @@ async def test_latest_handoff_predating_newer_tower_state_is_labeled_superseded(
 
 
 @pytest.mark.asyncio
-async def test_first_resolved_task_brief_binds_session_for_later_handoff(
+async def test_resolved_task_brief_leaves_session_unbound_and_handoff_queued(
         client, monkeypatch):
     import ai_team_sync.briefs as briefs
 
@@ -596,24 +596,30 @@ async def test_first_resolved_task_brief_binds_session_for_later_handoff(
         "objective": "continue the synthetic task A residual", "session_id": sid,
     }, headers={"X-ATS-Approval-Token": token})
     assert brief.status_code == 200, brief.text
-    assert brief.json()["session_linkage"]["status"] == "bound"
+    linkage = brief.json()["session_linkage"]
+    assert linkage["status"] == "not_bound"
+    assert linkage["claim_with"] == "start_session(ticket_id=4101)"
 
     session = await client.get(f"/api/sessions/{sid}")
-    assert session.json()["ticket_id"] == 4101
+    assert session.json()["ticket_id"] is None
     inbox = await client.get(f"/api/sessions/{sid}/messages",
                              headers={"X-ATS-Approval-Token": token})
+    assert not any(message["kind"] == "handoff" for message in inbox.json())
+
+    successor = await client.post("/api/sessions", json={
+        "developer": "patrick", "agent": "codex:successor", "scope": [],
+        "description": "explicit claim", "repo_root": "/repo", "ticket_id": 4101})
+    assert successor.status_code == 201, successor.text
+    successor_inbox = await client.get(
+        f"/api/sessions/{successor.json()['id']}/messages",
+        headers={"X-ATS-Approval-Token": successor.headers["X-ATS-Approval-Token"]})
     assert any(message["kind"] == "handoff"
                and "Continue exact residual" in message["body"]
-               for message in inbox.json())
-    completed = await client.patch(f"/api/sessions/{sid}", json={
-        "status": "completed", "summary": "done",
-        "handoff": {"verdict": "Continue residual"},
-    }, headers={"X-ATS-Approval-Token": token})
-    assert completed.status_code == 200, completed.text
+               for message in successor_inbox.json())
 
 
 @pytest.mark.asyncio
-async def test_resolved_brief_without_session_capability_does_not_mutate_linkage(
+async def test_resolved_brief_without_session_capability_reports_not_bound(
         client, monkeypatch):
     import ai_team_sync.briefs as briefs
 
@@ -633,7 +639,7 @@ async def test_resolved_brief_without_session_capability_does_not_mutate_linkage
         "objective": "continue the synthetic task A residual", "session_id": sid,
     })
     assert brief.status_code == 200, brief.text
-    assert brief.json()["session_linkage"]["status"] == "authorization_required"
+    assert brief.json()["session_linkage"]["status"] == "not_bound"
     session = await client.get(f"/api/sessions/{sid}")
     assert session.json()["ticket_id"] is None
 
