@@ -94,25 +94,110 @@ def governed(root: str) -> bool:
 
 # --- who is asking ----------------------------------------------------------
 
-def identify_session() -> tuple[str | None, str]:
-    """(ATS session id, source) of the agent running this git command.
+@dataclass
+class Identity:
+    """Who the guard believes is acting. COOPERATIVE, NOT AUTHENTICATED: every
+    source below is a value the acting process (or another process of the same
+    OS account) can set. See docs/commit-guard.md, "Identity"."""
 
-    The same resolution the post-commit hook uses for its mutation: an explicit
-    $ATS_SESSION_ID, then the per-Claude-session pointer keyed by
-    $CLAUDE_CODE_SESSION_ID (present in a Claude Bash tool's environment), then a
-    delegated child's capability file. The SHARED ~/.ats_session is refused: it
-    names whichever session on the box wrote it last, and a wrong guess would
-    drop that session's locks from this verdict.
+    session_id: str | None
+    source: str              # per_session | env | delegated | none
+    conflict: str = ""       # non-empty: $ATS_SESSION_ID contradicts the pointer
+
+    @property
+    def self_asserted(self) -> bool:
+        """An identity that came only from the environment / a capability file,
+        with no per-Claude-session pointer behind it."""
+        return self.source in ("env", "delegated")
+
+
+def resolve_identity(cid: str | None = None) -> Identity:
+    """The acting ATS session, local sources only (#3581 review finding 1).
+
+    An identity REMOVES that session's locks from the verdict, so a process
+    that inherits or sets another session's id -- the lock holder's -- would
+    pass. Order therefore differs from session_pointer.resolve_pointer, where
+    $ATS_SESSION_ID always wins:
+
+    1. When a Claude session id is known (the hook payload's, else
+       $CLAUDE_CODE_SESSION_ID / the live-cid record) and its per-session
+       pointer ~/.ats_session_<cid8> exists, the POINTER wins. A different
+       $ATS_SESSION_ID is a conflict: the caller refuses and names both.
+    2. Otherwise $ATS_SESSION_ID, then a delegated child's capability file --
+       both self-asserted, so the caller must validate them with
+       identity_problem() before trusting them.
+    3. The shared ~/.ats_session is never used: it names whichever session on
+       the box wrote it last.
     """
     from ai_team_sync import session_pointer as sp
 
-    sid, source = sp.resolve_pointer_source()
-    if sid and source in ("env", "per_session"):
-        return sid, source
+    env = (os.environ.get("ATS_SESSION_ID") or "").strip()
+    cid = (cid or sp.claude_session_id() or "").strip()
+    if cid:
+        try:
+            pointer = sp.session_pointer_path(cid).read_text().strip()
+        except OSError:
+            pointer = ""
+        if pointer:
+            conflict = ""
+            if env and env != pointer:
+                conflict = (f"$ATS_SESSION_ID={env} contradicts this Claude session's own "
+                            f"ATS pointer ({cid[:8]} -> {pointer}). An inherited or "
+                            f"borrowed session id would remove that session's locks from "
+                            f"the verdict; unset ATS_SESSION_ID or fix the pointer.")
+            return Identity(pointer, "per_session", conflict)
+    if env:
+        return Identity(env, "env")
     delegated = sp.load_delegated_capability()
     if delegated:
-        return delegated[0], "delegated"
-    return None, "none"
+        return Identity(delegated[0], "delegated")
+    return Identity(None, "none")
+
+
+def identify_session() -> tuple[str | None, str]:
+    """(session id, source) without validation; kept for callers that only
+    display it. Guards use resolve_identity() + identity_problem()."""
+    ident = resolve_identity()
+    return ident.session_id, ident.source
+
+
+def identity_problem(ident: Identity, results: list[dict], timeout: float = 5.0) -> str:
+    """Why `ident` must not be trusted, or '' when it may be.
+
+    Two checks, both by the server, against existing endpoints:
+
+    * ownership -- /api/locks/check, asked WITH this session id, sets
+      caller_identity_unresolved when the server's #2741 boundary
+      (routers/locks.cross_account: the kernel's uid for this loopback socket vs
+      the session's creator_uid) refuses the claim, or the id is unknown;
+    * liveness -- GET /api/sessions/<id> must say status 'active'.
+
+    LIMIT: cross_account accepts a legacy row whose creator_uid is NULL (rows
+    created before #2741) for an ordinary account; creator_uid is not exposed
+    by the session API, so this client cannot tell such a row apart.
+
+    Raises GuardUnavailable when the liveness read fails in transport."""
+    sid = ident.session_id
+    if not sid:
+        return ""
+    if any(r.get("caller_identity_unresolved") for r in results):
+        return (f"ATS does not accept session {sid} as one owned by this OS account "
+                f"(unknown id, or created by another account)")
+    try:
+        import httpx
+
+        with httpx.Client(timeout=timeout) as client:
+            resp = client.get(f"{server_url()}/api/sessions/{sid}")
+    except Exception as exc:
+        raise GuardUnavailable(f"{type(exc).__name__}: {exc}") from exc
+    if resp.status_code == 404:
+        return f"session {sid} is not known to ATS"
+    if resp.status_code != 200:
+        raise GuardUnavailable(f"GET /api/sessions/{sid} returned {resp.status_code}")
+    status = str((resp.json() or {}).get("status", ""))
+    if status != "active":
+        return f"session {sid} is '{status}', not active"
+    return ""
 
 
 # --- asking ATS ---------------------------------------------------------------
@@ -259,7 +344,15 @@ def run_git_guard(hook: str, paths: list[str], cwd: str | None = None) -> int:
         return 0
     _top, root = roots
     override = (os.environ.get(OVERRIDE_ENV) or "").strip()
-    sid, _source = identify_session()
+    ident = resolve_identity()
+    sid = ident.session_id
+
+    if ident.conflict:
+        if override:
+            return _override(hook, override, root, paths, sid, None,
+                             note=f"identity conflict: {ident.conflict}")
+        _err(f"\n{TAG} REFUSED ({hook}): {ident.conflict}")
+        return 1
 
     try:
         is_governed = governed(root)
@@ -275,6 +368,21 @@ def run_git_guard(hook: str, paths: list[str], cwd: str | None = None) -> int:
 
     try:
         results = check_paths(paths, root, sid)
+        problem = identity_problem(ident, results)
+        if problem:
+            if ident.self_asserted and is_governed and not override:
+                _err(f"\n{TAG} REFUSED ({hook}) in governed repository {root}: the "
+                     f"committing identity came from the environment "
+                     f"(${'ATS_SESSION_ID' if ident.source == 'env' else 'delegated capability'}"
+                     f") and is not valid: {problem}.\nUnset it, or commit from the "
+                     f"session that owns it.")
+                return 1
+            # Not trusted: judge as an unidentified committer, with a fresh answer
+            # (the invalid id may still have been honoured for is_own).
+            _err(f"{TAG} note: ignoring session identity ({problem}); judging as an "
+                 f"unidentified committer.")
+            sid = None
+            results = check_paths(paths, root, None)
     except GuardUnavailable as exc:
         if override:
             return _override(hook, override, root, paths, sid, None,
