@@ -25,7 +25,7 @@ from __future__ import annotations
 import fnmatch
 import os
 import posixpath
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 GLOB_META = frozenset("*?[]")
@@ -314,10 +314,61 @@ def lock_file_matcher(pattern: str, root: str = ""):
     return matches
 
 
+def _same_path(rel: str) -> str:
+    return rel
+
+
+@dataclass(frozen=True)
+class FileIndex:
+    """Every name a repository's files answer to.
+
+    `names` maps each name — a listed path, or a path reached through an in-repo
+    symlink — to the REAL repo-relative file it reaches. `dir_aliases` holds
+    (symlink, real directory) pairs so a file not created yet gets its alias
+    names too, and `resolve` gives a not-yet-listed path's real location.
+    """
+    names: dict
+    dir_aliases: tuple = ()
+    resolve: object = _same_path
+    aliases: dict = field(default_factory=dict)   # real -> its other names
+
+    @classmethod
+    def plain(cls, files) -> "FileIndex":
+        return cls({f: f for f in files})
+
+    @classmethod
+    def build(cls, names: dict, dir_aliases=(), resolve=_same_path) -> "FileIndex":
+        aliases: dict = {}
+        for name, real in names.items():
+            if name != real:
+                aliases.setdefault(real, []).append(name)
+        return cls(names, tuple(dir_aliases), resolve,
+                   {real: tuple(other) for real, other in aliases.items()})
+
+    def names_of(self, real: str) -> set:
+        out = {real, *self.aliases.get(real, ())}
+        for alias, target in self.dir_aliases:
+            if real.startswith(target + "/"):
+                out.add(alias + real[len(target):])
+        return out
+
+
+def as_index(files) -> "FileIndex | None":
+    if files is None or isinstance(files, FileIndex):
+        return files
+    return FileIndex.plain(files)
+
+
 def matching_files(pattern: str, files, root: str = "") -> frozenset[str]:
-    """The members of `files` (repo-relative) that `pattern` covers."""
+    """The real files `pattern` covers through any of their names."""
+    index = as_index(files)
     matches = lock_file_matcher(pattern, root)
-    return frozenset(f for f in files if matches(f))
+    return frozenset(real for name, real in index.names.items() if matches(name))
+
+
+def covers_real(pattern: str, real: str, index: FileIndex, root: str = "", matcher=None) -> bool:
+    matches = matcher or lock_file_matcher(pattern, root)
+    return any(matches(name) for name in index.names_of(real))
 
 
 def literal_target(pattern: str, root: str = "") -> str:
@@ -349,23 +400,29 @@ def patterns_overlap(a: str, b: str, files=None, root: str = "",
                      a_matches: frozenset[str] | None = None) -> bool:
     """Can lock patterns `a` and `b` name a common file?
 
-    With `files`, the repository's real file set: yes when a file matches both,
-    or when either is a literal path not in the set (a file not created yet)
-    that the other covers. Without it: a conservative literal-prefix test where
+    Both are relative to the same repository `root`. With `files` (a FileIndex,
+    or a plain set of paths): yes when some real file is covered by both through
+    any of its names (a symlink alias is the same file), or when either is a
+    literal path not listed yet (a file not created) whose real location the
+    other covers. Without it: a conservative literal-prefix test where
     uncertainty is overlap. Neither form is ever narrower than the legacy
     two-way fnmatch. `a_matches` is `matching_files(a, files, root)` when the
     caller already has it.
     """
     if a == b or fnmatch.fnmatch(a, b) or fnmatch.fnmatch(b, a):
         return True
-    if files is None:
+    index = as_index(files)
+    if index is None:
         return _algebraic_overlap(canonical_pattern(a, root), canonical_pattern(b, root))
     if a_matches is None:
-        a_matches = matching_files(a, files, root)
-    b_covers = lock_file_matcher(b, root)
-    if any(b_covers(f) for f in a_matches):
+        a_matches = matching_files(a, index, root)
+    b_matcher = lock_file_matcher(b, root)
+    if any(covers_real(b, real, index, root, b_matcher) for real in a_matches):
         return True
     for literal, other in ((literal_target(a, root), b), (literal_target(b, root), a)):
-        if literal and literal not in files and lock_file_matcher(other, root)(literal):
-            return True
+        if literal and literal not in index.names:
+            matcher = lock_file_matcher(other, root)
+            if matcher(literal) or covers_real(other, index.resolve(literal), index, root,
+                                               matcher):
+                return True
     return False

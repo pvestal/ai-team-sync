@@ -149,23 +149,48 @@ Session creation with `auto_lock`, `POST /api/locks` and MCP `extend_scope`
 (`routers/sessions.py`: `refuse_unbacked_patterns`, `_check_scope_conflicts`,
 `blocking_conflict`). Unlike the readers above, it consults the filesystem.
 
-**Overlap.** Two patterns overlap when they can name a common file
+**Placement.** Before two patterns are compared, each is placed in a repository
+by its OWN lock's `repo_root` (`repo_files.RepoContext.place`). A linked
+worktree resolves through `git rev-parse --git-common-dir` to its main checkout,
+so a worktree and its main checkout are one repository. A relative pattern
+belongs to its session's repository (an unanchored session's to every
+repository). An absolute pattern is relativized by the deepest checkout of that
+repository containing it, else by wherever it points (the checkout of its
+deepest existing directory). Patterns placed in different repositories never
+overlap; an absolute pattern no checkout contains is compared lexically and
+conservatively.
+
+**Overlap.** Two placed patterns overlap when they can name a common file
 (`scope_paths.patterns_overlap`). A file is covered by a pattern when either
 enforcement reader says so: the edit hook's `scope_matches` (prefix for `/**`,
-one level for `/*`, `fnmatch` otherwise) or `reader_covers` above. When the
-session's `repo_root` is a git checkout, overlap is decided on its real files,
-`git ls-files -co --exclude-standard` over the main checkout and every linked
-worktree: a file matching both patterns, or a glob-free path not yet created
-that the other pattern covers. Without a usable checkout the test is algebraic
-and conservative: compatible literal prefixes are overlap. Both are never
-narrower than the old two-way `fnmatch`, so `frontend/*/X.vue` and
-`frontend/src/**` overlap exactly when a file such as `frontend/src/X.vue`
+one level for `/*`, `fnmatch` otherwise) or `reader_covers` above. In a git
+repository overlap is decided on its real files: `git ls-files` (tracked plus
+untracked-not-ignored) over the main checkout and every linked worktree, where
+a path through an in-repo symlink is the file it reaches (`lnk/a.py` is
+`src/a.py` when `lnk -> src`; one level of directory links is expanded). Overlap
+means a real file covered by both through any of its names, or a glob-free path
+not yet created whose real location the other covers. Without a usable checkout
+the test is algebraic and conservative: compatible literal prefixes are overlap.
+Both are never narrower than the old two-way `fnmatch`, so `frontend/*/X.vue`
+and `frontend/src/**` overlap exactly when a file such as `frontend/src/X.vue`
 exists.
 
+**Every anchored session**: an absolute pattern outside its `repo_root` is
+refused 422 `pattern_outside_repo_root` (a lock the edit guard could never
+honour), and when the operator config is unreadable every acquisition by an
+anchored session is refused 503 `operator_config_unreadable` (fail closed;
+unanchored legacy sessions are unaffected). A session holding live locks cannot
+change its `repo_root` (409 `repo_root_change_with_live_locks`, nothing
+applied); completing it in the same request is allowed.
+
+**Serialized.** The conflict check, the insert and the commit are one step
+(`routers/locks.py` `acquisition_guard`): one in-process `asyncio.Lock`, and the
+acquiring transaction takes the database writer lock before it reads (SQLite
+`BEGIN IMMEDIATE`, PostgreSQL `pg_advisory_xact_lock`), so concurrent
+overlapping requests, from one server process or several, get one 201.
+
 **Governed repositories** are those in `~/.config/ai-team-sync/operator.toml`
-`[governance].repositories` (or `ATS_COORDINATED_REPOS`). A `repo_root` that is
-a linked worktree resolves through `git rev-parse --git-common-dir` to its main
-checkout, so a worktree and its main checkout are one repository. There:
+`[governance].repositories` (or `ATS_COORDINATED_REPOS`). There:
 
 | Request | Answer |
 |---------|--------|
@@ -182,15 +207,18 @@ These rules apply to every lock mode and to new acquisitions only. A lock that
 was already live when they shipped, or when a repository became governed, is not
 revoked or re-judged: agents holding broad or unbacked locks keep them until
 they complete, are reaped, or the lock expires. Lane restoration after a reap
-goes through the same overlap rule, so it does not re-grant a lane another
-session now holds in a governed repository. Outside governed repositories the
+goes through the same validation and overlap rule: a lane refused by the table
+above is not re-granted (its `not_restored_reasons` entry is the refusal's
+`error`), nor is one another session now holds in a governed repository.
+Restoration is not inside `acquisition_guard`. Outside governed repositories the
 old refusal rule stands: advisory locks share, and only an exclusive lock or an
 exclusive request refuses an overlap.
 
 **Ownership report.** `GET /api/locks/ownership?repo_root=R&paths=a,b&session_id=S`
 (MCP `lock_ownership`) lists, per path, every live session whose lock covers it
-with its mode, and `conflict: true` when one of them is not `S`. It is the final
-integration check before merging work that touched those paths.
+with its mode, and `conflict: true` when one of them is not `S`, after the same
+placement and symlink resolution (`real` is the file a path reaches). It is the
+final integration check before merging work that touched those paths.
 
 What this does not do: a lock is a claim, not a filesystem permission. Only the
 PreToolUse guard (Edit/Write/MultiEdit/NotebookEdit) consults it before a write;

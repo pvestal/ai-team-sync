@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import weakref
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import or_, select
+from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_team_sync import peer_identity
@@ -14,8 +16,8 @@ from ai_team_sync.database import get_db
 from ai_team_sync.models import ScopeLock, Session
 from ai_team_sync.notifications.dispatcher import dispatch
 from ai_team_sync.repo_files import RepoContext
-from ai_team_sync.scope_paths import (canonical_pattern, lock_file_matcher, reader_covers,
-                                      reader_lock, reader_query)
+from ai_team_sync.scope_paths import (canonical_pattern, covers_real, lock_file_matcher,
+                                      reader_covers, reader_lock, reader_query)
 from ai_team_sync.schemas import (
     LockCheckRequest,
     LockCheckResult,
@@ -25,6 +27,46 @@ from ai_team_sync.schemas import (
 )
 
 router = APIRouter(prefix="/locks", tags=["locks"])
+
+
+# ── acquisition is one step: check, insert, commit (#3581) ────────────────
+# One in-process lock, not one per repository: a request in one repository can
+# conflict with an unanchored legacy lock or an absolute pattern held from
+# another root, so a per-repository key would not be sound. Keyed by event loop
+# because an asyncio.Lock is bound to the loop it first waits on.
+_ACQUISITION_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = \
+    weakref.WeakKeyDictionary()
+_PG_ACQUISITION_KEY = 0x41545333  # 'ATS3'
+
+
+async def _take_database_writer_lock(db: AsyncSession) -> None:
+    """Across processes: the acquiring transaction holds the database's writer
+    lock BEFORE it reads the live locks, until its commit or rollback."""
+    conn = await db.connection()
+    if conn.dialect.name == "postgresql":
+        await conn.execute(text("SELECT pg_advisory_xact_lock(:key)"),
+                           {"key": _PG_ACQUISITION_KEY})
+    elif conn.dialect.name == "sqlite":
+        raw = await conn.get_raw_connection()
+        # Already in a write transaction means the writer lock is already held
+        # (or, on a shared in-memory test connection, cannot be taken twice).
+        if not raw.driver_connection.in_transaction:
+            await conn.exec_driver_sql("BEGIN IMMEDIATE")
+
+
+@asynccontextmanager
+async def acquisition_guard(db: AsyncSession):
+    """Serialize lock acquisition so concurrent overlapping requests get one 201
+    and the rest 409. Commit inside the block; a refusal rolls back first."""
+    loop = asyncio.get_running_loop()
+    lock = _ACQUISITION_LOCKS.setdefault(loop, asyncio.Lock())
+    async with lock:
+        await _take_database_writer_lock(db)
+        try:
+            yield
+        except BaseException:
+            await db.rollback()
+            raise
 
 
 def _lock_to_response(lock: ScopeLock, developer: str | None = None,
@@ -114,23 +156,27 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
     repo_ctx = RepoContext()
     await asyncio.to_thread(refuse_unbacked_patterns, [body.pattern],
                             session.repo_root or "", repo_ctx)
-    conflicts = await _check_scope_conflicts(
-        db, [body.pattern], session.developer, repo_root=session.repo_root or "",
-        exclude_session_id=session.id, requester_session_id=session.id,
-        repo_ctx=repo_ctx)
-    conflict = blocking_conflict(conflicts, body.mode)
-    if conflict is not None:
-        raise HTTPException(409, detail=scope_conflict_detail("lock", conflict, conflicts))
+    async with acquisition_guard(db):
+        await db.refresh(session)
+        if session.status not in ("active", "paused"):
+            raise HTTPException(400, "Session is not active")
+        conflicts = await _check_scope_conflicts(
+            db, [body.pattern], session.developer, repo_root=session.repo_root or "",
+            exclude_session_id=session.id, requester_session_id=session.id,
+            repo_ctx=repo_ctx)
+        conflict = blocking_conflict(conflicts, body.mode)
+        if conflict is not None:
+            raise HTTPException(409, detail=scope_conflict_detail("lock", conflict, conflicts))
 
-    # A lock made here coordinates; it never bears authority (#2741). A mutation
-    # grant is measured only against a bound session's creation-time claims, so
-    # a caller cannot manufacture the claim that would authorize it.
-    lock = ScopeLock(
-        session_id=body.session_id, pattern=body.pattern, mode=body.mode, reason=body.reason,
-        authority_bearing=False,
-    )
-    db.add(lock)
-    await db.commit()
+        # A lock made here coordinates; it never bears authority (#2741). A mutation
+        # grant is measured only against a bound session's creation-time claims, so
+        # a caller cannot manufacture the claim that would authorize it.
+        lock = ScopeLock(
+            session_id=body.session_id, pattern=body.pattern, mode=body.mode,
+            reason=body.reason, authority_bearing=False,
+        )
+        db.add(lock)
+        await db.commit()
     await db.refresh(lock)
     return _lock_to_response(lock, developer=session.developer, agent=session.agent,
                              repo_root=session.repo_root or "")
@@ -269,32 +315,38 @@ async def lock_ownership(repo_root: str = "", paths: str = "", session_id: str =
     ctx = RepoContext()
     active_locks = await _get_active_locks(db)
 
-    def _identities():
-        roots = {repo_root} | {root for _lock, _owner, root in active_locks}
-        return {root: ctx.identity(root) if root else "" for root in roots}
+    def _report():
+        placed_locks = [(lock, owner, lock_root, ctx.place(lock.pattern, lock_root))
+                        for lock, owner, lock_root in active_locks]
+        results = []
+        for path in wanted:
+            placed = ctx.place(path, repo_root)
+            ident, rel = placed if placed else ("", canonical_pattern(path, repo_root))
+            index = ctx.index(ident) if ident else None
+            real = (index.names.get(rel) or index.resolve(rel)) if index else rel
+            holders = []
+            for lock, owner, lock_root, lock_placed in placed_locks:
+                if placed is None or lock_placed is None:
+                    covered = reader_covers(reader_query(path, repo_root),
+                                            reader_lock(lock.pattern, lock_root))
+                else:
+                    lock_ident, lock_rel = lock_placed
+                    if ident and lock_ident and ident != lock_ident:
+                        continue  # another repository's lock
+                    matcher = lock_file_matcher(lock_rel, ident or lock_ident)
+                    covered = matcher(rel) or (index is not None and covers_real(
+                        lock_rel, real, index, ident, matcher))
+                if covered:
+                    holders.append({
+                        "session_id": lock.session_id, "agent": owner.agent,
+                        "developer": owner.developer, "pattern": lock.pattern,
+                        "mode": lock.mode, "lock_id": lock.id, "repo_root": lock_root or ""})
+            results.append({
+                "path": path, "relative": rel, "real": real, "holders": holders,
+                "conflict": any(h["session_id"] != session_id for h in holders)})
+        return results
 
-    identity = await asyncio.to_thread(_identities)
-    caller = identity[repo_root]
-    matchers = {}
-    results = []
-    for path in wanted:
-        rel = canonical_pattern(path, repo_root)
-        if rel.startswith("/") and caller:
-            rel = canonical_pattern(path, caller)
-        holders = []
-        for lock, owner, lock_root in active_locks:
-            if caller and identity[lock_root] and identity[lock_root] != caller:
-                continue  # another repository's lock
-            if lock.id not in matchers:
-                matchers[lock.id] = lock_file_matcher(lock.pattern, lock_root or repo_root)
-            if matchers[lock.id](rel):
-                holders.append({
-                    "session_id": lock.session_id, "agent": owner.agent,
-                    "developer": owner.developer, "pattern": lock.pattern,
-                    "mode": lock.mode, "lock_id": lock.id, "repo_root": lock_root or ""})
-        results.append({
-            "path": path, "relative": rel, "holders": holders,
-            "conflict": any(h["session_id"] != session_id for h in holders)})
+    results = await asyncio.to_thread(_report)
     return {"repo_root": repo_root, "session_id": session_id,
             "conflict": any(r["conflict"] for r in results), "paths": results}
 

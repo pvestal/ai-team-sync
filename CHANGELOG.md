@@ -16,7 +16,14 @@
   422 for a glob matching no file, a new file whose directory does not exist, a bare
   directory, or a pattern over `ATS_BROAD_CLAIM_LIMIT` (default 200) files. Existing
   live locks are not revoked. New read-only `GET /api/locks/ownership` and MCP
-  `lock_ownership` report who holds each path. Details: `docs/lock-readers.md`.
+  `lock_ownership` report who holds each path. After review: each pattern is placed
+  by its own lock's root (or where an absolute pattern points) before comparing; a
+  path through an in-repo symlink is the file it reaches; an absolute pattern
+  outside an anchored session's `repo_root` is refused 422; a session holding live
+  locks cannot be re-anchored (409); check-insert-commit is serialized in process
+  and by the database writer lock; an unreadable operator config refuses anchored
+  acquisitions (503); lane restoration applies the same validation. Details:
+  `docs/lock-readers.md`.
 - **Lock readers compare where a path actually is (#2761).** `POST /api/locks/check`
   and `POST /api/git/pre-commit-check` matched the raw path against the raw
   repo-relative pattern and skipped locks by a string compare of roots, so an

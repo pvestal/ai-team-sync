@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
@@ -29,10 +30,9 @@ from ai_team_sync.delegation import effective_authority
 from ai_team_sync.models import Delegation
 from ai_team_sync.config import settings
 from ai_team_sync import peer_identity
-from ai_team_sync.repo_files import RepoContext, broad_claim_limit
+from ai_team_sync.repo_files import RepoContext
 from ai_team_sync.scope_paths import (UnsafePath, canonical_claim, canonical_pattern,
-                                      canonical_root, literal_target, matching_files,
-                                      patterns_overlap)
+                                      canonical_root)
 
 logger = logging.getLogger(__name__)
 
@@ -366,101 +366,57 @@ async def _check_scope_conflicts(
     repository a worktree root is the same repository as its main checkout, and
     each conflict carries `governed_repo`, which makes any overlap blocking.
     """
-    from ai_team_sync.routers.locks import _cross_repo, _get_active_locks
+    from ai_team_sync.routers.locks import _get_active_locks
     from ai_team_sync.routers.override_requests import approved_override_for_lock
 
     ctx = repo_ctx or RepoContext()
     # Same notion of a live lock as the board and the grant check (#2741).
     active_locks = await _get_active_locks(db)
+    candidates = []
+    for lock, owner, lock_repo_root in active_locks:
+        if exclude_session_id and lock.session_id == exclude_session_id:
+            continue
+        if await approved_override_for_lock(db, requester_session_id, lock):
+            continue
+        candidates.append((lock, owner, lock_repo_root))
 
-    def _prepare():
+    def _decide():
+        # Each pattern is placed by its OWN root (a worktree is its main
+        # checkout; an absolute pattern is wherever it points) before comparing.
         governed = ctx.governed_root(repo_root)
-        same_repo = {}
-        for _lock, _owner, lock_root in active_locks:
-            if lock_root not in same_repo:
-                same_repo[lock_root] = (
-                    not _cross_repo(repo_root, lock_root) if not governed
-                    else not lock_root or ctx.governed_root(lock_root) == governed)
-        return governed, same_repo, ctx.files(repo_root)
+        return governed, [
+            (new_pattern, lock, owner)
+            for new_pattern in new_patterns
+            for lock, owner, lock_repo_root in candidates
+            if ctx.overlap(new_pattern, repo_root, lock.pattern, lock_repo_root)]
 
-    governed, same_repo, files = await asyncio.to_thread(_prepare)
-    root = repo_root  # file sets are repo-relative in a worktree and its main checkout alike
-
-    conflicts = []
-    for new_pattern in new_patterns:
-        new_matches = None
-        for lock, owner, lock_repo_root in active_locks:
-            if exclude_session_id and lock.session_id == exclude_session_id:
-                continue
-            if not same_repo[lock_repo_root]:
-                continue  # other repo's patterns can't collide with ours
-            if await approved_override_for_lock(db, requester_session_id, lock):
-                continue
-            if files is not None and new_matches is None:
-                new_matches = await asyncio.to_thread(matching_files, new_pattern, files, root)
-            if patterns_overlap(new_pattern, lock.pattern, files, root, a_matches=new_matches):
-                conflicts.append({
-                    "new_pattern": new_pattern,
-                    "existing_pattern": lock.pattern,
-                    "existing_developer": owner.developer,
-                    "existing_agent": owner.agent,
-                    "lock_mode": lock.mode,
-                    "session_id": lock.session_id,
-                    "governed_repo": governed,
-                })
-
-    return conflicts
+    governed, hits = await asyncio.to_thread(_decide)
+    return [{
+        "new_pattern": new_pattern,
+        "existing_pattern": lock.pattern,
+        "existing_developer": owner.developer,
+        "existing_agent": owner.agent,
+        "lock_mode": lock.mode,
+        "session_id": lock.session_id,
+        "governed_repo": governed,
+    } for new_pattern, lock, owner in hits]
 
 
 def refuse_unbacked_patterns(patterns: list[str], repo_root: str, ctx: RepoContext) -> None:
-    """In a governed repository, refuse (422) a new lock pattern that names no
-    real file, or that names more files than ATS_BROAD_CLAIM_LIMIT (#3581).
-
-    A glob must match an existing file. A literal path may name a file not yet
-    created only when its parent directory exists. Synchronous: it runs git, so
-    callers run it off the event loop. Existing locks are never re-judged.
+    """Refuse a NEW lock pattern that could never be honoured (#3581): 503 when
+    the operator config is unreadable, 422 for an absolute pattern outside
+    `repo_root`, and in a governed repository 422 for a pattern that names no
+    real file or more than ATS_BROAD_CLAIM_LIMIT files (RepoContext.unbacked_reason).
+    Synchronous: it runs git, so callers run it off the event loop. Existing
+    locks are never re-judged.
     """
-    governed = ctx.governed_root(repo_root)
-    if not governed:
-        return
-    files = ctx.files(repo_root)
-    if files is None:
-        return  # no file set to judge against; the overlap check stays conservative
-    root = repo_root
-    limit = broad_claim_limit()
     for pattern in patterns:
-        canon = canonical_pattern(pattern, root)
-        literal = literal_target(pattern, root)
-        matched = matching_files(pattern, files, root)
-        if literal and not matched:
-            if ctx.is_directory(root, literal):
-                _refuse_pattern("pattern_names_a_directory", pattern, governed, (
-                    f"'{pattern}' names a directory, which a lock does not cover; "
-                    f"lock '{literal}/**' or the exact files"))
-            parent = literal.rsplit("/", 1)[0] if "/" in literal else ""
-            if not ctx.is_directory(root, parent):
-                nearest = ctx.nearest_directory(root, literal)
-                _refuse_pattern("pattern_parent_missing", pattern, governed, (
-                    f"'{pattern}' is a new file whose directory '{parent}' does not exist "
-                    f"in {governed}; nearest existing directory: '{nearest or '.'}'"))
-            continue  # a new file in an existing directory
-        if not matched:
-            nearest = ctx.nearest_directory(root, canon) if not canon.startswith("/") else ""
-            hint = ctx.same_basename(root, canon) if not canon.startswith("/") else []
-            _refuse_pattern("pattern_matches_no_file", pattern, governed, (
-                f"'{pattern}' matches no file in {governed}, so it would protect nothing; "
-                f"nearest existing directory: '{nearest or '.'}'"
-                + (f"; files with that name: {', '.join(hint)}" if hint else "")))
-        if limit > 0 and len(matched) > limit:
-            _refuse_pattern("pattern_too_broad", pattern, governed, (
-                f"'{pattern}' matches {len(matched)} files in {governed}, over the "
-                f"broad-claim limit of {limit} (ATS_BROAD_CLAIM_LIMIT); a claim that wide "
-                f"blocks every other session there. Narrow it to the files you will edit"))
-
-
-def _refuse_pattern(error: str, pattern: str, repo_root: str, message: str) -> None:
-    raise HTTPException(422, detail={
-        "error": error, "message": message, "pattern": pattern, "repo_root": repo_root})
+        refusal = ctx.unbacked_reason(pattern, repo_root)
+        if refusal is not None:
+            status, error, message = refusal
+            raise HTTPException(status, detail={
+                "error": error, "message": message, "pattern": pattern,
+                "repo_root": ctx.governed_root(repo_root) or (repo_root or "").rstrip("/")})
 
 
 # Restoration outcome STATES. Every one of these used to render to a caller as
@@ -849,6 +805,7 @@ async def _grant_from_journal(
         validated.append((pattern, mode, reason, expires_at, created_at))
 
     outcome = RestorationOutcome(outcome=OUTCOME_RESTORED)
+    repo_ctx = RepoContext()
     for pattern, mode, reason, expires_at, created_at in validated:
         if expires_at <= now:
             outcome.not_restored.append(pattern)
@@ -864,10 +821,18 @@ async def _grant_from_journal(
         # would refuse for the same state. Canonicalisation stays where it
         # answers a different question — has the session moved away from the
         # repo its journal names — in the anchor gate above.
+        # The ordinary door's pattern validation too (#3581): a lane that could
+        # never be honoured, or is now too broad, is not re-granted.
+        refusal = await asyncio.to_thread(
+            repo_ctx.unbacked_reason, pattern, getattr(session, "repo_root", "") or "")
+        if refusal is not None:
+            outcome.not_restored.append(pattern)
+            outcome.not_restored_reasons.append(refusal[1])
+            continue
         conflicts = await _check_scope_conflicts(
             db, [pattern], session.developer,
             repo_root=getattr(session, "repo_root", "") or "",
-            exclude_session_id=session.id)
+            exclude_session_id=session.id, repo_ctx=repo_ctx)
         if blocking_conflict(conflicts, mode):
             outcome.not_restored.append(pattern)
             outcome.not_restored_reasons.append(NOT_RESTORED_NEWER_HOLDER)
@@ -1032,6 +997,27 @@ def blocking_conflict(conflicts: list[dict], requested_mode: str) -> dict | None
     if governed:
         return governed[0]
     return None
+
+
+def _refuse_reanchor_with_live_locks(session: Session, body: SessionUpdate) -> None:
+    """A lock pattern means a file only relative to its session's repo_root, so
+    moving the root of a session holding live locks would re-point every lock
+    with none of the acquisition checks (#3581). Refused (409); completing in the
+    same request releases the locks, so that is allowed."""
+    if body.repo_root is None or body.status == "completed":
+        return
+    if body.repo_root.rstrip("/") == (session.repo_root or "").rstrip("/"):
+        return
+    held = sorted(_live_lock_patterns(session))
+    if held:
+        raise HTTPException(409, detail={
+            "error": "repo_root_change_with_live_locks",
+            "message": (f"session {session.id} holds {len(held)} live lock(s) anchored to "
+                        f"{session.repo_root or '<unanchored>'}; release them (or complete the "
+                        f"session) before re-anchoring to {body.repo_root.rstrip('/')}. "
+                        f"No field of this request was applied."),
+            "session_id": session.id,
+            "locks": held})
 
 
 def scope_conflict_detail(what: str, conflict: dict, conflicts: list[dict]) -> dict:
@@ -1245,14 +1231,20 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
                             f"parent session may open its child"),
             })
 
-    # Check for scope conflicts BEFORE creating the session
-    if body.auto_lock and scope:
+    # Check for scope conflicts BEFORE creating the session. Validation runs git
+    # and reads no rows, so it precedes the acquisition guard; the conflict check
+    # through the commit is one serialized step (#3581).
+    locking = bool(body.auto_lock and scope)
+    conflicts: list[dict] = []
+    if locking:
         repo_ctx = RepoContext()
         await asyncio.to_thread(refuse_unbacked_patterns, scope, repo_root, repo_ctx)
-        conflicts = await _check_scope_conflicts(
-            db, scope, body.developer, repo_root=repo_root, repo_ctx=repo_ctx)
 
-        if conflicts:
+    from ai_team_sync.routers.locks import acquisition_guard
+    async with (acquisition_guard(db) if locking else contextlib.nullcontext()):
+        if locking:
+            conflicts = await _check_scope_conflicts(
+                db, scope, body.developer, repo_root=repo_root, repo_ctx=repo_ctx)
             new_lock_mode = getattr(body, 'lock_mode', settings.lock_default_mode)
             conflict = blocking_conflict(conflicts, new_lock_mode)
             if conflict is not None:
@@ -1261,59 +1253,59 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
                     detail=scope_conflict_detail("session", conflict, conflicts),
                 )
 
-            # Advisory conflicts: warn via notification but allow
-            for conflict in conflicts:
-                await dispatch("lock.conflict", {
-                    "new_pattern": conflict["new_pattern"],
-                    "existing_pattern": conflict["existing_pattern"],
-                    "new_developer": body.developer,
-                    "existing_developer": conflict["existing_developer"],
-                    "existing_agent": conflict["existing_agent"],
-                })
+        import hashlib
+        import secrets
+        approval_token = secrets.token_urlsafe(32)
+        session = Session(
+            developer=body.developer,
+            agent=body.agent,
+            scope=json.dumps(scope),
+            description=body.description,
+            branch=body.branch,
+            repo_root=repo_root,
+            creator_uid=peer_uid,
+            approval_token_hash=hashlib.sha256(approval_token.encode()).hexdigest(),
+            bound_worker=worker.name if bound else "",
+            bound_uid=bound_uid,
+            task_id=body.task_id,
+            ticket_id=body.ticket_id,
+            delegation_id=delegation.id if delegation is not None else None,
+        )
+        db.add(session)
+        await db.flush()  # Ensure session.id is populated
+        # Claim deferred messages atomically for the FIRST later session on this
+        # ticket. The ticket is coordination metadata; this grants no task authority.
+        await _claim_deferred_ticket_messages(
+            db, session, claim_before=session.started_at)
+        if delegation is not None:
+            delegation.child_session_id = session.id
 
-    import hashlib
-    import secrets
-    approval_token = secrets.token_urlsafe(32)
-    session = Session(
-        developer=body.developer,
-        agent=body.agent,
-        scope=json.dumps(scope),
-        description=body.description,
-        branch=body.branch,
-        repo_root=repo_root,
-        creator_uid=peer_uid,
-        approval_token_hash=hashlib.sha256(approval_token.encode()).hexdigest(),
-        bound_worker=worker.name if bound else "",
-        bound_uid=bound_uid,
-        task_id=body.task_id,
-        ticket_id=body.ticket_id,
-        delegation_id=delegation.id if delegation is not None else None,
-    )
-    db.add(session)
-    await db.flush()  # Ensure session.id is populated
-    # Claim deferred messages atomically for the FIRST later session on this
-    # ticket. The ticket is coordination metadata; this grants no task authority.
-    await _claim_deferred_ticket_messages(
-        db, session, claim_before=session.started_at)
-    if delegation is not None:
-        delegation.child_session_id = session.id
+        # Auto-create scope locks from scope patterns. Only a bound session's
+        # creation-time claims bear authority; see ScopeLock.authority_bearing.
+        if locking:
+            lock_mode = getattr(body, 'lock_mode', settings.lock_default_mode)
+            for pattern in scope:
+                lock = ScopeLock(session_id=session.id, pattern=pattern, mode=lock_mode,
+                                 authority_bearing=bound)
+                db.add(lock)
 
-    # Auto-create scope locks from scope patterns. Only a bound session's
-    # creation-time claims bear authority; see ScopeLock.authority_bearing.
-    if body.auto_lock and scope:
-        lock_mode = getattr(body, 'lock_mode', settings.lock_default_mode)
-        for pattern in scope:
-            lock = ScopeLock(session_id=session.id, pattern=pattern, mode=lock_mode,
-                             authority_bearing=bound)
-            db.add(lock)
+        await _queue_ticket_event(
+            db, session,
+            f"Session {session.id} ({session.agent}) started on ticket #{session.ticket_id}: "
+            f"{session.description}",
+        )
 
-    await _queue_ticket_event(
-        db, session,
-        f"Session {session.id} ({session.agent}) started on ticket #{session.ticket_id}: "
-        f"{session.description}",
-    )
+        await db.commit()
 
-    await db.commit()
+    # Advisory conflicts: warn via notification but allow
+    for conflict in conflicts:
+        await dispatch("lock.conflict", {
+            "new_pattern": conflict["new_pattern"],
+            "existing_pattern": conflict["existing_pattern"],
+            "new_developer": body.developer,
+            "existing_developer": conflict["existing_developer"],
+            "existing_agent": conflict["existing_agent"],
+        })
 
     # Reload with relationships
     result = await db.execute(
@@ -1511,6 +1503,7 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
     # mutation, so an invalid pattern leaves status, summary, scope, repo_root
     # and the lock rows exactly as they were.
     validated_scope = _validated_scope(list(body.scope)) if body.scope is not None else None
+    _refuse_reanchor_with_live_locks(session, body)
 
     if body.status is not None:
         if body.status == "completed":
