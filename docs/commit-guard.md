@@ -205,6 +205,40 @@ on stderr, except where noted:
   `git submodule update`, compilers, formatters and test runners. Absence of a
   warning is not proof that nothing was written.
 
+## Cross-project authority (operator ruling 2026-10-14)
+
+Prompt text does not decide which project a session may change. The ATS-first
+prompt hook (`hooks/ats_context.py`) is context routing: a governed project named
+in a prompt never blocks or re-anchors a session that already has an anchor; the
+worker gets an advisory line instead. On 2026-10-14 the previous keyword rule
+blocked the operator's Stage 1 GO because it said "Do not change anime-studio".
+
+Switching projects is a structured action: `start_session` with `repo_root` set
+to the target repository and its scope. That creates a session anchored there;
+locks always take their session's `repo_root`, so a lock held in one repository
+never covers a file in another (`claim_check`, `pre_tool_use_lockcheck.py`). The
+prompt hook still refuses one physical case: a session that holds work whose cwd
+is inside a different governed repository.
+
+What then stops a session anchored to repository A from acting in governed
+repository B, per operation. "Partial" and "documented only" are not enforcement.
+
+| Operation in B | Checked by | Against | ATS down | Status |
+|---|---|---|---|---|
+| Edit / Write / MultiEdit / NotebookEdit | layer 1 | own live lock anchored to B, and others' locks | **fails open** (exit 0) | enforced while ATS is up |
+| Bash write naming a path (redirect, sed -i, cp/mv, tee, rm, ...) | layer 2 | own lock (claim check) and others' locks | fails closed | enforced for the forms layer 2 resolves; best effort |
+| Bash write the parser cannot place (interpreters, programs, scripts) | none | -- | -- | documented only |
+| `git commit`, non-ff `git merge` | layers 3 and 4 | **others'** live locks only; the committer's own claim is not required | fails closed | partial |
+| `git commit` typed in Claude's Bash tool | layer 3 (git hook), not layer 2 | as above | as above | partial |
+| ff merge, cherry-pick, revert, rebase, `--no-verify` | none (layer 2 checks some of them in Claude's Bash tool) | -- | -- | documented only |
+| systemctl / service / kill / pkill of a governed unit | `pre_tool_use_restart_guard.py` | refused for every agent; `ats safe-restart` is the gated path | n/a (local) | enforced for the Bash tool only |
+| other MCP servers' tools, terminals, cron, timers, other agents without these hooks | none | -- | -- | documented only |
+
+Regression tests: `tests/test_cross_project_operations.py` (real ATS, real git
+hooks, hooks run as subprocesses); the tests named `*_residual` pin the partial
+and fail-open rows so a change to them is visible. The prompt side:
+`tests/test_prompt_project_mentions.py`, including the verbatim blocked GO prompt.
+
 ## Residual bypasses: what no layer here covers
 
 - `git commit --no-verify`, `git merge --no-verify`, or deleting or editing the
@@ -222,8 +256,12 @@ on stderr, except where noted:
   `core.hooksPath` was later pointed elsewhere
 - working-tree changes that are never committed. The commit hooks see only what
   is committed. Layers 1 and 2 see only what Claude's tools do
-- ATS outages outside governed repositories (fail open by design), and an
-  internal error in the Bash parser (fail open by design)
+- ATS outages: layers 2 to 4 fail open outside governed repositories, and the
+  edit guard (layer 1) fails open **everywhere**, governed repositories
+  included (exit 0 when ATS cannot be reached); an internal error in the Bash
+  parser also fails open (all by design)
+- the committer's own claim: layers 3 and 4 refuse other sessions' locks, but
+  do not require the committing session to hold a lock on what it commits
 - the override variable and the override log. Both are trusted, local, and
   editable by the user they protect against
 - session identity. It is cooperative, not authenticated (see "Identity"

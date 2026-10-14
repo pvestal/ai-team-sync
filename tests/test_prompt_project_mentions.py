@@ -1,11 +1,15 @@
-"""Incidental project mentions never move or block an anchored session.
+"""Prompt text never moves or blocks an anchored session.
 
 Incident 2026-10-14 19:01Z: the operator's Stage 1 GO prompt said "Do not
 change anime-studio". The ATS-first prompt hook read that as a request to switch
 a session anchored to the ATS repository over to /opt/anime-studio, and blocked
-the prompt, so the GO never reached the worker. A governed project named in a
-prompt only counts as a switch when the prompt instructs work there; negations,
-quotations, examples and reports are context, not direction.
+the prompt, so the GO never reached the worker.
+
+Operator ruling 2026-10-14: the prompt hook is advisory for cross-project
+mentions and context routing. Switching is the structured start_session action;
+authority is enforced by the operation guards (tests/test_cross_project_operations.py).
+The corpora below keep every phrasing collected while a keyword classifier was
+tried and reviewed, so none of them can regain the power to block.
 """
 
 from __future__ import annotations
@@ -65,7 +69,7 @@ PASTED_HANDBACK = (
     "</agent-message>"
 )
 
-# Prompts that NAME a governed project without instructing work there.
+# Prompts that name a governed project without instructing work there.
 INCIDENTAL = {
     "incident_go_prompt": INCIDENT_GO_PROMPT,
     "negative_do_not": "Fix the ATS hook. Do not touch Echo Brain.",
@@ -97,7 +101,7 @@ INCIDENTAL = {
     "pasted_handback": PASTED_HANDBACK,
 }
 
-# Prompts that genuinely instruct work in the named governed project.
+# Prompts that instruct work in the named project (the root is kept for reference).
 DIRECTIVES = {
     "correction_ask": ("Correction. Ask Echo Brain to find and render.", ECHO_ROOT),
     "switch_to": ("Switch to anime-studio and fix the hold check.", ANIME_ROOT),
@@ -134,106 +138,45 @@ DIRECTIVES = {
 }
 
 
-def _target(prompt, cwd="/home/patrick/Documents"):
-    from ai_team_sync.context_resolution import resolve_request_target
+# Codex CLASS 2 r2 (decision 30bea255) strings: under the 2026-10-14 ruling
+# these are ordinary mentions too -- prompt text never switches a session.
+LATER_REVIEW_FORMS = {
+    "investigate": "Investigate the anime-studio deadlock.",
+    "test": "Test anime-studio now.",
+    "review": "Review the anime-studio gateway implementation.",
+    "then_after_negation": "Do not touch ai-team-sync, then fix anime-studio.",
+    "now_after_negation": "Do not touch ai-team-sync, now restart anime-studio.",
+}
 
-    return resolve_request_target(prompt, cwd=cwd, governed_roots=ROOTS)
-
-
-# --------------------------------------------------------------------------- #
-# Resolver: classification of the text
-# --------------------------------------------------------------------------- #
-
-
-@pytest.mark.parametrize("name", sorted(INCIDENTAL))
-def test_incidental_mentions_are_not_directives(name):
-    target = _target(INCIDENTAL[name])
-
-    # None = generic (several names, no subject): unchanged long-standing rule.
-    assert target is None or target.directed == (), (name, target.directives)
-
-
-@pytest.mark.parametrize("name", sorted(DIRECTIVES))
-def test_work_directives_are_recognized(name):
-    prompt, root = DIRECTIVES[name]
-    target = _target(prompt)
-
-    assert target is not None
-    assert target.directed == (root,), (name, target.directives)
-
-
-def test_directive_evidence_names_the_triggering_clause():
-    target = _target("Thanks. Switch to anime-studio and fix the hold check.")
-
-    assert target.directives == (
-        (ANIME_ROOT, "Switch to anime-studio and fix the hold check"),
-    )
-
-
-def test_status_read_is_not_a_work_directive():
-    target = _target("Give me the current Echo Brain status.")
-
-    assert target.directed == ()
-    assert target.repo_root == ECHO_ROOT  # unchanged: a single name still supplies context
+# Every governed-project mention we have collected, whatever its grammar.
+MENTIONS = {
+    **INCIDENTAL,
+    **{f"directive_{k}": prompt for k, (prompt, _root) in DIRECTIVES.items()},
+    **{f"later_{k}": prompt for k, prompt in LATER_REVIEW_FORMS.items()},
+}
 
 
 def _old_rule(prompt, cwd, roots):
-    """Reference copy of the pre-fix resolver (a0fa3d6), for item 6."""
+    """Reference copy of the pre-change resolver (a0fa3d6): generic or governed."""
     from ai_team_sync.briefs import explicit_task_id
     from ai_team_sync.context_resolution import _aliases, _normal_words, _repo_from_cwd
 
     words = f" {_normal_words(prompt)} "
     matches = [r for r in roots if any(f" {a} " in words for a in _aliases(r))]
     prompt_repo = matches[0] if len(matches) == 1 else ""
-    cwd_repo = _repo_from_cwd(cwd, roots)
-    if explicit_task_id(prompt) is not None or prompt_repo or cwd_repo:
+    if explicit_task_id(prompt) is not None or prompt_repo or _repo_from_cwd(cwd, roots):
         return "governed"
     return None
 
 
-@pytest.mark.parametrize(
-    "prompt",
-    list(INCIDENTAL.values()) + [p for p, _r in DIRECTIVES.values()],
-)
-def test_previously_generic_prompts_stay_generic_unless_they_direct_work(prompt):
-    cwd = "/home/patrick/Documents"
-    target = _target(prompt, cwd=cwd)
-
-    if _old_rule(prompt, cwd, ROOTS) is None:
-        assert target is None or target.directed, (prompt, target)
-
-
-def test_incidental_mention_does_not_outrank_a_governed_cwd(tmp_path):
-    repo = tmp_path / "anime-studio"
-    (repo / ".git").mkdir(parents=True)
-    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+@pytest.mark.parametrize("name", sorted(MENTIONS))
+def test_generic_versus_governed_is_unchanged(name):
+    """No prompt gains or loses an ATS call (and so fail-closed exposure)."""
     from ai_team_sync.context_resolution import resolve_request_target
 
-    target = resolve_request_target(
-        "Run the suite here. Do not touch Echo Brain.",
-        cwd=str(repo),
-        governed_roots=[str(repo), ECHO_ROOT],
-    )
-
-    assert target.repo_root == str(repo)
-    assert target.reason == "governed_cwd"
-    assert target.mentioned == (ECHO_ROOT,)
-
-
-def test_work_directive_outranks_the_governed_cwd(tmp_path):
-    repo = tmp_path / "anime-studio"
-    (repo / ".git").mkdir(parents=True)
-    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
-    from ai_team_sync.context_resolution import resolve_request_target
-
-    target = resolve_request_target(
-        "Correction. Ask Echo Brain to find and render.",
-        cwd=str(repo),
-        governed_roots=[str(repo), ECHO_ROOT],
-    )
-
-    assert target.repo_root == ECHO_ROOT
-    assert target.reason == "project_name"
+    for cwd in ("/home/patrick/Documents", ANIME_ROOT):
+        new = resolve_request_target(MENTIONS[name], cwd=cwd, governed_roots=ROOTS)
+        assert (new is None) == (_old_rule(MENTIONS[name], cwd, ROOTS) is None), (name, cwd)
 
 
 # --------------------------------------------------------------------------- #
@@ -286,6 +229,16 @@ async def _claimed_session(client, tmp_path, monkeypatch, cid, repo_root):
     return sid
 
 
+async def _placeholder(client, tmp_path, monkeypatch, cid, first_prompt):
+    """An unclaimed placeholder anchored by its first governed prompt."""
+    from ai_team_sync.hooks import session_autostart
+
+    _env(monkeypatch, tmp_path, cid)
+    sid = await session_autostart.ensure_session("http://test", client)
+    await _prompt(client, cid, tmp_path, first_prompt)
+    return sid
+
+
 async def _prompt(client, cid, cwd, prompt):
     from ai_team_sync.hooks import ats_context
 
@@ -294,9 +247,13 @@ async def _prompt(client, cid, cwd, prompt):
     )
 
 
+async def _row(client, sid):
+    return (await client.get(f"/api/sessions/{sid}")).json()
+
+
 @pytest.mark.asyncio
 async def test_incident_go_prompt_reaches_the_anchored_owner(client, tmp_path, monkeypatch):
-    """Replay of 2026-10-14 19:01Z: the GO must be delivered, the anchor kept."""
+    """Replay of 2026-10-14 19:01Z: the GO is delivered and the anchor kept."""
     cid = "60606060-1111-2222-3333-444455556666"
     sid = await _claimed_session(client, tmp_path, monkeypatch, cid, ATS_ROOT)
 
@@ -304,150 +261,89 @@ async def test_incident_go_prompt_reaches_the_anchored_owner(client, tmp_path, m
 
     assert "ATS-FIRST CONTEXT RESOLUTION" in note
     assert f"resolved repo: {ATS_ROOT}" in note
-    assert "NOT A PROJECT SWITCH" in note and ANIME_ROOT in note
-    row = (await client.get(f"/api/sessions/{sid}")).json()
-    assert row["repo_root"] == ATS_ROOT
-    assert row["scope"] == ["src/**"]
+    assert "PROJECT MENTION (advisory, not a switch)" in note and ANIME_ROOT in note
+    assert "start_session with repo_root=/opt/anime-studio" in note
+    row = await _row(client, sid)
+    assert (row["repo_root"], row["scope"], row["ticket_id"]) == (ATS_ROOT, ["src/**"], None)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("name", sorted(INCIDENTAL))
-async def test_incidental_mention_neither_moves_nor_blocks_a_claimed_session(
+@pytest.mark.parametrize("name", sorted(MENTIONS))
+async def test_prompt_mention_never_moves_or_blocks_a_claimed_session(
     client, tmp_path, monkeypatch, name
 ):
     cid = f"{zlib.crc32(name.encode()):08x}-1111-2222-3333-444455556666"
     sid = await _claimed_session(client, tmp_path, monkeypatch, cid, ATS_ROOT)
 
-    note = await _prompt(client, cid, tmp_path, INCIDENTAL[name])
+    note = await _prompt(client, cid, tmp_path, MENTIONS[name])  # must not raise
 
     assert note is None or f"resolved repo: {ATS_ROOT}" in note
-    row = (await client.get(f"/api/sessions/{sid}")).json()
-    assert row["repo_root"] == ATS_ROOT
-    assert row["ticket_id"] is None
+    row = await _row(client, sid)
+    assert (row["repo_root"], row["ticket_id"]) == (ATS_ROOT, None)
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("name", sorted(DIRECTIVES))
-async def test_work_directive_to_another_project_blocks_a_claimed_session(
+@pytest.mark.parametrize("name", sorted(MENTIONS))
+async def test_prompt_mention_never_moves_an_anchored_placeholder(
     client, tmp_path, monkeypatch, name
 ):
-    from ai_team_sync.hooks import ats_context
+    cid = f"{zlib.crc32(name.encode()):08x}-7777-2222-3333-444455556666"
+    sid = await _placeholder(client, tmp_path, monkeypatch, cid, "Echo Brain status, please.")
+    assert (await _row(client, sid))["repo_root"] == ECHO_ROOT
 
-    cid = f"{zlib.crc32(name.encode()):08x}-9999-2222-3333-444455556666"
-    sid = await _claimed_session(client, tmp_path, monkeypatch, cid, ATS_ROOT)
-    prompt, root = DIRECTIVES[name]
+    note = await _prompt(client, cid, tmp_path, MENTIONS[name])
 
-    with pytest.raises(ats_context.ContextResolutionError, match="start a new session") as exc:
-        await _prompt(client, cid, tmp_path, prompt)
-
-    assert root in str(exc.value)
-    row = (await client.get(f"/api/sessions/{sid}")).json()
-    assert row["repo_root"] == ATS_ROOT
+    assert note is None or f"resolved repo: {ECHO_ROOT}" in note
+    assert (await _row(client, sid))["repo_root"] == ECHO_ROOT
 
 
 @pytest.mark.asyncio
-async def test_block_message_quotes_the_directive(client, tmp_path, monkeypatch):
-    from ai_team_sync.hooks import ats_context
-
-    cid = "70707070-1111-2222-3333-444455556666"
-    await _claimed_session(client, tmp_path, monkeypatch, cid, ATS_ROOT)
-
-    with pytest.raises(ats_context.ContextResolutionError) as exc:
-        await _prompt(client, cid, tmp_path, "Switch to anime-studio and fix the hold check.")
-
-    assert '"Switch to anime-studio and fix the hold check"' in str(exc.value)
-
-
-@pytest.mark.asyncio
-async def test_directive_to_a_second_project_blocks_even_when_it_names_the_anchor(
+async def test_cwd_inside_another_governed_repo_still_blocks_a_claimed_session(
     client, tmp_path, monkeypatch
 ):
-    from ai_team_sync.hooks import ats_context
-
-    cid = "71717171-1111-2222-3333-444455556666"
-    sid = await _claimed_session(client, tmp_path, monkeypatch, cid, ANIME_ROOT)
-
-    with pytest.raises(ats_context.ContextResolutionError, match=ECHO_ROOT):
-        await _prompt(client, cid, tmp_path, "Fix anime-studio and Echo Brain together.")
-
-    row = (await client.get(f"/api/sessions/{sid}")).json()
-    assert row["repo_root"] == ANIME_ROOT
-
-
-@pytest.mark.asyncio
-async def test_status_read_of_another_project_does_not_block_a_claimed_session(
-    client, tmp_path, monkeypatch
-):
-    cid = "72727272-1111-2222-3333-444455556666"
-    sid = await _claimed_session(client, tmp_path, monkeypatch, cid, ANIME_ROOT)
-
-    note = await _prompt(client, cid, tmp_path, "Give me the current Echo Brain status.")
-
-    assert f"resolved repo: {ANIME_ROOT}" in note
-    assert "NOT A PROJECT SWITCH" in note
-    row = (await client.get(f"/api/sessions/{sid}")).json()
-    assert row["repo_root"] == ANIME_ROOT
-
-
-@pytest.mark.asyncio
-async def test_working_from_another_governed_repo_still_blocks(client, tmp_path, monkeypatch):
-    """A physical switch (cwd inside a different governed repo) is still refused."""
+    """The physical switch (not keyword inference) keeps its existing refusal."""
     from ai_team_sync.hooks import ats_context
 
     repo = tmp_path / "anime-studio"
     (repo / ".git").mkdir(parents=True)
     (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
     cid = "73737373-1111-2222-3333-444455556666"
-    _env(monkeypatch, tmp_path, cid)
+    sid = await _claimed_session(client, tmp_path, monkeypatch, cid, ECHO_ROOT)
     monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{repo}:{ECHO_ROOT}")
-    from ai_team_sync.hooks import session_autostart
-
-    sid = await session_autostart.ensure_session("http://test", client)
-    response = await client.patch(
-        f"/api/sessions/{sid}", json={"repo_root": ECHO_ROOT, "scope": ["src/**"]}
-    )
-    assert response.status_code == 200
 
     with pytest.raises(ats_context.ContextResolutionError, match="start a new session"):
         await _prompt(client, cid, repo / "packages", "Run the tests here.")
 
-    row = (await client.get(f"/api/sessions/{sid}")).json()
-    assert row["repo_root"] == ECHO_ROOT
+    assert (await _row(client, sid))["repo_root"] == ECHO_ROOT
 
 
 @pytest.mark.asyncio
-async def test_incidental_mention_does_not_redirect_a_placeholder(client, tmp_path, monkeypatch):
-    """An unclaimed placeholder keeps its anchor when the next prompt only negates another."""
-    cid = "74747474-1111-2222-3333-444455556666"
-    _env(monkeypatch, tmp_path, cid)
-    from ai_team_sync.hooks import session_autostart
+async def test_structured_start_session_is_the_switch(client, tmp_path, monkeypatch):
+    """Switching projects = a new ATS session anchored there (what MCP start_session does)."""
+    from ai_team_sync import session_pointer as sp
 
-    sid = await session_autostart.ensure_session("http://test", client)
-    first = await _prompt(client, cid, tmp_path, "Give me the current Anime Studio status.")
-    assert f"resolved repo: {ANIME_ROOT}" in first
+    cid = "76767676-1111-2222-3333-444455556666"
+    old = await _claimed_session(client, tmp_path, monkeypatch, cid, ATS_ROOT)
+    repo = tmp_path / "anime-studio"  # a disposable governed repo, never the live tree
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    (repo / "holds.py").write_text("x = 1\n")
+    target = str(repo.resolve())
+    monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{target}:{ECHO_ROOT}")
 
-    second = await _prompt(client, cid, tmp_path, "Keep going. Do not touch Echo Brain.")
-
-    assert f"resolved repo: {ANIME_ROOT}" in second
-    row = (await client.get(f"/api/sessions/{sid}")).json()
-    assert row["repo_root"] == ANIME_ROOT
-
-
-@pytest.mark.asyncio
-async def test_status_report_does_not_redirect_a_placeholder(client, tmp_path, monkeypatch):
-    """Codex r1 (3b6f0c78): a report naming another project moved a placeholder."""
-    cid = "75757575-1111-2222-3333-444455556666"
-    _env(monkeypatch, tmp_path, cid)
-    from ai_team_sync.hooks import session_autostart
-
-    sid = await session_autostart.ensure_session("http://test", client)
-    await _prompt(client, cid, tmp_path, "Ask Echo Brain to find and render.")
-    assert (await client.get(f"/api/sessions/{sid}")).json()["repo_root"] == ECHO_ROOT
-
-    note = await _prompt(
-        client, cid, tmp_path, "Review of anime-studio complete; Echo Brain unchanged."
+    made = await client.post(
+        "/api/sessions",
+        json={"developer": "patrick", "agent": f"claude-code:{cid[:8]}", "scope": ["holds.py"],
+              "description": "explicit switch", "repo_root": target, "auto_lock": True},
     )
+    assert made.status_code == 201, made.text
+    new = made.json()["id"]
+    sp.save_pointer(new)
+    sp.save_approval_token(new, made.headers.get("X-ATS-Approval-Token", ""))
 
-    assert note is None or f"resolved repo: {ECHO_ROOT}" in note
-    row = (await client.get(f"/api/sessions/{sid}")).json()
-    assert row["repo_root"] == ECHO_ROOT
+    note = await _prompt(client, cid, tmp_path, "Continue the anime-studio hold check.")
+
+    assert f"session: {new}" in note and f"resolved repo: {target}" in note
+    assert "PROJECT MENTION" not in note
+    assert (await _row(client, new))["repo_root"] == target
+    assert (await _row(client, old))["repo_root"] == ATS_ROOT  # the old row is untouched

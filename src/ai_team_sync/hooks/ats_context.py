@@ -83,12 +83,10 @@ def _context_description(repo_root: str) -> str:
 def _is_context_only_placeholder(session: dict[str, Any]) -> bool:
     """True when changing the anchor cannot move any claimed work.
 
-    A prompt may mention one governed project and then correct itself to name
-    another before the worker has claimed scope or recorded work.  The
-    UserPromptSubmit hook must be able to follow that correction: telling the
-    worker to start a new session while blocking the prompt prevents the worker
-    from doing so.  Once the row carries any authority or durable work, its
-    repository remains fixed and the existing fail-closed path applies.
+    A worker whose cwd moves into another governed repository before it has
+    claimed scope or recorded work may follow it there.  Once the row carries
+    any authority or durable work, its repository remains fixed and the
+    existing fail-closed path applies.
     """
     count_fields = ("lock_count", "decision_count", "commit_count")
     return (
@@ -102,41 +100,30 @@ def _is_context_only_placeholder(session: dict[str, Any]) -> bool:
     )
 
 
-def _hold_anchor(
-    session: dict[str, Any], anchored: str, target: RequestTarget
-) -> tuple[RequestTarget, str]:
-    """Keep an anchored session where it is unless the prompt really moves it.
+def _hold_anchor(anchored: str, target: RequestTarget) -> tuple[RequestTarget, str]:
+    """Prompt text never moves or blocks an anchored session (ruling 2026-10-14).
 
-    Only a work directive (see context_resolution.classify_mentions) may ask an
-    anchored session to change repository; a session that holds work refuses
-    it outright. A cwd inside another governed repository is a physical switch
-    and keeps going to _anchor_session, which refuses it for a claimed session.
-    Anything else (negated, quoted, example, report or read-only mentions) is
-    context: the anchor stays and the worker is told so.
+    A project named in the prompt is context routing: the anchor stays and the
+    worker is told how to switch explicitly. Only the worker's physical
+    location -- a cwd inside a different governed repository -- still goes to
+    _anchor_session, which refuses it for a session that holds work. Project
+    authority itself is enforced where operations happen (edit, Bash, git and
+    restart guards), not here.
     """
-    placeholder = _is_context_only_placeholder(session)
-    foreign = [(root, clause) for root, clause in target.directives if root != anchored]
-    if foreign and not placeholder:
-        named = "; ".join(f'{root} ("{clause}")' for root, clause in foreign)
-        raise ContextResolutionError(
-            f"ATS session {session['id']} is already anchored to {anchored} and the "
-            f"prompt directs work in {named}; start a new session before switching "
-            f"governed project to {foreign[0][0]}. If that text is a quotation, "
-            "example or report, put it in quotes or a code block"
-        )
-    requested = target.repo_root
-    if not requested:
-        return replace(target, repo_root=anchored), ""
-    if requested == anchored or requested == target.cwd_repo:
-        return target, ""
-    if requested in target.directed:
-        return target, ""  # a placeholder follows a correction; claimed sessions raised above
-    named = ", ".join(root for root in target.mentioned if root != anchored) or requested
-    return replace(target, repo_root=anchored), (
-        f"NOT A PROJECT SWITCH: the prompt names {named} without directing work there "
-        f"(negated, quoted, example, report or read request). This session stays "
-        f"anchored to {anchored}. Work in {named} needs its own ATS session; the edit "
-        "guards refuse its files without a lock anchored there."
+    if target.cwd_repo and target.cwd_repo != anchored:
+        return replace(target, repo_root=target.cwd_repo), ""
+    held = replace(target, repo_root=anchored)
+    others = [root for root in target.mentioned if root != anchored]
+    if not others:
+        return held, ""
+    named = ", ".join(others)
+    return held, (
+        f"PROJECT MENTION (advisory, not a switch): the prompt names {named}. This "
+        f"session stays anchored to {anchored}; prompt text never switches projects. "
+        f"To work in {named}, start an ATS session there explicitly "
+        f"(start_session with repo_root={others[0]} and its scope). Edits and Bash "
+        "writes there need a lock held by that session; commits and merges there are "
+        "checked against other sessions' live locks."
     )
 
 
@@ -286,7 +273,7 @@ async def resolve_prompt_context(
     if anchored and _is_subagent_handback(prompt):
         target = RequestTarget(None, anchored, "subagent_handback")
     elif anchored:
-        target, advisory = _hold_anchor(session, anchored, target)
+        target, advisory = _hold_anchor(anchored, target)
 
     if target.repo_root:
         session = await _anchor_session(client, server_url, session, target.repo_root, token)

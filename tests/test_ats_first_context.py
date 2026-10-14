@@ -140,9 +140,11 @@ async def test_project_prompt_anchors_placeholder_and_gets_ats_brief(client, tmp
 
 
 @pytest.mark.asyncio
-async def test_project_correction_reanchors_context_only_placeholder(
+async def test_project_correction_in_prompt_text_does_not_reanchor_a_placeholder(
     client, tmp_path, monkeypatch
 ):
+    # Operator ruling 2026-10-14: switching is the structured start_session
+    # action, never keyword inference; the prompt only gets an advisory.
     from ai_team_sync.hooks import ats_context, session_autostart
 
     cid = "facefeed-1111-2222-3333-444455556666"
@@ -174,15 +176,17 @@ async def test_project_correction_reanchors_context_only_placeholder(
         },
     )
 
-    assert f"resolved repo: {ECHO_ROOT}" in corrected
+    assert f"resolved repo: {ANIME_ROOT}" in corrected
+    assert "PROJECT MENTION (advisory, not a switch)" in corrected
+    assert f"start_session with repo_root={ECHO_ROOT}" in corrected
     row = (await client.get(f"/api/sessions/{sid}")).json()
-    assert row["repo_root"] == ECHO_ROOT
+    assert row["repo_root"] == ANIME_ROOT
     assert row["scope"] == []
     assert row["lock_count"] == 0
 
 
 @pytest.mark.asyncio
-async def test_project_correction_refuses_to_move_claimed_session(
+async def test_project_correction_neither_moves_nor_blocks_claimed_session(
     client, tmp_path, monkeypatch
 ):
     from ai_team_sync.hooks import ats_context, session_autostart
@@ -210,17 +214,18 @@ async def test_project_correction_refuses_to_move_claimed_session(
     )
     assert response.status_code == 200
 
-    with pytest.raises(ats_context.ContextResolutionError, match="start a new session"):
-        await ats_context.resolve_prompt_context(
-            "http://test",
-            client,
-            {
-                "session_id": cid,
-                "cwd": str(tmp_path),
-                "prompt": "Correction. Ask Echo Brain to find and render.",
-            },
-        )
+    note = await ats_context.resolve_prompt_context(
+        "http://test",
+        client,
+        {
+            "session_id": cid,
+            "cwd": str(tmp_path),
+            "prompt": "Correction. Ask Echo Brain to find and render.",
+        },
+    )
 
+    assert f"resolved repo: {ANIME_ROOT}" in note
+    assert "PROJECT MENTION (advisory, not a switch)" in note
     row = (await client.get(f"/api/sessions/{sid}")).json()
     assert row["repo_root"] == ANIME_ROOT
 
@@ -297,33 +302,34 @@ async def test_pasted_handback_report_neither_moves_nor_blocks_a_claimed_session
     )
 
     assert f"resolved repo: {ANIME_ROOT}" in note
-    assert "NOT A PROJECT SWITCH" in note
+    assert "PROJECT MENTION (advisory, not a switch)" in note
     row = (await client.get(f"/api/sessions/{sid}")).json()
     assert row["repo_root"] == ANIME_ROOT
     assert row["ticket_id"] is None
 
 
 @pytest.mark.asyncio
-async def test_pasted_handback_with_an_operator_directive_still_blocks(
+async def test_pasted_handback_with_an_instruction_still_does_not_switch(
     client, tmp_path, monkeypatch
 ):
-    # Only a harness-framed hand-back is exempt; pasted text is still read.
+    # Ruling 2026-10-14: even an instruction to work elsewhere is routed, not a
+    # switch; the operation guards decide what this session may change there.
     from ai_team_sync.hooks import ats_context
 
     cid = "5eed5eee-1111-2222-3333-444455556666"
     sid = await _claimed_anime_session(client, tmp_path, monkeypatch, cid)
 
-    with pytest.raises(ats_context.ContextResolutionError, match="start a new session"):
-        await ats_context.resolve_prompt_context(
-            "http://test",
-            client,
-            {
-                "session_id": cid,
-                "cwd": str(tmp_path),
-                "prompt": "see this report:\n" + HANDBACK + "\nNow fix it in Echo Brain.",
-            },
-        )
+    note = await ats_context.resolve_prompt_context(
+        "http://test",
+        client,
+        {
+            "session_id": cid,
+            "cwd": str(tmp_path),
+            "prompt": "see this report:\n" + HANDBACK + "\nNow fix it in Echo Brain.",
+        },
+    )
 
+    assert f"resolved repo: {ANIME_ROOT}" in note
     row = (await client.get(f"/api/sessions/{sid}")).json()
     assert row["repo_root"] == ANIME_ROOT
 

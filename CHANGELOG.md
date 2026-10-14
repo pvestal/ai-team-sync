@@ -21,17 +21,17 @@
   (incident 2026-10-14).** The ATS-first prompt hook treated any governed project
   name as a project switch, so "Do not change anime-studio" in a GO prompt
   blocked a session anchored to the ATS repository and the GO never reached it.
-  `context_resolution.classify_mentions` now separates work directives (a
-  leading work verb aimed at the project inside one clause of the operator's own
-  text) from every other mention; negations (including one carried across a
-  colon or comma list in the same sentence), subordinate clauses, quotes, fenced
-  code, blockquotes, examples, harness frames and look-alike paths are not
-  directives. Only a directive can re-anchor a placeholder or block a session
-  that holds work, and the block now quotes the clause. A bare mention no longer
-  outranks a governed cwd, and a prompt that was generic stays generic unless
-  it directs work. A cwd inside another
-  governed repository still blocks a claimed session, and the edit guards are
-  unchanged.
+  Per operator ruling 2026-10-14, a project named in prompt text is context
+  routing only: it never blocks or re-anchors an anchored session (claimed or
+  placeholder), and the worker gets an advisory naming the structured switch,
+  `start_session` with `repo_root`. Only a cwd inside a different governed
+  repository still refuses a session that holds work. Which prompts reach ATS
+  at all is unchanged. Cross-project authority stays with the operation guards,
+  which are unchanged; `docs/commit-guard.md` now tabulates, per operation, what
+  checks it and what is partial or documented only (the edit guard fails open
+  when ATS is down; commits are checked against other sessions' locks, not the
+  committer's own claim), and `tests/test_cross_project_operations.py` exercises
+  each one against a real ATS and real git hooks.
 - **Reading a task brief no longer claims the ticket (D3, operator ruling
   2026-10-14).** `POST /api/brief` (and the MCP `task_brief` tool and the
   ATS-first prompt hook, which call it) used to bind the caller's session to the
