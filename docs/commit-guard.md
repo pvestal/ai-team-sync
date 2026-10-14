@@ -258,16 +258,29 @@ Installing into a real repository is a deployment step and needs operator
 approval. The tests use temporary repositories only.
 
 The Bash guard is wired in `~/.claude/settings.json`. Shown here only; nothing
-installs it:
+installs it. `settings.json` has ONE `PreToolUse` array: put this Bash guard and
+the restart guard (`docs/restart-gate.md`) in the same `Bash` matcher, next to the
+existing edit-guard matcher. Two separate `PreToolUse` keys are a duplicate JSON
+key, and one guard silently disappears.
 
 ```json
 {
   "hooks": {
     "PreToolUse": [
-      { "matcher": "Bash",
+      { "matcher": "Edit|Write|MultiEdit|NotebookEdit",
         "hooks": [{ "type": "command",
-          "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.pre_tool_use_bashguard" }] }
+          "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.pre_tool_use_lockcheck" }] },
+      { "matcher": "Bash",
+        "hooks": [
+          { "type": "command",
+            "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.pre_tool_use_bashguard" },
+          { "type": "command",
+            "command": "<ats-venv>/bin/python -m ai_team_sync.hooks.pre_tool_use_restart_guard" }
+        ] }
     ]
   }
 }
 ```
+
+Merge this into the existing `PreToolUse` array; keep every other matcher already
+there (for example the edit guard and any curate hooks).

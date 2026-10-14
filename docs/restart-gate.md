@@ -205,13 +205,10 @@ Check the `unix_socket` path against `OPERATOR_UI_SOCKET` in anime-studio
 
 ## Hook wiring (docs only: ATS does not edit `~/.claude/settings.json`)
 
-```json
-"PreToolUse": [
-  { "matcher": "Bash",
-    "hooks": [{ "type": "command",
-      "command": "/home/patrick/.local/share/pipx/venvs/ai-team-sync/bin/python -m ai_team_sync.hooks.pre_tool_use_restart_guard" }] }
-]
-```
+The restart guard shares the `Bash` matcher with the #3581 Bash write guard. Use
+the single combined `PreToolUse` array in `docs/commit-guard.md` ("The Bash guard
+is wired in ..."). Do not add a second `PreToolUse` key: a duplicate JSON key
+drops one of the two guards.
 
 ## Tests
 

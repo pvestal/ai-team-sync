@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Added
+- **Restart safety gate (#3580).** `ats safe-restart <unit>` takes a lease (one
+  active lease per unit, enforced by the database), asks the service to drain,
+  waits until its in-flight, active-job and GPU-queue probes are clear, renews the
+  lease and drain while `systemctl` and verification run, re-checks both just
+  before issuing the restart, and records every attempt and outcome. An eager
+  sweeper settles expired leases. Unavailable, slow or malformed probes, and
+  governed units without configured evidence, refuse. `--bootstrap` covers the
+  first load of a service's drain middleware. New `[restart_gate]` table in
+  `operator.toml` (upgrade every ATS install before adding it: older builds
+  reject unknown tables). `pre_tool_use_restart_guard.py` blocks raw service
+  control of governed units from an agent's Bash tool as defense in depth. It is
+  not an OS boundary: see `docs/restart-gate.md`.
+
 ### Fixed
 - **Governed repositories refuse conflicting live ownership (#3581).** Overlap was
   `fnmatch(a, b) or fnmatch(b, a)`, which called `frontend/*/X.vue` and
