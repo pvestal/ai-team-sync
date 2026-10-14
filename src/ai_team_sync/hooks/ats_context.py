@@ -19,6 +19,7 @@ import os
 import shlex
 import subprocess
 import sys
+from dataclasses import replace
 from typing import Any
 
 from ai_team_sync import session_pointer as sp
@@ -98,6 +99,45 @@ def _is_context_only_placeholder(session: dict[str, Any]) -> bool:
         and all(field in session for field in count_fields)
         and all(int(session[field]) == 0 for field in count_fields)
         and session.get("ticket_id") is None
+    )
+
+
+def _hold_anchor(
+    session: dict[str, Any], anchored: str, target: RequestTarget
+) -> tuple[RequestTarget, str]:
+    """Keep an anchored session where it is unless the prompt really moves it.
+
+    Only a work directive (see context_resolution.classify_mentions) may ask an
+    anchored session to change repository; a session that holds work refuses
+    it outright. A cwd inside another governed repository is a physical switch
+    and keeps going to _anchor_session, which refuses it for a claimed session.
+    Anything else (negated, quoted, example, report or read-only mentions) is
+    context: the anchor stays and the worker is told so.
+    """
+    placeholder = _is_context_only_placeholder(session)
+    foreign = [(root, clause) for root, clause in target.directives if root != anchored]
+    if foreign and not placeholder:
+        named = "; ".join(f'{root} ("{clause}")' for root, clause in foreign)
+        raise ContextResolutionError(
+            f"ATS session {session['id']} is already anchored to {anchored} and the "
+            f"prompt directs work in {named}; start a new session before switching "
+            f"governed project to {foreign[0][0]}. If that text is a quotation, "
+            "example or report, put it in quotes or a code block"
+        )
+    requested = target.repo_root
+    if not requested:
+        return replace(target, repo_root=anchored), ""
+    if requested == anchored or requested == target.cwd_repo:
+        return target, ""
+    movers = target.topical if placeholder else target.directed
+    if requested in movers:
+        return target, ""
+    named = ", ".join(root for root in target.mentioned if root != anchored) or requested
+    return replace(target, repo_root=anchored), (
+        f"NOT A PROJECT SWITCH: the prompt names {named} without directing work there "
+        f"(negated, quoted, example, report or read request). This session stays "
+        f"anchored to {anchored}. Work in {named} needs its own ATS session; the edit "
+        "guards refuse its files without a lock anchored there."
     )
 
 
@@ -243,8 +283,11 @@ async def resolve_prompt_context(
     session = await _get_session(client, server_url, session_id)
 
     anchored = str(session.get("repo_root") or "").rstrip("/")
+    advisory = ""
     if anchored and _is_subagent_handback(prompt):
         target = RequestTarget(None, anchored, "subagent_handback")
+    elif anchored:
+        target, advisory = _hold_anchor(session, anchored, target)
 
     if target.repo_root:
         session = await _anchor_session(client, server_url, session, target.repo_root, token)
@@ -257,7 +300,8 @@ async def resolve_prompt_context(
         f"session: {session_id}\n"
         f"trigger: {target.reason}\n"
         f"resolved repo: {target.repo_root or '(task context only)'}\n"
-        "Source precedence: ATS owns coordination/scope/authority/task context; "
+        + (f"{advisory}\n" if advisory else "")
+        + "Source precedence: ATS owns coordination/scope/authority/task context; "
         "Echo is supplemental; Git/DB/live services verify mutable facts.\n\n" + rendered
     )
 

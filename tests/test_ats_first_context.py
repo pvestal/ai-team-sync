@@ -276,10 +276,41 @@ async def test_subagent_handback_resolves_to_the_sessions_own_repo(
 
 
 @pytest.mark.asyncio
-async def test_pasted_handback_still_resolves_by_its_text(client, tmp_path, monkeypatch):
+async def test_pasted_handback_report_neither_moves_nor_blocks_a_claimed_session(
+    client, tmp_path, monkeypatch
+):
+    # A pasted cross-project report names Echo Brain without directing work
+    # there (incident 2026-10-14: incidental mentions blocked the operator).
     from ai_team_sync.hooks import ats_context
 
     cid = "5eed5eed-1111-2222-3333-444455556666"
+    sid = await _claimed_anime_session(client, tmp_path, monkeypatch, cid)
+
+    note = await ats_context.resolve_prompt_context(
+        "http://test",
+        client,
+        {
+            "session_id": cid,
+            "cwd": str(tmp_path),
+            "prompt": "why is the terminal showing:\n" + HANDBACK,
+        },
+    )
+
+    assert f"resolved repo: {ANIME_ROOT}" in note
+    assert "NOT A PROJECT SWITCH" in note
+    row = (await client.get(f"/api/sessions/{sid}")).json()
+    assert row["repo_root"] == ANIME_ROOT
+    assert row["ticket_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_pasted_handback_with_an_operator_directive_still_blocks(
+    client, tmp_path, monkeypatch
+):
+    # Only a harness-framed hand-back is exempt; pasted text is still read.
+    from ai_team_sync.hooks import ats_context
+
+    cid = "5eed5eee-1111-2222-3333-444455556666"
     sid = await _claimed_anime_session(client, tmp_path, monkeypatch, cid)
 
     with pytest.raises(ats_context.ContextResolutionError, match="start a new session"):
@@ -289,7 +320,7 @@ async def test_pasted_handback_still_resolves_by_its_text(client, tmp_path, monk
             {
                 "session_id": cid,
                 "cwd": str(tmp_path),
-                "prompt": "why is the terminal showing:\n" + HANDBACK,
+                "prompt": "see this report:\n" + HANDBACK + "\nNow fix it in Echo Brain.",
             },
         )
 

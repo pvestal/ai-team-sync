@@ -17,6 +17,19 @@
   not an OS boundary: see `docs/restart-gate.md`.
 
 ### Fixed
+- **Naming a project in a prompt no longer moves or blocks an anchored session
+  (incident 2026-10-14).** The ATS-first prompt hook treated any governed project
+  name as a project switch, so "Do not change anime-studio" in a GO prompt
+  blocked a session anchored to the ATS repository and the GO never reached it.
+  `context_resolution.classify_mentions` now separates work directives (a
+  leading work verb aimed at the project inside one clause of the operator's own
+  text) from read requests and incidental mentions; negations, subordinate
+  clauses, quotes, code, blockquotes, examples, harness frames and look-alike
+  paths are not directives. Only a directive can re-anchor a placeholder's read
+  context or block a session that holds work, and the block now quotes the
+  clause. A bare mention no longer outranks a governed cwd. A cwd inside another
+  governed repository still blocks a claimed session, and the edit guards are
+  unchanged.
 - **Reading a task brief no longer claims the ticket (D3, operator ruling
   2026-10-14).** `POST /api/brief` (and the MCP `task_brief` tool and the
   ATS-first prompt hook, which call it) used to bind the caller's session to the
