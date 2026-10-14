@@ -40,15 +40,18 @@ def _normalize_repositories(values: Any, *, source: str) -> list[str]:
     return roots
 
 
-def governed_repositories() -> list[str]:
-    """Return operator-governed roots, with the legacy env as explicit override."""
-    legacy = (os.environ.get("ATS_COORDINATED_REPOS") or "").strip()
-    if legacy:
-        return _normalize_repositories(legacy.split(":"), source="ATS_COORDINATED_REPOS")
+#: Top-level tables operator.toml may carry. `restart_gate` (#3580) is read by
+#: ai_team_sync.restart_gate; an ATS install older than #3580 rejects it, so the
+#: table must be added only after every ATS install (pipx copy included) is upgraded.
+_TOP_LEVEL_KEYS = {"governance", "restart_gate"}
 
+
+def load_operator_document() -> dict:
+    """The parsed operator.toml, {} when absent. Raises OperatorConfigError when
+    the file exists but cannot be trusted."""
     path = operator_config_path()
     if not path.exists():
-        return []
+        return {}
     try:
         with path.open("rb") as handle:
             document = tomllib.load(handle)
@@ -56,9 +59,22 @@ def governed_repositories() -> list[str]:
         raise OperatorConfigError(f"cannot read {path}: {exc}") from exc
     if not isinstance(document, dict):
         raise OperatorConfigError(f"{path}: root must be a TOML table")
-    unknown = set(document) - {"governance"}
+    unknown = set(document) - _TOP_LEVEL_KEYS
     if unknown:
         raise OperatorConfigError(f"{path}: unknown top-level key(s) {sorted(unknown)}")
+    return document
+
+
+def governed_repositories() -> list[str]:
+    """Return operator-governed roots, with the legacy env as explicit override."""
+    legacy = (os.environ.get("ATS_COORDINATED_REPOS") or "").strip()
+    if legacy:
+        return _normalize_repositories(legacy.split(":"), source="ATS_COORDINATED_REPOS")
+
+    path = operator_config_path()
+    document = load_operator_document()
+    if not document:
+        return []
     governance = document.get("governance", {})
     if not isinstance(governance, dict):
         raise OperatorConfigError(f"{path}: [governance] must be a table")
