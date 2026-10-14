@@ -74,13 +74,14 @@ async def _claim_deferred_ticket_messages(
     await ticket_roles.claim_pool(db, session)
 
 
-async def _write_or_ticket_owned(db: AsyncSession, ticket_id: int | None, *,
-                                 commit: bool) -> None:
+async def _write_or_ticket_owned(db: AsyncSession, ticket_id: int | None,
+                                 account_uid: int | None, *, commit: bool) -> None:
     """Flush or commit; the one-live-owner index refusing it is a 409 (#3585).
 
     The index can refuse at any flush, so every write that can make a session a
-    live owner goes through here. `ticket_id` is captured by the caller: after
-    the rollback, reading it from the row would reload it outside the event loop.
+    live owner goes through here. The values are captured by the caller: after
+    the rollback, reading them from the row would reload it outside the event
+    loop. The 409 names the owner that won, as a guarded refusal does.
     """
     try:
         await (db.commit() if commit else db.flush())
@@ -88,7 +89,9 @@ async def _write_or_ticket_owned(db: AsyncSession, ticket_id: int | None, *,
         if not ticket_roles.is_owner_conflict(exc):
             raise
         await db.rollback()
-        raise HTTPException(409, detail=ticket_roles.owner_conflict_detail(ticket_id)) from exc
+        owner = await ticket_roles.live_owner(db, ticket_id, account_uid)
+        raise HTTPException(409, detail=ticket_roles.owner_conflict_detail(
+            ticket_id, owner)) from exc
 
 
 async def bind_ticket_lineage(db: AsyncSession, session: Session,
@@ -1296,9 +1299,9 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
         )
         db.add(session)
         # Ensure session.id is populated; the owner index can refuse here.
-        await _write_or_ticket_owned(db, ticket_id, commit=False)
-        # Claim deferred messages atomically for the FIRST later session on this
-        # ticket. The ticket is coordination metadata; this grants no task authority.
+        await _write_or_ticket_owned(db, ticket_id, peer_uid, commit=False)
+        # An owner claims the ticket's pooled mail atomically with its creation
+        # (#3585). The ticket is coordination metadata; this grants no task authority.
         await _claim_deferred_ticket_messages(
             db, session, claim_before=session.started_at)
         if delegation is not None:
@@ -1320,7 +1323,7 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
         )
 
         # Backstop for a second writer the in-process guard cannot see.
-        await _write_or_ticket_owned(db, ticket_id, commit=True)
+        await _write_or_ticket_owned(db, ticket_id, peer_uid, commit=True)
 
     # Advisory conflicts: warn via notification but allow
     for conflict in conflicts:
@@ -1533,81 +1536,92 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
     validated_scope = _validated_scope(list(body.scope)) if body.scope is not None else None
     _refuse_reanchor_with_live_locks(session, body)
 
-    if body.status is not None:
-        if body.status == "completed":
-            # The OWNER is speaking, so the reaper's guess stops being the live
-            # account of this session — and its journal stops being replayable
-            # (#2760). Before this, `auto_completed` was only ever cleared inside
-            # the resurrect branch, so an owner completing a session the reaper
-            # had already latched left the flag set: the heartbeat's
-            # operator-completed refusal never fired, and a stray ping re-minted
-            # an EXCLUSIVE lock from a journal written a whole work cycle
-            # earlier, onto a session whose own summary said the lane was
-            # released.
-            session.auto_completed = False
-            session.reaped_locks = ""
-        elif session.status == "completed":
-            # A reaped session reopened by PATCH: if its ticket gained another
-            # owner meanwhile, it comes back as a non-owner (#3585). An owner
-            # that appears between this check and the write is a 409, not a 500.
-            await ticket_roles.yield_ownership_if_taken(db, session)
-            reopened_ticket = session.ticket_id
+    # Completing a ticket session is one serialized step with ticket-mail
+    # delivery (#3585): the same acquisition guard is taken by ticket-mode
+    # sends and by the owner's inbox claim, so a message can never be routed to
+    # or claimed by this session after its unread mail was released.
+    from ai_team_sync.routers.locks import acquisition_guard
+    serialize = body.status == "completed" and session.ticket_id is not None
+    async with (acquisition_guard(db) if serialize else contextlib.nullcontext()):
+        # Under the guard the release query below reads after every send or
+        # claim that committed while this request waited (SQLite: BEGIN
+        # IMMEDIATE before the first read; PostgreSQL: per-statement snapshot).
+        if body.status is not None:
+            if body.status == "completed":
+                # The OWNER is speaking, so the reaper's guess stops being the live
+                # account of this session — and its journal stops being replayable
+                # (#2760). Before this, `auto_completed` was only ever cleared inside
+                # the resurrect branch, so an owner completing a session the reaper
+                # had already latched left the flag set: the heartbeat's
+                # operator-completed refusal never fired, and a stray ping re-minted
+                # an EXCLUSIVE lock from a journal written a whole work cycle
+                # earlier, onto a session whose own summary said the lane was
+                # released.
+                session.auto_completed = False
+                session.reaped_locks = ""
+            elif session.status == "completed":
+                # A reaped session reopened by PATCH: if its ticket gained another
+                # owner meanwhile, it comes back as a non-owner (#3585). An owner
+                # that appears between this check and the write is a 409, not a 500.
+                await ticket_roles.yield_ownership_if_taken(db, session)
+                reopened_ticket, reopened_account = session.ticket_id, session.creator_uid
+                session.status = body.status
+                await _write_or_ticket_owned(db, reopened_ticket, reopened_account,
+                                             commit=False)
             session.status = body.status
-            await _write_or_ticket_owned(db, reopened_ticket, commit=False)
-        session.status = body.status
+            if body.status == "completed":
+                session.completed_at = datetime.now(timezone.utc)
+                await release_unread_ticket_messages(db, session.id)
+                # Release all locks
+                for lock in session.locks:
+                    await db.delete(lock)
+        if body.summary is not None:
+            session.summary = body.summary
+        if validated_scope is not None:
+            session.scope = json.dumps(validated_scope)
+        if body.description is not None:
+            session.description = body.description
+        if body.repo_root is not None:
+            # Anchor (or re-anchor) the session. Stored rstrip'd because
+            # find_conflicts and the repo-anchoring comparisons are string equality
+            # on this value — '/opt/anime-studio/' and '/opt/anime-studio' must not
+            # read as two different repos.
+            session.repo_root = body.repo_root.rstrip("/")
+
+        if body.handoff is not None:
+            handoff = Handoff(
+                ticket_id=session.ticket_id, source_session_id=session.id,
+                verdict=body.handoff.verdict,
+                blockers=json.dumps(body.handoff.blockers),
+                next_steps=json.dumps(body.handoff.next_steps),
+                artifacts=json.dumps(body.handoff.artifacts),
+            )
+            db.add(handoff)
+            await db.flush()
+            handoff_message = AgentMessage(
+                sender_session_id=session.id, recipient_session_id=None,
+                original_recipient_session_id=None, addressing_mode="ticket",
+                sender_agent=session.agent, sender_developer=session.developer,
+                recipient_agent="", ticket_id=session.ticket_id, kind="handoff",
+                handoff_id=handoff.id,
+                body=(f"Ticket #{session.ticket_id} handoff from {session.agent}:\n"
+                      f"Verdict: {handoff.verdict}\n"
+                      f"Blockers: {', '.join(body.handoff.blockers) or 'none'}\n"
+                      f"Next steps: {', '.join(body.handoff.next_steps) or 'none'}\n"
+                      f"Artifacts: {', '.join(body.handoff.artifacts) or 'none'}"),
+            )
+            db.add(handoff_message)
+            # A live owner receives it now; otherwise it waits for the next owner.
+            await ticket_roles.route_ticket_message(db, handoff_message, session)
+
         if body.status == "completed":
-            session.completed_at = datetime.now(timezone.utc)
-            await release_unread_ticket_messages(db, session.id)
-            # Release all locks
-            for lock in session.locks:
-                await db.delete(lock)
-    if body.summary is not None:
-        session.summary = body.summary
-    if validated_scope is not None:
-        session.scope = json.dumps(validated_scope)
-    if body.description is not None:
-        session.description = body.description
-    if body.repo_root is not None:
-        # Anchor (or re-anchor) the session. Stored rstrip'd because
-        # find_conflicts and the repo-anchoring comparisons are string equality
-        # on this value — '/opt/anime-studio/' and '/opt/anime-studio' must not
-        # read as two different repos.
-        session.repo_root = body.repo_root.rstrip("/")
+            await _queue_ticket_event(
+                db, session,
+                f"Session {session.id} ({session.agent}) completed on ticket "
+                f"#{session.ticket_id}. Summary: {session.summary or ''}",
+            )
 
-    if body.handoff is not None:
-        handoff = Handoff(
-            ticket_id=session.ticket_id, source_session_id=session.id,
-            verdict=body.handoff.verdict,
-            blockers=json.dumps(body.handoff.blockers),
-            next_steps=json.dumps(body.handoff.next_steps),
-            artifacts=json.dumps(body.handoff.artifacts),
-        )
-        db.add(handoff)
-        await db.flush()
-        handoff_message = AgentMessage(
-            sender_session_id=session.id, recipient_session_id=None,
-            original_recipient_session_id=None, addressing_mode="ticket",
-            sender_agent=session.agent, sender_developer=session.developer,
-            recipient_agent="", ticket_id=session.ticket_id, kind="handoff",
-            handoff_id=handoff.id,
-            body=(f"Ticket #{session.ticket_id} handoff from {session.agent}:\n"
-                  f"Verdict: {handoff.verdict}\n"
-                  f"Blockers: {', '.join(body.handoff.blockers) or 'none'}\n"
-                  f"Next steps: {', '.join(body.handoff.next_steps) or 'none'}\n"
-                  f"Artifacts: {', '.join(body.handoff.artifacts) or 'none'}"),
-        )
-        db.add(handoff_message)
-        # A live owner receives it now; otherwise it waits for the next owner.
-        await ticket_roles.route_ticket_message(db, handoff_message, session)
-
-    if body.status == "completed":
-        await _queue_ticket_event(
-            db, session,
-            f"Session {session.id} ({session.agent}) completed on ticket "
-            f"#{session.ticket_id}. Summary: {session.summary or ''}",
-        )
-
-    await _write_or_ticket_owned(db, session.ticket_id, commit=True)
+        await _write_or_ticket_owned(db, session.ticket_id, session.creator_uid, commit=True)
     if body.status == "completed" and session.ticket_id is not None:
         # After the commit: ticket mail a racing send addressed to this session
         # (or to an owner completing at the same moment) moves to the live

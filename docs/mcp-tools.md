@@ -16,8 +16,8 @@ nothing here should be treated as one.
 
 | Tool | Effect | Notes |
 |---|---|---|
-| `start_session` | mutates | Declares scope and takes advisory locks. Returns a context brief when one is available. Pass `repo_root` so patterns anchor to a repo and `ticket_id` when working a Tower ticket. `ticket_role` (`owner` / `contributor` / `reviewer`, #3585): one live owner per ticket per OS account receives the ticket's general mailbox; a contributor needs an explicit scope; a reviewer claims nothing. Omitted: owner if the ticket has no live owner, else contributor. See docs/collaboration-contract.md. |
-| `complete_session` | mutates | Pass `session_id`: it is authoritative for the call and is echoed back with the prior and resulting status, so you can see which row changed. Omitting it uses the legacy pointer path. Releases locks. A ticket-linked session may attach a structured `handoff` for the first later claimant. Refused while a child delegation is still open, and refused on a session you do not own. |
+| `start_session` | mutates | Declares scope and takes advisory locks. Returns a context brief when one is available. Pass `repo_root` so patterns anchor to a repo and `ticket_id` when working a Tower ticket. `ticket_role` (`owner` / `contributor` / `reviewer`, #3585): one live owner per ticket per OS account receives the ticket's general mailbox; a contributor needs an explicit scope; a reviewer claims nothing. Omitted: owner if the ticket has no live owner; otherwise contributor when files are named, reviewer when none are. A refused owner claim names the ticket's live owner. See docs/collaboration-contract.md. |
+| `complete_session` | mutates | Pass `session_id`: it is authoritative for the call and is echoed back with the prior and resulting status, so you can see which row changed. Omitting it uses the legacy pointer path. Releases locks. A ticket-linked session may attach a structured `handoff`; it goes to the ticket's live owner, or the next owner. Refused while a child delegation is still open, and refused on a session you do not own. |
 | `pause_session` / `resume_session` | mutates | Pauses work while keeping locks. |
 | `extend_scope` | mutates | Adds patterns to the current session mid-flight. |
 | `get_session_details` | reads | Locks, decisions and commits for your session. |
@@ -76,11 +76,11 @@ Unread exact-session messages are not silently retargeted. Their original sender
 can use `readdress_message` after the recipient ends; ATS records the original
 and new assignment on the same message and retains one receipt. If the original
 sender capability is unavailable too, send a new ticket-addressed handoff and
-record the prior message ID in its body. A ticket message is claimed by the first
-later same-account session on that ticket. If that session explicitly completes
-with its own capability while the message is unread, ATS returns the message to
-the ticket for a new session to claim; it keeps the same ID and assignment
-history. Reaping leaves unread ticket mail assigned because a late heartbeat can
+record the prior message ID in its body. A ticket message goes to the ticket's
+live same-account owner, or waits for the next one (#3585); contributors and
+reviewers never receive it. If the owner explicitly completes with its own
+capability while the message is unread, ATS returns the message to the ticket
+for the next owner to claim; it keeps the same ID and assignment history. Reaping leaves unread ticket mail assigned because a late heartbeat can
 resurrect the original session. A paused session keeps its locks and mail but
 cannot read or acknowledge until resumed; it is not reaped. An explicit
 completion is terminal and releases locks and unread ticket claims. General

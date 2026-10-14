@@ -463,18 +463,23 @@ async def test_a_reopen_that_races_a_new_owner_is_409_not_500(client, db_session
 
 
 @pytest.mark.asyncio
-async def test_an_owner_start_that_races_past_the_guard_is_409_not_500(client, monkeypatch):
-    await _new(client, "claude-code:aaaa1111", ticket_role="owner")
+async def test_an_owner_start_that_races_past_the_guard_is_409_naming_the_holder(
+        client, monkeypatch):
+    holder, _ = await _new(client, "claude-code:aaaa1111", ticket_role="owner")
 
-    async def nobody(*args, **kwargs):
-        return None
+    async def decided_owner_on_a_stale_read(db, **kwargs):
+        return ticket_roles.OWNER, None
 
-    monkeypatch.setattr(ticket_roles, "live_owner", nobody)
+    # Only the decision is stale; the index and the holder lookup are real.
+    monkeypatch.setattr(ticket_roles, "resolve_role", decided_owner_on_a_stale_read)
     raced = await client.post("/api/sessions", json={
         "developer": "pvestal", "agent": "claude-code:bbbb2222", "scope": [],
         "ticket_id": TICKET, "ticket_role": "owner"})
     assert raced.status_code == 409, raced.text
-    assert raced.json()["detail"]["error"] == "ticket_owned"
+    detail = raced.json()["detail"]
+    assert detail["error"] == "ticket_owned"
+    assert detail["owner_session_id"] == holder["id"]
+    assert detail["owner_agent"] == "claude-code:aaaa1111"
 
 
 # --- a send that races the owner's completion never strands mail ---------------------

@@ -63,12 +63,17 @@ def is_owner_conflict(exc: Exception) -> bool:
         and "sessions.ticket_id" in text and "sessions.creator_uid" in text)
 
 
-def owner_conflict_detail(ticket_id: int | None) -> dict:
-    return {"error": "ticket_owned",
-            "message": (f"ticket #{ticket_id} gained a live owner while this request ran; "
-                        f"retry (a returning owner then comes back as a non-owner) or start "
-                        f"as a scoped contributor or a reviewer"),
-            "ticket_id": ticket_id}
+def owner_conflict_detail(ticket_id: int | None, owner: Session | None = None) -> dict:
+    """The 409 body for an ownership conflict. Names only the ticket's live
+    owner (session id and agent label), the same fields resolve_role gives."""
+    detail = {"error": "ticket_owned",
+              "message": (f"ticket #{ticket_id} gained a live owner while this request ran; "
+                          f"retry (a returning owner then comes back as a non-owner) or "
+                          f"start as a scoped contributor or a reviewer"),
+              "ticket_id": ticket_id}
+    if owner is not None:
+        detail.update(owner_session_id=owner.id, owner_agent=owner.agent)
+    return detail
 
 
 def role_for_child(mode: str) -> str:

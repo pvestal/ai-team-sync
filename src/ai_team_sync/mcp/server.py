@@ -255,7 +255,7 @@ async def list_tools() -> list[Tool]:
     return [
         Tool(
             name="send_message",
-            description="Send a durable message to one active session or the first later session on your ticket. Receipt needs acknowledgement.",
+            description="Send a durable message to one active session (delivered to exactly that session, whatever its ticket role), or to your ticket's general mailbox (its live owner, or the next owner). Receipt needs acknowledgement.",
             inputSchema={"type": "object", "properties": {
                 "recipient_session_id": {"type": "string"},
                 "ticket_id": {"type": "integer", "minimum": 1},
@@ -325,11 +325,13 @@ async def list_tools() -> list[Tool]:
                                     "enum": ["owner", "contributor", "reviewer"],
                                     "description": (
                                         "Role on ticket_id. owner: the one accountable session; "
-                                        "receives the ticket's general mailbox (refused if the "
-                                        "ticket already has a live owner). contributor: works "
-                                        "under an explicit scope; never receives ticket mail. "
-                                        "reviewer: claims nothing. Omitted: owner if the ticket "
-                                        "has no live owner, else contributor.")},
+                                        "receives the ticket's general mailbox (refused, naming "
+                                        "the current owner, if the ticket already has a live "
+                                        "owner). contributor: works under an explicit scope "
+                                        "(required); never receives ticket mail. reviewer: "
+                                        "claims nothing. Omitted: owner if the ticket has no "
+                                        "live owner; otherwise contributor when scope names "
+                                        "files, reviewer when it does not.")},
                 },
                 "required": ["scope", "description"],
             },
@@ -731,7 +733,7 @@ async def list_tools() -> list[Tool]:
                     },
                     "handoff": {
                         "type": "object",
-                        "description": "Structured verdict for the first later session on this session's ticket.",
+                        "description": "Structured verdict for this session's ticket: delivered to the ticket's live owner, or the next owner.",
                         "properties": {
                             "verdict": {"type": "string"},
                             "blockers": {"type": "array", "items": {"type": "string"}},
@@ -1182,7 +1184,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     row = response.json()
                     target = (f"{row['recipient_agent']} (session {row['recipient_session_id']})"
                               if row['recipient_session_id'] else
-                              f"first later session on ticket #{row['ticket_id']}")
+                              f"the next owner of ticket #{row['ticket_id']}")
                     return [TextContent(type="text", text=(
                         f"📨 Message queued for {target}. Message ID: {row['id']}. "
                         "Delivery is unconfirmed until the recipient acknowledges it. "
@@ -1341,7 +1343,26 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
                 if response.status_code == 409:
                     error = response.json()
-                    conflicts = error["detail"].get("conflicts", [])
+                    detail = error.get("detail")
+                    if isinstance(detail, dict) and detail.get("error") == "ticket_owned":
+                        # #3585: a refused ownership claim names the ticket's
+                        # live owner (only that session), not a lock conflict.
+                        msg = (f"❌ Cannot start session as owner: ticket "
+                               f"#{detail.get('ticket_id')} already has a live owner")
+                        if detail.get("owner_session_id"):
+                            msg += (f": {detail.get('owner_agent') or 'unknown agent'} "
+                                    f"(session {detail['owner_session_id']})")
+                        msg += (".\nStart as ticket_role='contributor' with your files, or "
+                                "'reviewer', or have the owner hand off.\n"
+                                f"structured: {json.dumps(detail)}")
+                        return [TextContent(type="text", text=msg)]
+                    if isinstance(detail, dict) and detail.get("error") in (
+                            "role_fixed_by_delegation", "delegation_ticket_mismatch"):
+                        return [TextContent(type="text", text=(
+                            f"❌ Cannot start session: {detail.get('message')}\n"
+                            f"structured: {json.dumps(detail)}"))]
+                    conflicts = (detail or {}).get("conflicts", []) \
+                        if isinstance(detail, dict) else []
                     msg = f"❌ Cannot start session - conflicts detected:\n\n"
                     for c in conflicts:
                         msg += f"  • Pattern '{c['new_pattern']}' conflicts with '{c['existing_pattern']}'\n"

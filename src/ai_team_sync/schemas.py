@@ -30,7 +30,8 @@ class SessionCreate(BaseModel):
     task_id: StrictInt | None = None
     ticket_id: StrictInt | None = Field(default=None, gt=0)
     # Role on ticket_id (#3585). Omitted: owner when the ticket has no live
-    # owner, otherwise contributor. Delegation children get theirs from the mode.
+    # owner; otherwise contributor when scope names files, reviewer when it does
+    # not. Delegation children get theirs from the mode.
     ticket_role: Literal["owner", "contributor", "reviewer"] | None = None
 
 

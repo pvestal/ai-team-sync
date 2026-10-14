@@ -19,7 +19,9 @@ A session started with `ticket_id` has exactly one role on that ticket
 - At most one **live** (active or paused) owner per ticket per OS account,
   decided inside the acquisition guard and backed by the partial unique index
   `ux_sessions_live_ticket_owner`. A second owner request gets `409 ticket_owned`
-  naming the holder; a writer that reaches the index anyway also gets 409.
+  naming the holder (`owner_session_id`, `owner_agent`, nothing else); a writer
+  that reaches the index anyway gets the same 409. The MCP `start_session` tool
+  shows it as an ownership refusal with the same structured detail.
 - Per account because OS accounts are ATS's trust boundary (#2741): mail never
   crosses accounts, so one account's owner must not block another account's
   sessions from receiving their own mail. On a single-operator host every
@@ -49,10 +51,15 @@ messages sent to a ticket rather than to a session):
   otherwise. Briefs never claim anything (Stage 1).
 - Explicit completion still returns unread ticket mail to the pool, for the
   next owner.
-- After every ticket-mode send and every completion, unread ticket mail held by
-  a session that may not hold it (a live contributor or reviewer, or an
-  explicitly completed session reached by a send that raced its completion)
-  moves to the live owner or back to the pool (`ticket_roles.reconcile_ticket_mail`).
+- Completing a ticket-bound session, a ticket-mode send and the owner's inbox
+  claim take the same acquisition guard (SQLite: writer lock before the first
+  read; PostgreSQL: transaction advisory lock), so none of them interleaves
+  with another: a message is never routed to or claimed by an owner after its
+  completion released the owner's unread mail.
+- As a second net, after every ticket-mode send and every completion, unread
+  ticket mail held by a session that may not hold it (a live contributor or
+  reviewer, or an explicitly completed session) moves to the live owner or back
+  to the pool (`ticket_roles.reconcile_ticket_mail`).
 
 Unchanged, whatever the recipient's role: mail addressed to an exact session,
 addressed decisions, ticket start/complete events and delegation traffic.
@@ -77,6 +84,12 @@ contract.
 - The **effective verdict** is derived from the items: any material BLOCK item
   → BLOCK; only nonmaterial BLOCK items → PASS_WITH_CITATION. The reported code
   is stored beside it, and a mismatch is flagged.
+- A recorded verdict is final. The return moves the delegation from open to
+  returned with a compare-and-set, so of several simultaneous submissions
+  exactly one is written. Resubmitting the identical verdict (simultaneously or
+  later, also after the parent closes the delegation) returns the recorded
+  result unchanged; a different verdict is refused (`409 verdict_conflict`,
+  naming the recorded effective verdict and reviewed head).
 - Independence: a VERIFY delegation is refused (`409 review_not_independent`)
   when the reviewer is the same registered worker class as the requesting
   session, or when either class is not registered.

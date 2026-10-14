@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_team_sync import peer_identity, verdicts
@@ -268,6 +268,13 @@ async def return_delegation(delegation_id: str, body: DelegationReturn, request:
     d = await db.get(Delegation, delegation_id)
     if d is None:
         raise HTTPException(404, detail={"error": "no_such_delegation"})
+    if d.mode == VERIFY and d.state != "open" and d.structured_verdict:
+        # A recorded review verdict is final (#3585). The reviewer resubmitting
+        # the same verdict gets the recorded result back; a different one is
+        # refused. Same authority checks as a first submission.
+        _refuse_other_account(request, await db.get(Session, d.child_session_id), "child")
+        await _require_reviewer(db, d, body, request)
+        return _replay_or_conflict(d, _normalized(body.structured_verdict))
     if d.state != "open":
         raise HTTPException(409, detail={"error": "not_open", "state": d.state})
     # Returned from the child's account; with no child yet, from the parent's.
@@ -311,36 +318,72 @@ async def return_delegation(delegation_id: str, body: DelegationReturn, request:
                 "message": ("a VERIFY return must carry structured_verdict; a run with no "
                             "usable verdict is returned as verdict_code NO_RESULT, never as "
                             "success")})
-        # Only the reviewer itself records the verdict: the exact child session,
-        # proven by that session's own capability (an OS-account check alone
-        # would let any same-account caller pre-empt the review with a PASS).
-        child = await db.get(Session, d.child_session_id) if d.child_session_id else None
-        token = request.headers.get("X-ATS-Approval-Token", "")
-        if (child is None or body.actor_session_id != child.id or not token
-                or not child.approval_token_hash
-                or not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(),
-                                           child.approval_token_hash)):
-            raise HTTPException(403, detail={
-                "error": "not_the_reviewer",
-                "message": ("a VERIFY verdict is recorded only by the delegation's child "
-                            "session, with its own capability (X-ATS-Approval-Token)"),
-                "child_session_id": d.child_session_id})
-        try:
-            stored_verdict = verdicts.normalize(body.structured_verdict)
-        except verdicts.VerdictError as exc:
-            raise HTTPException(422, detail={"error": "invalid_verdict",
-                                             "message": str(exc)}) from exc
+        await _require_reviewer(db, d, body, request)
+        stored_verdict = _normalized(body.structured_verdict)
 
-    d.state = "returned"
-    d.result_summary = body.result_summary
-    d.evidence = json.dumps(body.evidence)
+    # open -> returned exactly once (#3585): compare-and-set on the state, so
+    # two simultaneous returns cannot both write; the loser sees what won.
+    values = {"state": "returned", "result_summary": body.result_summary,
+              "evidence": json.dumps(body.evidence)}
     if stored_verdict is not None:
-        d.verdict_code = stored_verdict["verdict_code"]
-        d.effective_verdict = stored_verdict["effective_verdict"]
-        d.structured_verdict = json.dumps(stored_verdict)
+        values.update(verdict_code=stored_verdict["verdict_code"],
+                      effective_verdict=stored_verdict["effective_verdict"],
+                      structured_verdict=json.dumps(stored_verdict))
+    won = await db.execute(update(Delegation).where(
+        Delegation.id == d.id, Delegation.state == "open",
+    ).values(**values).execution_options(synchronize_session=False))
+    if not won.rowcount:
+        await db.rollback()
+        await db.refresh(d)
+        if stored_verdict is not None and d.structured_verdict:
+            return _replay_or_conflict(d, stored_verdict)
+        raise HTTPException(409, detail={"error": "not_open", "state": d.state})
     await db.commit()
     await db.refresh(d)
     return _as_dict(d)
+
+
+async def _require_reviewer(db: AsyncSession, d: Delegation, body: DelegationReturn,
+                            request: Request) -> None:
+    """Only the reviewer itself records a verdict: the exact child session,
+    proven by that session's own capability (an OS-account check alone would let
+    any same-account caller pre-empt the review with a PASS)."""
+    child = await db.get(Session, d.child_session_id) if d.child_session_id else None
+    token = request.headers.get("X-ATS-Approval-Token", "")
+    if (child is None or body.actor_session_id != child.id or not token
+            or not child.approval_token_hash
+            or not hmac.compare_digest(hashlib.sha256(token.encode()).hexdigest(),
+                                       child.approval_token_hash)):
+        raise HTTPException(403, detail={
+            "error": "not_the_reviewer",
+            "message": ("a VERIFY verdict is recorded only by the delegation's child "
+                        "session, with its own capability (X-ATS-Approval-Token)"),
+            "child_session_id": d.child_session_id})
+
+
+def _normalized(structured_verdict) -> dict:
+    if structured_verdict is None:
+        raise HTTPException(422, detail={"error": "verdict_required",
+                                         "message": "structured_verdict is required"})
+    try:
+        return verdicts.normalize(structured_verdict)
+    except verdicts.VerdictError as exc:
+        raise HTTPException(422, detail={"error": "invalid_verdict",
+                                         "message": str(exc)}) from exc
+
+
+def _replay_or_conflict(d: Delegation, submitted: dict) -> dict:
+    """A recorded verdict never changes: the same one is answered with the
+    recorded result, a different one is refused naming what was recorded."""
+    recorded = json.loads(d.structured_verdict)
+    if recorded == submitted:
+        return _as_dict(d)
+    raise HTTPException(409, detail={
+        "error": "verdict_conflict",
+        "message": ("this delegation's review verdict is already recorded and final; a "
+                    "different verdict is refused"),
+        "recorded_effective_verdict": d.effective_verdict,
+        "recorded_head_sha": (recorded.get("reviewed") or {}).get("head_sha")})
 
 
 @router.post("/{delegation_id}/close")

@@ -7,6 +7,7 @@ acknowledgement marks it seen by the recipient agent.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import json
@@ -22,7 +23,7 @@ from ai_team_sync.database import get_db
 from ai_team_sync.events import broadcast_event
 from ai_team_sync.models import AgentMessage, Handoff, Session
 from ai_team_sync.message_lifecycle import append_delivery_event
-from ai_team_sync.routers.locks import cross_account
+from ai_team_sync.routers.locks import acquisition_guard, cross_account
 
 router = APIRouter(tags=["messages"])
 
@@ -114,11 +115,15 @@ async def send_message(body: MessageCreate, request: Request,
         append_delivery_event(row, "assigned", recipient.id, "direct_send")
     db.add(row)
     ticket_mode = not recipient
-    if ticket_mode:
-        # Ticket-mode mail goes to the ticket's live owner now, or waits in the
-        # pool for the next owner. Contributors and reviewers never receive it.
-        recipient = await ticket_roles.route_ticket_message(db, row, sender)
-    await db.commit()
+    # Ticket-mode delivery and an owner's completion are serialized by the same
+    # acquisition guard (#3585), so a send never reads an owner that is midway
+    # through completing.
+    async with (acquisition_guard(db) if ticket_mode else contextlib.nullcontext()):
+        if ticket_mode:
+            # Ticket-mode mail goes to the ticket's live owner now, or waits in
+            # the pool for the next owner. Contributors and reviewers never get it.
+            recipient = await ticket_roles.route_ticket_message(db, row, sender)
+        await db.commit()
     if ticket_mode and await ticket_roles.reconcile_ticket_mail(
             db, row.ticket_id, sender.creator_uid):
         # The owner this send read completed (or lost ownership) before the
@@ -214,8 +219,15 @@ async def message_inbox(session_id: str, request: Request,
     reader = await _actor(session_id, request, db)
     # The ticket's owner (and only the owner) collects pool mail that raced its
     # own start (#3585). A contributor's or reviewer's read claims nothing.
-    if await ticket_roles.claim_pool(db, reader):
-        await db.commit()
+    # The claim runs under the acquisition guard, re-reading the owner's own
+    # row there, so it cannot land after a concurrent completion released mail.
+    if reader.ticket_role == ticket_roles.OWNER and reader.ticket_id is not None:
+        async with acquisition_guard(db):
+            await db.refresh(reader, ["status", "ticket_role"])
+            if await ticket_roles.claim_pool(db, reader):
+                await db.commit()
+            else:
+                await db.rollback()  # release the writer lock now, not at teardown
     query = select(AgentMessage).where(AgentMessage.recipient_session_id == session_id)
     if pending_only:
         query = query.where(AgentMessage.acknowledged_at.is_(None))
