@@ -29,6 +29,9 @@ class SessionCreate(BaseModel):
     # rather than coerced, because it scopes authority.
     task_id: StrictInt | None = None
     ticket_id: StrictInt | None = Field(default=None, gt=0)
+    # Role on ticket_id (#3585). Omitted: owner when the ticket has no live
+    # owner, otherwise contributor. Delegation children get theirs from the mode.
+    ticket_role: Literal["owner", "contributor", "reviewer"] | None = None
 
 
 class HandoffCreate(BaseModel):
@@ -66,6 +69,9 @@ class SessionResponse(BaseModel):
     branch: str
     repo_root: str = ""  # '' = unanchored (legacy session)
     ticket_id: int | None = None
+    ticket_role: str | None = None  # owner | contributor | reviewer (#3585)
+    # Set at creation when this session joined a ticket another session owns.
+    ticket_owner_session_id: str | None = None
     started_at: datetime
     completed_at: datetime | None = None
     last_heartbeat: datetime | None = None  # NULL = never heartbeated (see Gap 1)

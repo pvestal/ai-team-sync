@@ -10,10 +10,11 @@ from ai_team_sync.mcp.server import format_message_nudge
 from ai_team_sync.models import ScopeLock, Session
 
 
-async def _session(client, agent, *, ticket_id=None):
+async def _session(client, agent, *, ticket_id=None, role=None):
+    # role: #3585 ticket role (None = owner if the ticket has no live owner).
     response = await client.post("/api/sessions", json={
         "developer": "pvestal", "agent": agent, "scope": [],
-        "ticket_id": ticket_id,
+        "ticket_id": ticket_id, "ticket_role": role,
     })
     assert response.status_code == 201, response.text
     return response.json()["id"], response.headers["X-ATS-Approval-Token"]
@@ -70,7 +71,7 @@ async def test_completed_recipient_cannot_be_messaged(client):
 
 @pytest.mark.asyncio
 async def test_unread_direct_message_can_be_readdressed_by_sender_after_turnover(client):
-    sender, sender_token = await _session(client, "codex:sender", ticket_id=2907)
+    sender, sender_token = await _session(client, "codex:sender", ticket_id=2907, role="reviewer")
     old, old_token = await _session(client, "claude-code:old", ticket_id=2907)
     sent = await client.post("/api/messages", json={
         "sender_session_id": sender, "recipient_session_id": old, "body": "keep this text",
@@ -124,7 +125,7 @@ async def test_unread_direct_message_can_be_readdressed_by_sender_after_turnover
 
 @pytest.mark.asyncio
 async def test_ticket_message_requeues_after_unread_recipient_ends(client):
-    sender, sender_token = await _session(client, "codex:sender", ticket_id=2899)
+    sender, sender_token = await _session(client, "codex:sender", ticket_id=2899, role="reviewer")
     sent = await client.post("/api/messages", json={
         "sender_session_id": sender, "ticket_id": 2899, "body": "durable handoff",
     }, headers={"X-ATS-Approval-Token": sender_token})
@@ -167,7 +168,7 @@ async def test_ticket_message_requeues_after_unread_recipient_ends(client):
 
 @pytest.mark.asyncio
 async def test_reaper_keeps_unread_ticket_with_revivable_owner(client, db_session):
-    sender, sender_token = await _session(client, "codex:sender", ticket_id=2907)
+    sender, sender_token = await _session(client, "codex:sender", ticket_id=2907, role="reviewer")
     sent = await client.post("/api/messages", json={
         "sender_session_id": sender, "ticket_id": 2907, "body": "survive reap",
     }, headers={"X-ATS-Approval-Token": sender_token})

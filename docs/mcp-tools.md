@@ -16,7 +16,7 @@ nothing here should be treated as one.
 
 | Tool | Effect | Notes |
 |---|---|---|
-| `start_session` | mutates | Declares scope and takes advisory locks. Returns a context brief when one is available. Pass `repo_root` so patterns anchor to a repo and `ticket_id` when working a Tower ticket. |
+| `start_session` | mutates | Declares scope and takes advisory locks. Returns a context brief when one is available. Pass `repo_root` so patterns anchor to a repo and `ticket_id` when working a Tower ticket. `ticket_role` (`owner` / `contributor` / `reviewer`, #3585): one live owner per ticket per OS account receives the ticket's general mailbox; a contributor needs an explicit scope; a reviewer claims nothing. Omitted: owner if the ticket has no live owner, else contributor. See docs/collaboration-contract.md. |
 | `complete_session` | mutates | Pass `session_id`: it is authoritative for the call and is echoed back with the prior and resulting status, so you can see which row changed. Omitting it uses the legacy pointer path. Releases locks. A ticket-linked session may attach a structured `handoff` for the first later claimant. Refused while a child delegation is still open, and refused on a session you do not own. |
 | `pause_session` / `resume_session` | mutates | Pauses work while keeping locks. |
 | `extend_scope` | mutates | Adds patterns to the current session mid-flight. |
@@ -60,7 +60,7 @@ speaks for *this* caller allowed to refuse a mismatch. See
 
 | Tool | Effect | Notes |
 |---|---|---|
-| `send_message` | mutates | Address one active ATS session by `recipient_session_id`, or the first later claimant of your `ticket_id`. Returns a message ID; queueing is not delivery. |
+| `send_message` | mutates | Address one active ATS session by `recipient_session_id` (delivered to exactly that session, whatever its ticket role), or your `ticket_id`'s general mailbox: the ticket's live owner receives it now, otherwise the next owner when it starts. Returns a message ID; queueing is not delivery. |
 | `message_inbox` | reads | Shows pending messages for this exact session, with sender and message IDs. |
 | `acknowledge_message` | mutates | Persist receipt of one message addressed to this session. Other sessions cannot acknowledge it. |
 | `message_status` | reads | Sender checks whether its message has an `acknowledged_at` receipt. |
@@ -119,7 +119,7 @@ See [Delegation](delegation.md) for the full contract.
 | Tool | Effect | Notes |
 |---|---|---|
 | `delegate` | mutates | Hands a bounded subproblem to another worker. You keep the task. Records the requested worker and the binary actually resolved at spawn; an unsupported worker/mode fails closed. With `task`, the child inherits that Tower task's authority envelope. |
-| `delegation_status` | reads | Whole lifecycle: ids, mode, state, the child's effective authority, lock counts. |
+| `delegation_status` | reads | Whole lifecycle: ids, mode, state, the child's effective authority, lock counts, and for VERIFY the structured review verdict (effective verdict derived from the items, reported code, reviewed SHA, BLOCK items). |
 | `reconcile_delegation` | mutates | Owner-bound: only the parent accepts or rejects. |
 | `my_authority` | reads | What you may do, base and effective. |
 

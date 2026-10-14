@@ -5,7 +5,7 @@ from __future__ import annotations
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 from ai_team_sync.config import settings
@@ -78,6 +78,10 @@ class Session(Base):
     task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Coordination lineage only. Never interpreted as task-close authority.
     ticket_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    # owner | contributor | reviewer on ticket_id (#3585; see ticket_roles.py).
+    # NULL = no ticket, or a row that predates roles. At most one live owner per
+    # ticket (ux_sessions_live_ticket_owner).
+    ticket_role: Mapped[str | None] = mapped_column(String(20), nullable=True)
     # The delegation this session was created as the child of, recorded at
     # creation. Delegation.child_session_id is a pointer on another row; a grant
     # must never depend on it alone, or moving it moves the narrowing.
@@ -397,6 +401,12 @@ class Delegation(Base):
     result_summary: Mapped[str] = mapped_column(Text, default="")
     evidence: Mapped[str] = mapped_column(Text, default="{}")  # JSON object
     verdict: Mapped[str] = mapped_column(Text, default="")
+    # The child's structured VERIFY verdict (#3585; see verdicts.py). `verdict`
+    # above stays the PARENT's reconciliation note. effective_verdict is derived
+    # from the items, never copied from the reviewer's headline.
+    verdict_code: Mapped[str] = mapped_column(String(30), default="")
+    effective_verdict: Mapped[str] = mapped_column(String(30), default="")
+    structured_verdict: Mapped[str] = mapped_column(Text, default="")  # JSON object
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -423,6 +433,17 @@ Index(
     Delegation.created_at,
 )
 Index("ix_decisions_created_at_id", Decision.created_at, Decision.id)
+# One live owner per ticket per OS account (#3585; ticket_roles.py says why per
+# account). Existing databases get the same index from database.init_db, which
+# create_all cannot do for an existing table.
+Index(
+    "ux_sessions_live_ticket_owner",
+    Session.ticket_id,
+    Session.creator_uid,
+    unique=True,
+    sqlite_where=text("ticket_role = 'owner' AND status IN ('active', 'paused')"),
+    postgresql_where=text("ticket_role = 'owner' AND status IN ('active', 'paused')"),
+)
 Index("ix_authority_checks_created_at_id", AuthorityCheck.created_at, AuthorityCheck.id)
 Index("ix_file_activities_created_at_id", FileActivity.created_at, FileActivity.id)
 Index("ix_override_requests_created_at_id", OverrideRequest.created_at, OverrideRequest.id)

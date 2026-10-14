@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field, StrictInt, field_validator
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_team_sync import peer_identity
+from ai_team_sync import peer_identity, ticket_roles
 from ai_team_sync.database import get_db
 from ai_team_sync.events import broadcast_event
 from ai_team_sync.models import AgentMessage, Handoff, Session
@@ -109,8 +109,14 @@ async def send_message(body: MessageCreate, request: Request,
         recipient_agent=recipient.agent if recipient else "", body=body.body,
     )
     if recipient:
+        # Addressed mail keeps its exact recipient whatever that session's
+        # ticket role (#3585): never rerouted to the owner, never pooled.
         append_delivery_event(row, "assigned", recipient.id, "direct_send")
     db.add(row)
+    if not recipient:
+        # Ticket-mode mail goes to the ticket's live owner now, or waits in the
+        # pool for the next owner. Contributors and reviewers never receive it.
+        recipient = await ticket_roles.route_ticket_message(db, row, sender)
     await db.commit()
     await db.refresh(row)
     if recipient:
@@ -196,7 +202,11 @@ async def message_inbox(session_id: str, request: Request,
                         pending_only: bool = True,
                         limit: int = Query(20, ge=1, le=100),
                         db: AsyncSession = Depends(get_db)):
-    await _actor(session_id, request, db)
+    reader = await _actor(session_id, request, db)
+    # The ticket's owner (and only the owner) collects pool mail that raced its
+    # own start (#3585). A contributor's or reviewer's read claims nothing.
+    if await ticket_roles.claim_pool(db, reader):
+        await db.commit()
     query = select(AgentMessage).where(AgentMessage.recipient_session_id == session_id)
     if pending_only:
         query = query.where(AgentMessage.acknowledged_at.is_(None))

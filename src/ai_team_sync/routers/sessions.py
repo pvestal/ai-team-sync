@@ -14,7 +14,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from sqlalchemy import select, update
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -30,6 +31,7 @@ from ai_team_sync.delegation import effective_authority
 from ai_team_sync.models import Delegation
 from ai_team_sync.config import settings
 from ai_team_sync import peer_identity
+from ai_team_sync import ticket_roles
 from ai_team_sync.repo_files import RepoContext
 from ai_team_sync.scope_paths import (UnsafePath, canonical_claim, canonical_pattern,
                                       canonical_root)
@@ -62,39 +64,14 @@ async def _queue_ticket_event(db: AsyncSession, session: Session, body: str) -> 
 
 async def _claim_deferred_ticket_messages(
         db: AsyncSession, session: Session, *, claim_before: datetime) -> None:
-    """Assign the ticket mailbox to its first same-account claimant."""
-    if session.ticket_id is None or session.creator_uid is None:
-        return
-    queued = (await db.execute(select(AgentMessage.id).where(
-        AgentMessage.ticket_id == session.ticket_id,
-        AgentMessage.addressing_mode == "ticket",
-        AgentMessage.acknowledged_at.is_(None),
-        AgentMessage.recipient_session_id.is_(None),
-        AgentMessage.sender_session_id != session.id,
-        AgentMessage.created_at <= claim_before,
-        AgentMessage.sender_session_id.in_(select(Session.id).where(
-            Session.creator_uid == session.creator_uid)),
-    ))).scalars().all()
-    for message_id in queued:
-        claimed = await db.execute(update(AgentMessage).where(
-            AgentMessage.id == message_id,
-            AgentMessage.ticket_id == session.ticket_id,
-            AgentMessage.addressing_mode == "ticket",
-            AgentMessage.acknowledged_at.is_(None),
-            AgentMessage.recipient_session_id.is_(None),
-            AgentMessage.sender_session_id.in_(select(Session.id).where(
-                Session.creator_uid == session.creator_uid)),
-        ).values(recipient_session_id=session.id, recipient_agent=session.agent))
-        if claimed.rowcount:
-            message = await db.get(AgentMessage, message_id)
-            if message:
-                message.recipient_session_id = session.id
-                message.recipient_agent = session.agent
-                append_delivery_event(message, "assigned", session.id, "ticket_claim")
-            if message and message.handoff_id:
-                handoff = await db.get(Handoff, message.handoff_id)
-                if handoff is not None:
-                    handoff.recipient_session_id = session.id
+    """Assign the ticket mailbox to the ticket's OWNER only (#3585).
+
+    Contributors and reviewers never claim it. The owner takes the whole
+    same-account pool: mail sent while it is live is routed to it at send time
+    (ticket_roles.route_ticket_message), so anything still pooled was written
+    while no owner was live. `claim_before` is kept for callers' signatures.
+    """
+    await ticket_roles.claim_pool(db, session)
 
 
 async def bind_ticket_lineage(db: AsyncSession, session: Session,
@@ -330,6 +307,7 @@ def _session_to_response(s: Session, uncommitted_cache: dict[str, list[str]] | N
         branch=s.branch,
         repo_root=getattr(s, "repo_root", "") or "",
         ticket_id=getattr(s, "ticket_id", None),
+        ticket_role=getattr(s, "ticket_role", None),
         started_at=s.started_at,
         completed_at=s.completed_at,
         last_heartbeat=s.last_heartbeat,
@@ -901,6 +879,9 @@ async def resurrect_session(db: AsyncSession, session: Session) -> RestorationOu
                     session.id)
         return outcome
 
+    # One live owner per ticket (#3585): a resurrecting owner whose ticket was
+    # taken over while it was reaped comes back as a contributor.
+    await ticket_roles.yield_ownership_if_taken(db, session)
     session.status = "active"
     session.completed_at = None
     session.auto_completed = False
@@ -1242,7 +1223,11 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
         await asyncio.to_thread(refuse_unbacked_patterns, scope, repo_root, repo_ctx)
 
     from ai_team_sync.routers.locks import acquisition_guard
-    async with (acquisition_guard(db) if locking else contextlib.nullcontext()):
+    # The ticket-role decision reads who owns the ticket, so it shares the
+    # acquisition guard with the insert: two sessions asking to own one ticket
+    # get one owner and one 409 (#3585). The partial unique index is the backstop.
+    guarded = locking or body.ticket_id is not None
+    async with (acquisition_guard(db) if guarded else contextlib.nullcontext()):
         if locking:
             conflicts = await _check_scope_conflicts(
                 db, scope, body.developer, repo_root=repo_root, repo_ctx=repo_ctx)
@@ -1253,6 +1238,13 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
                     status_code=409,
                     detail=scope_conflict_detail("session", conflict, conflicts),
                 )
+        try:
+            ticket_role, ticket_owner_id = await ticket_roles.resolve_role(
+                db, ticket_id=body.ticket_id, requested=body.ticket_role,
+                delegation_mode=delegation.mode if delegation is not None else None,
+                scope=scope, creator_uid=peer_uid)
+        except ticket_roles.RoleRefused as exc:
+            raise HTTPException(exc.status, detail=exc.detail) from exc
 
         import hashlib
         import secrets
@@ -1270,6 +1262,7 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
             bound_uid=bound_uid,
             task_id=body.task_id,
             ticket_id=body.ticket_id,
+            ticket_role=ticket_role,
             delegation_id=delegation.id if delegation is not None else None,
         )
         db.add(session)
@@ -1296,7 +1289,18 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
             f"{session.description}",
         )
 
-        await db.commit()
+        try:
+            await db.commit()
+        except IntegrityError as exc:
+            # Backstop for a second writer the in-process guard cannot see.
+            if ticket_roles.OWNER_INDEX not in str(exc.orig):
+                raise
+            await db.rollback()
+            raise HTTPException(409, detail={
+                "error": "ticket_owned",
+                "message": (f"ticket #{body.ticket_id} gained a live owner while this session "
+                            f"was being created; start as a scoped contributor or a reviewer"),
+                "ticket_id": body.ticket_id}) from exc
 
     # Advisory conflicts: warn via notification but allow
     for conflict in conflicts:
@@ -1326,7 +1330,10 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
     })
 
     response.headers["X-ATS-Approval-Token"] = approval_token
-    return _session_to_response(session)
+    created = _session_to_response(session)
+    created.ticket_owner_session_id = (session.id if ticket_role == ticket_roles.OWNER
+                                       else ticket_owner_id)
+    return created
 
 
 @router.get("", response_model=list[SessionResponse])
@@ -1519,6 +1526,10 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
             # released.
             session.auto_completed = False
             session.reaped_locks = ""
+        elif session.status == "completed":
+            # A reaped session reopened by PATCH: if its ticket gained another
+            # owner meanwhile, it comes back as a contributor (#3585).
+            await ticket_roles.yield_ownership_if_taken(db, session)
         session.status = body.status
         if body.status == "completed":
             session.completed_at = datetime.now(timezone.utc)
@@ -1549,7 +1560,7 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
         )
         db.add(handoff)
         await db.flush()
-        db.add(AgentMessage(
+        handoff_message = AgentMessage(
             sender_session_id=session.id, recipient_session_id=None,
             original_recipient_session_id=None, addressing_mode="ticket",
             sender_agent=session.agent, sender_developer=session.developer,
@@ -1560,7 +1571,10 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
                   f"Blockers: {', '.join(body.handoff.blockers) or 'none'}\n"
                   f"Next steps: {', '.join(body.handoff.next_steps) or 'none'}\n"
                   f"Artifacts: {', '.join(body.handoff.artifacts) or 'none'}"),
-        ))
+        )
+        db.add(handoff_message)
+        # A live owner receives it now; otherwise it waits for the next owner.
+        await ticket_roles.route_ticket_message(db, handoff_message, session)
 
     if body.status == "completed":
         await _queue_ticket_event(

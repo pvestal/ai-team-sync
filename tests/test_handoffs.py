@@ -6,10 +6,11 @@ from sqlalchemy import update
 from ai_team_sync.models import Session
 
 
-async def _start(client, agent, ticket_id):
+async def _start(client, agent, ticket_id, role=None):
+    # role: #3585 ticket role (None = owner if the ticket has no live owner).
     response = await client.post("/api/sessions", json={
         "developer": "pvestal", "agent": agent, "scope": [],
-        "repo_root": "/repo", "ticket_id": ticket_id})
+        "repo_root": "/repo", "ticket_id": ticket_id, "ticket_role": role})
     assert response.status_code == 201, response.text
     return response.json(), response.headers["X-ATS-Approval-Token"]
 
@@ -86,7 +87,7 @@ async def test_handoff_remains_after_recipient_reap_and_resurrection(client, db_
 
 @pytest.mark.asyncio
 async def test_next_session_message_waits_for_later_ticket_claimant(client):
-    sender, sender_token = await _start(client, "codex:sender", 2907)
+    sender, sender_token = await _start(client, "codex:sender", 2907, role="reviewer")
     queued = await client.post("/api/messages", json={
         "sender_session_id": sender["id"], "ticket_id": 2907,
         "body": "Read the handoff first"},

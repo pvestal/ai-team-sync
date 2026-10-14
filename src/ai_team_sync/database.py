@@ -57,7 +57,25 @@ _COLUMN_MIGRATIONS = [
     ("agent_messages", "original_recipient_session_id", "VARCHAR(36)"),
     ("agent_messages", "addressing_mode", "VARCHAR(20) DEFAULT 'legacy'"),
     ("agent_messages", "delivery_history", "TEXT DEFAULT '[]'"),
+    # Ticket roles and structured VERIFY verdicts (#3585). Existing sessions
+    # backfill to NULL (no role: they neither own nor claim a ticket mailbox),
+    # existing delegations to '' (no structured verdict was recorded).
+    ("sessions", "ticket_role", "VARCHAR(20)"),
+    ("delegations", "verdict_code", "VARCHAR(30) DEFAULT ''"),
+    ("delegations", "effective_verdict", "VARCHAR(30) DEFAULT ''"),
+    ("delegations", "structured_verdict", "TEXT DEFAULT ''"),
 ]
+
+# One live owner per ticket per OS account (#3585). A partial UNIQUE index, so
+# it cannot ride _INDEX_MIGRATIONS (plain, non-unique column lists). Safe on
+# existing data: every pre-existing row has ticket_role NULL, so no row is in
+# the index yet. Unidentified rows (creator_uid NULL) are not constrained by the
+# index (NULLs are distinct); the acquisition guard still serializes them.
+_OWNER_INDEX_SQL = (
+    "CREATE UNIQUE INDEX {concurrently}IF NOT EXISTS ux_sessions_live_ticket_owner "
+    "ON sessions (ticket_id, creator_uid) "
+    "WHERE ticket_role = 'owner' AND status IN ('active', 'paused')"
+)
 
 # Existing databases need the composite lifecycle indexes declared in models.py;
 # create_all only creates them for new tables. These are projections indexes,
@@ -151,9 +169,11 @@ async def init_db():
                         f"CREATE INDEX CONCURRENTLY IF NOT EXISTS {name} " f"ON {table} ({columns})"
                     )
                 )
+            await conn.execute(text(_OWNER_INDEX_SQL.format(concurrently="CONCURRENTLY ")))
     else:
         async with engine.begin() as conn:
             for name, table, columns in _INDEX_MIGRATIONS:
                 await conn.execute(
                     text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})")
                 )
+            await conn.execute(text(_OWNER_INDEX_SQL.format(concurrently="")))

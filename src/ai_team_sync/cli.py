@@ -840,16 +840,29 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
     # the two were sequential in one block, so a failed return left the child
     # session open forever.
     return_state = "return_not_attempted"
+    # A VERIFY result is the child's structured verdict; an empty, failed or
+    # malformed run becomes NO_RESULT, never a pass (#3585).
+    structured_verdict = None
+    if mode == "VERIFY":
+        from ai_team_sync.verdicts import from_child_output
+        structured_verdict = from_child_output(output, launch_error=launch_error,
+                                               exit_ok=not failure)
+    effective_verdict = None
     with httpx.Client(timeout=30) as c:
         try:
-            ret = c.post(f"{server}/api/delegations/{d['id']}/return", json={
+            payload = {
                 "result_summary": output[:20000] or f"(no result: {launch_error})",
                 "evidence": {"exit_ok": not failure, "child_session_id": child_id,
                              "launch_error": launch_error or None},
                 "actor_session_id": child_id,
-            })
+            }
+            if structured_verdict is not None:
+                payload["structured_verdict"] = structured_verdict
+            ret = c.post(f"{server}/api/delegations/{d['id']}/return", json=payload)
             return_state = (ret.json().get("state") if ret.status_code < 400
                             else "return_refused")
+            if ret.status_code < 400:
+                effective_verdict = ret.json().get("effective_verdict")
         except Exception as exc:  # noqa: BLE001
             return_state = f"return_error: {type(exc).__name__}"
         try:
@@ -896,6 +909,9 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         "verify_worktree": (str(verify_env.path) if verify_env else None),
         "verify_base_commit": (verify_env.base_commit if verify_env else None),
         "verify_worktree_removed": verify_removed,
+        # The recorded verdict (#3585): what counts is effective_verdict.
+        "effective_verdict": effective_verdict,
+        "structured_verdict": structured_verdict,
         "result": output,
         "verify_before_accepting": d["acceptance"],
     }, indent=2))

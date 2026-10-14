@@ -14,9 +14,9 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ai_team_sync import peer_identity
+from ai_team_sync import peer_identity, verdicts
 from ai_team_sync.database import get_db
-from ai_team_sync.delegation import MODES, READ_ONLY, prohibitions_for
+from ai_team_sync.delegation import MODES, READ_ONLY, VERIFY, prohibitions_for
 from ai_team_sync.launch_spec import RoutingFailure, validate_resolution
 from ai_team_sync.models import Delegation, Session
 from ai_team_sync.workers import registry
@@ -47,6 +47,8 @@ class DelegationReturn(BaseModel):
     evidence: dict = Field(default_factory=dict)
     # The CHILD submits its result. Exact id, not a worker name.
     actor_session_id: str = ""
+    # Required for VERIFY (#3585): see verdicts.py for the shape and the rules.
+    structured_verdict: dict | None = None
 
 
 class DelegationClose(BaseModel):
@@ -88,6 +90,11 @@ def _as_dict(d: Delegation) -> dict:
         "result_summary": d.result_summary,
         "evidence": json.loads(d.evidence or "{}"),
         "verdict": d.verdict,
+        # The reviewer's structured verdict (#3585). effective_verdict is the
+        # one that counts; verdict_code is what the reviewer reported.
+        "verdict_code": d.verdict_code or None,
+        "effective_verdict": d.effective_verdict or None,
+        "structured_verdict": json.loads(d.structured_verdict) if d.structured_verdict else None,
         "created_at": _aware(d.created_at).isoformat(),
         "closed_at": _aware(d.closed_at).isoformat() if d.closed_at else None,
     }
@@ -180,6 +187,21 @@ async def create_delegation(body: DelegationCreate, request: Request,
         raise HTTPException(404, detail={"error": "no_such_parent"})
     _refuse_other_account(request, parent, "parent")
 
+    # Independent review (#3585): a VERIFY reviewer is never the same worker
+    # class as the session that asked for the review (no Claude-on-Claude).
+    # Classes come from the registry's label resolution, not from the text.
+    if body.mode == VERIFY:
+        parent_class = registry().registered(parent.agent)
+        reviewer_class = registry().registered(body.delegated_worker)
+        if (parent_class is not None and reviewer_class is not None
+                and parent_class.name == reviewer_class.name):
+            raise HTTPException(409, detail={
+                "error": "review_not_independent",
+                "message": (f"a VERIFY review of {parent_class.name} work must be done by "
+                            f"a different worker class; {body.delegated_worker} is the same "
+                            f"class as the requesting session {parent.agent}"),
+                "worker_class": parent_class.name})
+
     # delegation_depth = 1. A chain of workers 'collaborating' on one bug is a
     # chain in which nobody owns it.
     if await _is_a_delegated_child(db, parent.id):
@@ -265,9 +287,28 @@ async def return_delegation(delegation_id: str, body: DelegationReturn, request:
                     "message": ("the lease ran out; the parent must re-delegate "
                                 "rather than accept work of unknown age")})
 
+    # A VERIFY result is a structured verdict or it is not a result (#3585).
+    # Validated before any field changes, so a refusal leaves the row open.
+    stored_verdict = None
+    if body.structured_verdict is not None:
+        try:
+            stored_verdict = verdicts.normalize(body.structured_verdict)
+        except verdicts.VerdictError as exc:
+            raise HTTPException(422, detail={"error": "invalid_verdict",
+                                             "message": str(exc)}) from exc
+    elif d.mode == VERIFY:
+        raise HTTPException(422, detail={
+            "error": "verdict_required",
+            "message": ("a VERIFY return must carry structured_verdict; a run with no usable "
+                        "verdict is returned as verdict_code NO_RESULT, never as success")})
+
     d.state = "returned"
     d.result_summary = body.result_summary
     d.evidence = json.dumps(body.evidence)
+    if stored_verdict is not None:
+        d.verdict_code = stored_verdict["verdict_code"]
+        d.effective_verdict = stored_verdict["effective_verdict"]
+        d.structured_verdict = json.dumps(stored_verdict)
     await db.commit()
     await db.refresh(d)
     return _as_dict(d)

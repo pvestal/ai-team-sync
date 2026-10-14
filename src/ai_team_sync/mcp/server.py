@@ -321,6 +321,15 @@ async def list_tools() -> list[Tool]:
                     },
                     "ticket_id": {"type": "integer", "minimum": 1,
                                   "description": "Optional Tower ticket for handoff lineage; grants no task authority."},
+                    "ticket_role": {"type": "string",
+                                    "enum": ["owner", "contributor", "reviewer"],
+                                    "description": (
+                                        "Role on ticket_id. owner: the one accountable session; "
+                                        "receives the ticket's general mailbox (refused if the "
+                                        "ticket already has a live owner). contributor: works "
+                                        "under an explicit scope; never receives ticket mail. "
+                                        "reviewer: claims nothing. Omitted: owner if the ticket "
+                                        "has no live owner, else contributor.")},
                 },
                 "required": ["scope", "description"],
             },
@@ -1324,6 +1333,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         "branch": get_git_branch(),
                         "repo_root": arguments.get("repo_root", ""),
                         "ticket_id": ticket_id,
+                        "ticket_role": arguments.get("ticket_role") or None,
                         "auto_lock": True,
                         "lock_mode": "exclusive" if exclusive else "advisory",
                     },
@@ -1396,7 +1406,13 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     msg += f"⚠️ {warning}; session start continued.\n"
                 msg += f"Session ID: {data['id']}\n"
                 if data.get("ticket_id") is not None:
-                    msg += f"Ticket: #{data['ticket_id']}\n"
+                    msg += f"Ticket: #{data['ticket_id']}"
+                    if data.get("ticket_role"):
+                        msg += f" as {data['ticket_role']}"
+                        owner = data.get("ticket_owner_session_id")
+                        if data["ticket_role"] != "owner" and owner:
+                            msg += f" (owner: session {owner})"
+                    msg += "\n"
                 msg += f"Scope: {', '.join(data['scope'])}\n"
                 msg += f"Branch: {data['branch']}\n"
                 msg += f"Locks created: {data['lock_count']}\n"
@@ -1997,6 +2013,22 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                               f"commit={e['commit']} close={e['task_close']}"]
                     if eff.get("prohibitions"):
                         lines.append("  child may not: " + ", ".join(eff["prohibitions"]))
+                if d.get("effective_verdict"):
+                    sv = d.get("structured_verdict") or {}
+                    lines += ["", f"  review verdict: {d['effective_verdict']}"
+                                  f" (reported {d.get('verdict_code')})"]
+                    if sv.get("mismatch"):
+                        lines.append("  ⚠️ reported verdict differs from the items; the derived "
+                                     "verdict above is the one that counts")
+                    reviewed = sv.get("reviewed") or {}
+                    if reviewed.get("head_sha"):
+                        lines.append(f"  reviewed {reviewed.get('repo')} @ {reviewed['head_sha']}")
+                    for item in sv.get("items") or []:
+                        if item["status"] == "BLOCK":
+                            lines.append(f"  BLOCK {item['item_id']} [{item['severity']}, "
+                                         f"{item['claim_category']}] {item['citation'][:200]}")
+                    if sv.get("reason"):
+                        lines.append("  reason: " + sv["reason"][:300])
                 if d.get("result_summary"):
                     lines += ["", "  result: " + d["result_summary"][:400]]
                 if d.get("verdict"):

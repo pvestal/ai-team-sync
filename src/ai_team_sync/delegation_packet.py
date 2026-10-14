@@ -105,5 +105,11 @@ def build_child_packet(*, mode: str, delegation: Mapping[str, Any],
             "plainly and stop; do not silently pick one.",
         ]
 
+    if mode == "VERIFY":
+        # The supervisor records the verdict from this block alone (#3585);
+        # prose is kept as the summary but never read as the verdict.
+        from ai_team_sync.verdicts import CONTRACT_TEXT
+        lines += ["", CONTRACT_TEXT]
+
     lines += ["", "-" * 60, brief]
     return "\n".join(lines)

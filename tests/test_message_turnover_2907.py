@@ -3,6 +3,7 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.dml import Update
@@ -12,11 +13,15 @@ from ai_team_sync import peer_identity
 from ai_team_sync.background_tasks import auto_complete_stale_sessions
 from ai_team_sync.config import settings
 from ai_team_sync.models import Session
+from tests.test_hook_delivery_live import live_ats  # noqa: F401  (fixture)
 
 
-async def new_session(client, agent, ticket=2907):
+async def new_session(client, agent, ticket=2907, role=None):
+    # role: #3585 ticket role. A session that only SENDS ticket mail starts as
+    # a reviewer, so the ticket's owner is the later session that claims it.
     response = await client.post("/api/sessions", json={
         "developer": "pvestal", "agent": agent, "ticket_id": ticket, "scope": [],
+        "ticket_role": role,
     })
     assert response.status_code == 201, response.text
     return response.json()["id"], response.headers["X-ATS-Approval-Token"]
@@ -43,7 +48,7 @@ async def inbox(client, session, token):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("alias", [False, True])
 async def test_foreign_capability_cannot_complete_or_release_claimed_ticket(client, alias):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     message_id = await send_ticket(client, sender, sender_token)
     owner, owner_token = await new_session(client, "claude-code:owner")
     assert message_id in [m["id"] for m in await inbox(client, owner, owner_token)]
@@ -83,7 +88,7 @@ async def test_foreign_capability_cannot_complete_or_release_claimed_ticket(clie
 async def test_ticket_claim_and_peer_events_stay_with_creating_account(client, monkeypatch):
     peer = {"uid": 1001}
     monkeypatch.setattr(peer_identity, "peer_uid_for_request", lambda request: peer["uid"])
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     message_id = await send_ticket(client, sender, sender_token)
     peer["uid"] = 1002
     foreign, foreign_token = await new_session(client, "claude-code:foreign")
@@ -100,7 +105,7 @@ async def test_ticket_claim_and_peer_events_stay_with_creating_account(client, m
 
 @pytest.mark.asyncio
 async def test_readdress_requires_original_sender_even_with_other_valid_capability(client):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     other, other_token = await new_session(client, "codex:other")
     old, old_token = await new_session(client, "claude-code:old")
     sent = await client.post("/api/messages", json={
@@ -127,7 +132,7 @@ async def test_readdress_requires_original_sender_even_with_other_valid_capabili
 
 @pytest.mark.asyncio
 async def test_reap_then_late_heartbeat_preserves_only_original_mail_owner(client, db_session):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     message_id = await send_ticket(client, sender, sender_token)
     owner, owner_token = await new_session(client, "claude-code:owner")
     row = await db_session.get(Session, owner)
@@ -144,14 +149,17 @@ async def test_reap_then_late_heartbeat_preserves_only_original_mail_owner(clien
     assert (await client.patch(f"/api/sessions/{owner}", json={
         "status": "completed"}, headers=auth(owner_token))).status_code == 200
     assert (await client.post(f"/api/sessions/{owner}/heartbeat")).status_code == 409
-    assert message_id not in [m["id"] for m in await inbox(client, successor, successor_token)]
+    # #3585: the successor took ownership while the old owner was reaped (the
+    # revived session came back as a contributor), so the released ticket mail
+    # goes to that live owner, and a later session joins as a contributor.
+    assert message_id in [m["id"] for m in await inbox(client, successor, successor_token)]
     later, later_token = await new_session(client, "claude-code:later")
-    assert message_id in [m["id"] for m in await inbox(client, later, later_token)]
+    assert message_id not in [m["id"] for m in await inbox(client, later, later_token)]
 
 
 @pytest.mark.asyncio
 async def test_successor_claim_before_late_heartbeat_blocks_resurrection(client, db_session):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     mid = await send_ticket(client, sender, sender_token)
     owner, owner_token = await new_session(client, "claude-code:owner")
     row = await db_session.get(Session, owner)
@@ -172,7 +180,7 @@ async def test_successor_claim_before_late_heartbeat_blocks_resurrection(client,
 
 @pytest.mark.asyncio
 async def test_explicit_completion_cannot_patch_reopen_after_successor_claim(client):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     mid = await send_ticket(client, sender, sender_token)
     old, old_token = await new_session(client, "claude-code:old")
     assert mid in [m["id"] for m in await inbox(client, old, old_token)]
@@ -197,7 +205,7 @@ async def test_explicit_completion_cannot_patch_reopen_after_successor_claim(cli
 
 @pytest.mark.asyncio
 async def test_paused_session_retains_mail_and_locks_until_owner_resumes(client):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     mid = await send_ticket(client, sender, sender_token)
     owner, owner_token = await new_session(client, "claude-code:owner")
     paused = await client.patch(f"/api/sessions/{owner}", json={
@@ -214,7 +222,7 @@ async def test_paused_session_retains_mail_and_locks_until_owner_resumes(client)
 
 @pytest.mark.asyncio
 async def test_invalid_status_cannot_strand_ticket_mail(client):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     message_id = await send_ticket(client, sender, sender_token)
     owner, owner_token = await new_session(client, "claude-code:owner")
     for value in ("abandoned", "reaped", "", 123):
@@ -227,7 +235,7 @@ async def test_invalid_status_cannot_strand_ticket_mail(client):
 
 @pytest.mark.asyncio
 async def test_send_racing_owner_completion_keeps_direct_provenance(client):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     old, old_token = await new_session(client, "claude-code:old")
     send, close = await asyncio.gather(
         client.post("/api/messages", json={
@@ -254,7 +262,7 @@ async def test_send_racing_owner_completion_keeps_direct_provenance(client):
 
 @pytest.mark.asyncio
 async def test_send_racing_foreign_completion_does_not_end_recipient(client):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     recipient, recipient_token = await new_session(client, "claude-code:recipient")
     attacker, attacker_token = await new_session(client, "codex:attacker")
     send, close = await asyncio.gather(
@@ -274,7 +282,7 @@ async def test_send_racing_foreign_completion_does_not_end_recipient(client):
 
 @pytest.mark.asyncio
 async def test_inbox_read_is_not_ack_when_completion_intervenes(client):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     message_id = await send_ticket(client, sender, sender_token)
     owner, owner_token = await new_session(client, "claude-code:owner")
     assert message_id in [m["id"] for m in await inbox(client, owner, owner_token)]
@@ -295,7 +303,7 @@ async def test_inbox_read_is_not_ack_when_completion_intervenes(client):
 
 @pytest.mark.asyncio
 async def test_concurrent_ack_has_one_receipt_and_no_reclaim(client):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     message_id = await send_ticket(client, sender, sender_token)
     owner, owner_token = await new_session(client, "claude-code:owner")
     endpoint = f"/api/messages/{message_id}/acknowledge"
@@ -317,7 +325,7 @@ async def test_concurrent_ack_has_one_receipt_and_no_reclaim(client):
 
 @pytest.mark.asyncio
 async def test_ack_and_release_interleaving_has_one_outcome(client):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     message_id = await send_ticket(client, sender, sender_token)
     owner, owner_token = await new_session(client, "claude-code:owner")
     ack, close = await asyncio.gather(
@@ -343,7 +351,7 @@ async def test_ack_and_release_interleaving_has_one_outcome(client):
 
 @pytest.mark.asyncio
 async def test_ack_and_readdress_are_mutually_exclusive(client):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     old, old_token = await new_session(client, "claude-code:old")
     sent = await client.post("/api/messages", json={
         "sender_session_id": sender, "recipient_session_id": old, "body": "direct",
@@ -371,22 +379,29 @@ async def test_ack_and_readdress_are_mutually_exclusive(client):
 
 
 @pytest.mark.asyncio
-async def test_duplicate_successor_claims_have_one_winner(client):
-    sender, sender_token = await new_session(client, "codex:sender")
-    mid = await send_ticket(client, sender, sender_token)
-    a, b = await asyncio.gather(new_session(client, "claude-code:a"),
-                                new_session(client, "claude-code:b"))
-    a_rows = [m for m in await inbox(client, *a) if m["id"] == mid]
-    b_rows = [m for m in await inbox(client, *b) if m["id"] == mid]
-    assert len(a_rows) + len(b_rows) == 1
-    row = (a_rows or b_rows)[0]
-    assert row["sender_session_id"] == sender
-    assert len([e for e in row["delivery_history"] if e["action"] == "assigned"]) == 1
+async def test_duplicate_successor_claims_have_one_winner(live_ats):  # noqa: F811
+    # Run against a real server on a file database (#3585). Ticket sessions now
+    # decide ownership inside the acquisition guard, and the in-process `client`
+    # shares ONE in-memory connection across requests, where one request's
+    # teardown ROLLBACK can undo another's guarded insert. Two concurrent
+    # successful writers need real connections to be tested at all.
+    url, _sync_client, _env = live_ats
+    async with httpx.AsyncClient(base_url=url, timeout=10) as client:
+        sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
+        mid = await send_ticket(client, sender, sender_token)
+        a, b = await asyncio.gather(new_session(client, "claude-code:a"),
+                                    new_session(client, "claude-code:b"))
+        a_rows = [m for m in await inbox(client, *a) if m["id"] == mid]
+        b_rows = [m for m in await inbox(client, *b) if m["id"] == mid]
+        assert len(a_rows) + len(b_rows) == 1
+        row = (a_rows or b_rows)[0]
+        assert row["sender_session_id"] == sender
+        assert len([e for e in row["delivery_history"] if e["action"] == "assigned"]) == 1
 
 
 @pytest.mark.asyncio
 async def test_completed_sender_can_readdress_with_its_original_capability(client):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     old, old_token = await new_session(client, "claude-code:old")
     sent = await client.post("/api/messages", json={
         "sender_session_id": sender, "recipient_session_id": old, "body": "direct",
@@ -408,8 +423,9 @@ async def test_completed_sender_can_readdress_with_its_original_capability(clien
 @pytest.mark.asyncio
 async def test_message_writes_keep_receipt_and_owner_compare_and_set(client, monkeypatch):
     """A guard deletion must fail even when a sequential happy path still passes."""
-    sender, sender_token = await new_session(client, "codex:sender")
-    direct_old, old_token = await new_session(client, "claude-code:old")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
+    # Only a direct-message recipient here, so not the ticket's owner (#3585).
+    direct_old, old_token = await new_session(client, "claude-code:old", role="reviewer")
     direct = await client.post("/api/messages", json={
         "sender_session_id": sender, "recipient_session_id": direct_old,
         "body": "direct",
@@ -465,7 +481,7 @@ async def test_message_writes_keep_receipt_and_owner_compare_and_set(client, mon
 
 @pytest.mark.asyncio
 async def test_ticket_claim_guards_both_selection_and_compare_and_set(client, monkeypatch):
-    sender, sender_token = await new_session(client, "codex:sender")
+    sender, sender_token = await new_session(client, "codex:sender", role="reviewer")
     mid = await send_ticket(client, sender, sender_token)
     statements = []
     original_execute = AsyncSession.execute

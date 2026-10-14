@@ -95,17 +95,18 @@ def test_isolated_server_ticket_turnover_and_direct_authority(live_ats):
     """Fresh loopback server, real HTTP requests, one receipt per message."""
     _, client, _ = live_ats
 
-    def ticket_session(agent, ticket=2907):
+    def ticket_session(agent, ticket=2907, role=None):
+        # role: #3585 ticket role (None = owner if the ticket has no live owner).
         made = client.post("/api/sessions", json={
             "developer": "pvestal", "agent": agent, "scope": [],
-            "ticket_id": ticket})
+            "ticket_id": ticket, "ticket_role": role})
         assert made.status_code == 201, made.text
         return made.json()["id"], made.headers["X-ATS-Approval-Token"]
 
     def headers(token):
         return {"X-ATS-Approval-Token": token}
 
-    sender, sender_token = ticket_session("codex:sender")
+    sender, sender_token = ticket_session("codex:sender", role="reviewer")
     queued = client.post("/api/messages", json={
         "sender_session_id": sender, "ticket_id": 2907, "body": "ticket handoff",
     }, headers=headers(sender_token))
