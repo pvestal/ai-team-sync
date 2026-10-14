@@ -367,3 +367,120 @@ Evidence key (raw logs in the rehearsal scratchpad, `stage1/logs/`):
 | R6 | `claude -p` hook semantics |
 | R7 | rollback and ordering hazard |
 | R8 | mixed MCP |
+
+---
+
+## 10. Revalidation, 2026-10-14 18:43-19:05 UTC (integration owner claude-code:7be0617e, ATS session 1351ef46)
+
+This section supersedes sections 1, 3 and 9 where they conflict. Sections 2, 4-7
+still apply, with `f5cb28b` read as `1b094ed`. Evidence:
+`/home/patrick/Documents/anime-studio-audit/2026-10-14-ats-p0-owner/`.
+
+### 10.1 Candidate
+
+- **Code SHA: `1b094ed`** on `fix/d3-side-effect-free-brief` = reviewed
+  `cf705e5` (f5cb28b + packet docs) + D3. ATS `main` `d6038df` is an ancestor:
+  a fast-forward is possible. Under `src/`, `f5cb28b..1b094ed` changes only
+  `routers/briefs.py` and `hooks/ats_context.py`, so the R2-R8 evidence above
+  still covers every other module.
+- **D3** (operator ruling 2026-10-14, "reading task information must not
+  silently claim work"): `POST /api/brief` (MCP `task_brief`, the ATS-first
+  prompt hook) no longer binds ticket lineage or claims the ticket mailbox.
+  Claiming is only `start_session(ticket_id=...)`.
+
+### 10.2 Independent review
+
+| Commit | Review |
+|---|---|
+| f5cb28b | Codex PASS-WITH-CITATION (e80b5c72, decision 753b99aa), chain in section 1 |
+| 1b094ed | **Codex CLASS 2 PASS-WITH-CITATION** (delegation 32319ba3, decision 40bbf783), I1-I7 MET, reconciled by owner |
+
+Codex executed 0 tests in both reviews (read-only sandbox; collect-only 61 for
+1b094ed). The test evidence below is owner-run.
+
+### 10.3 Tests (reproducible)
+
+- Red check: the 10 D3 tests fail on `cf705e5`, pass on `1b094ed`.
+- Full suite, same environment (repo `.venv`, `PYTHONPATH=src`,
+  `--ignore=tests/test_tower_console_app.py` because `textual` is not installed
+  there): base `cf705e5` 1 failed / 1625 passed / 42 skipped; `1b094ed`
+  1 failed / 1631 passed / 42 skipped. Identical failure set:
+  `test_codex_close_authority::test_the_registry_declares_no_worker_this_tranche_did_not_account_for`
+  (reads the workstation `workers.toml`; the "1 workstation-config test" of
+  section 1).
+- Non-production rehearsal of a stamped `1b094ed` (scratch pipx home, server on
+  :18410 against a backup-API copy of the live ats.db, scratch state dir):
+  - install: `identity()` commit 1b094ed, dirty False; loader keys
+    `{governance, restart_gate}`;
+  - migration: only `restart_leases` added; every other row count identical;
+  - D3 on real data: three briefs (exact id, prose, exact) on #3582, whose
+    handoff 27f76403 is queued, left message, handoff and session rows
+    unchanged and the reader's inbox empty; an explicit
+    `start_session(ticket_id=3582)` then received it (`ticket_claim`);
+  - prompt hook, prompt "Give me the status of #3577." in /opt/anime-studio:
+    exact context injected with the TICKET NOT CLAIMED line; the session
+    registered with `ticket_id` NULL; #3577's queued handoff untouched;
+  - guards, payload only: restart guard `systemctl restart anime-studio` exit 2,
+    `ls` exit 0; Bash guard `sed -i` on an unclaimed file exit 2; edit guard on
+    an unclaimed file exit 2;
+  - teardown: server stopped, 0 listeners on 18400-18419, scratch removed.
+    Production compared to a pre-rehearsal baseline: settings.json,
+    operator.toml, ~/.codex hooks/config sha256, venv source hash, ats-server
+    PID 4754 NRestarts 0, /opt git hooks, and the five governed units' MainPID
+    and ActiveEnterTimestamp all identical.
+
+### 10.4 Pre-deploy lock census (P2)
+
+`ats lock preflight-deploy` with candidate code, live DB read-only, 18:5x UTC:
+**9 live locks, 0 hazards, exit 0** (the 04:18 UTC repo_wide and broad hazards
+are gone). P2 is met now and must be re-run at the deploy moment.
+
+### 10.5 Version and hook compatibility
+
+- One production install: pipx venv `ai-team-sync` (stamp still says
+  `d56f144` dirty; its source equals main `b6e242d`). It serves ats-server,
+  every ats-mcp, the Claude hooks and the Codex hooks
+  (`~/.codex/hooks.json`: codex_session_autostart, ats_context). Other
+  `ai_team_sync` copies are editable dev installs that no hook or unit runs.
+- P5 met: running Claude binaries are 2.1.299 and 2.1.300.
+- `settings.json` PreToolUse is unchanged from the base used for the S4 array
+  (curate-gate + lockcheck without timeout/onFailure).
+- Six long-running ats-mcp processes keep their old code until their client
+  restarts (R8). Old MCP `task_brief` against the new REST works (same request).
+- D3 behavior change: a session that never calls
+  `start_session(ticket_id=...)` stays ticket-unlinked. It receives no queued
+  ticket mail and cannot leave a ticket handoff (`sessions.py:1489-1490`).
+
+### 10.6 Installation and migration order
+
+Unchanged from section 4 with `1b094ed`: S1 backups, S2 install from a clean
+`1b094ed` tree with the stamp written, S3 restart ats-server and verify
+`restart_leases`, S4 settings.json array, S5 git hooks, no `[restart_gate]`.
+
+### 10.7 Rollback
+
+Unchanged from section 4. Rolling back the venv also restores brief binding.
+
+### 10.8 Residual bypasses
+
+Section 7, plus:
+- Edit guard fails open while ATS is unreachable, including the ~1 s ats-server
+  restart in S3.
+- The prompt hook still auto-registers sessions and anchors their repo (not a
+  ticket claim).
+- Direct messages already addressed to ended sessions (174) and ticket mail held
+  by reaped sessions are not returned by this change (audit D4).
+- `bind_ticket_lineage` remains defined with no caller.
+
+### 10.9 Operator actions
+
+Section 8 D1-D7 still stand. D4 is moot (no hazards). Added:
+- **D8.** Accept the D3 behavior change in 10.5 (agents claim tickets only
+  through `start_session(ticket_id=...)`).
+- At deploy: P3 (no session mid-edit, no Codex run), P4 backups, P2 re-run.
+
+### 10.10 Recommendation: CONDITIONAL GO
+
+No technical blocker remains. P1, P2, P5 and P6 are met. Go when the operator
+gives D1 with D2, D3, D5-D8, and P3, P4 and P2 are re-verified at the deploy
+moment.
