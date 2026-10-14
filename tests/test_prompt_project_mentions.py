@@ -266,7 +266,8 @@ async def test_incident_go_prompt_reaches_the_anchored_owner(client, tmp_path, m
     assert "PROJECT MENTION (advisory, not a switch)" in note and ANIME_ROOT in note
     assert "start_session with repo_root=/opt/anime-studio" in note
     assert (
-        "Agent commits and merges there (where the ATS git hooks are installed) need the "
+        "Agent commits and non-fast-forward merges there (where the ATS git hooks are "
+        "installed; fast-forward merges and --no-verify are not checked) need the "
         "committing session's own live locks on those files and are refused on other "
         "sessions' conflicting locks."
     ) in note

@@ -122,9 +122,11 @@ def _hold_anchor(anchored: str, target: RequestTarget) -> tuple[RequestTarget, s
         f"session stays anchored to {anchored}; prompt text never switches projects. "
         f"To work in {named}, start an ATS session there explicitly "
         f"(start_session with repo_root={others[0]} and its scope). Edits and Bash "
-        "writes there need a lock held by that session. Agent commits and merges there "
-        "(where the ATS git hooks are installed) need the committing session's own live "
-        "locks on those files and are refused on other sessions' conflicting locks."
+        "writes there need a lock held by that session. Agent commits and "
+        "non-fast-forward merges there (where the ATS git hooks are installed; "
+        "fast-forward merges and --no-verify are not checked) need the committing "
+        "session's own live locks on those files and are refused on other sessions' "
+        "conflicting locks."
     )
 
 
