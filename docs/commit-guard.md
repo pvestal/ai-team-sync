@@ -60,8 +60,11 @@ The Bash guard and both git hooks share one resolver,
      `caller_identity_unresolved`. That is the server's #2741 check: the
      kernel's uid for the loopback socket against the session's `creator_uid`.
    - **Liveness.** `GET /api/sessions/<id>` must report `status: active`.
+   - **Creator.** The same read's `creator_uid` must be this process's uid. A
+     NULL `creator_uid` (a legacy row from before #2741) is unverified, and a
+     failure in a governed repository.
 
-   If an env identity fails either check, a governed repository **refuses**. An
+   If an env identity fails any check, a governed repository **refuses**. An
    ungoverned repository judges the commit as unidentified (the
    exclusive-only rule).
 3. The shared `~/.ats_session` file is never used, because it names whichever
@@ -82,16 +85,20 @@ of the same OS account can set. Identity is cooperative:
 - A same-account process can write or overwrite a pointer file
   `~/.ats_session_<cid8>`, or set `CLAUDE_CODE_SESSION_ID` to another Claude
   session's id.
-- The ownership check is the server's `cross_account`. It accepts a legacy
-  session row whose `creator_uid` is NULL (created before #2741) for an ordinary
-  account. The session API does not expose `creator_uid`, so this client cannot
-  tell such a row from one this account created.
-- A **pointer-backed** identity that fails the same two checks, for example
-  because its session was completed or reaped, is not refused. It is judged as
-  unidentified. Only self-asserted identities are refused on failure.
-- The edit guard (`pre_tool_use_lockcheck.py`) still resolves
-  `$ATS_SESSION_ID` first, through `session_pointer.resolve_pointer`. It was not
-  changed in this fix.
+- The server's `cross_account` accepts a legacy session row whose `creator_uid`
+  is NULL (created before #2741) for an ordinary account. The session API now
+  returns `creator_uid`, and the guards treat NULL as unverified in a governed
+  repository; in an ungoverned one such a row is still accepted.
+- A **pointer-backed** identity that fails the same checks, for example
+  because its session was completed or reaped, is not refused by the git and
+  Bash guards. It is judged as unidentified. Only self-asserted identities are
+  refused on failure.
+- The edit guard (`pre_tool_use_lockcheck.py`) resolves identity the same way
+  (`commit_guard.resolve_identity`): the pointer wins, a contradicting
+  `$ATS_SESSION_ID` is refused (exit 2), and a self-asserted identity is
+  validated with `identity_problem`. Failing validation refuses the edit in a
+  governed repository and is judged unidentified elsewhere. It does not
+  validate pointer-backed identities (unchanged).
 
 **Paths checked.** pre-commit checks `git diff --cached --name-only --no-renames`,
 where a rename counts as both its deleted and its added path. When `MERGE_HEAD`

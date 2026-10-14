@@ -266,20 +266,51 @@ def main() -> None:
     # An approved override clears only the specific existing lock for this
     # session. Failed lookups leave the original conflict intact.
     approved_lock_ids: set[str] = set()
-    my_sid = None
+    # Identity as the git and Bash guards resolve it (#3581): this Claude
+    # session's pointer wins, a contradicting $ATS_SESSION_ID is refused, and an
+    # env-only (or delegated) identity counts only once ATS confirms it. The
+    # identity removes its own locks from the verdict, so a borrowed holder id
+    # would otherwise turn the holder's lock into "mine".
+    from ai_team_sync.hooks import commit_guard as cg
+
+    ident = cg.resolve_identity(payload.get("session_id") or None)
+    if ident.conflict:
+        print(f"ATS LOCK GUARD: {ident.conflict}", file=sys.stderr)
+        sys.exit(2)
+    my_sid = ident.session_id
+    results = []
     try:
-        from ai_team_sync import session_pointer as sp
-        my_sid = sp.resolve_pointer(payload.get("session_id", ""), allow_global=False)
         if my_sid:
             with httpx.Client(timeout=2) as client:
                 check = client.post(f"{server}/api/locks/check", json={
                     "paths": [rel], "repo_root": froot, "session_id": my_sid})
                 check.raise_for_status()
-                matches = check.json()[0].get("matches", [])
+                results = check.json()
+                matches = results[0].get("matches", [])
             approved_lock_ids = {m["lock_id"] for m in matches
                                  if m.get("override_granted") and not m.get("is_own")}
     except Exception:
         pass
+    if my_sid and ident.self_asserted:
+        try:
+            governed_here = froot in _coordinated_roots()
+        except OperatorConfigError:
+            governed_here = True  # the claim guard below refuses on the config itself
+        try:
+            problem = cg.identity_problem(ident, results, timeout=2,
+                                          governed_repo=governed_here)
+        except cg.GuardUnavailable as exc:
+            problem = f"ATS could not confirm it ({exc})"
+        if problem:
+            if governed_here:
+                print(f"ATS LOCK GUARD: the acting identity came from "
+                      f"{'$ATS_SESSION_ID' if ident.source == 'env' else 'a delegated capability'}"
+                      f" (no pointer for this Claude session) and is not valid: {problem}. "
+                      f"Refusing edits in the governed repository {froot}.", file=sys.stderr)
+                sys.exit(2)
+            print(f"ATS LOCK GUARD: ignoring session identity ({problem}); judging as an "
+                  f"unidentified editor.", file=sys.stderr)
+            my_sid, approved_lock_ids = None, set()
     conflicts = find_conflicts(rel, sessions, payload.get("session_id", ""),
                                file_repo_root=froot, locks=locks,
                                approved_lock_ids=approved_lock_ids,

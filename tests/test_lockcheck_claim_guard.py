@@ -151,7 +151,6 @@ def test_edit_hook_uses_live_locks_for_both_sides(
         monkeypatch, capsys, other_mode, own_lock, coordinated, exit_code, message):
     """The actual hook reads both endpoints; scope-only rows cannot decide."""
     import httpx
-    from ai_team_sync import session_pointer
 
     sessions = [
         _sess(scope=["packages/**"]),
@@ -190,7 +189,7 @@ def test_edit_hook_uses_live_locks_for_both_sides(
     monkeypatch.setattr(guard, "_roots", lambda _path: (REPO, REPO))
     monkeypatch.setattr(guard, "_coordinated_roots",
                         lambda: [REPO] if coordinated else [])
-    monkeypatch.setattr(session_pointer, "resolve_pointer", lambda *_a, **_kw: MY_SID)
+    _pointer_identity(monkeypatch, MY_SID)
     monkeypatch.delenv("ATS_LOCKCHECK_BLOCK", raising=False)
     monkeypatch.delenv("ATS_CLAIMCHECK", raising=False)
     monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({
@@ -204,11 +203,19 @@ def test_edit_hook_uses_live_locks_for_both_sides(
     assert message in capsys.readouterr().err
 
 
+def _pointer_identity(monkeypatch, sid):
+    """This Claude session's per-session pointer names `sid` (None: no pointer).
+    The hook resolves identity through commit_guard.resolve_identity (#3581)."""
+    from ai_team_sync.hooks import commit_guard
+
+    ident = commit_guard.Identity(sid, "per_session") if sid else commit_guard.Identity(None, "none")
+    monkeypatch.setattr(commit_guard, "resolve_identity", lambda *_a, **_kw: ident)
+
+
 def _invoke_edit_hook(monkeypatch, capsys, *, sessions, locks, sid=MY_SID,
                       cid=MY_CID8, coordinated=True, block=None):
     """Exercise main() with the two ATS read responses and Claude hook input."""
     import httpx
-    from ai_team_sync import session_pointer
 
     class Response:
         def __init__(self, body):
@@ -241,7 +248,7 @@ def _invoke_edit_hook(monkeypatch, capsys, *, sessions, locks, sid=MY_SID,
     monkeypatch.setattr(httpx, "Client", Client)
     monkeypatch.setattr(guard, "_roots", lambda _path: (REPO, REPO))
     monkeypatch.setattr(guard, "_coordinated_roots", coordinated_roots)
-    monkeypatch.setattr(session_pointer, "resolve_pointer", lambda *_a, **_kw: sid)
+    _pointer_identity(monkeypatch, sid)
     monkeypatch.delenv("ATS_CLAIMCHECK", raising=False)
     if block is None:
         monkeypatch.delenv("ATS_LOCKCHECK_BLOCK", raising=False)

@@ -107,7 +107,8 @@ def world(live_ats, tmp_path):  # noqa: F811
 
         yield {"gov": gov, "free": free, "a": a, "b": b, "env": env, "audit": audit,
                "url": url, "session": session, "complete": complete, "lock": lock,
-               "claude_env": claude_env, "gov_real": gov_real}
+               "claude_env": claude_env, "gov_real": gov_real,
+               "db": server_env["DATABASE_URL"].split(":///", 1)[1]}
     finally:
         shutil.rmtree(base, ignore_errors=True)
 
@@ -427,3 +428,59 @@ def test_cp_parents_target_is_resolved_under_the_replicated_path(world):
     r = _bash_guard("cp --parents sub/x.txt mirror/", world["gov"], world["env"](world["b"]))
     assert r.returncode == 2, r.stderr
     assert "'mirror/sub/x.txt'" in r.stderr and world["a"] in r.stderr
+
+
+# integration: the edit guard resolves identity like the git and Bash guards -------
+
+def _edit_guard(path, env, cid=CID_B):
+    payload = {"tool_name": "Edit", "session_id": cid, "tool_input": {"file_path": str(path)}}
+    return subprocess.run([sys.executable, "-m", "ai_team_sync.hooks.pre_tool_use_lockcheck"],
+                          input=json.dumps(payload), env=env, capture_output=True, text=True,
+                          timeout=30)
+
+
+def test_edit_with_a_borrowed_holder_id_is_refused(world):
+    """B's Claude session borrows A's id via $ATS_SESSION_ID. Before, the env id
+    won, A's exclusive lock on f.txt became 'own' and the claim guard granted the
+    Edit from A's lock."""
+    a, b = world["a"], world["b"]
+    r = _edit_guard(world["gov"] / "f.txt", world["claude_env"](CID_B, b, ATS_SESSION_ID=a))
+    assert r.returncode == 2, r.stderr
+    assert "contradicts" in r.stderr and a in r.stderr and b in r.stderr
+    # B as itself: A's exclusive lock refuses; B's own lane is editable.
+    assert _edit_guard(world["gov"] / "f.txt", world["claude_env"](CID_B, b)).returncode == 2
+    ok = _edit_guard(world["gov"] / "g.txt", world["claude_env"](CID_B, b, ATS_SESSION_ID=b))
+    assert ok.returncode == 0, ok.stderr
+
+
+def test_edit_with_an_env_only_unknown_identity_is_refused_in_a_governed_repo(world):
+    r = _edit_guard(world["gov"] / "g.txt",
+                    world["env"]("00000000-dead-beef-0000-000000000000"))
+    assert r.returncode == 2
+    assert "is not valid" in r.stderr and "00000000-dead-beef" in r.stderr
+
+
+def test_session_response_carries_creator_uid(world):
+    import httpx
+
+    body = httpx.get(f"{world['url']}/api/sessions/{world['b']}").json()
+    assert body["creator_uid"] == os.getuid()
+
+
+def test_a_legacy_null_creator_identity_is_unverified_in_a_governed_repo(world):
+    """A row from before #2741 (creator_uid NULL) is accepted by the server's
+    cross_account for an ordinary account; the guards refuse it as an
+    env-only identity in a governed repository."""
+    import sqlite3
+
+    legacy = world["session"]("claude-code:dddddddd", world["gov_real"])
+    world["lock"](legacy, "g2.txt", "advisory")
+    with sqlite3.connect(world["db"]) as db:
+        db.execute("UPDATE sessions SET creator_uid = NULL WHERE id = ?", (legacy,))
+    env = world["env"](legacy)
+    edit = _edit_guard(world["gov"] / "g2.txt", env)
+    assert edit.returncode == 2 and "no recorded creator" in edit.stderr
+    commit = _commit(world["gov"], env, path="g2.txt")
+    assert commit.returncode != 0 and "no recorded creator" in commit.stderr
+    g = _bash_guard("echo x >> g2.txt", world["gov"], env)
+    assert g.returncode == 2 and "no recorded creator" in g.stderr

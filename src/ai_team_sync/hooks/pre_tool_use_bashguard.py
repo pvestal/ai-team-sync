@@ -1247,6 +1247,7 @@ def decide(command: str, cwd: str | None, claude_sid: str) -> Decision:
         return result
     my_sid = ident.session_id
     problem: str | None = None  # None = not yet validated
+    problems: dict[bool, str] = {}  # by governed: a legacy creator is refused only there
     cid8 = (claude_sid or "")[:8]
     blocks: list[str] = []
     claim_ctx: tuple[list, list] | None = None
@@ -1263,8 +1264,11 @@ def decide(command: str, cwd: str | None, claude_sid: str) -> Decision:
         rels = [r for r, _ in items]
         try:
             results = cg.check_paths(rels, root, my_sid, timeout=3)
-            if my_sid and problem is None:
-                problem = cg.identity_problem(ident, results, timeout=3)
+            if my_sid and is_governed not in problems:
+                problems[is_governed] = cg.identity_problem(
+                    ident, results, timeout=3, governed_repo=is_governed)
+            if my_sid:
+                problem = problems[is_governed]
             if my_sid and problem:
                 if ident.self_asserted and is_governed:
                     blocks.append(

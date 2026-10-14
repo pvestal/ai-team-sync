@@ -340,6 +340,7 @@ def _session_to_response(s: Session, uncommitted_cache: dict[str, list[str]] | N
         idle_seconds=idle_seconds,
         is_stale=is_stale,
         auto_completed=bool(getattr(s, "auto_completed", False)),
+        creator_uid=getattr(s, "creator_uid", None),
         uncommitted_in_scope=_uncommitted_in_scope(s, uncommitted_cache),
     )
 

@@ -161,20 +161,20 @@ def identify_session() -> tuple[str | None, str]:
     return ident.session_id, ident.source
 
 
-def identity_problem(ident: Identity, results: list[dict], timeout: float = 5.0) -> str:
+def identity_problem(ident: Identity, results: list[dict], timeout: float = 5.0,
+                     governed_repo: bool = False) -> str:
     """Why `ident` must not be trusted, or '' when it may be.
 
-    Two checks, both by the server, against existing endpoints:
+    Checks against existing endpoints:
 
     * ownership -- /api/locks/check, asked WITH this session id, sets
       caller_identity_unresolved when the server's #2741 boundary
       (routers/locks.cross_account: the kernel's uid for this loopback socket vs
       the session's creator_uid) refuses the claim, or the id is unknown;
-    * liveness -- GET /api/sessions/<id> must say status 'active'.
-
-    LIMIT: cross_account accepts a legacy row whose creator_uid is NULL (rows
-    created before #2741) for an ordinary account; creator_uid is not exposed
-    by the session API, so this client cannot tell such a row apart.
+    * liveness -- GET /api/sessions/<id> must say status 'active';
+    * creator -- the same read's creator_uid must be this process's uid. A NULL
+      creator_uid (a legacy row from before #2741, which cross_account accepts
+      for an ordinary account) is unverified, and refused in a governed repo.
 
     Raises GuardUnavailable when the liveness read fails in transport."""
     sid = ident.session_id
@@ -194,9 +194,17 @@ def identity_problem(ident: Identity, results: list[dict], timeout: float = 5.0)
         return f"session {sid} is not known to ATS"
     if resp.status_code != 200:
         raise GuardUnavailable(f"GET /api/sessions/{sid} returned {resp.status_code}")
-    status = str((resp.json() or {}).get("status", ""))
+    body = resp.json() or {}
+    status = str(body.get("status", ""))
     if status != "active":
         return f"session {sid} is '{status}', not active"
+    creator = body.get("creator_uid")
+    if creator is None:
+        if governed_repo:
+            return (f"session {sid} is a legacy row with no recorded creator (pre-#2741), "
+                    f"so its ownership cannot be verified")
+    elif creator != os.getuid():
+        return f"session {sid} was created by another OS account (uid {creator})"
     return ""
 
 
@@ -368,7 +376,7 @@ def run_git_guard(hook: str, paths: list[str], cwd: str | None = None) -> int:
 
     try:
         results = check_paths(paths, root, sid)
-        problem = identity_problem(ident, results)
+        problem = identity_problem(ident, results, governed_repo=is_governed)
         if problem:
             if ident.self_asserted and is_governed and not override:
                 _err(f"\n{TAG} REFUSED ({hook}) in governed repository {root}: the "

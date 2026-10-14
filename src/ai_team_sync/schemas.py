@@ -87,6 +87,10 @@ class SessionResponse(BaseModel):
     # so a client can tell "I was reaped" (recoverable — heartbeat resurrects it)
     # from "I finished" (terminal), instead of both reading as plain 'completed'.
     auto_completed: bool = False
+    # The OS account that created the session (#2741), so a client can verify it
+    # owns an identity it was handed (#3581). None = a legacy row created before
+    # #2741, whose ownership cannot be verified.
+    creator_uid: int | None = None
     # Resurrection result, STRUCTURED (#2760). The lifecycle marker carries only
     # counts and an outcome, because a lock pattern is arbitrary glob syntax and
     # narrative text is the wrong place to encode it. Anything that needs the
