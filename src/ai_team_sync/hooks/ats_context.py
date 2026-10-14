@@ -129,9 +129,8 @@ def _hold_anchor(
         return replace(target, repo_root=anchored), ""
     if requested == anchored or requested == target.cwd_repo:
         return target, ""
-    movers = target.topical if placeholder else target.directed
-    if requested in movers:
-        return target, ""
+    if requested in target.directed:
+        return target, ""  # a placeholder follows a correction; claimed sessions raised above
     named = ", ".join(root for root in target.mentioned if root != anchored) or requested
     return replace(target, repo_root=anchored), (
         f"NOT A PROJECT SWITCH: the prompt names {named} without directing work there "

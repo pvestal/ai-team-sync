@@ -25,7 +25,6 @@ class RequestTarget:
     # How the prompt text names governed repositories (see classify_mentions).
     # Only `directives` may move or block a session that already holds work.
     mentioned: tuple[str, ...] = ()
-    topical: tuple[str, ...] = ()
     directives: tuple[tuple[str, str], ...] = ()
     cwd_repo: str = ""
 
@@ -78,7 +77,8 @@ def _repo_from_cwd(cwd: str, roots: list[str]) -> str:
 # change anime-studio" in a GO prompt was read as a switch and blocked the GO.
 # A mention is a WORK directive only when, inside one clause of the operator's
 # own text, it follows a leading work verb with no negation or subordinator in
-# between. Quoted, fenced, example and harness-framed text is not the operator's
+# between, and no negation earlier in the same sentence carries over to it.
+# Quoted, fenced, example and harness-framed text is not the operator's
 # instruction and is removed first. The rules are deliberately narrow: a missed
 # directive still meets the edit guards, a false one blocks the operator.
 # --------------------------------------------------------------------------- #
@@ -90,15 +90,11 @@ _WORK_VERBS = frozenset(
     "rename render repair replace restart resume revert rewrite rollback run ship start "
     "switch train tune update upgrade work write".split()
 )
-_SUBJECT_VERBS = frozenset(
-    "audit check describe explain find give inspect investigate list look read report "
-    "review show summarise summarize tell".split()
-)
 # Leading words that do not change what the clause asks for.
 _FILLERS = frozenset(
     "please now then next also instead correction ok okay so first second third finally "
     "and just kindly immediately right lets let s us i we you need needs want to "
-    "should must thanks thank".split()
+    "should must thanks thank ahead".split()
 )
 # A modal is a polite request only before "you" ("could you fix X"); "I would
 # build X" is a recommendation, not an instruction.
@@ -113,9 +109,11 @@ _CONTRACTED_NEGATIONS = frozenset(
 # session before switching ... to anime-studio" does not direct work there.
 _SUBORDINATORS = frozenset(
     "before after until unless rather instead than while when whenever if whether "
-    "because since so that which who whose where once though although like ahead "
-    "behind".split()
+    "because since so that which who whose where once though although like".split()
 )
+# A clause carrying one of these turns away from a preceding negation:
+# "do not touch ATS, fix anime-studio instead".
+_CONTRASTS = frozenset("instead rather".split())
 
 _NON_INSTRUCTION = [
     # Harness frames carry reports and tool output, not operator direction.
@@ -125,7 +123,6 @@ _NON_INSTRUCTION = [
         re.S | re.I,
     ),
     re.compile(r"(```|~~~).*?(\1|\Z)", re.S),           # fenced code
-    re.compile(r"`[^`\n]*`"),                             # inline code
     re.compile(r'"[^"\n]*"|\u201c[^\u201d\n]*\u201d'),   # double quotes
     re.compile(r"(?<![\w])'[^'\n]+'(?![\w])"),           # single quotes, not apostrophes
     re.compile(r"^[ \t]*>.*$", re.M),                     # blockquote lines
@@ -135,10 +132,11 @@ _NON_INSTRUCTION = [
         re.I,
     ),
 ]
-_CLAUSE_SPLIT = re.compile(r"[\n;:,()\[\]{}|]+|[.!?]+(?=\s|$)|\s[-\u2013\u2014]+\s")
+# Sentences end a negation's reach; clauses inside one sentence inherit it.
+_SENTENCE_SPLIT = re.compile(r"[\n;]+|[.!?]+(?=\s|$)")
+_CONTRAST_SPLIT = re.compile(r"\s(?:but)\s", re.I)
+_CLAUSE_SPLIT = re.compile(r"[:,()\[\]{}|]+|\s[-\u2013\u2014]+\s")
 _LIST_MARKER = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
-
-
 _ABSOLUTE_PATH = re.compile(r"(?<![\w.~-])/[\w.@+-]+(?:/[\w.@+-]*)*")
 
 
@@ -146,6 +144,9 @@ def _operator_text(prompt: str, roots: list[str]) -> str:
     text = re.sub(r"</?pasted_content\b[^>]*>", "\n", prompt or "")
     for pattern in _NON_INSTRUCTION:
         text = pattern.sub(" ", text)
+    # Inline code is usually the target itself ("edit `/opt/x/y.py`"), so only
+    # its backticks go; the words still have to form a directive to count.
+    text = text.replace("`", " ")
 
     # A path names a governed repository only when it lies inside one;
     # /home/x/anime-studio-authz merely shares the name.
@@ -158,14 +159,19 @@ def _operator_text(prompt: str, roots: list[str]) -> str:
     return text.replace("**", " ").replace("__", " ")
 
 
+def _is_negation(words: list[str], j: int) -> bool:
+    return words[j] in _NEGATIONS or (
+        words[j] == "t" and j > 0 and words[j - 1] in _CONTRACTED_NEGATIONS
+    )
+
+
 def _alias_positions(words: list[str], alias: str) -> list[int]:
     target = alias.split()
     width = len(target)
     return [i for i in range(len(words) - width + 1) if words[i : i + width] == target]
 
 
-def _clause_level(words: list[str], mention: int) -> int:
-    """2 = work directive, 1 = subject (read) request, 0 = incidental."""
+def _is_directive(words: list[str], mention: int) -> bool:
     i = 0
     while i < mention:
         if words[i] in _FILLERS:
@@ -174,52 +180,57 @@ def _clause_level(words: list[str], mention: int) -> int:
             i += 2
         else:
             break
-    if i >= mention:
-        return 0
-    verb = words[i]
-    if verb in _WORK_VERBS:
-        level = 2
-    elif verb in _SUBJECT_VERBS:
-        level = 1
-    else:
-        return 0
+    if i >= mention or words[i] not in _WORK_VERBS:
+        return False
     for j in range(i + 1, mention):
-        word = words[j]
-        if word in _NEGATIONS or word in _SUBORDINATORS:
-            return 0
-        if word == "t" and words[j - 1] in _CONTRACTED_NEGATIONS:
-            return 0
-    return level
+        if _is_negation(words, j) or words[j] in _SUBORDINATORS:
+            return False
+        if words[j] == "ahead" and j + 1 < len(words) and words[j + 1] == "of":
+            return False
+    return True
 
 
-def classify_mentions(
-    prompt: str, roots: list[str]
-) -> tuple[list[str], list[str], list[tuple[str, str]]]:
-    """(mentioned, topical, directives) for the governed roots a prompt names.
+def _clauses(text: str):
+    """(clause text, words, inherited negation) for each clause of operator text."""
+    for sentence in _SENTENCE_SPLIT.split(text):
+        for segment in _CONTRAST_SPLIT.split(sentence):
+            negated = False
+            for clause in _CLAUSE_SPLIT.split(segment):
+                clause = _LIST_MARKER.sub("", clause).strip()
+                words = _normal_words(clause).split()
+                if not words:
+                    continue
+                inherited = negated and not (_CONTRASTS & set(words))
+                yield clause, words, inherited
+                # "Never do this: ..." / "do not change X, Y or Z" carry their
+                # negation forward; a bare interjection ("No, switch to X") does not.
+                if len(words) > 1 and any(_is_negation(words, j) for j in range(len(words))):
+                    negated = True
+                elif not inherited:
+                    negated = False
+
+
+def classify_mentions(prompt: str, roots: list[str]) -> tuple[list[str], list[tuple[str, str]]]:
+    """(mentioned, directives) for the governed roots a prompt names.
 
     `mentioned` is every root named anywhere (the long-standing rule, used for
-    first anchoring). `topical` adds read requests ("give me the X status").
-    `directives` pairs each root with the clause that instructs work there.
+    first anchoring). `directives` pairs each root with the clause of the
+    operator's own text that instructs work there.
     """
     raw = f" {_normal_words(prompt)} "
     mentioned = [r for r in roots if any(f" {a} " in raw for a in _aliases(r))]
-    best: dict[str, int] = {}
     evidence: dict[str, str] = {}
-    for clause in _CLAUSE_SPLIT.split(_operator_text(prompt, roots)):
-        clause = _LIST_MARKER.sub("", clause).strip()
-        words = _normal_words(clause).split()
-        if not words:
+    for clause, words, inherited in _clauses(_operator_text(prompt, roots)):
+        if inherited:
             continue
         for root in roots:
+            if root in evidence:
+                continue
             for alias in _aliases(root):
-                for position in _alias_positions(words, alias):
-                    level = _clause_level(words, position)
-                    if level > best.get(root, 0):
-                        best[root] = level
-                        evidence[root] = clause
-    topical = [r for r in roots if best.get(r, 0) >= 1]
-    directives = [(r, evidence[r]) for r in roots if best.get(r, 0) == 2]
-    return mentioned, topical, directives
+                if any(_is_directive(words, at) for at in _alias_positions(words, alias)):
+                    evidence[root] = clause
+                    break
+    return mentioned, [(r, evidence[r]) for r in roots if r in evidence]
 
 
 def _unique(values: list[str]) -> str:
@@ -233,23 +244,17 @@ def resolve_request_target(
     roots = governed_roots if governed_roots is not None else globals()["governed_roots"]()
     roots = [os.path.realpath(root).rstrip("/") or "/" for root in roots]
     task_id = explicit_task_id(prompt)
-    mentioned, topical, directives = classify_mentions(prompt, roots)
+    mentioned, directives = classify_mentions(prompt, roots)
     directed = list(dict.fromkeys(root for root, _clause in directives))
     cwd_repo = _repo_from_cwd(cwd, roots)
-    # The strongest unambiguous signal names the prompt's repository. A bare
-    # mention never outranks the repository the worker is standing in.
+    # A work directive names the prompt's repository. Otherwise the long-standing
+    # single-name rule applies, except that a bare mention never outranks the
+    # repository the worker is standing in.
     if directed:
         prompt_repo = _unique(directed)
-    elif topical:
-        prompt_repo = _unique(topical)
     else:
         prompt_repo = "" if cwd_repo else _unique(mentioned)
-    evidence = dict(
-        mentioned=tuple(mentioned),
-        topical=tuple(topical),
-        directives=tuple(directives),
-        cwd_repo=cwd_repo,
-    )
+    evidence = dict(mentioned=tuple(mentioned), directives=tuple(directives), cwd_repo=cwd_repo)
     if task_id is not None:
         return RequestTarget(task_id, prompt_repo or cwd_repo, "explicit_task", **evidence)
     if prompt_repo:

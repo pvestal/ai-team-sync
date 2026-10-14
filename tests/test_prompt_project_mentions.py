@@ -88,6 +88,12 @@ INCIDENTAL = {
     "conditional_recommendation": "I would finally build the Anime Studio adapter.",
     "ahead_of": "Move the dirty-tree problem ahead of any further anime-studio work.",
     "lookalike_path": "Commit 86f4196c in /home/patrick/Documents/anime-studio-authz.",
+    # Codex CLASS 2 r1 (decision 3b6f0c78) reproductions and their classes.
+    "colon_negation": "Never do this: restart anime-studio.",
+    "negated_list_continuation": "Do not change ATS, restart anime-studio, or touch Echo Brain.",
+    "status_report_noun": "Review of anime-studio complete; Echo Brain unchanged.",
+    "read_two_names": "Give me the Anime Studio status; Echo Brain is out of scope.",
+    "read_then_negation": "Explain Anime Studio. Do not touch Echo Brain.",
     "pasted_handback": PASTED_HANDBACK,
 }
 
@@ -106,6 +112,12 @@ DIRECTIVES = {
     "polite_question": ("Can you work on Echo Brain next?", ECHO_ROOT),
     "we_need_to": ("We need to deploy anime-studio tonight.", ANIME_ROOT),
     "could_you": ("Could you restart anime-studio once?", ANIME_ROOT),
+    # Codex CLASS 2 r1 (decision 3b6f0c78) reproductions and their classes.
+    "backticked_path": ("Edit `/opt/anime-studio/packages/gateway.py` now.", ANIME_ROOT),
+    "go_ahead": ("Go ahead and fix anime-studio.", ANIME_ROOT),
+    "but_contrast": ("Don't edit ATS but fix anime-studio.", ANIME_ROOT),
+    "comma_instead": ("Do not touch ATS, fix the anime-studio gateway instead.", ANIME_ROOT),
+    "interjection_no": ("No, switch to anime-studio.", ANIME_ROOT),
     "governed_path_command": (
         "cd /opt/tower-echo-brain/.worktrees/fix-3537 && run the suite.",
         ECHO_ROOT,
@@ -158,12 +170,37 @@ def test_directive_evidence_names_the_triggering_clause():
     )
 
 
-def test_status_read_is_a_subject_not_a_work_directive():
+def test_status_read_is_not_a_work_directive():
     target = _target("Give me the current Echo Brain status.")
 
-    assert target.topical == (ECHO_ROOT,)
     assert target.directed == ()
-    assert target.repo_root == ECHO_ROOT  # unchanged: first anchoring follows the subject
+    assert target.repo_root == ECHO_ROOT  # unchanged: a single name still supplies context
+
+
+def _old_rule(prompt, cwd, roots):
+    """Reference copy of the pre-fix resolver (a0fa3d6), for item 6."""
+    from ai_team_sync.briefs import explicit_task_id
+    from ai_team_sync.context_resolution import _aliases, _normal_words, _repo_from_cwd
+
+    words = f" {_normal_words(prompt)} "
+    matches = [r for r in roots if any(f" {a} " in words for a in _aliases(r))]
+    prompt_repo = matches[0] if len(matches) == 1 else ""
+    cwd_repo = _repo_from_cwd(cwd, roots)
+    if explicit_task_id(prompt) is not None or prompt_repo or cwd_repo:
+        return "governed"
+    return None
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    list(INCIDENTAL.values()) + [p for p, _r in DIRECTIVES.values()],
+)
+def test_previously_generic_prompts_stay_generic_unless_they_direct_work(prompt):
+    cwd = "/home/patrick/Documents"
+    target = _target(prompt, cwd=cwd)
+
+    if _old_rule(prompt, cwd, ROOTS) is None:
+        assert target is None or target.directed, (prompt, target)
 
 
 def test_incidental_mention_does_not_outrank_a_governed_cwd(tmp_path):
@@ -394,3 +431,23 @@ async def test_incidental_mention_does_not_redirect_a_placeholder(client, tmp_pa
     assert f"resolved repo: {ANIME_ROOT}" in second
     row = (await client.get(f"/api/sessions/{sid}")).json()
     assert row["repo_root"] == ANIME_ROOT
+
+
+@pytest.mark.asyncio
+async def test_status_report_does_not_redirect_a_placeholder(client, tmp_path, monkeypatch):
+    """Codex r1 (3b6f0c78): a report naming another project moved a placeholder."""
+    cid = "75757575-1111-2222-3333-444455556666"
+    _env(monkeypatch, tmp_path, cid)
+    from ai_team_sync.hooks import session_autostart
+
+    sid = await session_autostart.ensure_session("http://test", client)
+    await _prompt(client, cid, tmp_path, "Ask Echo Brain to find and render.")
+    assert (await client.get(f"/api/sessions/{sid}")).json()["repo_root"] == ECHO_ROOT
+
+    note = await _prompt(
+        client, cid, tmp_path, "Review of anime-studio complete; Echo Brain unchanged."
+    )
+
+    assert note is None or f"resolved repo: {ECHO_ROOT}" in note
+    row = (await client.get(f"/api/sessions/{sid}")).json()
+    assert row["repo_root"] == ECHO_ROOT

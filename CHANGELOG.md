@@ -23,11 +23,13 @@
   blocked a session anchored to the ATS repository and the GO never reached it.
   `context_resolution.classify_mentions` now separates work directives (a
   leading work verb aimed at the project inside one clause of the operator's own
-  text) from read requests and incidental mentions; negations, subordinate
-  clauses, quotes, code, blockquotes, examples, harness frames and look-alike
-  paths are not directives. Only a directive can re-anchor a placeholder's read
-  context or block a session that holds work, and the block now quotes the
-  clause. A bare mention no longer outranks a governed cwd. A cwd inside another
+  text) from every other mention; negations (including one carried across a
+  colon or comma list in the same sentence), subordinate clauses, quotes, fenced
+  code, blockquotes, examples, harness frames and look-alike paths are not
+  directives. Only a directive can re-anchor a placeholder or block a session
+  that holds work, and the block now quotes the clause. A bare mention no longer
+  outranks a governed cwd, and a prompt that was generic stays generic unless
+  it directs work. A cwd inside another
   governed repository still blocks a claimed session, and the edit guards are
   unchanged.
 - **Reading a task brief no longer claims the ticket (D3, operator ruling
