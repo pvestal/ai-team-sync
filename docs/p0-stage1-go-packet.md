@@ -37,11 +37,12 @@ server would only have refused. That case was evaluated in-process instead (R5).
 | 3e4eace | #3580 restart gate | Codex r3 PASS-WITH-CITATION (35c5e82e) |
 | 15f13ba | `--no-ff` merge of the two | Codex integration r2 PASS-WITH-CITATION (58badc5b), together with bb41200 |
 | bb41200 | Docs: one combined PreToolUse array | Codex integration r2 PASS-WITH-CITATION (58badc5b), together with 15f13ba |
-| 12ad48a | Docs: onFailure | review in flight |
-| 8626571, f5cb28b | MCP delete_lock names its own session; hook timeouts 30/180/30 s | **no verdict recorded here** |
+| 12ad48a | Docs: onFailure | Codex BLOCK (cfd0983d): 30 s too short for the Bash guard; resolved in 8626571 |
+| 8626571 | Hook timeouts 30/180/30 s; MCP delete_lock names its own session | Codex BLOCK (e451d7a0): delete_lock skipped deny_mutation; resolved in f5cb28b |
+| f5cb28b | delete_lock names the caller only when the mutation rule accepts it | **Codex PASS-WITH-CITATION (e80b5c72, decision 753b99aa)** |
 
-The owner reports the f5cb28b suite at 1625 passed. This rehearsal did not
-re-run the suite.
+Owner-verified full suite at f5cb28b: 1625 passed, 42 skipped (1
+workstation-config test deselected). This rehearsal did not re-run the suite.
 
 ## 2. What Stage 1 changes in production
 
@@ -332,13 +333,14 @@ Blocking items:
 
 1. **P2.** Live repo_wide and broad hazards: preflight exits 1. Deploying now
    would refuse every new anime-studio claim.
-2. **P1.** No Codex verdict recorded for the 12ad48a..f5cb28b delta.
-3. Operator decisions D1-D3 and D6.
+2. Operator decisions D1-D3 and D6.
+
+P1 is met: f5cb28b has a Codex PASS-WITH-CITATION (753b99aa) and an
+owner-verified green suite.
 
 **Conditional GO** once all of these hold:
 
 - preflight shows only `matches_no_file` (or exits 0);
-- P1 is recorded;
 - P3-P6 are verified at the moment of deploy.
 
 Everything else rehearsed clean:
