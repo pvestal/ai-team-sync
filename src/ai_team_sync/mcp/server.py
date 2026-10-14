@@ -2621,9 +2621,13 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
                 # Name this session as the actor: the server lets a live session
                 # drop its OWN lock only when the caller says who it is (#3581).
+                # An identity the mutation rule refuses (e.g. the shared pointer)
+                # is never named; the call then acts as before, reaping only
+                # locks of sessions that are no longer live.
+                actor = "" if await deny_mutation(client) else (active_session_id or "")
                 response = await client.delete(
                     f"{SERVER_URL}/api/locks/{lock_id}",
-                    params={"actor_session_id": active_session_id or ""})
+                    params={"actor_session_id": actor})
                 response.raise_for_status()
 
                 msg = f"🗑️ Lock deleted!\n\n"

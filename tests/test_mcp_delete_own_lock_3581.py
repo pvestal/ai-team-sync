@@ -71,6 +71,19 @@ async def test_the_holder_releases_its_own_lock_through_mcp(wired, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_a_shared_pointer_naming_the_holder_cannot_drop_its_lock(wired, monkeypatch):
+    """The shared ~/.ats_session names whichever session wrote it last; an MCP
+    process resolving its identity there must not act as that session."""
+    holder, lock_id = await _session_with_lock(wired, "src/a/**")
+    monkeypatch.setattr(mcp, "resolve_identity", lambda: (holder, "global"))
+
+    out = await mcp.call_tool("delete_lock", {"lock_id": lock_id})
+
+    assert "Lock deleted" not in out[0].text
+    assert lock_id in await _live_lock_ids(wired)
+
+
+@pytest.mark.asyncio
 async def test_another_live_session_still_cannot_drop_it_through_mcp(wired, monkeypatch):
     _owner, lock_id = await _session_with_lock(wired, "src/a/**")
     stranger, _ = await _session_with_lock(wired, "src/b/**")

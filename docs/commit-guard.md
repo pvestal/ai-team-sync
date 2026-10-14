@@ -292,7 +292,8 @@ failures block, so a broken guard refuses instead of waving the call through. Th
 cost: if the ATS install itself is broken, every Bash call and edit is refused
 until `settings.json` is fixed by hand, and a guard that runs past its timeout
 refuses a valid command. Timeouts are sized to each guard's own budget: the edit
-guard and the restart guard make a few 2-3 s ATS calls (30 s is ample); the Bash
+guard makes a few 2 s ATS calls and the restart guard at most a couple of 3 s
+`systemctl show` lookups (30 s is ample for both); the Bash
 guard runs git for analysis (10 s to find the repository, up to 20 s per ref
 check, diff or `git apply --numstat`, 3 s per ATS call), so one `git merge` can
 legitimately take ~55 s and a compound command with several git steps longer.
