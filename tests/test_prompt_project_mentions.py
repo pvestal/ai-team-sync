@@ -265,6 +265,11 @@ async def test_incident_go_prompt_reaches_the_anchored_owner(client, tmp_path, m
     assert f"resolved repo: {ATS_ROOT}" in note
     assert "PROJECT MENTION (advisory, not a switch)" in note and ANIME_ROOT in note
     assert "start_session with repo_root=/opt/anime-studio" in note
+    assert (
+        "Agent commits and merges there (where the ATS git hooks are installed) need the "
+        "committing session's own live locks on those files and are refused on other "
+        "sessions' conflicting locks."
+    ) in note
     row = await _row(client, sid)
     assert (row["repo_root"], row["scope"], row["ticket_id"]) == (ATS_ROOT, ["src/**"], None)
 

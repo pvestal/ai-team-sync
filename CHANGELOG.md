@@ -23,8 +23,13 @@
   blocked a session anchored to the ATS repository and the GO never reached it.
   Per operator ruling 2026-10-14, a project named in prompt text is context
   routing only: it never blocks or re-anchors an anchored session (claimed or
-  placeholder), and the worker gets an advisory naming the structured switch,
-  `start_session` with `repo_root`. Only a cwd inside a different governed
+  placeholder). When the prompt reaches ATS (it names exactly one governed
+  project, names a ticket, or the worker's cwd is in a governed repository) and
+  names a project other than the session's anchor, the worker gets an advisory
+  naming the structured switch, `start_session` with `repo_root`. A prompt that
+  names several governed projects and nothing else governed resolves no target:
+  it stays generic, as before, and gets no ATS context and no advisory. Only a
+  cwd inside a different governed
   repository still refuses a session that holds work. Which prompts reach ATS
   at all is unchanged. Cross-project authority is enforced by the operation
   guards; `docs/commit-guard.md` tabulates, per operation, what checks it and
