@@ -80,10 +80,14 @@ async def test_anchor_is_stored_without_a_trailing_slash(client, tmp_path):
     '/repo/' and '/repo' must not read as two different repos."""
     repo = _repo_with_dirty(tmp_path, ["src/a.py"])
 
+    # Scope declared without locks: re-anchoring a session that holds live
+    # locks is refused (#3581), and this test is about the stored spelling.
     created = await client.post("/api/sessions", json={
-        "developer": "slash-tester", "agent": "claude-code", "scope": ["src/**"]})
+        "developer": "slash-tester", "agent": "claude-code", "scope": ["src/**"],
+        "auto_lock": False})
     sid = created.json()["id"]
-    await client.patch(f"/api/sessions/{sid}", json={"repo_root": str(repo) + "/"})
+    patched = await client.patch(f"/api/sessions/{sid}", json={"repo_root": str(repo) + "/"})
+    assert patched.status_code == 200, patched.text
 
     listed = await client.get("/api/sessions", params={"status": "active"})
     (s,) = [x for x in listed.json() if x["developer"] == "slash-tester"]
