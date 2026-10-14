@@ -101,10 +101,10 @@ never blocks a prompt.
 
 | State | Inbox and locks | Reaper and turnover |
 |---|---|---|
-| `active` | Own capability reads and acknowledges inbox; held locks are live. | Silence may reap it. Ticket claims happen only at session creation. |
+| `active` | Own capability reads and acknowledges inbox; held locks are live. | Silence may reap it. Only a ticket's owner claims ticket mail: when it starts and whenever it reads its inbox (#3585). |
 | `paused` | Inbox reads and acknowledgments are refused; locks stay held. | No automatic reap while paused. Owner capability may resume or complete it. |
 | `completed` by owner | Inbox reads and acknowledgments are refused; locks are released. | Terminal. Unread ticket claims return to the pool; direct mail stays addressed. Heartbeat cannot resurrect it. |
-| `completed` by reaper (`auto_completed=true`) | Inbox reads and acknowledgments are refused; locks are journaled and released. | Unread mail stays assigned. A late same-account heartbeat can resurrect the session and restore eligible locks, with the same inbox. Its capability holder may explicitly complete it instead, releasing unread ticket claims. |
+| `completed` by reaper (`auto_completed=true`) | Inbox reads and acknowledgments are refused; locks are journaled and released. | Unread mail stays assigned. A late same-account heartbeat can resurrect the session and restore eligible locks, with the same inbox; a resurrected owner whose ticket gained another live owner returns as a non-owner and its unread ticket mail moves to that owner (#3585). Its capability holder may explicitly complete it instead, releasing unread ticket claims. |
 
 `SessionUpdate.status` accepts only `active`, `paused`, and `completed`.
 Unknown status text is rejected. Ticket claims require the creating account of
