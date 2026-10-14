@@ -14,8 +14,16 @@ lease expires.
 
 HEARTBEAT. From authorization until the outcome is reported, a background
 thread renews the lease AND the service drain every ttl/3, so neither expires
-under a slow `systemctl restart` or verification. A renewal that fails BEFORE
-the restart is issued aborts the restart.
+under a slow `systemctl restart` or verification. A refused renewal, a lease
+that comes back inactive, or (drain units) a failed drain re-assertion marks
+the heartbeat LOST.
+
+PRE-ISSUE RE-CHECK. Immediately before `systemctl restart`, preissue_check()
+re-reads the lease (cleared, active, >= 5 s left) and, for drain units, asks the
+service whether it is draining for THIS lease with nothing in flight. A LOST
+heartbeat or a failed re-check aborts with a recorded 'aborted' outcome (exit 3).
+The window that remains -- between that last read and systemctl's exec -- is
+stated in preissue_check().
 
 --bootstrap is the first restart only -- the one that LOADS the in-flight
 middleware the normal path depends on. It is gated on different evidence
@@ -99,32 +107,58 @@ def _say_refusal(out, what: str, resp: httpx.Response) -> None:
 
 
 class Heartbeat:
-    """Renews lease + drain every `interval` seconds until stopped."""
+    """Renews lease + drain every `interval` seconds until stopped.
+
+    LOST means the authorization can no longer be relied on:
+      * the renewal was refused (non-200), or it returned a lease that is not
+        active -- the thread stops;
+      * on a unit whose drain is required, the drain re-assertion did not
+        succeed -- recorded as `drain_lost`; the lease keeps being renewed,
+        because once systemctl has stopped the old process a failed
+        re-assertion is expected, and the lease still has to cover the outcome.
+    The wrapper refuses to ISSUE the restart if either is set; after issue they
+    are recorded with the outcome.
+    """
 
     def __init__(self, http: httpx.Client, url: str, interval: float,
-                 out: Callable[[str], None]):
+                 out: Callable[[str], None], drain_required: bool = False):
         self.http, self.url, self.interval, self.out = http, url, interval, out
+        self.drain_required = drain_required
         self.stop_event = threading.Event()
         self.renewals = 0
         self.lost: str = ""
+        self.drain_lost: str = ""
         self.thread = threading.Thread(target=self._run, name="lease-heartbeat", daemon=True)
+
+    def beat_once(self) -> None:
+        try:
+            resp = self.http.post(self.url, json={})
+        except httpx.HTTPError as exc:
+            self.out(f"WARNING: lease renewal failed: {exc}")
+            return
+        try:
+            body = resp.json() if resp.status_code == 200 else {}
+        except ValueError:
+            body = {}
+        lease = body.get("lease") if isinstance(body, dict) else None
+        if resp.status_code != 200 or not isinstance(lease, dict) or not lease.get("active"):
+            state = lease.get("state") if isinstance(lease, dict) else None
+            self.lost = (f"HTTP {resp.status_code}, lease state {state!r}: {resp.text[:200]}")
+            self.out(f"WARNING: lease LOST ({self.lost})")
+            self.stop_event.set()
+            return
+        self.renewals += 1
+        drain = body.get("drain")
+        if self.drain_required and not (isinstance(drain, dict) and drain.get("ok")):
+            self.drain_lost = f"drain re-assertion failed: {drain!r}"
+            self.out(f"note: {self.drain_lost}")
 
     def _run(self) -> None:
         while not self.stop_event.wait(self.interval):
-            try:
-                resp = self.http.post(self.url, json={})
-            except httpx.HTTPError as exc:
-                self.out(f"WARNING: lease renewal failed: {exc}")
-                continue
-            if resp.status_code == 200:
-                self.renewals += 1
-                drain = (resp.json() or {}).get("drain")
-                if drain and not drain.get("ok"):
-                    self.out(f"note: drain re-assertion: {drain.get('detail')}")
-            else:
-                self.lost = f"HTTP {resp.status_code}: {resp.text[:200]}"
-                self.out(f"WARNING: lease renewal refused ({self.lost})")
-                return
+            self.beat_once()
+
+    def lost_reason(self) -> str:
+        return self.lost or self.drain_lost
 
     def start(self) -> "Heartbeat":
         self.thread.start()
@@ -133,6 +167,57 @@ class Heartbeat:
     def stop(self) -> None:
         self.stop_event.set()
         self.thread.join(timeout=10)
+
+
+class LeaseLost(Exception):
+    """The authorization is gone (or unprovable) before the restart is issued."""
+
+
+#: The lease must have at least this long left when the restart is issued. It
+#: covers the gap between the pre-issue re-check and systemctl's exec, during
+#: which nothing renews it; the heartbeat takes over after that.
+PREISSUE_MIN_REMAINING_S = 5.0
+
+
+def preissue_check(http: httpx.Client, base: str, lease_id: str, policy: dict,
+                   drain_required: bool) -> str:
+    """Re-prove the authorization immediately before systemctl. '' when it holds.
+
+    1. ATS: the lease is 'cleared', active, and has PREISSUE_MIN_REMAINING_S left.
+    2. Drain units: the service itself reports draining == THIS lease and no
+       request in flight.
+    What it cannot close: the time between the last of these reads and the exec
+    of `systemctl restart` (process spawn; milliseconds). No lock spans that
+    boundary -- systemd knows nothing of ATS leases -- so a release of this
+    lease's drain, or an expiry, landing inside it is not detected.
+    """
+    try:
+        resp = http.get(f"{base}/{lease_id}", timeout=10)
+        lease = resp.json() if resp.status_code == 200 else None
+    except (httpx.HTTPError, ValueError) as exc:
+        return f"lease unreadable: {exc}"
+    if not isinstance(lease, dict) or lease.get("state") != "cleared" or not lease.get("active"):
+        return f"lease is no longer cleared and active: {lease.get('state') if isinstance(lease, dict) else lease!r}"
+    if (lease.get("expires_in_s") or 0) < PREISSUE_MIN_REMAINING_S:
+        return f"lease expires in {lease.get('expires_in_s')}s (< {PREISSUE_MIN_REMAINING_S}s)"
+    if drain_required:
+        urls = [p.get("url") for p in policy.get("probes") or [] if p.get("kind") == "inflight"]
+        if not urls:
+            return "no inflight probe to confirm the service is draining"
+        for url in urls:
+            try:
+                snap = http.get(url, timeout=5).json()
+            except (httpx.HTTPError, ValueError) as exc:
+                return f"cannot confirm the drain at {url}: {exc}"
+            drain = snap.get("drain") if isinstance(snap, dict) else None
+            if not isinstance(snap, dict) or snap.get("draining") is not True \
+                    or not isinstance(drain, dict) or drain.get("lease_id") != lease_id:
+                return (f"service at {url} is not draining for lease {lease_id} "
+                        f"(draining={snap.get('draining') if isinstance(snap, dict) else '?'}, "
+                        f"holder={drain.get('lease_id') if isinstance(drain, dict) else None})")
+            if snap.get("in_flight") != 0:
+                return f"service at {url} reports {snap.get('in_flight')} request(s) in flight"
+    return ""
 
 
 def _install_signal_handlers() -> dict:
@@ -220,13 +305,18 @@ def run_safe_restart(unit: str, reason: str, *, server: str, session_id: str | N
         after: dict = {"argv": restart_argv(scope, unit)}
         state = {"reported": False, "issued": False, "new_pid": None}
         interval = heartbeat_interval or max(1.0, lease["ttl_s"] / 3)
-        beat = Heartbeat(http, f"{base}/{lease_id}/renew", interval, out).start()
+        drain_required = (lease.get("mode") == "normal" and bool(policy.get("drains"))
+                          and "drain" not in (policy.get("waivers") or {}))
+        beat = Heartbeat(http, f"{base}/{lease_id}/renew", interval, out,
+                         drain_required=drain_required).start()
         previous = _install_signal_handlers()
         started = clock()
 
         def report(outcome: str) -> int:
             after["elapsed_s"] = round(clock() - started, 2)
             after["heartbeat_renewals"] = beat.renewals
+            if beat.lost_reason():
+                after["heartbeat_lost"] = beat.lost_reason()
             try:
                 resp = http.post(f"{base}/{lease_id}/complete", json={
                     "outcome": outcome, "old_pid": old_pid, "new_pid": state["new_pid"],
@@ -243,8 +333,11 @@ def run_safe_restart(unit: str, reason: str, *, server: str, session_id: str | N
             return EXIT_OK if outcome == "success" else EXIT_FAILED
 
         try:
-            if beat.lost:
-                raise RuntimeError(f"lease lost before the restart was issued: {beat.lost}")
+            # Re-prove the authorization at the last moment before issuing.
+            lost = beat.lost_reason() or preissue_check(http, base, lease_id, policy,
+                                                         drain_required)
+            if lost:
+                raise LeaseLost(lost)
             state["issued"] = True
             try:
                 proc = runner(after["argv"], policy["restart_timeout_s"])
@@ -297,6 +390,9 @@ def run_safe_restart(unit: str, reason: str, *, server: str, session_id: str | N
             if isinstance(exc, Interrupted):
                 out(f"interrupted ({exc}); outcome reported")
                 return EXIT_INTERRUPTED
+            if isinstance(exc, LeaseLost):
+                out(f"REFUSED before issuing the restart: {exc}; recorded as aborted")
+                return EXIT_UNAVAILABLE
             if isinstance(exc, Exception):
                 out(f"ERROR: {type(exc).__name__}: {exc}; outcome reported")
                 return EXIT_FAILED if state["issued"] else EXIT_LOCAL

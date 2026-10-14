@@ -205,9 +205,28 @@ async def _release_quietly(lease: RestartLease) -> None:
 
 
 async def _settle_expired(db: AsyncSession, lease: RestartLease) -> bool:
-    """Expire a live lease past its TTL, writing what is known. True if expired now."""
+    """Expire a live lease past its TTL, writing what is known. True if expired now.
+
+    The DATABASE decides, not the in-memory row: a /renew can commit an extension
+    after the caller (the sweeper, say) loaded this lease as due. So expiry is a
+    conditional UPDATE -- id, still active, expires_at <= now -- and the record,
+    the cleared active_unit and the drain release happen only if it matched.
+    The in-memory check below is just a cheap filter for leases that are not due.
+    """
     if lease.state not in ACTIVE_STATES or _remaining_s(lease) > 0:
         return False
+    now = _now()
+    moved = await db.execute(
+        update(RestartLease)
+        .where(RestartLease.id == lease.id, RestartLease.state.in_(ACTIVE_STATES),
+               RestartLease.expires_at <= now)
+        .values(state="expired", active_unit=None, finished_at=now)
+        .execution_options(synchronize_session=False))
+    if moved.rowcount != 1:
+        await db.rollback()
+        await db.refresh(lease)  # renewed, completed or released meanwhile
+        return False
+    await db.refresh(lease)  # the row as this transaction now holds it
     if lease.cleared_at is not None:
         if lease.outcome_restart_id is None:
             row = await _record(db, lease, "unknown", {
@@ -219,7 +238,6 @@ async def _settle_expired(db: AsyncSession, lease: RestartLease) -> bool:
         lease.refusal = lease.refusal or f"lease expired in state {lease.state} before the drain cleared"
         row = await _record(db, lease, "refused", {"stage": "expired", "refusal": lease.refusal})
         lease.attempt_restart_id = row.id
-    _finish(lease, "expired")
     await db.commit()
     await _release_quietly(lease)
     return True
@@ -441,8 +459,14 @@ async def renew_lease(lease_id: str, db: AsyncSession = Depends(get_db)):
         .values(expires_at=new_expiry)
         .execution_options(synchronize_session=False))
     await db.commit()
-    await db.refresh(lease)
-    if renewed.rowcount != 1:
+
+    async def still_live() -> bool:
+        # Re-read AFTER commit: 200 means the lease is live now, not that an
+        # UPDATE matched at some earlier instant.
+        await db.refresh(lease)
+        return lease.state in ACTIVE_STATES and _remaining_s(lease) > 0
+
+    if renewed.rowcount != 1 or not await still_live():
         await _settle_expired(db, lease)
         return JSONResponse(status_code=410, content={"detail": "lease expired or finished",
                                                       "lease": _view(lease)})
@@ -452,6 +476,14 @@ async def renew_lease(lease_id: str, db: AsyncSession = Depends(get_db)):
             and "drain" not in gate.waived and lease.state in ("draining", "cleared"):
         ok, why = await rg.request_drain(gate, lease.id, min(rg.MAX_TTL_S, lease.ttl_s))
         drain = {"ok": ok, "detail": why}
+        # The re-assertion is a network round trip; the lease can be settled
+        # (sweeper, release, complete) while it runs. A drain re-asserted for a
+        # lease that is no longer live must not be left standing.
+        if not await still_live():
+            await _release_quietly(lease)
+            return JSONResponse(status_code=410, content={
+                "detail": "lease ended while the drain was being re-asserted",
+                "lease": _view(lease), "drain": drain})
     return {"lease": _view(lease), "drain": drain}
 
 
@@ -528,15 +560,19 @@ async def sweep_expired(session_factory) -> int:
     settled = 0
     async with session_factory() as db:
         due = (await db.execute(
-            select(RestartLease).where(RestartLease.active_unit.is_not(None),
-                                       RestartLease.expires_at <= _now()))).scalars().all()
-        for lease in due:
+            select(RestartLease.id).where(RestartLease.active_unit.is_not(None),
+                                          RestartLease.expires_at <= _now()))).scalars().all()
+    # One session per lease: a settlement that loses its race rolls back, and a
+    # rollback must not expire the other rows this sweep still has to read.
+    for lease_id in due:
+        async with session_factory() as db:
             try:
-                if await _settle_expired(db, lease):
+                lease = await db.get(RestartLease, lease_id)
+                if lease is not None and await _settle_expired(db, lease):
                     settled += 1
             except Exception:  # noqa: BLE001 -- one bad row must not stop the sweep
                 await db.rollback()
-                logger.exception("restart lease sweep failed for %s", lease.id)
+                logger.exception("restart lease sweep failed for %s", lease_id)
     return settled
 
 

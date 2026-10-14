@@ -29,7 +29,8 @@ which restarts those are.
 | Final round plus a check at commit time | `routers/restart_leases.py` `drain_lease` | Clearing a lease on stale evidence. A lease becomes `cleared` only after a complete, concurrent probe round shows all of: `draining` is true for this lease, `in_flight` is 0, jobs are 0, and GPU queues are empty. The clearing UPDATE also requires `state='draining' AND expires_at > now`, inside the same transaction as the attempt row. |
 | Lease and drain renewal | `safe_restart.py` `Heartbeat`, `POST /leases/{id}/renew` | The lease or drain expiring under a slow `systemctl restart` or slow verification. Config load rejects any `lease_ttl_s` that is not greater than `drain_wait + restart + verify + 10s`. |
 | Outcome on every exit path | `safe_restart.py`, plus `start_sweeper()` in `routers/restart_leases.py` | An authorized attempt with no outcome. The wrapper catches exceptions and SIGTERM/SIGINT and reports `failed` or `aborted`. For SIGKILL, the server's sweeper settles the expired lease as `unknown` and releases the drain within one interval (`ATS_RESTART_SWEEP_S`, default 15 s). |
-| In-process GPU producers | `inflight.is_draining()`, plus `docs/patches/3580_gateway_drain_check.diff` (anime-studio) | New GPU submissions from inside the API while it drains. See the deploy notes. |
+| In-process GPU producers | `inflight.is_draining()`, plus `docs/patches/3580_gateway_drain_check.diff` (anime-studio) | **Not in effect yet.** The freeze applies only once that patch lands in `packages/scene_generation/gpu_gateway.py`. That file is held by another session, and the patch ships with the #3579 gateway change. Until then, background loops and already-admitted requests can still submit GPU work during a drain, and the only safeguard is the GPU-queue probe, which refuses or waits on what it sees queued. |
+| Expiry vs renewal (Codex round 2) | `_settle_expired`, `renew_lease`, `Heartbeat`, `preissue_check` | Settling a lease that a renewal has just extended. Expiry is a conditional UPDATE (`id`, `state` active, `expires_at <= now`), and the record, `active_unit` clear and drain release happen only if it matched. `/renew` returns 200 only if the lease is still active and unexpired after commit, re-checked again after the drain is re-asserted. The heartbeat treats an inactive lease, or a failed drain re-assertion on a drain unit, as LOST. Immediately before `systemctl`, the wrapper re-reads the lease and, for drain units, the service's `draining == this lease` and `in_flight == 0`. If either fails it aborts and records `aborted`. |
 | `ats safe-restart` | `safe_restart.py`, `cli.py` | The full sequence: lease, drain, wait, restart, then verify that the unit is active with a new MainPID and its health URL answers. Records the outcome. |
 | Bash PreToolUse hook | `hooks/pre_tool_use_restart_guard.py` | An agent's Claude Code `Bash` tool call that runs raw service control on a governed unit. |
 | Evidence | `service_restarts` | One attempt row per attempt (`refused`, `authorized` or `aborted`) and one outcome row per authorized attempt (`completed`, `failed`, `timeout`, `aborted` or `unknown`). Both rows carry the mode and the waivers. |
@@ -61,6 +62,20 @@ which restarts those are.
   being submitted after the last probe round.
 - **The single-worker proof** is the service's own report from `/proc` (parent process and
   sibling workers). It does not cross-check against the unit's MainPID.
+- **The gap between the pre-issue re-check and `systemctl`.** `preissue_check` takes its
+  last reads (the lease, then the service's drain), then the wrapper spawns
+  `systemctl restart`. That gap is normally milliseconds, and no lock spans it, because
+  systemd knows nothing about ATS leases. A release of this lease's drain, or an expiry,
+  that lands inside the gap is not detected. The lease must have at least 5 s left at the
+  re-check, so it cannot expire in that gap through its TTL alone.
+- **The GPU producer freeze (`is_draining()` in the gateway) is not in effect** until
+  `docs/patches/3580_gateway_drain_check.diff` lands in `gpu_gateway.py`. See the table
+  above.
+- **The bootstrap admission window is not closed.** In `--bootstrap` mode there is no
+  drain, so a new request or job can be admitted between bootstrap's last check
+  (connections, which runs last) and the restart. Nothing refuses it. That gap is the
+  known cost of the one restart that loads the middleware, and it is recorded as
+  `mode=bootstrap`.
 
 ### What a real OS boundary would take
 
@@ -84,14 +99,18 @@ ats safe-restart <unit> --reason "..."
       rounds until a FINAL round is clear AND shows draining for THIS lease ->
       conditional UPDATE (state='draining' AND expires_at > now) + 'authorized' row
   -- authorized: heartbeat renews lease + drain every ttl/3; signals report --
+  pre-issue re-check: GET lease (cleared, active, >= 5 s left) and, for drain units,
+      the service's inflight (draining == this lease, in_flight == 0); else 'aborted'
   sudo -n systemctl restart <unit>       (systemctl --user for scope = "user")
   verify: active, new MainPID, health 2xx  (own budget, starting when systemctl returns)
   POST /api/restarts/leases/{id}/complete {outcome} -> outcome row; drain released
 ```
 
-The new process is not draining, so writes resume there at once. A renewal sent during
-the restart may fail to reach the old process while it stops. That is reported and is not
-fatal.
+A heartbeat renewal can land on the new process before `/complete`. When it does, it
+drains the new process too, until `/complete` releases the drain or its TTL ends it. A
+renewal sent while the old process is stopping may fail to reach it. That is recorded as
+`heartbeat_lost` on the outcome. It no longer affects an issued restart, and it can no
+longer go unnoticed before the restart is issued.
 
 ## Bootstrap: the ONLY sanctioned first-load path
 
@@ -118,9 +137,12 @@ and refuses unless all of these hold:
 Then the wrapper restarts the unit, verifies it, and records the attempt and outcome with
 `mode = "bootstrap"`.
 
-Bootstrap cannot drain. A request can still arrive between the final round and
-`systemctl restart`. That window is the cost of the one ungated-by-drain restart, and the
-attempt records it as such.
+**Bootstrap has an admission window that is NOT closed.** With no drain, nothing stops a
+new request, a new job, or a new client connection between bootstrap's last check and
+`systemctl restart`. The checks shrink that window, since the connection count runs last,
+right before the wrapper's pre-issue lease re-check. They do not close it. This is the
+known cost of the one restart that loads the middleware, and the attempt and outcome rows
+say `mode=bootstrap`.
 
 ## Configuration (`~/.config/ai-team-sync/operator.toml`)
 
@@ -200,6 +222,10 @@ Check the `unix_socket` path against `OPERATOR_UI_SOCKET` in anime-studio
   - leases, including the file-DB race and a lease that expires mid-drain and is refused
     at commit
   - renew, and the sweeper (once and on an interval)
+  - the round-2 race, made deterministic: a delay is injected between the sweeper's
+    select and its settlement, and a renewal commits in between. This test fails on
+    4ac3457. Also covered: renew returning 410 when the lease dies during the drain
+    re-assertion, the heartbeat's LOST rules, and the pre-issue re-check
   - bootstrap
   - the wrapper's exception, signal, lost-lease and heartbeat paths
 - `tests/test_restart_guard_hook_3580.py`: the hook matrix and its process protocol.

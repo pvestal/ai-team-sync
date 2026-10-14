@@ -635,6 +635,111 @@ async def test_the_sweeper_task_runs_on_an_interval(gate_env, db_engine, monkeyp
     assert [r["outcome"] for r in await _restarts(client)] == ["authorized", "unknown"]
 
 
+@pytest.fixture
+async def file_client(gate_env, tmp_path):
+    """A client on a FILE database (one connection per session, as in
+    production), plus its session factory for driving the sweeper directly."""
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    from ai_team_sync.database import get_db
+    from ai_team_sync.models import Base
+    from ai_team_sync.server import create_app
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path}/race.db")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+    async def override():
+        async with factory() as s:
+            yield s
+
+    app = create_app()
+    app.dependency_overrides[get_db] = override
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                 base_url="http://test") as c:
+        yield c, factory, engine
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_a_renewal_that_commits_after_the_sweepers_select_wins(file_client, gate_env,
+                                                                    monkeypatch):
+    """Codex round-2 finding 1, made deterministic.
+
+    The sweeper SELECTs a lease as due, then (injected delay) a /renew commits
+    an extension before the sweeper settles it. The renew's time predicate is
+    bound when the statement is built, so it can commit just after expiry --
+    modelled here by pinning the renew handler's clock 1 s before expiry. The
+    settlement must then be a no-op: no 'unknown' row, the unit still leased,
+    the drain NOT released, and the renew's 200 must be true."""
+    client, factory, engine = file_client
+    svc, _ = gate_env
+    lease = await _cleared(client)
+    expired_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    async with factory() as s:
+        await s.execute(update(RestartLease).where(RestartLease.id == lease["id"])
+                        .values(expires_at=expired_at))
+        await s.commit()
+
+    real_settle = restart_leases._settle_expired
+    entered, proceed = asyncio.Event(), asyncio.Event()
+    calls = {"n": 0}
+
+    async def delayed_settle(db, lease_obj):
+        calls["n"] += 1
+        if calls["n"] == 1:          # the sweeper's call: hold it between select and settle
+            entered.set()
+            await proceed.wait()
+        return await real_settle(db, lease_obj)
+
+    monkeypatch.setattr(restart_leases, "_settle_expired", delayed_settle)
+    sweeper = asyncio.create_task(restart_leases.sweep_expired(factory))
+    await asyncio.wait_for(entered.wait(), 5)
+
+    real_now = restart_leases._now
+    monkeypatch.setattr(restart_leases, "_now", lambda: expired_at - timedelta(seconds=1))
+    renewed = await client.post(f"/api/restarts/leases/{lease['id']}/renew", json={})
+    monkeypatch.setattr(restart_leases, "_now", real_now)
+    assert renewed.status_code == 200, renewed.text
+    assert renewed.json()["lease"]["active"] is True
+
+    proceed.set()
+    settled = await asyncio.wait_for(sweeper, 10)
+
+    view = (await client.get(f"/api/restarts/leases/{lease['id']}")).json()
+    outcomes = [r["outcome"] for r in await _restarts(client)]
+    assert settled == 0, "the sweeper acted on a lease the renewal had extended"
+    assert view["state"] == "cleared" and view["active"], view
+    assert outcomes == ["authorized"], outcomes
+    assert svc.drain == lease["id"], "the drain of a live, renewed lease was released"
+
+
+@pytest.mark.asyncio
+async def test_renew_returns_410_if_the_lease_dies_during_the_drain_reassertion(
+        file_client, gate_env, monkeypatch):
+    """Round-2 finding 1(b): 200 only if the lease is still live AFTER commit."""
+    client, factory, engine = file_client
+    svc, _ = gate_env
+    lease = await _cleared(client)
+    real_request_drain = rg.request_drain
+
+    async def drain_while_the_lease_dies(gate, lease_id, ttl_s):
+        ok = await real_request_drain(gate, lease_id, ttl_s)
+        async with factory() as s:
+            await s.execute(update(RestartLease).where(RestartLease.id == lease_id).values(
+                expires_at=datetime.now(timezone.utc) - timedelta(seconds=1)))
+            await s.commit()
+        await restart_leases.sweep_expired(factory)
+        return ok
+
+    monkeypatch.setattr(rg, "request_drain", drain_while_the_lease_dies)
+    resp = await client.post(f"/api/restarts/leases/{lease['id']}/renew", json={})
+    assert resp.status_code == 410, resp.text
+    assert resp.json()["lease"]["active"] is False
+    assert svc.drain is None, "a drain re-asserted for a dead lease is released"
+
+
 # ── bootstrap (finding 7) ───────────────────────────────────────────────────
 
 
@@ -707,20 +812,36 @@ def test_bootstrap_sql_dsn_may_not_carry_a_password(tmp_path, monkeypatch):
 
 
 class FakeAts:
+    """ATS + the service, as the wrapper sees them. `lease_view` is what GET
+    /leases/L1 returns at pre-issue; `service` is the service's inflight view."""
+
     def __init__(self, acquire=201, drain=200, complete=200, renew=200):
         self.codes = {"acquire": acquire, "drain": drain, "complete": complete,
                       "renew": renew}
         self.calls: list[tuple[str, dict]] = []
+        self.lease_view = {"id": "L1", "state": "cleared", "active": True,
+                           "expires_in_s": 100}
+        self.service = {"draining": True, "drain": {"lease_id": "L1"}, "in_flight": 0}
+        self.renew_body = {"lease": {"id": "L1", "state": "cleared", "active": True},
+                           "drain": {"ok": True, "detail": "draining"}}
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else {}
         path = request.url.path
         if request.url.host == "svc.test":
+            if path == "/api/system/inflight":
+                self.calls.append(("service-inflight", {}))
+                return httpx.Response(200, json=self.service)
             self.calls.append(("health", {}))
             return httpx.Response(200)
+        if request.method == "GET" and path == "/api/restarts/leases/L1":
+            self.calls.append(("get-lease", {}))
+            return httpx.Response(200, json=self.lease_view)
         name = path.rsplit("/", 1)[-1] if path != "/api/restarts/leases" else "acquire"
         self.calls.append((name, body))
         code = self.codes.get(name, 200)
+        if name == "renew" and code == 200:
+            return httpx.Response(200, json=self.renew_body)
         lease = {"id": "L1", "state": "x", "mode": "normal", "ttl_s": 30,
                  "expires_in_s": 100, "waivers": {}, "probes": [
                      {"name": "api", "status": "busy", "detail": "POST /w in flight"}]}
@@ -730,8 +851,10 @@ class FakeAts:
             "lease": lease, "outcome_restart_id": "R2", "drain": {"ok": True},
             "policy": {
                 "unit": "svc", "scope": "user", "health_url": "http://svc.test/health",
-                "drain_wait_s": 1, "verify_timeout_s": 5, "restart_timeout_s": 5,
-                "waivers": {}}})
+                "drains": True, "drain_wait_s": 1, "verify_timeout_s": 5,
+                "restart_timeout_s": 5, "waivers": {},
+                "probes": [{"name": "api", "kind": "inflight",
+                            "url": "http://svc.test/api/system/inflight"}]}})
 
     def completes(self):
         return [b for n, b in self.calls if n == "complete"]
@@ -851,9 +974,86 @@ def test_a_lost_lease_before_the_restart_aborts_without_restarting(monkeypatch):
     monkeypatch.setattr(sr.Heartbeat, "start", lost_start)
     monkeypatch.setattr(sr.Heartbeat, "stop", lambda self: None)
     code, _ = _drive(ats, systemd)
-    assert code == sr.EXIT_LOCAL
+    assert code == sr.EXIT_UNAVAILABLE
     assert not any("restart" in a for a in systemd.argvs)
     assert ats.completes()[0]["outcome"] == "aborted"
+
+
+def _heartbeat(ats, drain_required=True):
+    lines = []
+    beat = sr.Heartbeat(httpx.Client(transport=httpx.MockTransport(ats.handler)),
+                        "http://ats.test/api/restarts/leases/L1/renew", 60, lines.append,
+                        drain_required=drain_required)
+    beat.beat_once()
+    return beat
+
+
+@pytest.mark.parametrize("renew_code,renew_body,lost,drain_lost", [
+    (200, {"lease": {"state": "cleared", "active": True}, "drain": {"ok": True}}, "", ""),
+    # 200 but the lease it describes is no longer active (the round-2 race)
+    (200, {"lease": {"state": "expired", "active": False}, "drain": {"ok": True}}, "x", ""),
+    (410, None, "x", ""),
+    # a drain unit whose drain re-assertion failed
+    (200, {"lease": {"state": "cleared", "active": True},
+           "drain": {"ok": False, "detail": "drain refused: HTTP 409"}}, "", "x"),
+    (200, {"lease": {"state": "cleared", "active": True}, "drain": None}, "", "x"),
+])
+def test_heartbeat_treats_an_inactive_lease_or_failed_drain_as_lost(renew_code, renew_body,
+                                                                    lost, drain_lost):
+    """Round-2 finding 1(c): any 200 is not success."""
+    ats = FakeAts(renew=renew_code)
+    if renew_body is not None:
+        ats.renew_body = renew_body
+    beat = _heartbeat(ats)
+    assert bool(beat.lost) == bool(lost)
+    assert bool(beat.drain_lost) == bool(drain_lost)
+
+
+def test_heartbeat_ignores_drain_on_a_waived_drain_unit():
+    ats = FakeAts()
+    ats.renew_body = {"lease": {"state": "cleared", "active": True}, "drain": None}
+    assert not _heartbeat(ats, drain_required=False).lost_reason()
+
+
+@pytest.mark.parametrize("lease_view,service,needle", [
+    ({"state": "expired", "active": False, "expires_in_s": -1}, None, "no longer cleared"),
+    ({"state": "cleared", "active": True, "expires_in_s": 2}, None, "expires in 2"),
+    (None, {"draining": False, "drain": None, "in_flight": 0}, "not draining for lease L1"),
+    (None, {"draining": True, "drain": {"lease_id": "OTHER"}, "in_flight": 0}, "holder=OTHER"),
+    (None, {"draining": True, "drain": {"lease_id": "L1"}, "in_flight": 1}, "in flight"),
+])
+def test_preissue_recheck_aborts_with_a_recorded_outcome(lease_view, service, needle):
+    """Round-2 finding 1(d): re-prove the lease (and the drain) right before
+    systemctl; abort -- never restart -- and record 'aborted' if it fails."""
+    ats, systemd = FakeAts(), FakeSystemd()
+    if lease_view is not None:
+        ats.lease_view = {"id": "L1", **lease_view}
+    if service is not None:
+        ats.service = service
+    code, lines = _drive(ats, systemd)
+    assert code == sr.EXIT_UNAVAILABLE, lines
+    assert not any("restart" in a for a in systemd.argvs), "never issued"
+    (complete,) = ats.completes()
+    assert complete["outcome"] == "aborted"
+    assert needle in complete["after"]["exception"], complete["after"]
+
+
+def test_preissue_recheck_reads_the_lease_and_the_drain_before_systemctl():
+    ats, systemd = FakeAts(), FakeSystemd()
+    order = []
+    real = ats.handler
+
+    def spy(request):
+        if request.method == "GET":
+            order.append(request.url.path)
+        return real(request)
+
+    ats.handler = spy
+    calls_before_restart = []
+    systemd.on_restart = lambda: calls_before_restart.extend(order)
+    code, _ = _drive(ats, systemd)
+    assert code == 0
+    assert calls_before_restart[:2] == ["/api/restarts/leases/L1", "/api/system/inflight"]
 
 
 def test_the_heartbeat_renews_during_a_slow_restart():
