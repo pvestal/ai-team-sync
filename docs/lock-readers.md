@@ -210,7 +210,9 @@ they complete, are reaped, or the lock expires. Lane restoration after a reap
 goes through the same validation and overlap rule: a lane refused by the table
 above is not re-granted (its `not_restored_reasons` entry is the refusal's
 `error`), nor is one another session now holds in a governed repository.
-Restoration is not inside `acquisition_guard`. Outside governed repositories the
+The restoring heartbeat runs its journal compare-and-set, conflict check, lock
+insert and commit inside `acquisition_guard`, so a restoration and a rival
+acquisition never both own a file. Outside governed repositories the
 old refusal rule stands: advisory locks share, and only an exclusive lock or an
 exclusive request refuses an overlap.
 

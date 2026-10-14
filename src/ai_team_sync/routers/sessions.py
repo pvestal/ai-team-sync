@@ -1682,14 +1682,18 @@ async def heartbeat_session(session_id: str, request: Request, db: AsyncSession 
                 detail="another request holds this session's restoration claim"))
         await claim.acquire()
 
+    from ai_team_sync.routers.locks import acquisition_guard
     try:
-        if claim is not None:
-            # Bring it back WITH ITS LOCKS, which is what this branch has always
-            # claimed to do.
-            restoration = await resurrect_session(db, session)
+        # Restoration is an acquisition: its CAS, conflict check, insert and
+        # commit run inside the same guard as POST /api/locks (#3581).
+        async with (acquisition_guard(db) if claim is not None else contextlib.nullcontext()):
+            if claim is not None:
+                # Bring it back WITH ITS LOCKS, which is what this branch has always
+                # claimed to do.
+                restoration = await resurrect_session(db, session)
 
-        session.last_heartbeat = datetime.now(timezone.utc)
-        await db.commit()
+            session.last_heartbeat = datetime.now(timezone.utc)
+            await db.commit()
         # Reload the lock collection explicitly: a CONCURRENT restorer in another
         # PROCESS may have granted the lane, and a response whose lock_count
         # predates that commit is the same false board state, one layer up.
