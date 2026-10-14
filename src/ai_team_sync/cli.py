@@ -415,100 +415,49 @@ def hooks():
 
 
 @hooks.command("install")
-@click.option("--force", is_flag=True, help="Overwrite existing hooks")
-def hooks_install(force):
-    """Install ai-team-sync git hooks in the current repository."""
-    import shutil
-    from pathlib import Path
+@click.argument("repo", required=False, default=".")
+@click.option("--hook", "hook_names", multiple=True,
+              help="Hook to install (repeatable). Default: pre-commit pre-merge-commit. "
+                   "Also: prepare-commit-msg, post-commit, post-checkout.")
+@click.option("--python", "python", default=None,
+              help="Interpreter the hooks run (default: this one).")
+@click.option("--force", is_flag=True, hidden=True,
+              help="Accepted for compatibility; install never overwrites a foreign hook.")
+def hooks_install(repo, hook_names, python, force):
+    """Install ATS git hooks for REPO (default: current directory).
 
-    # Find git hooks directory
+    Hooks go to the COMMON git dir, so every worktree of the repository is
+    covered. An existing hook is never clobbered: a guard hook is preserved as
+    <hook>.ats-chained and runs first; a post hook is only appended to.
+    Idempotent. What the guards cover and cannot cover: docs/commit-guard.md.
+    """
+    from ai_team_sync import git_hook_install as ghi
+
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--git-dir"],
-            capture_output=True, text=True, check=True,
-        )
-        git_dir = Path(result.stdout.strip())
-    except subprocess.CalledProcessError:
-        click.echo("Error: Not in a git repository", err=True)
+        report = ghi.install(repo, tuple(hook_names) or ghi.DEFAULT_HOOKS, python)
+    except ghi.InstallError as exc:
+        click.echo(f"Error: {exc}", err=True)
         raise SystemExit(1)
-
-    hooks_dir = git_dir / "hooks"
-    hooks_dir.mkdir(exist_ok=True)
-
-    # Find source hooks (installed with package)
-    package_dir = Path(__file__).parent
-    source_hooks_dir = package_dir / "hooks"
-
-    # Hook mapping: source file -> git hook name
-    hooks_to_install = {
-        "pre_commit.py": "pre-commit",
-        "prepare_commit_msg.py": "prepare-commit-msg",
-        "post_checkout.py": "post-checkout",
-    }
-
-    installed = []
-    skipped = []
-
-    for source_file, hook_name in hooks_to_install.items():
-        source = source_hooks_dir / source_file
-        dest = hooks_dir / hook_name
-
-        if not source.exists():
-            click.echo(f"Warning: {source_file} not found, skipping", err=True)
-            continue
-
-        if dest.exists() and not force:
-            skipped.append(hook_name)
-            continue
-
-        shutil.copy(source, dest)
-        dest.chmod(0o755)  # Make executable
-        installed.append(hook_name)
-
-    if installed:
-        click.echo(f"Installed hooks: {', '.join(installed)}")
-    if skipped:
-        click.echo(f"Skipped (already exist): {', '.join(skipped)}")
-        click.echo("Use --force to overwrite existing hooks")
-
-    if installed or skipped:
-        click.echo("\nGit hooks are now active for this repository.")
+    for line in report.lines():
+        click.echo(line)
+    if report.skipped:
+        raise SystemExit(2)
 
 
 @hooks.command("uninstall")
-def hooks_uninstall():
-    """Remove ai-team-sync git hooks from the current repository."""
-    from pathlib import Path
+@click.argument("repo", required=False, default=".")
+def hooks_uninstall(repo):
+    """Remove ATS git hooks from REPO and restore any hook they chained."""
+    from ai_team_sync import git_hook_install as ghi
 
     try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--git-dir"],
-            capture_output=True, text=True, check=True,
-        )
-        git_dir = Path(result.stdout.strip())
-    except subprocess.CalledProcessError:
-        click.echo("Error: Not in a git repository", err=True)
+        actions = ghi.uninstall(repo)
+    except ghi.InstallError as exc:
+        click.echo(f"Error: {exc}", err=True)
         raise SystemExit(1)
-
-    hooks_dir = git_dir / "hooks"
-    hook_names = ["pre-commit", "prepare-commit-msg", "post-checkout"]
-
-    removed = []
-    for hook_name in hook_names:
-        hook_file = hooks_dir / hook_name
-        if hook_file.exists():
-            # Check if it's our hook (contains ai-team-sync marker)
-            try:
-                with open(hook_file) as f:
-                    content = f.read()
-                if "ai-team-sync" in content:
-                    hook_file.unlink()
-                    removed.append(hook_name)
-            except Exception:
-                pass
-
-    if removed:
-        click.echo(f"Removed hooks: {', '.join(removed)}")
+    if actions:
+        for line in actions:
+            click.echo(line)
     else:
         click.echo("No ai-team-sync hooks found.")
 

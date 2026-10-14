@@ -125,7 +125,8 @@ probing or path coincidence.
 | MCP `pre_commit_check` | `repo_root` when the caller passes it | same |
 | MCP `whos_editing` | `repo_root` when the caller passes it | same |
 | CLI `ats lock check` | paths only | absolute paths yes; relative paths legacy (row 7) |
-| `hooks/pre_commit.py` | relative staged paths only | legacy (row 7); installed in no repository as of 2026-09-15 |
+| `hooks/pre_commit.py`, `hooks/pre_merge_commit.py` | staged paths + the canonical `repo_root` (main checkout, via `git rev-parse --git-common-dir`) + the committing `session_id` when one is identified (#3581) | yes. Rules and limits: [commit-guard.md](commit-guard.md). Installed only where `ats hooks install` was run |
+| `hooks/pre_tool_use_bashguard.py` | resolved Bash write targets + canonical `repo_root` + `session_id` (#3581) | yes, for the targets it can resolve; see [commit-guard.md](commit-guard.md) |
 
 A rootless relative query stays conservative: an anchored lock from any
 repository with a matching relative pattern is reported. That is a false
