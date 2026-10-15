@@ -234,11 +234,15 @@ async def _delegated_child_context(
     delegation is open, its lease unexpired and the child session active.
     """
     child = (os.environ.get("ATS_SESSION_ID") or "").strip()
-    token = (os.environ.get("ATS_DELEGATION_TOKEN") or "").strip()
+    # The token comes from the supervisor's private 0600 capability file, the
+    # same proof start_session uses -- never from env, which Codex forwards as
+    # world-readable -c arguments.
+    capability = sp.load_delegated_capability()
+    token = capability[1] if capability and capability[0] == child else ""
     if not child or not token:
         raise ContextResolutionError(
-            f"ATS_DELEGATION={delegation_id} is set without this child's session "
-            "token; refusing to skip ATS-first resolution on ids alone"
+            f"ATS_DELEGATION={delegation_id} is set without this child's private "
+            "capability token; refusing to skip ATS-first resolution on ids alone"
         )
     response = await client.post(
         f"{server_url}/api/delegations/{delegation_id}/verify-child",

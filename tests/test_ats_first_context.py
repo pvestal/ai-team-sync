@@ -538,12 +538,20 @@ class _VerifyChildOnlyClient:
 def _delegated_child_env(monkeypatch, *, child="child-sid", delegation="deleg-1",
                          token="child-token"):
     monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{ANIME_ROOT}:{ECHO_ROOT}")
+    import tempfile
+    from pathlib import Path
+
+    from ai_team_sync import session_pointer as sp
+
     monkeypatch.setenv("ATS_SESSION_ID", child)
     monkeypatch.setenv("ATS_DELEGATION", delegation)
+    # The supervisor's private capability file is the child's proof; the token
+    # is never in env (Codex forwards env as world-readable -c arguments).
+    state = Path(tempfile.mkdtemp(prefix="ats-child-"))
+    monkeypatch.setenv("ATS_STATE_DIR", str(state))
+    monkeypatch.delenv("ATS_DELEGATION_TOKEN", raising=False)
     if token:
-        monkeypatch.setenv("ATS_DELEGATION_TOKEN", token)
-    else:
-        monkeypatch.delenv("ATS_DELEGATION_TOKEN", raising=False)
+        sp.save_delegated_capability(state, child, token)
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
 
 
@@ -668,3 +676,21 @@ def test_governed_prompt_runs_ats_before_supplement(monkeypatch, capsys):
     assert events == ["ats", "echo"]
     output = capsys.readouterr().out
     assert output.index("ATS CONTEXT") < output.index("ECHO SUPPLEMENT")
+
+
+async def test_a_capability_for_another_session_does_not_prove_this_child(monkeypatch):
+    """The capability file must name THIS child; a token for another session is
+    not this child's credential, and the hook never asks ATS with it."""
+    from ai_team_sync import session_pointer as sp
+    from ai_team_sync.hooks import ats_context
+
+    _delegated_child_env(monkeypatch, token="")
+    import os
+    from pathlib import Path
+    sp.save_delegated_capability(Path(os.environ["ATS_STATE_DIR"]), "other-sid", "other-token")
+    client = _VerifyChildOnlyClient(200, {})
+
+    with pytest.raises(ats_context.ContextResolutionError, match="private capability"):
+        await ats_context.resolve_prompt_context("http://test", client, _CHILD_PROMPT,
+                                                 agent="codex")
+    assert client.calls == []

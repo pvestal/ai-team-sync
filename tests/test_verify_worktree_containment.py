@@ -463,9 +463,10 @@ def test_the_reported_result_names_the_worktree_and_the_reviewed_revision(superv
 
 
 @pytest.mark.parametrize("worker", ["claude-code", "codex"])
-def test_the_child_gets_its_delegation_token_in_env_never_in_argv(supervisor, spy, worker):
-    """verify-child needs the child's own token; Codex's -c overrides are argv,
-    which any local process can read with `ps`, so the token must not ride there."""
+def test_the_child_token_is_never_in_env_or_argv(supervisor, spy, worker):
+    """verify-child needs the child's own token, which reaches the child only in
+    its private 0600 capability file: Codex forwards its MCP env as -c
+    arguments, and argv is readable by any local process."""
     from tests.test_child_session_lifecycle import CHILD_TOKEN
 
     captured = {}
@@ -476,7 +477,7 @@ def test_the_child_gets_its_delegation_token_in_env_never_in_argv(supervisor, sp
 
     _run_verify(supervisor, capture, worker=worker)
 
-    assert captured["env"]["ATS_DELEGATION_TOKEN"] == CHILD_TOKEN
+    assert CHILD_TOKEN not in json.dumps(captured["env"])
     assert not any(CHILD_TOKEN in str(a) for a in captured["argv"])
 
 
