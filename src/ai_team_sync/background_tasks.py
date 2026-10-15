@@ -142,16 +142,13 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
         # SQLite returns tz-naive datetimes even for timezone=True columns; assume UTC.
         return dt.replace(tzinfo=timezone.utc) if dt and dt.tzinfo is None else dt
 
+    from ai_team_sync.routers.locks import acquisition_guard
+
     now = datetime.now(timezone.utc)
     slow_cutoff = now - timedelta(hours=settings.session_inactivity_hours)
     fast_cutoff = now - timedelta(minutes=settings.session_heartbeat_timeout_minutes)
-    result = await db.execute(select(Session).where(Session.status == "active"))
-    completed = 0
-    lost_cas = False
-    # One `git status` per repo_root across the whole sweep, not per session —
-    # sessions cluster on the same few repos.
-    uncommitted_cache: dict[str, list[str]] = {}
-    for sess in result.scalars().all():
+
+    async def judge(sess) -> tuple[bool, datetime]:
         last_lock = await db.scalar(
             select(func.max(ScopeLock.created_at)).where(ScopeLock.session_id == sess.id))
         last_commit = await db.scalar(
@@ -161,38 +158,70 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
         last_activity = max(
             _aware(t) for t in
             (sess.started_at, last_lock, last_commit, last_decision, sess.last_heartbeat) if t)
+        cutoff = fast_cutoff if sess.last_heartbeat is not None else slow_cutoff
+        return last_activity < cutoff, last_activity
 
-        heartbeated = sess.last_heartbeat is not None
-        cutoff = fast_cutoff if heartbeated else slow_cutoff
-        if last_activity < cutoff:
-            # LOOK BEFORE COMPLETING (#2554). Reaping drops the session's locks,
-            # and anything it left dirty in a shared repo becomes unattributed:
-            # the next session's `git add -A` sweeps it into an unrelated commit,
-            # or a checkout destroys it. Measured 2026-08-23 on /opt/anime-studio
-            # — four reaped sessions had left 10 uncommitted files (four real
-            # fixes plus their passing tests) and NOTHING surfaced them.
-            #
-            # This has to happen BEFORE the status flip, because the answer is
-            # unknowable afterwards: a live `git status` on a session completed
-            # hours ago reports whoever is dirty in that repo NOW.
-            #
-            # We still reap. Holding a dead session's locks is worse than
-            # reaping it — the lane stays blocked for everyone. What changes is
-            # that the stranded work is NAMED, in the summary (durable) and on
-            # the event (live), instead of vanishing silently.
-            stranded: list[str] = []
-            try:
-                scope = json.loads(sess.scope) if sess.scope else []
-                stranded = uncommitted_for_scope(
-                    getattr(sess, "repo_root", "") or "", scope, uncommitted_cache)
-            except Exception:  # noqa: BLE001 — never let the sweep die on a git call
-                stranded = []
+    # Pass 1, unserialized reads only: who LOOKS idle, kept as plain values.
+    candidates = []
+    for sess in (await db.execute(
+            select(Session).where(Session.status == "active"))).scalars().all():
+        if (await judge(sess))[0]:
+            candidates.append((sess.id, getattr(sess, "repo_root", "") or "", sess.scope))
 
-            # COMPARE-AND-SET (#2811). Everything above was judged from the
-            # plain SELECT at the top of the sweep; a heartbeat committed since
-            # then has disproved it. Complete only the row that was judged --
-            # still active, same last_heartbeat -- and touch nothing (locks,
-            # journal, events) when the CAS loses.
+    completed = 0
+    # One `git status` per repo_root across the whole sweep, not per session —
+    # sessions cluster on the same few repos.
+    uncommitted_cache: dict[str, list[str]] = {}
+    for session_id, repo_root, raw_scope in candidates:
+        # LOOK BEFORE COMPLETING (#2554). Reaping drops the session's locks,
+        # and anything it left dirty in a shared repo becomes unattributed:
+        # the next session's `git add -A` sweeps it into an unrelated commit,
+        # or a checkout destroys it. Measured 2026-08-23 on /opt/anime-studio
+        # — four reaped sessions had left 10 uncommitted files (four real
+        # fixes plus their passing tests) and NOTHING surfaced them.
+        #
+        # This has to happen BEFORE the status flip, because the answer is
+        # unknowable afterwards: a live `git status` on a session completed
+        # hours ago reports whoever is dirty in that repo NOW. It runs outside
+        # the writer lock below, so a slow git call never stalls other writers.
+        #
+        # We still reap. Holding a dead session's locks is worse than
+        # reaping it — the lane stays blocked for everyone. What changes is
+        # that the stranded work is NAMED, in the summary (durable) and on
+        # the event (live), instead of vanishing silently.
+        stranded: list[str] = []
+        try:
+            scope = json.loads(raw_scope) if raw_scope else []
+            stranded = uncommitted_for_scope(repo_root, scope, uncommitted_cache)
+        except Exception:  # noqa: BLE001 — never let the sweep die on a git call
+            stranded = []
+
+        # Pass 2, SERIALIZED (#2811). Retirement takes the same guard as every
+        # lock grant, commit record, decision and owner completion: the
+        # in-process acquisition lock plus the database writer lock (SQLite
+        # BEGIN IMMEDIATE, PostgreSQL advisory xact lock). Under it the row and
+        # its activity are read again and the verdict is decided and written in
+        # one transaction, so any activity either committed before this read
+        # (and keeps the session alive) or waits until after the commit (and
+        # finds it completed and is refused). Pass 1's verdict is only a hint.
+        async with acquisition_guard(db):
+            sess = (await db.execute(
+                select(Session).where(Session.id == session_id)
+                .execution_options(populate_existing=True))).scalar_one_or_none()
+            idle, last_activity = ((await judge(sess)) if sess is not None
+                                   and sess.status == "active" else (False, now))
+            if not idle:
+                # Nothing written: commit only ends the transaction and frees the
+                # writer lock. Not rollback, which would expire every object the
+                # caller holds in this session.
+                await db.commit()
+                continue
+            heartbeated = sess.last_heartbeat is not None
+
+            # COMPARE-AND-SET (#2811), kept under the guard as defense in depth:
+            # complete only the row that was judged -- still active, same
+            # last_heartbeat -- and touch nothing (locks, journal, events) when
+            # it misses.
             judged = sess.last_heartbeat
             flipped = await db.execute(
                 update(Session)
@@ -202,7 +231,7 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
                 .values(status="completed", completed_at=now, auto_completed=True)
                 .execution_options(synchronize_session=False))
             if flipped.rowcount != 1:
-                lost_cas = True
+                await db.commit()  # a zero-row UPDATE: ends the transaction only
                 continue
             set_committed_value(sess, "status", "completed")
             set_committed_value(sess, "completed_at", now)
@@ -265,18 +294,15 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
             # A reaped session is a completed session: same v1 event, same
             # outbox, reason 'reaped' (#3537). It used to emit nothing.
             await completion_events.record_completion(db, sess, completion_events.REAPED)
-            await broadcast_event(sess.id, "session.auto_completed", {
-                "session_id": sess.id, "last_activity": last_activity.isoformat(),
-                "reason": reason, "uncommitted_in_scope": stranded,
-                "locks_released": len(released)})
-            completed += 1
+            await db.commit()
+        # Told only once it is durable, and outside the writer lock.
+        await broadcast_event(session_id, "session.auto_completed", {
+            "session_id": session_id, "last_activity": last_activity.isoformat(),
+            "reason": reason, "uncommitted_in_scope": stranded,
+            "locks_released": len(released)})
+        completed += 1
     if completed:
-        await db.commit()
         completion_events.kick()
-    elif lost_cas:
-        # A zero-row UPDATE still opened a write transaction; end it here
-        # rather than holding the database write lock until the caller closes.
-        await db.rollback()
     return completed
 
 
