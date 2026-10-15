@@ -150,3 +150,45 @@ def test_echo_events_are_explicitly_partial_metadata():
     assert event["source"]["agent"] == "codex"
     assert event["target"]["agent"] == "echo"
     assert event["detail"]["content"] == "SOURCE_METADATA_ONLY"
+
+
+@pytest.mark.asyncio
+async def test_api_collections_are_not_cut_to_fifty_rows(  # #3589
+):
+    """The server bounds these lists (<=500 events, <=200 sessions).
+
+    The client used to run every response through the same 50-item cap used
+    for nested display values, keeping the OLDEST 50 of a 250-event bootstrap
+    while the server's next_cursor pointed past all 250 -- 200 events were
+    never shown. The collection must arrive whole.
+    """
+    events = [{"id": f"e{i}", "summary": "x"} for i in range(250)]
+    sessions = [{"id": f"s{i}"} for i in range(120)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/observability/events":
+            return httpx.Response(200, json={"events": events, "next_cursor": "c"})
+        if request.url.path == "/api/observability/sessions":
+            return httpx.Response(200, json={"sessions": sessions, "count": 120})
+        raise AssertionError(request.url)
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    source = ReadOnlySources(ConsoleConfig(ats_url="http://ats", echo_url="http://echo"), client)
+    got_events = (await source.ats_events())["events"]
+    got_sessions = (await source.ats_sessions())["sessions"]
+    await client.aclose()
+    assert [e["id"] for e in got_events] == [f"e{i}" for i in range(250)]
+    assert len(got_sessions) == 120
+    # Nested values inside one record keep the display cap.
+    assert len(safe_value({"k": list(range(80))})["k"]) == 50
+
+
+def test_sanitizer_redacts_prefixed_secret_variables():  # #3589
+    """`\\bsecret=` misses JWT_SECRET=..., the exact variable leaked in #3556."""
+    value = safe_text(
+        "JWT_SECRET=abc123 ECHO_DB_PASSWORD: hunter2 GITHUB_TOKEN=ghx_zzz plain=ok"
+    )
+    assert "abc123" not in value
+    assert "hunter2" not in value
+    assert "ghx_zzz" not in value
+    assert "plain=ok" in value

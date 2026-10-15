@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Claim Verification</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --ink: #1d2330; --muted: #5d6677; --line: #dde1e8;
+  --code: #f0f2f5;
+  --verified: #1a7f37; --verified-bg: #e6f4ea;
+  --contradicted: #c0262d; --contradicted-bg: #fde8e8;
+  --stale: #a35a00; --stale-bg: #fff1dc;
+  --unverified: #5d6677; --unverified-bg: #eceef2;
+  --observed: #1f5fbf; --self: #7a4fbf; --focus: #1f5fbf;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0f1218; --panel: #171b23; --ink: #e5e8ee; --muted: #9aa3b2; --line: #2a303b;
+    --code: #1f242e;
+    --verified: #4cc26b; --verified-bg: #13301d;
+    --contradicted: #ff6b70; --contradicted-bg: #3a1618;
+    --stale: #f0a640; --stale-bg: #3a2810;
+    --unverified: #a3abb9; --unverified-bg: #262b35;
+    --observed: #6aa5ff; --self: #b693ff; --focus: #6aa5ff;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0f1218; --panel: #171b23; --ink: #e5e8ee; --muted: #9aa3b2; --line: #2a303b;
+  --code: #1f242e;
+  --verified: #4cc26b; --verified-bg: #13301d;
+  --contradicted: #ff6b70; --contradicted-bg: #3a1618;
+  --stale: #f0a640; --stale-bg: #3a2810;
+  --unverified: #a3abb9; --unverified-bg: #262b35;
+  --observed: #6aa5ff; --self: #b693ff; --focus: #6aa5ff;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+header { padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { margin: 0 0 4px; font-size: 18px; }
+.sub { color: var(--muted); font-size: 13px; }
+.bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 10px; }
+button, input { font: inherit; color: inherit; }
+button { background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  padding: 4px 10px; cursor: pointer; }
+button:focus-visible, input:focus-visible, .row:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
+input { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; width: 7em; }
+.chip { display: inline-block; font-size: 12px; font-weight: 600; letter-spacing: .02em;
+  border-radius: 4px; padding: 1px 7px; white-space: nowrap; }
+.v-VERIFIED { color: var(--verified); background: var(--verified-bg); }
+.v-CONTRADICTED { color: var(--contradicted); background: var(--contradicted-bg); }
+.v-STALE { color: var(--stale); background: var(--stale-bg); }
+.v-UNVERIFIED { color: var(--unverified); background: var(--unverified-bg); }
+.k-OBSERVED { color: var(--observed); border: 1px solid currentColor; }
+.k-SELF_REPORTED { color: var(--self); border: 1px solid currentColor; }
+.filter[aria-pressed="true"] { outline: 2px solid var(--ink); }
+details.legend { margin-top: 8px; color: var(--muted); font-size: 13px; }
+details.legend dl { display: grid; grid-template-columns: max-content 1fr; gap: 4px 10px; margin: 6px 0 0; }
+details.legend dd { margin: 0; }
+main { display: grid; grid-template-columns: minmax(260px, 360px) 1fr; gap: 0; min-height: 60vh; }
+#list { border-right: 1px solid var(--line); background: var(--panel); overflow: auto; max-height: calc(100vh - 140px); }
+.group { padding: 8px 12px 2px; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.row { display: flex; gap: 8px; align-items: baseline; padding: 6px 12px; cursor: pointer; border-left: 3px solid transparent; }
+.row:hover { background: var(--code); }
+.row[aria-selected="true"] { border-left-color: var(--ink); background: var(--code); }
+.row .t { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+#detail { padding: 16px; overflow: auto; max-height: calc(100vh - 140px); min-width: 0; }
+h2 { font-size: 16px; margin: 0 0 6px; }
+h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 18px 0 6px; }
+.verdict { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.verdict .chip { font-size: 14px; padding: 3px 10px; }
+.box { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+.statement { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0 0 8px; }
+.meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+table { width: 100%; border-collapse: collapse; }
+td, th { text-align: left; vertical-align: top; padding: 6px 6px; border-top: 1px solid var(--line); }
+th { font-size: 12px; color: var(--muted); font-weight: 600; }
+tr.ev { cursor: pointer; }
+tr.ev:hover td { background: var(--code); }
+.rel { font-weight: 600; font-size: 12px; white-space: nowrap; }
+.rel-supports { color: var(--verified); } .rel-contradicts { color: var(--contradicted); }
+.rel-stale { color: var(--stale); } .rel-context { color: var(--muted); }
+.sum { overflow-wrap: anywhere; }
+pre { background: var(--code); padding: 8px 10px; border-radius: 6px; overflow: auto; max-height: 420px;
+  white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; margin: 6px 0; }
+.missing li { color: var(--stale); }
+.tree ul { list-style: none; padding-left: 18px; margin: 4px 0; border-left: 1px dashed var(--line); }
+.tree > ul { padding-left: 0; border-left: 0; }
+.tree li { margin: 6px 0; }
+.node { overflow-wrap: anywhere; }
+.edge { cursor: pointer; text-decoration: underline dotted; }
+.err { color: var(--contradicted); padding: 16px; }
+@media (max-width: 760px) {
+  main { grid-template-columns: 1fr; }
+  #list { max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--line); }
+  #detail { max-height: none; }
+  td.when, th.when { display: none; }
+}
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Claim verification</h1>
+  <div class="sub" id="subtitle">Loading…</div>
+  <div class="bar">
+    <label>Ticket <input id="ticket" inputmode="numeric" aria-label="Ticket number"></label>
+    <button id="load">Load</button>
+    <button id="refresh" title="Re-collect evidence now">Re-check now</button>
+    <span id="filters"></span>
+  </div>
+  <details class="legend"><summary>What the verdicts mean</summary><dl id="legend"></dl></details>
+</header>
+<main>
+  <nav id="list" aria-label="Claims"></nav>
+  <section id="detail" aria-live="polite"></section>
+</main>
+<script>
+"use strict";
+const ORDER = ["completion", "operator acceptance", "deployment", "review coverage", "review", "delegation", "test result", "handoff delivery"];
+const REL_ORDER = { contradicts: 0, stale: 1, supports: 2, context: 3 };
+let report = null, filter = null, selected = null;
+
+const el = (tag, attrs = {}, ...kids) => {
+  const node = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") node.className = v; else if (k.startsWith("on")) node.addEventListener(k.slice(2), v);
+    else node.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) if (kid !== null && kid !== undefined) node.append(kid.nodeType ? kid : String(kid));
+  return node;
+};
+const chip = (v) => el("span", { class: `chip v-${v}` }, v);
+const kindChip = (k) => el("span", { class: `chip k-${k}` }, k === "SELF_REPORTED" ? "SELF-REPORTED" : k);
+// Every time in one zone (the viewer's), named, so rows from git, systemd and transcripts compare.
+// ISO-ish times as git, systemd, Postgres and transcripts write them, WITH a zone.
+// A time without a zone is left as written: converting it would be a guess.
+const STAMP = /\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}(?::?\d{2})?)(?![\d:])/g;
+const toDate = (t) => {
+  const s = String(t).replace(" ", "T").replace(/(\.\d{3})\d+/, "$1")
+    .replace(/([+-]\d{2})$/, "$1:00").replace(/([+-]\d{2})(\d{2})$/, "$1:$2");
+  return new Date(s);
+};
+// Times written inside text are shown in the same zone as the When column.
+const localize = (text) => text == null ? "" : String(text).replace(STAMP, (m) => fmt(m));
+const fmt = (t) => {
+  if (!t) return "";
+  const d = toDate(t);
+  if (isNaN(d)) return String(t);
+  const zone = new Intl.DateTimeFormat(undefined, { timeZoneName: "short" })
+    .formatToParts(d).find(p => p.type === "timeZoneName");
+  return d.toLocaleString("sv-SE", { hour12: false }) + (zone ? " " + zone.value : "");
+};
+
+function readHash() {
+  const p = new URLSearchParams(location.hash.slice(1));
+  return { ticket: p.get("ticket") || "", claim: p.get("claim") };
+}
+function writeHash() {
+  const p = new URLSearchParams({ ticket: report ? report.ticket.id : readHash().ticket });
+  if (selected) p.set("claim", selected);
+  history.replaceState(null, "", "#" + p.toString());
+}
+
+async function load(refresh = false) {
+  const { ticket, claim } = readHash();
+  document.getElementById("ticket").value = ticket;
+  if (!ticket) {
+    document.getElementById("subtitle").textContent = "Enter a ticket number and press Load.";
+    return;
+  }
+  document.getElementById("subtitle").textContent = "Collecting evidence…";
+  try {
+    const res = await fetch(`/api/ticket/${encodeURIComponent(ticket)}${refresh ? "?refresh=1" : ""}`);
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.detail || body.error || res.status);
+    report = body;
+    selected = claim === "__graph" || (claim && report.claims.some(c => c.id === claim))
+      ? claim : (report.claims[0] || {}).id;
+    render();
+  } catch (e) {
+    document.getElementById("detail").replaceChildren(el("div", { class: "err" }, `Could not build the report: ${e.message}`));
+    document.getElementById("subtitle").textContent = "";
+  }
+}
+
+function render() {
+  const t = report.ticket;
+  document.getElementById("title").textContent = `Claim verification — #${t.id} ${t.title || ""}`;
+  document.getElementById("subtitle").textContent =
+    `Ticket status ${t.status || "?"} · evidence collected ${fmt(report.generated_at)} · ` +
+    Object.entries(report.records).map(([k, v]) => `${v} ${k.replace("_", " ")}`).join(", ");
+  const legend = document.getElementById("legend");
+  legend.replaceChildren(...Object.entries(report.legend).flatMap(([k, v]) =>
+    [el("dt", {}, k.includes("_") || k === "OBSERVED" ? kindChip(k) : chip(k)), el("dd", {}, v)]));
+  const filters = document.getElementById("filters");
+  filters.replaceChildren(...["CONTRADICTED", "STALE", "UNVERIFIED", "VERIFIED"].map(v =>
+    el("button", { class: `chip v-${v} filter`, "aria-pressed": String(filter === v),
+      onclick: () => { filter = filter === v ? null : v; render(); } }, `${report.counts[v] || 0} ${v}`)));
+  renderList(); renderDetail(); writeHash();
+}
+
+function renderList() {
+  const list = document.getElementById("list");
+  const claims = report.claims.filter(c => !filter || c.verdict === filter);
+  const kinds = [...new Set(claims.map(c => c.kind))].sort((a, b) => ORDER.indexOf(a) - ORDER.indexOf(b));
+  const nodes = [];
+  for (const kind of kinds) {
+    nodes.push(el("div", { class: "group" }, kind));
+    for (const c of claims.filter(x => x.kind === kind)) {
+      nodes.push(el("div", { class: "row", role: "option", tabindex: "0", "aria-selected": String(c.id === selected),
+        onclick: () => select(c.id), onkeydown: (e) => { if (e.key === "Enter") select(c.id); } },
+        chip(c.verdict), el("span", { class: "t" }, c.title)));
+    }
+  }
+  nodes.push(el("div", { class: "group" }, "graph"));
+  nodes.push(el("div", { class: "row", tabindex: "0", "aria-selected": String(selected === "__graph"),
+    onclick: () => select("__graph") }, el("span", { class: "t" }, "Agents, delegations and handoffs")));
+  list.replaceChildren(...nodes);
+}
+
+function select(id) { selected = id; renderList(); renderDetail(); writeHash(); }
+
+function evidenceDetail(e) {
+  const d = e.detail || {};
+  const parts = [];
+  if (d.diff) parts.push(el("div", { class: "meta" }, "Unreviewed change (git diff):"), el("pre", {}, d.diff));
+  if (d.changed) parts.push(el("div", { class: "meta" }, "Changed paths:"), el("pre", {}, d.changed.join("\n")));
+  if (d.final_message) parts.push(el("div", { class: "meta" }, "The reviewer's own last message:"), el("pre", {}, d.final_message));
+  if (d.excerpt) parts.push(el("div", { class: "meta" }, d.excerpt.startsWith("<pasted_content") ? "Operator turn (pasted text):" : "Operator turn:"), el("pre", {}, d.excerpt));
+  if (d.runs) for (const r of d.runs) parts.push(el("pre", {}, `${r.commands.join("\n")}\n-> exit ${r.exit_codes.join(",") || "unrecorded"}  ${r.summaries.join("; ")}`));
+  if (d.commands) parts.push(el("div", { class: "meta" }, `Recorded by the ${d.recorded_by || "harness"}:`),
+    el("pre", {}, `${d.commands.join("\n")}\n-> exit ${(d.exit_codes || []).join(",") || "unrecorded"}  ${(d.summaries || []).join("; ")}`));
+  const rest = Object.fromEntries(Object.entries(d).filter(([k]) =>
+    !["diff", "changed", "final_message", "excerpt", "runs", "commands", "exit_codes", "summaries", "recorded_by", "ref"].includes(k)));
+  if (Object.keys(rest).length) parts.push(el("pre", {}, JSON.stringify(rest, null, 2)));
+  if (e.ref || d.ref) parts.push(el("div", { class: "meta" }, `Source: ${e.ref || d.ref}`));
+  return parts.length ? parts : [el("div", { class: "meta" }, "No further detail recorded.")];
+}
+
+function renderDetail() {
+  const pane = document.getElementById("detail");
+  if (selected === "__graph") { pane.replaceChildren(...renderGraph()); return; }
+  const c = report.claims.find(x => x.id === selected);
+  if (!c) { pane.replaceChildren(el("p", {}, "No claim selected.")); return; }
+  const rows = [...c.evidence].sort((a, b) => REL_ORDER[a.relation] - REL_ORDER[b.relation]);
+  const table = el("table", {}, el("thead", {}, el("tr", {}, el("th", {}, "Relation"), el("th", {}, "Source"),
+    el("th", { class: "when" }, "When"), el("th", {}, "What was found"))));
+  const tbody = el("tbody");
+  rows.forEach((e) => {
+    const drill = el("tr", { hidden: "" }, el("td", { colspan: "4" }, ...evidenceDetail(e)));
+    const row = el("tr", { class: "ev", tabindex: "0", "aria-expanded": "false",
+      onclick: () => toggle(), onkeydown: (ev) => { if (ev.key === "Enter") toggle(); } },
+      el("td", {}, el("div", { class: `rel rel-${e.relation}` }, e.relation), kindChip(e.kind),
+        e.admission ? el("div", { class: "meta" }, "claimant's own record") : null),
+      el("td", {}, e.source), el("td", { class: "when meta" }, fmt(e.at)), el("td", { class: "sum" }, localize(e.summary)));
+    function toggle() { drill.hidden = !drill.hidden; row.setAttribute("aria-expanded", String(!drill.hidden)); }
+    tbody.append(row, drill);
+  });
+  table.append(tbody);
+  const parts = [
+    el("h2", {}, c.title),
+    el("div", { class: "verdict" }, chip(c.verdict), el("span", {}, localize(c.basis))),
+    c.meaning ? el("p", { class: "meta" }, c.meaning) : null,
+    el("h3", {}, "Claim (self-reported)"),
+    el("div", { class: "box" }, el("p", { class: "statement" }, localize(c.statement)),
+      el("div", { class: "meta" }, `Claimant: ${c.claimant}`),
+      el("div", { class: "meta" }, `Made: ${fmt(c.made_at) || "time not recorded"} · Record: ${c.source_record}`)),
+  ];
+  if (c.requirements && c.requirements.length) {
+    parts.push(el("h3", {}, "Acceptance criteria vs evidence"));
+    parts.push(el("table", {}, el("tbody", {}, c.requirements.map(r => el("tr", {},
+      el("td", {}, chip(r.status)), el("td", {}, r.criterion), el("td", { class: "meta" }, localize(r.evidence)))))));
+  }
+  parts.push(el("h3", {}, `Evidence (${rows.length}) — click a row for the raw record`));
+  parts.push(rows.length ? table : el("p", { class: "meta" }, "No evidence of any kind was found."));
+  if (c.missing && c.missing.length) {
+    parts.push(el("h3", {}, "Missing evidence"));
+    parts.push(el("ul", { class: "missing" }, c.missing.map(m => el("li", {}, localize(m)))));
+  }
+  pane.replaceChildren(...parts);
+}
+
+function renderGraph() {
+  const g = report.graph;
+  const byId = Object.fromEntries(g.nodes.map(n => [n.id, n]));
+  const childOf = new Set(g.edges.filter(e => e.kind === "delegation" && e.to).map(e => e.to));
+  const label = (n) => el("span", { class: "node" },
+    el("b", {}, n.agent || "?"), ` ${n.id.slice(0, 8)} · ${fmt(n.started_at)} · ticket ${n.ticket_link} · runtime `,
+    n.observed_runtime === "UNOBSERVED" ? chip("UNVERIFIED") : el("span", { class: "chip k-OBSERVED" }, n.observed_runtime));
+  const nodeItem = (n, depth = 0) => {
+    const kids = [];
+    for (const e of g.edges.filter(x => x.from === n.id)) {
+      if (e.kind === "delegation") {
+        const target = byId[e.to];
+        kids.push(el("li", {}, el("span", { class: "edge", tabindex: "0", onclick: () => e.claim_id && select(e.claim_id) },
+          "delegated ", e.verdict ? chip(e.verdict) : "", ` ${localize(e.label)} · ${fmt(e.at)}`),
+          target && depth < 4 ? el("ul", {}, nodeItem(target, depth + 1)) : el("div", { class: "meta" }, "no child session recorded")));
+      } else {
+        const hops = [`handoff "${localize(e.label)}" · ${fmt(e.at)} → ${e.mailbox ? e.mailbox + " mailbox" : (byId[e.to] || {}).agent || "?"}`];
+        for (const d of e.delivered) hops.push(`${d.action} → ${(byId[d.to] || {}).agent || "session"} ${(d.to || "").slice(0, 8)} (${d.reason}) ${fmt(d.at)}`);
+        if (e.acknowledged_at) hops.push(`acknowledged ${fmt(e.acknowledged_at)}`);
+        kids.push(el("li", {}, el("div", {}, el("span", { class: "edge", tabindex: "0", onclick: () => e.claim_id && select(e.claim_id) }, "handed off ", e.verdict ? chip(e.verdict) : "", " ", hops[0])),
+          ...hops.slice(1).map(h => el("div", { class: "meta" }, h)),
+          el("div", { class: "meta" }, e.intake_receipt.stored
+            ? `Intake receipt (observed): handoff stored, job ${e.intake_receipt.job_status} ${fmt(e.intake_receipt.finished_at)}`
+            : "Intake receipt: none tied to this handoff")));
+      }
+    }
+    return el("li", {}, label(n), kids.length ? el("ul", {}, kids) : null);
+  };
+  const roots = g.nodes.filter(n => !childOf.has(n.id));
+  return [
+    el("h2", {}, "Agents, delegations and handoffs"),
+    el("p", { class: "meta" }, "Edges come from ATS records (self-reported). A delegation's chip is the verdict of its claim: VERIFIED only when the delegated process's own transcript names it. Runtime chips show what the harness transcripts observed; UNVERIFIED means no transcript was bound. Handoffs show where they were addressed when written, each later assignment, and the intake receipt."),
+    el("div", { class: "tree" }, el("ul", {}, roots.map(n => nodeItem(n)))),
+  ];
+}
+
+document.getElementById("load").addEventListener("click", () => {
+  location.hash = `ticket=${encodeURIComponent(document.getElementById("ticket").value.trim())}`;
+});
+document.getElementById("ticket").addEventListener("keydown", (e) => { if (e.key === "Enter") document.getElementById("load").click(); });
+document.getElementById("refresh").addEventListener("click", () => load(true));
+window.addEventListener("hashchange", () => { if (!report || String(report.ticket.id) !== readHash().ticket) load(); });
+load();
+</script>
+</body>
+</html>

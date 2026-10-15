@@ -18,6 +18,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--repo", default="", help="Repository for read-only git status")
     parser.add_argument("--snapshot", action="store_true", help="Print one sanitized JSON snapshot")
+    parser.add_argument(
+        "--verify-ticket",
+        type=int,
+        metavar="N",
+        help="Verify ticket N's claims against independent evidence and print JSON",
+    )
+    parser.add_argument(
+        "--serve-verify",
+        action="store_true",
+        help="Serve the claim-verification browser view on loopback",
+    )
+    parser.add_argument("--port", type=int, default=8765, help="Port for --serve-verify")
     return parser
 
 
@@ -60,6 +72,16 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.snapshot:
         return asyncio.run(_snapshot(config))
+    if args.verify_ticket is not None:
+        from .verify import ticket_report
+
+        print(json.dumps(ticket_report(args.verify_ticket), indent=2, default=str))
+        return 0
+    if args.serve_verify:
+        from .web import serve
+
+        serve(port=args.port)
+        return 0
     try:
         from .app import TowerConsole
     except ImportError as exc:

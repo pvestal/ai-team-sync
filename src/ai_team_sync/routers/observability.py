@@ -155,6 +155,56 @@ def _party(session_id: str | None, sessions: dict[str, Session], agent: str = ""
     }
 
 
+def _task_int(value: Any) -> int | None:
+    """delegations.parent_task is text; anything non-numeric names no task."""
+    try:
+        return int(str(value).strip()) if value is not None and str(value).strip() else None
+    except ValueError:
+        return None
+
+
+def _mailbox(ticket_id: int | None) -> dict | None:
+    if ticket_id is None:
+        return None
+    return {"session_id": None, "agent": f"ticket #{ticket_id} mailbox"}
+
+
+def _creation_target(row: AgentMessage, sessions: dict[str, Session]) -> dict | None:
+    """Who a message was addressed to WHEN IT WAS WRITTEN (#3589).
+
+    ``recipient_session_id`` is the current assignee: ticket turnover and
+    readdress rewrite it later. Projecting it at ``created_at`` showed a
+    2026-10-09 ticket-mailbox handoff as received by a session that started
+    2026-10-14. Ticket mail was written to the mailbox; a direct message keeps
+    ``original_recipient_session_id``.
+    """
+    if row.addressing_mode == "ticket":
+        return _mailbox(row.ticket_id)
+    original = row.original_recipient_session_id or row.recipient_session_id
+    agent = row.recipient_agent if original == row.recipient_session_id else ""
+    return _party(original, sessions, agent)
+
+
+def _delivery_history(row: AgentMessage, sessions: dict[str, Session]) -> list[dict]:
+    entries = _json(row.delivery_history, [])
+    out = []
+    for entry in entries if isinstance(entries, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        sid = entry.get("recipient_session_id")
+        party = _party(sid, sessions) or {}
+        out.append(
+            {
+                "action": _text(entry.get("action"), 20),
+                "recipient_session_id": sid,
+                "recipient_agent": party.get("agent"),
+                "reason": _text(entry.get("reason"), 80),
+                "at": _text(entry.get("at"), 40),
+            }
+        )
+    return out
+
+
 def _event(
     *,
     event_id: str,
@@ -224,8 +274,13 @@ async def _recent(
     *,
     after_key: tuple[str, str] | None,
     cutoff: datetime,
+    where: Any = None,
 ) -> tuple[list[Any], bool]:
-    """Read each lifecycle timestamp in bounded, cursor-safe pages."""
+    """Read each lifecycle timestamp in bounded, cursor-safe pages.
+
+    ``where`` scopes the read BEFORE the cap; filtering a capped page after
+    the fact silently drops older matching rows (#3589).
+    """
     by_id: dict[str, Any] = {}
     truncated = False
     after = datetime.fromisoformat(after_key[0]) if after_key else None
@@ -245,17 +300,90 @@ async def _recent(
                     timestamp > after,
                     and_(timestamp == after, model.id >= raw_id),
                 )
-        rows: Any = await db.execute(
-            select(model)
-            .where(timestamp.is_not(None), boundary)
-            .order_by(order, id_order)
-            .limit(limit + 1)
-        )
+        stmt = select(model).where(timestamp.is_not(None), boundary)
+        if where is not None:
+            stmt = stmt.where(where)
+        rows: Any = await db.execute(stmt.order_by(order, id_order).limit(limit + 1))
         found = list(rows.scalars().all())
         truncated = truncated or len(found) > limit
         for row in found[:limit]:
             by_id[row.id] = row
     return list(by_id.values()), truncated
+
+
+async def _task_scopes(db: AsyncSession, task_id: int) -> dict[type[Any], Any]:
+    """Per-table predicates selecting one ticket's rows before any cap (#3589).
+
+    A ticket's sessions are those linked directly plus both ends of every
+    delegation the ticket launched: delegated children usually carry no
+    ticket_id of their own.
+    """
+    direct = await db.execute(
+        select(Session.id).where(or_(Session.ticket_id == task_id, Session.task_id == task_id))
+    )
+    ids = set(direct.scalars().all())
+    linked = await db.execute(
+        select(Delegation.parent_session_id, Delegation.child_session_id).where(
+            Delegation.parent_task == str(task_id)
+        )
+    )
+    for parent, child in linked.all():
+        ids.add(parent)
+        if child:
+            ids.add(child)
+    sid = sorted(ids)
+    return {
+        Session: Session.id.in_(sid),
+        AgentMessage: or_(
+            AgentMessage.ticket_id == task_id,
+            AgentMessage.sender_session_id.in_(sid),
+            AgentMessage.recipient_session_id.in_(sid),
+        ),
+        Handoff: or_(Handoff.ticket_id == task_id, Handoff.source_session_id.in_(sid)),
+        Delegation: or_(
+            Delegation.parent_task == str(task_id),
+            Delegation.parent_session_id.in_(sid),
+            Delegation.child_session_id.in_(sid),
+        ),
+        Decision: or_(Decision.ticket_id == task_id, Decision.session_id.in_(sid)),
+        AuthorityCheck: or_(AuthorityCheck.task_id == task_id, AuthorityCheck.session_id.in_(sid)),
+        FileActivity: FileActivity.session_id.in_(sid),
+        OverrideRequest: or_(
+            OverrideRequest.requester_session_id.in_(sid),
+            OverrideRequest.owner_session_id.in_(sid),
+        ),
+        ServiceRestart: ServiceRestart.session_id.in_(sid),
+        CommitRecord: CommitRecord.session_id.in_(sid),
+    }
+
+
+async def _session_tasks(
+    db: AsyncSession, sessions: dict[str, Session], delegations: list[Delegation]
+) -> dict[str, int]:
+    """Ticket of each session: its own task/ticket, else its delegation's parent_task."""
+    out: dict[str, int] = {}
+    for row in sessions.values():
+        value = row.task_id if row.task_id is not None else row.ticket_id
+        if value is not None:
+            out[row.id] = value
+    by_child: dict[str, int | None] = {
+        d.child_session_id: _task_int(d.parent_task) for d in delegations if d.child_session_id
+    }
+    need = [sid for sid in sessions if sid not in out and sid not in by_child]
+    if need:
+        found = await db.execute(
+            select(Delegation.child_session_id, Delegation.parent_task).where(
+                Delegation.child_session_id.in_(need)
+            )
+        )
+        for child, task in found.all():
+            if child:
+                by_child.setdefault(child, _task_int(task))
+    for sid in sessions:
+        task_id = by_child.get(sid)
+        if sid not in out and task_id is not None:
+            out[sid] = task_id
+    return out
 
 
 @router.get("/sessions")
@@ -287,6 +415,10 @@ async def projected_sessions(
     parent_by_child = {
         d.child_session_id: d.parent_session_id for d in delegations if d.child_session_id
     }
+    # 303 of 342 delegated children carry no ticket_id; their delegation names it.
+    task_by_child = {
+        d.child_session_id: _task_int(d.parent_task) for d in delegations if d.child_session_id
+    }
     children: dict[str, list[str]] = {}
     for delegation in delegations:
         if delegation.child_session_id:
@@ -300,6 +432,8 @@ async def projected_sessions(
         scope = _json(row.scope, [])
         heartbeat = _stamp(row.last_heartbeat) if row.last_heartbeat else None
         task_id = row.task_id if row.task_id is not None else row.ticket_id
+        if task_id is None:
+            task_id = task_by_child.get(row.id)
         delegation_info = authority.get("delegation")
         projected.append(
             {
@@ -376,6 +510,7 @@ async def projected_events(
         (ServiceRestart, (ServiceRestart.created_at,), "restart"),
         (CommitRecord, (CommitRecord.created_at,), "commit"),
     )
+    scopes = await _task_scopes(db, task_id) if task_id is not None else {}
     loaded = {
         model: await _recent(
             db,
@@ -385,6 +520,7 @@ async def projected_events(
             per_source,
             after_key=cursor_key,
             cutoff=cutoff,
+            where=scopes.get(model),
         )
         for model, timestamps, event_prefix in models
     }
@@ -414,12 +550,27 @@ async def projected_events(
         referenced.add(row.requester_session_id)
         referenced.add(row.owner_session_id)
     referenced.update(row.session_id for row in batches[ServiceRestart] if row.session_id)
+    handoff_ids = [row.id for row in batches[Handoff]]
+    handoff_messages: dict[str, AgentMessage] = {}
+    if handoff_ids:
+        linked = await db.execute(
+            select(AgentMessage).where(AgentMessage.handoff_id.in_(handoff_ids))
+        )
+        handoff_messages = {m.handoff_id: m for m in linked.scalars().all() if m.handoff_id}
+    for row in [*batches[AgentMessage], *handoff_messages.values()]:
+        for entry in _json(row.delivery_history, []):
+            if isinstance(entry, dict) and entry.get("recipient_session_id"):
+                referenced.add(str(entry["recipient_session_id"]))
     if referenced:
         extra = await db.execute(select(Session).where(Session.id.in_(referenced)))
         session_rows = list(
             {row.id: row for row in [*session_rows, *extra.scalars().all()]}.values()
         )
     sessions = {row.id: row for row in session_rows}
+    session_task = await _session_tasks(db, sessions, batches[Delegation])
+
+    def task_of(session_id: str | None) -> int | None:
+        return session_task.get(session_id or "")
 
     events: list[dict[str, Any]] = []
     for row in batches[Session]:
@@ -431,7 +582,7 @@ async def projected_events(
                 summary="ATS session registered",
                 source_record=f"sessions:{row.id}",
                 session_id=row.id,
-                task_id=row.task_id if row.task_id is not None else row.ticket_id,
+                task_id=task_of(row.id),
                 status=row.status,
                 source=_party(row.id, sessions),
                 detail={
@@ -449,7 +600,7 @@ async def projected_events(
                     summary="ATS session completed",
                     source_record=f"sessions:{row.id}",
                     session_id=row.id,
-                    task_id=row.task_id if row.task_id is not None else row.ticket_id,
+                    task_id=task_of(row.id),
                     status="completed",
                     source=_party(row.id, sessions),
                     detail={"auto_completed": row.auto_completed},
@@ -464,14 +615,20 @@ async def projected_events(
                 summary=f"Agent-visible {row.kind} (contents withheld)",
                 source_record=f"agent_messages:{row.id}",
                 session_id=row.sender_session_id,
-                task_id=row.ticket_id,
+                task_id=(
+                    row.ticket_id if row.ticket_id is not None else task_of(row.sender_session_id)
+                ),
                 status="acknowledged" if row.acknowledged_at else "pending",
                 source=_party(row.sender_session_id, sessions, row.sender_agent),
-                target=_party(row.recipient_session_id, sessions, row.recipient_agent),
+                target=_creation_target(row, sessions),
                 detail={
                     "kind": _text(row.kind, 20),
                     "addressing_mode": _text(row.addressing_mode, 20),
                     "content": "WITHHELD",
+                    "delivery_history": _delivery_history(row, sessions),
+                    "current_recipient": _party(
+                        row.recipient_session_id, sessions, row.recipient_agent
+                    ),
                 },
             )
         )
@@ -484,7 +641,11 @@ async def projected_events(
                     summary="Agent-visible message acknowledged (contents withheld)",
                     source_record=f"agent_messages:{row.id}",
                     session_id=row.recipient_session_id,
-                    task_id=row.ticket_id,
+                    task_id=(
+                        row.ticket_id
+                        if row.ticket_id is not None
+                        else task_of(row.recipient_session_id)
+                    ),
                     status="acknowledged",
                     source=_party(row.recipient_session_id, sessions, row.recipient_agent),
                     target=_party(row.sender_session_id, sessions, row.sender_agent),
@@ -493,6 +654,14 @@ async def projected_events(
             )
     for row in batches[Handoff]:
         blockers = [_text(x) for x in _json(row.blockers, [])]
+        linked_message = handoff_messages.get(row.id)
+        # Handoffs are written to the ticket mailbox; recipient_session_id is the
+        # current assignee. Rows with no linked message predate #2907 and keep it.
+        handoff_target = (
+            _creation_target(linked_message, sessions)
+            if linked_message is not None
+            else _party(row.recipient_session_id, sessions)
+        )
         events.append(
             _event(
                 event_id=f"handoff:{row.id}:created",
@@ -504,11 +673,17 @@ async def projected_events(
                 task_id=row.ticket_id,
                 status=row.verdict,
                 source=_party(row.source_session_id, sessions),
-                target=_party(row.recipient_session_id, sessions),
+                target=handoff_target,
                 detail={
                     "blockers": blockers,
                     "next_steps": [_text(x) for x in _json(row.next_steps, [])],
                     "artifacts": [_text(x) for x in _json(row.artifacts, [])],
+                    "delivery_history": (
+                        _delivery_history(linked_message, sessions)
+                        if linked_message is not None
+                        else []
+                    ),
+                    "current_recipient": _party(row.recipient_session_id, sessions),
                 },
             )
         )
@@ -524,7 +699,7 @@ async def projected_events(
                     task_id=row.ticket_id,
                     status=row.verdict,
                     source=_party(row.source_session_id, sessions),
-                    target=_party(row.recipient_session_id, sessions),
+                    target=handoff_target,
                     detail={"blockers": blockers},
                 )
             )
@@ -537,6 +712,7 @@ async def projected_events(
                 summary="Bounded delegation recorded",
                 source_record=f"delegations:{row.id}",
                 session_id=row.parent_session_id,
+                task_id=_task_int(row.parent_task) or task_of(row.parent_session_id),
                 status=row.state,
                 source=_party(row.parent_session_id, sessions),
                 target=_party(row.child_session_id, sessions) if row.child_session_id else None,
@@ -558,6 +734,7 @@ async def projected_events(
                     summary="Delegation result returned",
                     source_record=f"delegations:{row.id}",
                     session_id=row.child_session_id,
+                    task_id=_task_int(row.parent_task) or task_of(row.parent_session_id),
                     status=row.verdict or row.state,
                     source=_party(row.child_session_id, sessions),
                     target=_party(row.parent_session_id, sessions),
@@ -573,7 +750,7 @@ async def projected_events(
                 summary="ATS decision recorded",
                 source_record=f"decisions:{row.id}",
                 session_id=row.session_id,
-                task_id=row.ticket_id,
+                task_id=row.ticket_id if row.ticket_id is not None else task_of(row.session_id),
                 status="recorded",
                 source=_party(row.session_id, sessions),
                 target=_party(row.recipient_session_id, sessions),
@@ -594,7 +771,7 @@ async def projected_events(
                 summary=f"Authority check: {_text(row.action, 40)}",
                 source_record=f"authority_checks:{row.id}",
                 session_id=row.session_id,
-                task_id=row.task_id,
+                task_id=row.task_id if row.task_id is not None else task_of(row.session_id),
                 status="allowed" if row.allowed else "denied",
                 source=_party(row.session_id, sessions, row.agent),
                 detail={
@@ -614,6 +791,7 @@ async def projected_events(
                 summary=f"File {row.action}: {_text(row.path, 1024)}",
                 source_record=f"file_activities:{row.id}",
                 session_id=row.session_id,
+                task_id=task_of(row.session_id),
                 status="observed",
                 source=_party(row.session_id, sessions, row.agent),
                 detail={
@@ -633,6 +811,7 @@ async def projected_events(
                 summary="Scope override requested",
                 source_record=f"override_requests:{row.id}",
                 session_id=row.requester_session_id,
+                task_id=task_of(row.requester_session_id),
                 status="requested",
                 source=_party(row.requester_session_id, sessions),
                 target=_party(row.owner_session_id, sessions),
@@ -651,6 +830,7 @@ async def projected_events(
                     summary="Scope override response",
                     source_record=f"override_requests:{row.id}",
                     session_id=row.owner_session_id,
+                    task_id=task_of(row.requester_session_id),
                     status=row.status,
                     source=_party(row.owner_session_id, sessions),
                     target=_party(row.requester_session_id, sessions),
@@ -666,6 +846,7 @@ async def projected_events(
                 summary=f"Shared service restart recorded: {_text(row.unit, 100)}",
                 source_record=f"service_restarts:{row.id}",
                 session_id=row.session_id,
+                task_id=task_of(row.session_id),
                 status=row.outcome,
                 source=_party(row.session_id, sessions),
                 detail={"unit": row.unit, "old_pid": row.old_pid, "new_pid": row.new_pid},
@@ -680,6 +861,7 @@ async def projected_events(
                 summary=f"Git commit {_text(row.commit_hash, 12)}",
                 source_record=f"commit_records:{row.id}",
                 session_id=row.session_id,
+                task_id=task_of(row.session_id),
                 status="recorded",
                 source=_party(row.session_id, sessions),
                 detail={"commit_hash": _text(row.commit_hash, 40), "message": _text(row.message)},

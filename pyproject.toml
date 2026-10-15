@@ -75,6 +75,9 @@ Repository = "https://github.com/pvestal/ai-team-sync"
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+"ai_team_sync.console" = ["verify_page.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"

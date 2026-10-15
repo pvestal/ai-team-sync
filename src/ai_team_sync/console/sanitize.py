@@ -12,6 +12,8 @@ _SECRETS = (
     re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
     re.compile(r"\beyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\b"),
     re.compile(r"(?i)\b(?:api[_-]?key|token|password|secret)\s*[:=]\s*[^\s,;]+"),
+    # `\b` above cannot fire inside an identifier, so JWT_SECRET=... (#3556) slipped by.
+    re.compile(r"(?i)\b\w*(?:secret|token|passw(?:or)?d|api_?key)\w*\s*[:=]\s*[^\s,;]+"),
     re.compile(r"(?i)\b(?:postgres(?:ql)?|redis)://[^\s]+"),
     re.compile(r"(?i)\bBearer\s+[a-z0-9._~+/-]+=*"),
     re.compile(r"(?is)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----"),
@@ -25,19 +27,28 @@ def safe_text(value: Any, limit: int = 500) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def safe_value(value: Any, *, depth: int = 0) -> Any:
-    """Sanitize nested API values and cap their shape for terminal rendering."""
+def safe_value(value: Any, *, depth: int = 0, top_list_limit: int = 50) -> Any:
+    """Sanitize nested API values and cap their shape for terminal rendering.
+
+    ``top_list_limit`` applies only to lists directly under the top-level
+    object: a response's collection (events, sessions) is already bounded by
+    the server and must arrive whole, while values nested inside one record
+    keep the 50-item display cap (#3589).
+    """
     if depth > 5:
         return "[TRUNCATED]"
     if isinstance(value, str):
         return safe_text(value)
     if isinstance(value, dict):
         return {
-            safe_text(key, 100): safe_value(item, depth=depth + 1)
+            safe_text(key, 100): safe_value(
+                item, depth=depth + 1, top_list_limit=top_list_limit if depth == 0 else 50
+            )
             for key, item in list(value.items())[:50]
         }
     if isinstance(value, list):
-        return [safe_value(item, depth=depth + 1) for item in value[:50]]
+        cap = top_list_limit if depth == 1 else 50
+        return [safe_value(item, depth=depth + 1) for item in value[:cap]]
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     return safe_text(value)

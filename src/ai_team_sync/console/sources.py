@@ -15,6 +15,10 @@ import httpx
 from . import runtime as runtime_proof
 from .sanitize import safe_text, safe_value
 
+# Upper bound on a response collection; above every server-side page limit
+# (events <= 500, sessions <= 200), so it never truncates a real page.
+_COLLECTION_LIMIT = 1000
+
 
 @dataclass(frozen=True)
 class ConsoleConfig:
@@ -49,7 +53,9 @@ class ReadOnlySources:
         response = await self.client.get(f"{base}{path}", params=params)
         response.raise_for_status()
         value = response.json()
-        return safe_value(value) if isinstance(value, dict) else {"value": safe_value(value)}
+        if isinstance(value, dict):
+            return dict(safe_value(value, top_list_limit=_COLLECTION_LIMIT))
+        return {"value": safe_value(value)}
 
     async def ats_sessions(self, limit: int = 100) -> dict:
         return await self._get(
