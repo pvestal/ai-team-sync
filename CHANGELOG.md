@@ -17,6 +17,18 @@
   not an OS boundary: see `docs/restart-gate.md`.
 
 ### Fixed
+- **A heartbeat racing a reaper sweep can no longer leave the answer and the row
+  disagreeing (#2811).** Both sides wrote unconditionally after deciding from an
+  earlier read. A heartbeat that loaded an active session before the reaper
+  completed it answered 200 "active" over a completed row with its locks
+  deleted; a sweep that judged a session silent before a heartbeat landed
+  reaped a session that had just proved it was alive. Reproduced on a
+  file-backed SQLite in both orders and under unforced concurrency. The
+  reaper's completion is now a compare-and-set on `status='active'` and the
+  `last_heartbeat` it judged, applied before any lock is journalled or deleted;
+  the ordinary heartbeat stamps with a compare-and-set on the status it loaded
+  and, when that misses, decides again from the current row (a reaped session
+  is resurrected with its locks, an owner-completed one is refused 409).
 - **Naming a project in a prompt no longer moves or blocks an anchored session
   (incident 2026-10-14).** The ATS-first prompt hook treated any governed project
   name as a project switch, so "Do not change anime-studio" in a GO prompt

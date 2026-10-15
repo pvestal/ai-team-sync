@@ -14,10 +14,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ai_team_sync.database import get_db
 from ai_team_sync.background_tasks import replace_lifecycle_marker
@@ -1664,7 +1665,27 @@ async def heartbeat_session(session_id: str, request: Request, db: AsyncSession 
     """Liveness ping: bump last_heartbeat to now. Cheap, idempotent, called often
     by a live client (e.g. a per-turn Stop hook). Gives the reaper a fast path to
     reclaim a dead session's locks instead of waiting the full inactivity window
-    (see background_tasks.auto_complete_stale_sessions + Gap 1 doc)."""
+    (see background_tasks.auto_complete_stale_sessions + Gap 1 doc).
+
+    The stamp is a compare-and-set on the status this request loaded (#2811).
+    A completion committed between the load and the stamp -- the reaper's or
+    the owner's -- makes it miss, and the request decides again from the row as
+    it now is (resurrect a reaped session, refuse an owner-completed one)
+    instead of stamping a corpse and answering "active"."""
+    for _ in range(_HEARTBEAT_ATTEMPTS):
+        response = await _heartbeat_attempt(session_id, request, db)
+        if response is not None:
+            return response
+    raise HTTPException(409, "Session status kept changing under this heartbeat; retry.")
+
+
+_HEARTBEAT_ATTEMPTS = 3
+
+
+async def _heartbeat_attempt(session_id: str, request: Request,
+                             db: AsyncSession) -> "SessionResponse | None":
+    """One load-decide-stamp pass. None when the stamp lost its compare-and-set,
+    after rolling back, so the caller can decide again from the current row."""
     result = await db.execute(
         select(Session)
         .where(Session.id == session_id)
@@ -1673,6 +1694,7 @@ async def heartbeat_session(session_id: str, request: Request, db: AsyncSession 
     session = result.scalar_one_or_none()
     if not session:
         raise HTTPException(404, "Session not found")
+    loaded_status = session.status
 
     # Only the owning account proves a session alive (#2741). A heartbeat from
     # anyone else was reproduced moving a never-heartbeating session from the 4h
@@ -1745,7 +1767,22 @@ async def heartbeat_session(session_id: str, request: Request, db: AsyncSession 
                 # claimed to do.
                 restoration = await resurrect_session(db, session)
 
-            session.last_heartbeat = datetime.now(timezone.utc)
+            now = datetime.now(timezone.utc)
+            if claim is None:
+                # #2811: stamp only the row whose status we decided on. The
+                # restoration path above needs no CAS: the row is completed, the
+                # reaper never touches it, and #2760's claim serializes revivals.
+                stamped = await db.execute(
+                    update(Session)
+                    .where(Session.id == session.id, Session.status == loaded_status)
+                    .values(last_heartbeat=now)
+                    .execution_options(synchronize_session=False))
+                if stamped.rowcount != 1:
+                    await db.rollback()
+                    return None
+                set_committed_value(session, "last_heartbeat", now)
+            else:
+                session.last_heartbeat = now
             await db.commit()
         # Reload the lock collection explicitly: a CONCURRENT restorer in another
         # PROCESS may have granted the lane, and a response whose lock_count
@@ -1760,19 +1797,6 @@ async def heartbeat_session(session_id: str, request: Request, db: AsyncSession 
         if claim is not None:
             claim.release()
 
-    if restoration is not None and not restoration.lost_the_claim:
-        # After the commit, never inside it: a notification adapter can reach
-        # Slack or Telegram, and a webhook round-trip inside an open SQLite
-        # write transaction holds the whole-file lock for its duration.
-        await dispatch_resurrection(session, restoration)
-    return _session_to_response(session, restoration=restoration)
-
-    session.last_heartbeat = datetime.now(timezone.utc)
-    await db.commit()
-    # Reload the lock collection explicitly: a CONCURRENT restorer may have
-    # granted the lane in another transaction, and a response whose lock_count
-    # predates that commit is the same false board state, one layer up.
-    await db.refresh(session, ["locks"])
     if restoration is not None and not restoration.lost_the_claim:
         # After the commit, never inside it: a notification adapter can reach
         # Slack or Telegram, and a webhook round-trip inside an open SQLite

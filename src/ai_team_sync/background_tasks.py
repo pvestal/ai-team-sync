@@ -8,8 +8,9 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.attributes import set_committed_value
 
 from ai_team_sync import completion_events
 from ai_team_sync.config import settings
@@ -146,6 +147,7 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
     fast_cutoff = now - timedelta(minutes=settings.session_heartbeat_timeout_minutes)
     result = await db.execute(select(Session).where(Session.status == "active"))
     completed = 0
+    lost_cas = False
     # One `git status` per repo_root across the whole sweep, not per session —
     # sessions cluster on the same few repos.
     uncommitted_cache: dict[str, list[str]] = {}
@@ -186,8 +188,25 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
             except Exception:  # noqa: BLE001 — never let the sweep die on a git call
                 stranded = []
 
-            sess.status = "completed"
-            sess.completed_at = now
+            # COMPARE-AND-SET (#2811). Everything above was judged from the
+            # plain SELECT at the top of the sweep; a heartbeat committed since
+            # then has disproved it. Complete only the row that was judged --
+            # still active, same last_heartbeat -- and touch nothing (locks,
+            # journal, events) when the CAS loses.
+            judged = sess.last_heartbeat
+            flipped = await db.execute(
+                update(Session)
+                .where(Session.id == sess.id, Session.status == "active",
+                       Session.last_heartbeat.is_(None) if judged is None
+                       else Session.last_heartbeat == judged)
+                .values(status="completed", completed_at=now, auto_completed=True)
+                .execution_options(synchronize_session=False))
+            if flipped.rowcount != 1:
+                lost_cas = True
+                continue
+            set_committed_value(sess, "status", "completed")
+            set_committed_value(sess, "completed_at", now)
+            set_committed_value(sess, "auto_completed", True)
             # Reap is reversible: a late heartbeat can restore this session's
             # locks and inbox. Keep unread ticket claims with it until its
             # capability holder explicitly completes it. Releasing on reap
@@ -231,10 +250,10 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
             })
             for lock in released:
                 await db.delete(lock)
-            # Mark WHO completed it. A later heartbeat on a reaper-completed
-            # session is proof this decision was wrong and resurrects it; the
-            # same heartbeat on an operator-completed session must not.
-            sess.auto_completed = True
+            # WHO completed it (auto_completed=True, set by the CAS above): a
+            # later heartbeat on a reaper-completed session is proof this
+            # decision was wrong and resurrects it; the same heartbeat on an
+            # operator-completed session must not.
             reason = (f"silent >{settings.session_heartbeat_timeout_minutes}m (heartbeat lost)"
                       if heartbeated else
                       f"inactive >{settings.session_inactivity_hours}h")
@@ -254,6 +273,10 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
     if completed:
         await db.commit()
         completion_events.kick()
+    elif lost_cas:
+        # A zero-row UPDATE still opened a write transaction; end it here
+        # rather than holding the database write lock until the caller closes.
+        await db.rollback()
     return completed
 
 
