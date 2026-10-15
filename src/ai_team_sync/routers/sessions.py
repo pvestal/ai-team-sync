@@ -1521,7 +1521,10 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
     # (auto_completed) is not owner-completed: the owner completing it is a new
     # account of the session and records its own event.
     from ai_team_sync.routers.locks import acquisition_guard
-    serialize = body.status == "completed"
+    # Every status change is serialized with the reaper's retirement (#2811),
+    # not only completion: the checks above ran on the row as loaded.
+    serialize = body.status is not None
+    loaded_status = session.status
     already_completed = False
     async with (acquisition_guard(db) if serialize else contextlib.nullcontext()):
         # Under the guard the release query below reads after every send or
@@ -1534,8 +1537,24 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
             already_completed = current.status == "completed" and not current.auto_completed
             if already_completed and body.handoff is not None:
                 raise HTTPException(409, "Session already completed; handoff is immutable")
-            if already_completed:
-                await db.refresh(session)
+        if serialize:
+            # The whole row (#2811): the reaper may have completed it since it
+            # was loaded above. Writing auto_completed=False over the stale
+            # loaded False is no change to the ORM, so the flush would leave the
+            # reaper's True on an owner-completed row, and the stale lock list
+            # would name rows the reaper already deleted.
+            await db.refresh(session)
+            if body.status != "completed" and session.status != loaded_status:
+                # Pause/resume decided on a status that no longer holds (e.g.
+                # the reaper retired it meanwhile). Applying it would revive a
+                # reaped row past the refusals above; a retry meets them with
+                # the current row.
+                raise HTTPException(409, detail={
+                    "error": "session_status_changed",
+                    "message": (f"session {session.id} is now {session.status} (was "
+                                f"{loaded_status} when this request read it); nothing "
+                                f"was applied. Retry against the current state."),
+                    "session_id": session.id, "status": session.status})
         if body.status is not None and not already_completed:
             if body.status == "completed":
                 # The OWNER is speaking, so the reaper's guess stops being the live
@@ -1830,7 +1849,7 @@ async def record_commit(
     if not session:
         raise HTTPException(404, "Session not found")
 
-    from ai_team_sync.routers.locks import cross_account
+    from ai_team_sync.routers.locks import acquisition_guard, cross_account
     if cross_account(peer_identity.peer_uid_for_request(request), session, any_status=True):
         raise HTTPException(403, detail={
             "error": "session_not_yours",
@@ -1840,14 +1859,24 @@ async def record_commit(
         raise HTTPException(409, f"Session is {session.status}; commit not recorded. "
                                  "Start a new session.")
 
-    existing = await db.scalar(select(CommitRecord).where(
-        CommitRecord.session_id == session_id, CommitRecord.commit_hash == commit_hash))
-    if existing:
-        response.status_code = 200
-        return existing
+    # Serialized with the reaper's retirement (#2811): a commit record is
+    # activity, so it is either written while the session is live (and keeps
+    # it live) or refused because the retirement committed first.
+    async with acquisition_guard(db):
+        await db.refresh(session, ["status"])
+        if session.status not in ("active", "paused"):
+            raise HTTPException(409, f"Session is {session.status}; commit not recorded. "
+                                     "Start a new session.")
+        existing = await db.scalar(select(CommitRecord).where(
+            CommitRecord.session_id == session_id, CommitRecord.commit_hash == commit_hash))
+        if existing:
+            await db.commit()  # nothing written; ends the guarded transaction
+            response.status_code = 200
+            return existing
 
-    record = CommitRecord(session_id=session_id, commit_hash=commit_hash, message=body.message)
-    db.add(record)
-    await db.commit()
+        record = CommitRecord(session_id=session_id, commit_hash=commit_hash,
+                              message=body.message)
+        db.add(record)
+        await db.commit()
     await db.refresh(record)
     return record

@@ -31,7 +31,7 @@ import logging
 from datetime import datetime, timezone
 
 from fastapi import Depends, Request
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_team_sync.database import get_db
@@ -88,11 +88,16 @@ async def touch_session_liveness(
         sessions = [s for s in sessions if not cross_account(peer_uid, s)]
         if not sessions:
             return False
-        now = datetime.now(timezone.utc)
-        for session in sessions:
-            session.last_heartbeat = now
+        # Stamp only rows that are STILL active (#2811): the reaper may have
+        # retired one since the select above, and a stamp on that row would be
+        # activity accepted onto a retired session.
+        stamped = await db.execute(
+            update(Session)
+            .where(Session.id.in_([s.id for s in sessions]), Session.status == "active")
+            .values(last_heartbeat=datetime.now(timezone.utc))
+            .execution_options(synchronize_session=False))
         await db.commit()
-        return True
+        return stamped.rowcount > 0
     except Exception:  # noqa: BLE001 — liveness must never break a request
         logger.debug("liveness touch failed", exc_info=True)
         return False

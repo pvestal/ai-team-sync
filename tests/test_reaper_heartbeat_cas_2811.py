@@ -62,12 +62,20 @@ class _HookedSession(AsyncSession):
 
     after_first_statement = None
 
-    async def execute(self, *args, **kwargs):
-        result = await super().execute(*args, **kwargs)
+    async def _after(self, result):
         hook, self.after_first_statement = self.after_first_statement, None
         if hook is not None:
             await hook()
         return result
+
+    async def execute(self, *args, **kwargs):
+        return await self._after(await super().execute(*args, **kwargs))
+
+    async def scalar(self, *args, **kwargs):
+        return await self._after(await super().scalar(*args, **kwargs))
+
+    async def get(self, *args, **kwargs):
+        return await self._after(await super().get(*args, **kwargs))
 
 
 @pytest_asyncio.fixture

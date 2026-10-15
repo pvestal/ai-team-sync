@@ -29,6 +29,20 @@
   the ordinary heartbeat stamps with a compare-and-set on the status it loaded
   and, when that misses, decides again from the current row (a reaped session
   is resurrected with its locks, an owner-completed one is refused 409).
+- **Retiring a session is atomic with every kind of activity, not only the
+  heartbeat (#2811).** A lock granted 201 after the reaper had judged the
+  session idle was journalled and deleted with the session; a commit record or
+  decision in the same gap was accepted onto a retired session; a pause that
+  loaded the row before a reap revived it with zero locks; an owner completing
+  a just-reaped session left it marked reaper-completed. The reaper now decides
+  each retirement under the same guard as lock grants (in-process acquisition
+  lock plus the database writer lock), re-reading the row and its activity
+  there, so activity either commits first and keeps the session alive or waits
+  and is refused. Commit records, decisions and every session status change
+  take that guard and re-check the current row; a decision on a session that is
+  not active or paused is now refused 409, as commits already were. The
+  app-wide liveness touch stamps only rows that are still active. The
+  `git status` for stranded work runs before the guard, not inside it.
 - **Naming a project in a prompt no longer moves or blocks an anchored session
   (incident 2026-10-14).** The ATS-first prompt hook treated any governed project
   name as a project switch, so "Do not change anime-studio" in a GO prompt

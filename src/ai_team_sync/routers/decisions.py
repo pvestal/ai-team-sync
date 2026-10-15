@@ -15,7 +15,7 @@ from ai_team_sync.database import get_db
 from ai_team_sync.models import AgentMessage, Decision, Session
 from ai_team_sync.message_lifecycle import append_delivery_event
 from ai_team_sync import peer_identity
-from ai_team_sync.routers.locks import cross_account
+from ai_team_sync.routers.locks import acquisition_guard, cross_account
 from ai_team_sync.notifications.dispatcher import dispatch
 from ai_team_sync.schemas import DecisionCreate, DecisionResponse
 
@@ -86,31 +86,39 @@ async def create_decision(body: DecisionCreate, request: Request,
             and session.ticket_id != body.ticket_id):
         raise HTTPException(409, "Decision ticket must match its session ticket")
 
-    decision = Decision(
-        session_id=body.session_id,
-        ticket_id=body.ticket_id if body.ticket_id is not None else session.ticket_id,
-        recipient_session_id=recipient.id if recipient else None,
-        title=body.title,
-        chosen=body.chosen,
-        rejected=body.rejected,
-        reasoning=body.reasoning,
-        files=json.dumps(body.files),
-    )
-    db.add(decision)
-    await db.flush()
-    if recipient:
-        message = AgentMessage(
-            sender_session_id=session.id, recipient_session_id=recipient.id,
-            original_recipient_session_id=recipient.id, addressing_mode="session",
-            sender_agent=session.agent, sender_developer=session.developer,
-            recipient_agent=recipient.agent, ticket_id=decision.ticket_id,
-            kind="decision",
-            body=(f"Decision {decision.id} — {decision.title}\n"
-                  f"Chosen: {decision.chosen}\nReasoning: {decision.reasoning}"),
+    # A decision is activity the reaper counts, so it is recorded only on a
+    # live session and serialized with retirement (#2811): written while the
+    # session is live (keeping it live), or refused because retirement won.
+    async with acquisition_guard(db):
+        await db.refresh(session, ["status"])
+        if session.status not in ("active", "paused"):
+            raise HTTPException(409, f"Session is {session.status}; decision not recorded. "
+                                     "Start a new session.")
+        decision = Decision(
+            session_id=body.session_id,
+            ticket_id=body.ticket_id if body.ticket_id is not None else session.ticket_id,
+            recipient_session_id=recipient.id if recipient else None,
+            title=body.title,
+            chosen=body.chosen,
+            rejected=body.rejected,
+            reasoning=body.reasoning,
+            files=json.dumps(body.files),
         )
-        append_delivery_event(message, "assigned", recipient.id, "addressed_decision")
-        db.add(message)
-    await db.commit()
+        db.add(decision)
+        await db.flush()
+        if recipient:
+            message = AgentMessage(
+                sender_session_id=session.id, recipient_session_id=recipient.id,
+                original_recipient_session_id=recipient.id, addressing_mode="session",
+                sender_agent=session.agent, sender_developer=session.developer,
+                recipient_agent=recipient.agent, ticket_id=decision.ticket_id,
+                kind="decision",
+                body=(f"Decision {decision.id} — {decision.title}\n"
+                      f"Chosen: {decision.chosen}\nReasoning: {decision.reasoning}"),
+            )
+            append_delivery_event(message, "assigned", recipient.id, "addressed_decision")
+            db.add(message)
+        await db.commit()
     await db.refresh(decision)
 
     await dispatch("decision.logged", {
