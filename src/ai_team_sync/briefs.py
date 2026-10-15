@@ -257,13 +257,30 @@ def fetch_task_overlaps(objective: str, *, exclude_ids: list[int], limit: int = 
 _NAMED_TASKS_CAP = 5
 
 
+def current_rulings(env: dict[str, Any]) -> list[dict[str, Any]]:
+    """The task's CURRENT operator rulings from its authoritative envelope.
+
+    Echo builds task_context.operator_rulings from validated, operator-reviewed
+    decisions by an identity join on the task id -- never by prose or
+    similarity. Recommendation/notes prose is not included: it is unauthenticated.
+    """
+    rulings = ((env.get("task_context") or {}).get("operator_rulings") or {}).get("current") or []
+    return [{"id": r.get("id"), "effect": r.get("effect"),
+             "prohibition": bool(r.get("prohibition")),
+             "ruling": str(r.get("ruling") or "")[:300]} for r in rulings]
+
+
 def _named_task_card(env: dict[str, Any]) -> dict[str, Any]:
     description = str(env.get("description") or "")
     return {"id": env.get("id"), "title": env.get("title"), "status": env.get("status"),
             "gate": env.get("gate"), "parent_id": env.get("parent_id"),
             "recommendation": str(env.get("recommendation") or "")[:400],
             "description_head": description[:1200],
-            "description_truncated": len(description) > 1200}
+            "description_truncated": len(description) > 1200,
+            "operator_rulings": current_rulings(env)}
+
+
+_BRANCH_TICKET_RULINGS_CAP = 6
 
 
 def fetch_tower_task_envelope(task_id: str | int, *, timeout: float = 10.0
@@ -943,6 +960,21 @@ async def _existing_work(db: AsyncSession, *, objective: str, repo_root: str,
                 b["live_owner"] = ({"session_id": holder.id, "agent": holder.agent}
                                    if holder else None)
 
+    # Authoritative rulings on the tickets that unfinished branches name. This
+    # path is code -> branch -> ticket -> operator decision: no similarity at
+    # any step, so a ruling surfaces even when no text resembles the request.
+    ruling_by_ticket = {int(c["id"]): current_rulings({"task_context": {"operator_rulings": {
+        "current": c.get("operator_rulings") or []}}}) for c in candidates}
+    ruling_by_ticket.update({int(c["id"]): c.get("operator_rulings") or []
+                             for c in named if not c.get("error")})
+    wanted = [t for b in branches for t in b["tickets"] if t not in ruling_by_ticket]
+    for tid in list(dict.fromkeys(wanted))[:_BRANCH_TICKET_RULINGS_CAP]:
+        env, error = await asyncio.to_thread(fetch_tower_task_data, tid)
+        ruling_by_ticket[tid] = current_rulings(env) if env and not error else []
+    for b in branches:
+        b["ticket_rulings"] = {t: ruling_by_ticket[t] for t in b["tickets"]
+                               if ruling_by_ticket.get(t)}
+
     return {"named_tasks": named, "named_tasks_omitted": named_omitted,
             "overlaps": candidates, "overlaps_status": overlap_status,
             "active_branches": branches, "active_branches_status": branch_status}
@@ -963,6 +995,9 @@ def _render_existing_work(packet: dict[str, Any]) -> list[str]:
                          f"{card.get('title')}")
             if owner:
                 lines.append(f"      live owner: {owner['agent']} session {owner['session_id']}")
+            for r in card.get("operator_rulings") or []:
+                lines.append(f"      CURRENT OPERATOR RULING ({'PROHIBITION' if r['prohibition'] else r['effect']}): "
+                             + r["ruling"].replace("\n", " ")[:240])
             if card.get("recommendation"):
                 lines.append("      recommendation (legacy prose): "
                              + card["recommendation"].replace("\n", " ")[:300])
@@ -1020,6 +1055,11 @@ def _render_existing_work(packet: dict[str, Any]) -> list[str]:
                 detail.append("in your scope: " + ", ".join(b["files_in_scope"][:4]))
             if detail:
                 lines.append("      " + " | ".join(detail))
+            for t, rulings in (b.get("ticket_rulings") or {}).items():
+                for r in rulings:
+                    lines.append(f"      #{t} CURRENT OPERATOR RULING "
+                                 f"({'PROHIBITION' if r['prohibition'] else r['effect']}): "
+                                 + r["ruling"].replace("\n", " ")[:240])
     return lines
 
 

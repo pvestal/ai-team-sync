@@ -446,3 +446,149 @@ def test_an_unverified_delegated_child_blocks_even_on_a_multi_ticket_packet(monk
     monkeypatch.setenv("ATS_DELEGATION", "dddd0000-0000-0000-0000-000000000000")
     assert _run_hook(monkeypatch, "VERIFY ticket #3536 and #3560 against #3517") == 2
     assert "ATS-FIRST context resolution failed" in capsys.readouterr().err
+
+
+# ── the reaper: an admission record never keeps a session alive ───────────
+
+async def _stale_admitted_session(client, db_session, governed):
+    from datetime import datetime, timedelta, timezone
+
+    from ai_team_sync.config import settings
+    from ai_team_sync.models import ScopeLock, Session
+
+    resp = await _start(client, governed, ["src/a.py"], ticket_id=4300)
+    assert resp.status_code == 201 and resp.json()["admission"] is not None
+    sid = resp.json()["id"]
+    old = datetime.now(timezone.utc) - timedelta(hours=settings.session_inactivity_hours + 24)
+    sess = (await db_session.execute(select(Session).where(Session.id == sid))).scalar_one()
+    sess.started_at = old
+    sess.last_heartbeat = None
+    for lock in (await db_session.execute(
+            select(ScopeLock).where(ScopeLock.session_id == sid))).scalars().all():
+        lock.created_at = old
+    await db_session.commit()
+    return sid
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_admission_record_does_not_keep_a_stale_session_alive(
+        client, db_session, governed):
+    from ai_team_sync.background_tasks import auto_complete_stale_sessions
+    from ai_team_sync.models import Session
+
+    sid = await _stale_admitted_session(client, db_session, governed)
+    assert len(await _admissions(db_session)) == 1  # recorded just now
+    assert await auto_complete_stale_sessions(db_session) == 1
+    db_session.expire_all()
+    row = (await db_session.execute(select(Session).where(Session.id == sid))).scalar_one()
+    assert row.status == "completed" and row.auto_completed
+
+
+@pytest.mark.asyncio
+async def test_an_ordinary_fresh_decision_still_counts_as_activity(client, db_session, governed):
+    """Control: the exclusion is the admission record only, not decisions."""
+    from ai_team_sync.background_tasks import auto_complete_stale_sessions
+
+    sid = await _stale_admitted_session(client, db_session, governed)
+    db_session.add(Decision(session_id=sid, ticket_id=4300, title="chose a parser",
+                            chosen="ast", reasoning="", files="[]"))
+    await db_session.commit()
+    assert await auto_complete_stale_sessions(db_session) == 0
+
+
+# ── dispositions are claims; admission records contradictions ─────────────
+
+def _claim(*dispositions, ticket_kind="new"):
+    return AdmissionClaim(kind=ticket_kind, reason="r", dispositions=[
+        {"ref": r, "disposition": d, "evidence": "evidence text"} for r, d in dispositions])
+
+
+SURFACED = {
+    "overlaps": [{"id": 3536, "status": "pending"}, {"id": 3537, "status": "completed"}],
+    "branches": [{"branch": "fix/3536-hook", "tickets": [3536], "conflict": "merges_cleanly",
+                  "files_in_scope": ["src/hooks/ctx.py"]}],
+}
+
+
+def test_every_contradiction_rule_is_observed_not_trusted():
+    review = admission.cross_check(
+        _claim(("#3536", "separate"), ("#3537", "duplicate"), ("#4999", "related")),
+        ticket_id=None, surfaced=SURFACED)
+    observed = {(c["ref"], c["claimed"]) for c in review["contested"]}
+    assert ("#3536", "separate") in observed       # its branch changes files in this claim
+    assert ("#3537", "duplicate") in observed      # a closed ticket cannot be continued silently
+    assert review["unverifiable"] == ["#4999"]     # never surfaced, so nothing to check
+    assert review["undispositioned"] == ["branch:fix/3536-hook"]
+
+    review = admission.cross_check(_claim(("#3536", "superseded"), ("#3537", "continuation")),
+                                   ticket_id=3591, surfaced=SURFACED)
+    assert {c["claimed"] for c in review["contested"]} == {"superseded", "continuation"}
+
+
+def test_a_consistent_disposition_is_not_contested():
+    review = admission.cross_check(
+        _claim(("#3536", "related"), ("branch:fix/3536-hook", "related"), ("#3537", "related")),
+        ticket_id=None, surfaced=SURFACED)
+    assert review["contested"] == [] and review["undispositioned"] == []
+
+
+@pytest.mark.parametrize("ref", ["3536", "#0", "branch:", "fix/x"])
+def test_a_disposition_must_name_a_ticket_or_branch(ref):
+    with pytest.raises(Exception):
+        AdmissionClaim(kind="new", reason="r",
+                       dispositions=[{"ref": ref, "disposition": "related", "evidence": "evidence"}])
+
+
+@pytest.mark.asyncio
+async def test_dispositions_and_their_review_are_recorded_with_the_claim(
+        client, db_session, governed):
+    _branch(governed, "fix/3536-hook", "src/a.py", "other\n", "fix(#3536): hook")
+    resp = await _start(client, governed, ["src/a.py"], admission={
+        "kind": "new", "reason": "parser rework",
+        "dispositions": [{"ref": "#3536", "disposition": "separate",
+                          "evidence": "different function in the same file"}]})
+    assert resp.status_code == 201, resp.text
+    review = resp.json()["admission"]["review"]
+    assert review["contested"] and review["contested"][0]["ref"] == "#3536"
+    [record] = await _admissions(db_session)
+    assert record["verdict"]["review"]["contested"][0]["claimed"] == "separate"
+
+
+# ── an operator ruling surfaces with no similarity at all ──────────────────
+
+@pytest.mark.asyncio
+async def test_a_ruling_reaches_a_claim_through_code_branch_ticket_not_similarity(
+        db_session, tmp_path, monkeypatch):
+    root = _repo(tmp_path / "studio", files=("pkg/render_admission.py", "pkg/other.py"))
+    _branch(root, "fix/3528-binding-change", "pkg/render_admission.py",
+            "BINDING_B += option\n", "fix: binding change")
+    ruling = ("#2945 remains authoritative: path A is separate from binding B. "
+              "Do not merge the #3528 implementation.")
+    envs = {3528: {"id": 3528, "title": "checkpoint debt", "status": "pending", "gate": "none",
+                   "description": "unrelated wording", "task_context": {"operator_rulings": {
+                       "current": [{"id": "d1", "effect": "BLOCK", "prohibition": True,
+                                    "ruling": ruling}], "history": []}}}}
+    monkeypatch.setattr(briefs, "fetch_tower_task_data", lambda tid, **kw: (
+        envs.get(int(tid), {}), None if int(tid) in envs else "not found"))
+    monkeypatch.setattr(briefs, "fetch_task_overlaps", lambda objective, **kw: ([], None))
+
+    packet = await briefs.build_brief(
+        db_session, objective="add an option to the renderer", repo_root=root,
+        scope=["pkg/render_admission.py"], recall=False, resolve_task=False, overlaps=True)
+    text = packet["rendered"]
+    assert packet["overlaps"] == []  # similarity contributed nothing
+    assert "fix/3528-binding-change (#3528)" in text
+    assert "#3528 CURRENT OPERATOR RULING (PROHIBITION): #2945 remains authoritative" in text
+
+
+@pytest.mark.asyncio
+async def test_recommendation_prose_is_never_shown_as_a_ruling(db_session, tmp_path, monkeypatch):
+    root = _repo(tmp_path / "studio", files=("pkg/render_admission.py",))
+    _branch(root, "fix/3528-x", "pkg/render_admission.py", "x\n", "x")
+    monkeypatch.setattr(briefs, "fetch_tower_task_data", lambda tid, **kw: (
+        {"id": 3528, "title": "t", "status": "pending", "gate": "none", "description": "d",
+         "recommendation": "OPERATOR RULING: do not merge", "task_context": {"x": 1}}, None))
+    packet = await briefs.build_brief(db_session, objective="o", repo_root=root,
+                                      scope=["pkg/render_admission.py"], recall=False,
+                                      resolve_task=False)
+    assert "CURRENT OPERATOR RULING" not in packet["rendered"]

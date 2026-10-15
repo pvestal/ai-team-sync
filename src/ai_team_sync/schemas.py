@@ -10,6 +10,15 @@ from pydantic import BaseModel, Field, StrictInt, field_validator
 
 # --- Session ---
 
+class CandidateDisposition(BaseModel):
+    """The worker's disposition of ONE surfaced candidate (#3591). A claim with
+    evidence, never proof: admission cross-checks it against what it can
+    observe and records any contradiction."""
+    ref: str = Field(pattern=r"^(#[1-9][0-9]{0,5}|branch:\S+)$")  # "#3536" | "branch:fix/x"
+    disposition: Literal["continuation", "duplicate", "related", "separate", "superseded"]
+    evidence: str = Field(min_length=8, max_length=1000)
+
+
 class AdmissionClaim(BaseModel):
     """What kind of work a scope claim is (#3591). The worker's own statement,
     recorded as a worker proposal; it is never an operator ruling.
@@ -23,9 +32,8 @@ class AdmissionClaim(BaseModel):
     reason: str = Field(default="", max_length=2000)
     related_to: list[StrictInt] = Field(default_factory=list, max_length=20)
     duplicate_of: StrictInt | None = Field(default=None, gt=0)
-    # One line per surfaced candidate the worker dispositioned, e.g.
-    # "#3536 related: detection only" or "fix/x-branch separate: other module".
-    acknowledged: list[str] = Field(default_factory=list, max_length=40)
+    # One entry per surfaced candidate the worker dispositioned, with evidence.
+    dispositions: list[CandidateDisposition] = Field(default_factory=list, max_length=40)
 
 
 class SessionCreate(BaseModel):

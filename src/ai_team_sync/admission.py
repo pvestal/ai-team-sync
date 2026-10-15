@@ -53,6 +53,8 @@ class Verdict:
     mode: str
     hard_conflicts: list[dict] = field(default_factory=list)
     surfaced: dict = field(default_factory=dict)
+    # Worker dispositions next to what admission observed (claims vs facts).
+    review: dict = field(default_factory=dict)
 
     @property
     def refuse(self) -> bool:
@@ -89,6 +91,50 @@ def evaluate(claim: AdmissionClaim | None, *, ticket_id: int | None, governed: b
                         "pass ticket_id, or admission kind new/related (with a reason) or "
                         "exception (naming the operator authorization)")})
     return verdict
+
+
+def cross_check(claim: AdmissionClaim | None, *, ticket_id: int | None,
+                surfaced: dict) -> dict:
+    """Compare the worker's dispositions with what admission itself observed.
+
+    A disposition is a claim, never proof. Contradictions are recorded as
+    OBSERVATIONS for review ("contested"); none of them refuses the claim,
+    because e.g. a 'separate' change can legitimately touch the same file.
+    """
+    overlaps = {f"#{c['id']}": c for c in surfaced.get("overlaps") or [] if c.get("id")}
+    branches = {f"branch:{b['branch']}": b for b in surfaced.get("branches") or []}
+    by_ticket: dict[str, list[dict]] = {}
+    for b in branches.values():
+        for t in b.get("tickets") or []:
+            by_ticket.setdefault(f"#{t}", []).append(b)
+    seen = set(overlaps) | set(branches) | set(by_ticket)
+    given = {d.ref: d for d in (claim.dispositions if claim else [])}
+    contested, unverifiable = [], []
+    for ref, d in given.items():
+        if ref not in seen:
+            unverifiable.append(ref)
+        if d.disposition == "continuation" and ref.startswith("#") \
+                and int(ref[1:]) != (ticket_id or 0):
+            contested.append({"ref": ref, "claimed": d.disposition, "observed": (
+                f"this session works #{ticket_id}" if ticket_id else "this session names no ticket")})
+        if d.disposition == "separate":
+            touching = [b for b in (by_ticket.get(ref, []) + ([branches[ref]] if ref in branches else []))
+                        if b.get("files_in_scope")]
+            for b in touching:
+                contested.append({"ref": ref, "claimed": "separate", "observed": (
+                    f"branch {b['branch']} changes files in this claim: "
+                    + ", ".join(b["files_in_scope"][:4]))})
+        status = (overlaps.get(ref) or {}).get("status")
+        if d.disposition == "superseded" and status in ("pending", "in_progress", "blocked"):
+            contested.append({"ref": ref, "claimed": "superseded",
+                              "observed": f"{ref} is still {status}; only its owner or the "
+                                          "operator closes it"})
+        if d.disposition == "duplicate" and status in ("completed", "skipped"):
+            contested.append({"ref": ref, "claimed": "duplicate",
+                              "observed": f"{ref} is {status}"})
+    return {"dispositions": [d.model_dump() for d in given.values()],
+            "contested": contested, "unverifiable": unverifiable,
+            "undispositioned": sorted(r for r in set(overlaps) | set(branches) if r not in given)}
 
 
 def validate(claim: AdmissionClaim | None, ticket_id: int | None) -> str | None:
@@ -189,6 +235,7 @@ async def admit(claim: AdmissionClaim | None, *, ticket_id: int | None, repo_roo
         return None
     verdict = evaluate(claim, ticket_id=ticket_id, governed=is_governed(repo_root), mode=mode)
     verdict.surfaced = await surfaced_work(repo_root, scope, ticket_id, objective)
+    verdict.review = cross_check(claim, ticket_id=ticket_id, surfaced=verdict.surfaced)
     if verdict.refuse:
         raise HTTPException(409, detail={
             "error": "admission_refused",

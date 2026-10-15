@@ -257,8 +257,10 @@ _ADMISSION_SCHEMA = {
         "What this work is, stated at the claim. kind: continue (your ticket_id) | new "
         "(genuinely new; reason) | related (builds on related_to tickets) | duplicate "
         "(it IS duplicate_of: ATS redirects you there) | exception (operator-authorized; "
-        "reason names the authorization). acknowledged: one line per candidate the brief "
-        "surfaced, e.g. '#3536 related: detection only'. Similarity never blocks; only a "
+        "reason names the authorization). dispositions: one per candidate the brief "
+        "surfaced -- ref '#3536' or 'branch:<name>', disposition continuation | duplicate | "
+        "related | separate | superseded, and the evidence. Dispositions are claims: ATS "
+        "records any that contradict what it observed. Similarity never blocks; only a "
         "declared duplicate, or a ticketless governed claim with no kind, can be refused, "
         "and only where the operator enabled enforcement."),
     "properties": {
@@ -267,7 +269,14 @@ _ADMISSION_SCHEMA = {
         "reason": {"type": "string"},
         "related_to": {"type": "array", "items": {"type": "integer"}},
         "duplicate_of": {"type": "integer", "minimum": 1},
-        "acknowledged": {"type": "array", "items": {"type": "string"}},
+        "dispositions": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "ref": {"type": "string"},
+                "disposition": {"type": "string", "enum": [
+                    "continuation", "duplicate", "related", "separate", "superseded"]},
+                "evidence": {"type": "string"}},
+            "required": ["ref", "disposition", "evidence"]}},
     },
     "required": ["kind"],
 }
@@ -286,6 +295,13 @@ def format_admission(admission: dict | None) -> str:
         if status and status != "ok":
             line += f"; {name} {status}"
     line += "\n"
+    review = admission.get("review") or {}
+    if review.get("undispositioned"):
+        line += "Not yet dispositioned: " + ", ".join(review["undispositioned"][:8]) + "\n"
+    for c in review.get("contested") or []:
+        line += f"⚠️ Contested: {c['ref']} claimed {c['claimed']}, but {c['observed']}\n"
+    if review.get("unverifiable"):
+        line += "Dispositioned but not observed by ATS: " + ", ".join(review["unverifiable"]) + "\n"
     if admission.get("would_refuse") and not admission.get("refused"):
         line += ("⚠️ Would be REFUSED under enforcement: "
                  + "; ".join(c.get("message", "") for c in admission.get("hard_conflicts") or [])
