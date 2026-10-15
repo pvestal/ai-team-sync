@@ -12,9 +12,50 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 # Force SQLite test database before any imports
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite://"
 
+# No test may reach the live Echo Brain (#3537). Every session a test completed
+# -- in this process or in a spawned ats-server, which inherits this environment
+# -- used to be POSTed to the production default localhost:8309. The URL is set
+# here, before any import reads it, to a local tripwire that refuses and records;
+# delivery is off unless a test opts in; and a completion event reaching the
+# tripwire fails the test that caused it (or the run, if it arrives late).
+from .echo_tripwire import Tripwire  # noqa: E402
+
+ECHO_TRIPWIRE = Tripwire()
+os.environ["ECHO_BRAIN_URL"] = ECHO_TRIPWIRE.url
+os.environ["ATS_EMIT_COMPLETION"] = "0"
+
 from ai_team_sync.models import Base
 from ai_team_sync.server import create_app
 from ai_team_sync.database import get_db
+
+
+@pytest.fixture
+def echo_tripwire():
+    """The run's Echo stand-in, for tests that assert what reached it."""
+    return ECHO_TRIPWIRE
+
+
+@pytest.fixture(autouse=True)
+def _no_completion_event_reaches_echo(request):
+    start = ECHO_TRIPWIRE.count()
+    yield
+    leaked = ECHO_TRIPWIRE.completion_events(since=start)
+    if "echo_tripwire" in request.fixturenames:
+        config = request.config
+        config._echo_tripwire_allowed = getattr(config, "_echo_tripwire_allowed", 0) + len(leaked)
+        return
+    assert not leaked, ("test sent completion event(s) toward Echo: "
+                        + Tripwire.describe(leaked))
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """A spawned server can deliver after its test returned; nothing escapes."""
+    allowed = getattr(session.config, "_echo_tripwire_allowed", 0)
+    leaked = ECHO_TRIPWIRE.completion_events()
+    if len(leaked) > allowed:
+        session.exitstatus = 1
+        print(f"\nECHO TRIPWIRE: {len(leaked)} completion event(s) reached the Echo "
+              f"stand-in ({allowed} expected by opted-in tests): {Tripwire.describe(leaked)}")
 
 
 @pytest.fixture(autouse=True)
