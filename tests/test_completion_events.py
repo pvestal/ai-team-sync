@@ -13,7 +13,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from ai_team_sync import completion_events as ce
 from ai_team_sync.background_tasks import auto_complete_stale_sessions
@@ -283,20 +283,23 @@ async def test_completion_succeeds_and_releases_locks_while_echo_is_down(client,
 
 
 @pytest.mark.asyncio
-async def test_emission_switched_off_records_nothing(client, db_session, monkeypatch):
+async def test_transport_switched_off_still_records(client, db_session, monkeypatch):
+    """Codex A2: the switch stops sending, never recording (see the fault suite)."""
     monkeypatch.setenv("ATS_EMIT_COMPLETION", "0")
     sid = await _complete(client)
-    assert await _outbox(db_session, sid) == []
+    (row,) = await _outbox(db_session, sid)
+    assert row.delivered_at is None and row.suppressed_reason is None
 
 
 # ── 12. historical replay ─────────────────────────────────────────────────
 
 @pytest.mark.asyncio
 async def test_replay_builds_live_identical_events_once(client, db_session, completion_capture, monkeypatch):
-    monkeypatch.setenv("ATS_EMIT_COMPLETION", "0")  # the history predates the outbox
     with_h = await _complete(client, HANDOFF)
     without = await _complete(client)
-    monkeypatch.setenv("ATS_EMIT_COMPLETION", "1")
+    # The history predates the outbox: those sessions never had a row.
+    await db_session.execute(delete(CompletionOutbox))
+    await db_session.commit()
     assert await _outbox(db_session) == []
 
     plan = await ce.replay_plan(db_session)

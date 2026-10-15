@@ -23,10 +23,11 @@ import hashlib
 import json
 import logging
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_team_sync.models import CompletionOutbox, Handoff, Session
@@ -40,6 +41,9 @@ REAPED = "reaped"
 DEFAULT_ECHO_URL = "http://localhost:8309"
 RETRY_BASE_S = 30
 RETRY_CAP_S = 3600
+# How long a sender owns a claimed row. Far above the 10 s send timeout, so only
+# a sender that died or hung past it ever loses a claim.
+CLAIM_LEASE_S = 120
 # Echo answers these for an event it will never accept; retrying cannot help.
 _REJECTED = {409, 422}
 
@@ -127,7 +131,9 @@ def build_event(session: Session, handoff: Handoff | None, reason: str,
 
 # ── outbox ────────────────────────────────────────────────────────────────
 
-def emission_enabled() -> bool:
+def delivery_enabled() -> bool:
+    """ATS_EMIT_COMPLETION=0 turns off the TRANSPORT only. Events are still
+    recorded and wait in the outbox, visible in health(), until it is back on."""
     return os.environ.get("ATS_EMIT_COMPLETION", "1") != "0"
 
 
@@ -147,10 +153,8 @@ async def record_completion(db: AsyncSession, session: Session, reason: str) -> 
 
     Call it after the completion fields (and any handoff) are set and before the
     commit, so the event and the state it describes land together or not at all.
-    Returns the event_id, or None when emission is switched off.
+    Recording never depends on delivery being switched on. Returns the event_id.
     """
-    if not emission_enabled():
-        return None
     handoff = (await db.execute(
         select(Handoff).where(Handoff.source_session_id == session.id))).scalar_one_or_none()
     event = build_event(session, handoff, reason)
@@ -174,53 +178,113 @@ def _backoff(attempts: int) -> timedelta:
     return timedelta(seconds=min(RETRY_BASE_S * 2 ** max(attempts - 1, 0), RETRY_CAP_S))
 
 
-async def deliver_pending(db: AsyncSession, *, limit: int = 50) -> dict[str, int]:
-    """Send every due, undelivered event once. Commits per event."""
-    now = datetime.now(timezone.utc)
-    rows = (await db.execute(
-        select(CompletionOutbox)
-        .where(CompletionOutbox.delivered_at.is_(None), CompletionOutbox.rejected_at.is_(None),
-               CompletionOutbox.suppressed_reason.is_(None),
-               CompletionOutbox.next_attempt_at <= now)
-        .order_by(CompletionOutbox.created_at).limit(limit))).scalars().all()
-    out = {"due": len(rows), "delivered": 0, "failed": 0, "rejected": 0, "suppressed": 0}
-    if not rows:
+def _open(now: datetime):
+    """Undelivered, not terminal, due, and not held by a live claim."""
+    O = CompletionOutbox
+    return (O.delivered_at.is_(None) & O.rejected_at.is_(None) & O.suppressed_reason.is_(None)
+            & (O.next_attempt_at <= now)
+            & (O.claim_token.is_(None) | (O.claim_expires_at < now)))
+
+
+async def _finish(db: AsyncSession, event_id: str, token: str, **values) -> bool:
+    """Record an outcome only while this sender still holds the claim."""
+    O = CompletionOutbox
+    result = await db.execute(
+        update(O).where(O.event_id == event_id, O.claim_token == token)
+        .values(claim_token=None, claim_expires_at=None, **values))
+    await db.commit()
+    return result.rowcount == 1
+
+
+async def deliver_pending(db: AsyncSession, *, limit: int = 50,
+                          now: datetime | None = None) -> dict[str, int]:
+    """Send each due, undelivered event at most once per pass, across passes.
+
+    Rows are CLAIMED in one conditional UPDATE and committed before anything is
+    sent, so a concurrent pass (kick() racing the background loop, or another
+    process on the same database) skips them. The claim is a lease: a sender
+    that dies mid-send leaves a claim that expires after CLAIM_LEASE_S, and the
+    row is sent again with the same event_id. That is at-least-once delivery --
+    a send whose response was lost is repeated -- and Echo's intake is
+    idempotent on event_id. Outcomes are written only while the claim is still
+    held, so a sender that outlived its lease cannot overwrite a newer outcome.
+
+    `now` exists for tests; production passes nothing.
+    """
+    O = CompletionOutbox
+    now = now or datetime.now(timezone.utc)
+    out = {"due": 0, "delivered": 0, "failed": 0, "rejected": 0, "suppressed": 0,
+           "lost_claim": 0}
+    if not delivery_enabled():
         return out
     if ephemeral_database():
-        for row in rows:
-            row.suppressed_reason = "ephemeral ATS database: session cannot be read back"
-        out["suppressed"] = len(rows)
+        result = await db.execute(
+            update(O).where(_open(now)).values(
+                suppressed_reason="ephemeral ATS database: session cannot be read back"))
         await db.commit()
+        out["due"] = out["suppressed"] = result.rowcount
         return out
 
+    token = str(uuid.uuid4())
+    candidates = select(O.event_id).where(_open(now)).order_by(O.created_at).limit(limit)
+    await db.execute(
+        update(O).where(O.event_id.in_(candidates.scalar_subquery()), _open(now))
+        .values(claim_token=token, claim_expires_at=now + timedelta(seconds=CLAIM_LEASE_S),
+                attempts=O.attempts + 1, last_attempt_at=now)
+        .execution_options(synchronize_session=False))
+    await db.commit()
+    claimed = (await db.execute(
+        select(O.event_id, O.payload, O.attempts).where(O.claim_token == token)
+        .order_by(O.created_at))).all()
+    out["due"] = len(claimed)
+
     url = f"{echo_url()}/api/ats/session-completed"
-    for row in rows:
-        row.attempts += 1
-        row.last_attempt_at = datetime.now(timezone.utc)
+    for event_id, payload, attempts in claimed:
         try:
-            status = await _post(url, json.loads(row.payload))
+            status = await _post(url, json.loads(payload))
         except Exception as exc:  # noqa: BLE001 -- Echo down is a retry, not an error
             status, error = None, f"{type(exc).__name__}: {exc}"
         else:
             error = f"HTTP {status}"
+        finished = datetime.now(timezone.utc)
         if status is not None and 200 <= status < 300:
-            row.delivered_at = row.last_attempt_at
-            row.last_error = None
-            out["delivered"] += 1
+            kept = await _finish(db, event_id, token, delivered_at=finished, last_error=None)
+            outcome = "delivered"
         elif status in _REJECTED:
-            row.rejected_at = row.last_attempt_at
-            row.last_error = error
-            out["rejected"] += 1
-            logger.error("completion event %s REJECTED by Echo (%s); not retried",
-                         row.event_id, error)
+            kept = await _finish(db, event_id, token, rejected_at=finished, last_error=error)
+            outcome = "rejected"
+            if kept:
+                logger.error("completion event %s REJECTED by Echo (%s); not retried "
+                             "until requeued", event_id, error)
         else:
-            row.last_error = error[:2000]
-            row.next_attempt_at = row.last_attempt_at + _backoff(row.attempts)
-            out["failed"] += 1
-            logger.warning("completion event %s not delivered (attempt %d, %s); retry at %s",
-                           row.event_id, row.attempts, error, row.next_attempt_at.isoformat())
-        await db.commit()
+            retry_at = now + _backoff(attempts)
+            kept = await _finish(db, event_id, token, last_error=error[:2000],
+                                 next_attempt_at=retry_at)
+            outcome = "failed"
+            if kept:
+                logger.warning("completion event %s not delivered (attempt %d, %s); retry at %s",
+                               event_id, attempts, error, retry_at.isoformat())
+        if kept:
+            out[outcome] += 1
+        else:
+            out["lost_claim"] += 1
+            logger.warning("completion event %s: claim expired during the send (%s); the "
+                           "newer claimant's outcome stands", event_id, error)
     return out
+
+
+async def requeue(db: AsyncSession, event_ids: list[str]) -> int:
+    """Make undelivered events due again now -- the operator's recovery path for
+    a rejected event once its cause is fixed. A delivered event is never resent."""
+    O = CompletionOutbox
+    result = await db.execute(
+        update(O).where(O.event_id.in_(event_ids), O.delivered_at.is_(None),
+                        O.suppressed_reason.is_(None))
+        .values(rejected_at=None, next_attempt_at=datetime.now(timezone.utc),
+                claim_token=None, claim_expires_at=None)
+        .execution_options(synchronize_session=False))
+    await db.commit()
+    return result.rowcount
 
 
 def kick() -> None:
@@ -229,7 +293,7 @@ def kick() -> None:
     The task is held in a module set until it finishes: an unreferenced task can
     be garbage-collected mid-flight, which is one way the old emitter lost events.
     """
-    if not emission_enabled() or ephemeral_database():
+    if not delivery_enabled() or ephemeral_database():
         return
 
     async def _run() -> None:
@@ -263,6 +327,8 @@ async def health(db: AsyncSession) -> dict[str, Any]:
         func.count().filter(O.completion_reason == REAPED),
         func.coalesce(func.sum(O.attempts), 0) - func.count().filter(O.attempts > 0),
         func.min(O.created_at).filter(pending),
+        func.count().filter(pending & O.claim_token.is_not(None)
+                            & (O.claim_expires_at >= datetime.now(timezone.utc))),
     ))).one()
     oldest = row[9]
     if oldest is not None and oldest.tzinfo is None:
@@ -279,7 +345,8 @@ async def health(db: AsyncSession) -> dict[str, Any]:
                              if oldest else None),
         "last_error": ({"event_id": last_error[0], "error": last_error[1],
                         "at": iso_utc(last_error[2])} if last_error else None),
-        "echo_url": echo_url(), "emission_enabled": emission_enabled(),
+        "in_flight": row[10],
+        "echo_url": echo_url(), "delivery_enabled": delivery_enabled(),
     }
 
 
@@ -317,7 +384,8 @@ async def replay_apply(db: AsyncSession, events: list[dict[str, Any]]) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """python -m ai_team_sync.completion_events replay [--apply] [--all-sessions]"""
+    """python -m ai_team_sync.completion_events replay [--apply] [--all-sessions]
+    python -m ai_team_sync.completion_events requeue EVENT_ID [EVENT_ID ...]"""
     import argparse
     p = argparse.ArgumentParser(prog="ai_team_sync.completion_events")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -326,6 +394,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--all-sessions", action="store_true",
                    help="include sessions without a handoff (default: handoffs only)")
     sub.add_parser("health", help="print outbox counters")
+    q = sub.add_parser("requeue", help="make undelivered (e.g. rejected) events due again")
+    q.add_argument("event_ids", nargs="+")
     args = p.parse_args(argv)
 
     async def run() -> int:
@@ -335,6 +405,10 @@ def main(argv: list[str] | None = None) -> int:
             if args.cmd == "health":
                 print(json.dumps(await health(db), indent=2))
                 return 0
+            if args.cmd == "requeue":
+                n = await requeue(db, args.event_ids)
+                print(f"requeued {n} of {len(args.event_ids)} event(s)")
+                return 0 if n == len(args.event_ids) else 1
             events = await replay_plan(db, handoffs_only=not args.all_sessions)
             print(json.dumps({
                 "mode": "apply" if args.apply else "dry-run",

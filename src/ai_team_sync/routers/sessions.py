@@ -1510,13 +1510,32 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
     # delivery (#3585): the same acquisition guard is taken by ticket-mode
     # sends and by the owner's inbox claim, so a message can never be routed to
     # or claimed by this session after its unread mail was released.
+    #
+    # Every completion takes the guard, ticket-linked or not (#3537): it is also
+    # what makes completion idempotent. The row loaded above may be stale, so the
+    # guard re-reads it, and a session the OWNER already completed -- a PATCH
+    # retry, a POST /complete retry, or the loser of two simultaneous requests --
+    # changes nothing: no new completed_at (which is the event identity), no
+    # second outbox event, ticket notice or completion dispatch. A reaped session
+    # (auto_completed) is not owner-completed: the owner completing it is a new
+    # account of the session and records its own event.
     from ai_team_sync.routers.locks import acquisition_guard
-    serialize = body.status == "completed" and session.ticket_id is not None
+    serialize = body.status == "completed"
+    already_completed = False
     async with (acquisition_guard(db) if serialize else contextlib.nullcontext()):
         # Under the guard the release query below reads after every send or
         # claim that committed while this request waited (SQLite: BEGIN
         # IMMEDIATE before the first read; PostgreSQL: per-statement snapshot).
-        if body.status is not None:
+        if body.status == "completed":
+            current = (await db.execute(
+                select(Session.status, Session.auto_completed)
+                .where(Session.id == session.id))).one()
+            already_completed = current.status == "completed" and not current.auto_completed
+            if already_completed and body.handoff is not None:
+                raise HTTPException(409, "Session already completed; handoff is immutable")
+            if already_completed:
+                await db.refresh(session)
+        if body.status is not None and not already_completed:
             if body.status == "completed":
                 # The OWNER is speaking, so the reaper's guess stops being the live
                 # account of this session — and its journal stops being replayable
@@ -1584,7 +1603,7 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
             # A live owner receives it now; otherwise it waits for the next owner.
             await ticket_roles.route_ticket_message(db, handoff_message, session)
 
-        if body.status == "completed":
+        if body.status == "completed" and not already_completed:
             await _queue_ticket_event(
                 db, session,
                 f"Session {session.id} ({session.agent}) completed on ticket "
@@ -1606,7 +1625,7 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
     await db.refresh(session)
     await db.refresh(session, ["locks"])
 
-    if body.status == "completed":
+    if body.status == "completed" and not already_completed:
         # Support-staff intake, alongside the human-facing notification. Both
         # are after the commit, so neither can describe a state that did not land.
         # kick() only hurries the outbox; the background loop retries regardless.

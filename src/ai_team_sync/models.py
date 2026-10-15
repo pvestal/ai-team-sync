@@ -224,6 +224,10 @@ class CompletionOutbox(Base):
     retried with the same event_id until Echo acknowledges it. Exactly one of
     delivered_at / rejected_at / suppressed_reason ends a row's life; until then
     it is pending and visible in completion_events.health().
+
+    A sender claims a row (claim_token, claim_expires_at) before sending it and
+    records the outcome only while it still holds that claim; a claim left by a
+    crashed sender expires and the row is sent again under the same event_id.
     """
 
     __tablename__ = "completion_outbox"
@@ -244,6 +248,9 @@ class CompletionOutbox(Base):
     delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     suppressed_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    claim_token: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True),
+                                                              nullable=True)
 
 
 class CommitRecord(Base):
