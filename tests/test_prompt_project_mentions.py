@@ -171,12 +171,16 @@ def _old_rule(prompt, cwd, roots):
 
 @pytest.mark.parametrize("name", sorted(MENTIONS))
 def test_generic_versus_governed_is_unchanged(name):
-    """No prompt gains or loses an ATS call (and so fail-closed exposure)."""
+    """No prompt gains or loses FAIL-CLOSED exposure. Since #3591 a prompt
+    naming several projects receives context, but only best-effort: if ATS
+    cannot answer it proceeds, exactly as it did when it got no ATS call."""
     from ai_team_sync.context_resolution import resolve_request_target
 
     for cwd in ("/home/patrick/Documents", ANIME_ROOT):
-        new = resolve_request_target(MENTIONS[name], cwd=cwd, governed_roots=ROOTS)
-        assert (new is None) == (_old_rule(MENTIONS[name], cwd, ROOTS) is None), (name, cwd)
+        new = resolve_request_target(MENTIONS[name], cwd=cwd, governed_roots=ROOTS,
+                                     context_roots=[])
+        fail_closed = new is not None and not new.best_effort
+        assert fail_closed == (_old_rule(MENTIONS[name], cwd, ROOTS) is not None), (name, cwd)
 
 
 # --------------------------------------------------------------------------- #

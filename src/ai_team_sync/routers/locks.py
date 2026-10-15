@@ -156,6 +156,19 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
     repo_ctx = RepoContext()
     await asyncio.to_thread(refuse_unbacked_patterns, [body.pattern],
                             session.repo_root or "", repo_ctx)
+    # Work admission (#3591) at a session's first claim. Sessions begin
+    # auto-registered and unscoped, so extend_scope is the usual first claim;
+    # start_session's admission is not the only door.
+    from ai_team_sync import admission
+    from ai_team_sync.session_marker import is_autoregistered
+
+    admitted = None
+    if not await admission.already_admitted(db, session.id):
+        objective = body.reason or ("" if is_autoregistered(session.description)
+                                    else session.description or "")
+        admitted = await admission.admit(
+            body.admission, ticket_id=session.ticket_id, repo_root=session.repo_root or "",
+            scope=[body.pattern], objective=objective)
     async with acquisition_guard(db):
         await db.refresh(session)
         if session.status not in ("active", "paused"):
@@ -176,10 +189,14 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
             reason=body.reason, authority_bearing=False,
         )
         db.add(lock)
+        if admitted is not None:
+            await admission.record(db, session, admitted, body.admission, [body.pattern])
         await db.commit()
     await db.refresh(lock)
-    return _lock_to_response(lock, developer=session.developer, agent=session.agent,
-                             repo_root=session.repo_root or "")
+    response = _lock_to_response(lock, developer=session.developer, agent=session.agent,
+                                 repo_root=session.repo_root or "")
+    response.admission = admitted.as_dict() if admitted is not None else None
+    return response
 
 
 @router.get("", response_model=list[LockResponse])

@@ -10,6 +10,24 @@ from pydantic import BaseModel, Field, StrictInt, field_validator
 
 # --- Session ---
 
+class AdmissionClaim(BaseModel):
+    """What kind of work a scope claim is (#3591). The worker's own statement,
+    recorded as a worker proposal; it is never an operator ruling.
+
+    continue: works the session's ticket. new: genuinely new work (reason).
+    related: new work that builds on related_to tickets. duplicate: the worker
+    found this IS duplicate_of -- the claim is redirected there, not admitted.
+    exception: operator-authorized urgent work (reason names the authorization).
+    """
+    kind: Literal["continue", "new", "related", "duplicate", "exception"]
+    reason: str = Field(default="", max_length=2000)
+    related_to: list[StrictInt] = Field(default_factory=list, max_length=20)
+    duplicate_of: StrictInt | None = Field(default=None, gt=0)
+    # One line per surfaced candidate the worker dispositioned, e.g.
+    # "#3536 related: detection only" or "fix/x-branch separate: other module".
+    acknowledged: list[str] = Field(default_factory=list, max_length=40)
+
+
 class SessionCreate(BaseModel):
     developer: str
     agent: str = "unknown"
@@ -33,6 +51,7 @@ class SessionCreate(BaseModel):
     # owner; otherwise contributor when scope names files, reviewer when it does
     # not. Delegation children get theirs from the mode.
     ticket_role: Literal["owner", "contributor", "reviewer"] | None = None
+    admission: AdmissionClaim | None = None
 
 
 class HandoffCreate(BaseModel):
@@ -71,6 +90,8 @@ class SessionResponse(BaseModel):
     repo_root: str = ""  # '' = unanchored (legacy session)
     ticket_id: int | None = None
     ticket_role: str | None = None  # owner | contributor | reviewer (#3585)
+    # The work-admission verdict for this claim, when one was evaluated (#3591).
+    admission: dict | None = None
     # Set at creation when this session joined a ticket another session owns.
     ticket_owner_session_id: str | None = None
     started_at: datetime
@@ -138,6 +159,9 @@ class LockCreate(BaseModel):
     pattern: str
     mode: str = "advisory"
     reason: str = ""  # human/agent-readable WHY; put prose HERE, never in `pattern`
+    # Used only when this lock is the session's first claim in a governed
+    # repository and the session was never admitted (#3591).
+    admission: AdmissionClaim | None = None
 
     @field_validator("pattern")
     @classmethod
@@ -208,6 +232,7 @@ class LockResponse(BaseModel):
     developer: str | None = None
     agent: str | None = None
     repo_root: str = ""
+    admission: dict | None = None  # set when this lock admitted the session (#3591)
 
     model_config = {"from_attributes": True}
 

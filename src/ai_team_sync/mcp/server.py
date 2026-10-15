@@ -249,6 +249,50 @@ def format_conflict_guidance(conflicts: list[dict]) -> str:
     return msg
 
 
+# Work admission (#3591): what kind of work a claim is. Optional; with a
+# ticket_id the claim is "continue" by default.
+_ADMISSION_SCHEMA = {
+    "type": "object",
+    "description": (
+        "What this work is, stated at the claim. kind: continue (your ticket_id) | new "
+        "(genuinely new; reason) | related (builds on related_to tickets) | duplicate "
+        "(it IS duplicate_of: ATS redirects you there) | exception (operator-authorized; "
+        "reason names the authorization). acknowledged: one line per candidate the brief "
+        "surfaced, e.g. '#3536 related: detection only'. Similarity never blocks; only a "
+        "declared duplicate, or a ticketless governed claim with no kind, can be refused, "
+        "and only where the operator enabled enforcement."),
+    "properties": {
+        "kind": {"type": "string",
+                 "enum": ["continue", "new", "related", "duplicate", "exception"]},
+        "reason": {"type": "string"},
+        "related_to": {"type": "array", "items": {"type": "integer"}},
+        "duplicate_of": {"type": "integer", "minimum": 1},
+        "acknowledged": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["kind"],
+}
+
+
+def format_admission(admission: dict | None) -> str:
+    """One readable line (plus any would-refuse reasons) for a claim's verdict."""
+    if not admission:
+        return ""
+    surfaced = admission.get("surfaced") or {}
+    line = (f"Admission ({admission.get('mode')}): {admission.get('classification')}; "
+            f"surfaced {len(surfaced.get('branches') or [])} unfinished branch(es), "
+            f"{len(surfaced.get('overlaps') or [])} overlap candidate(s)")
+    for name in ("branches", "overlaps"):
+        status = surfaced.get(f"{name}_status")
+        if status and status != "ok":
+            line += f"; {name} {status}"
+    line += "\n"
+    if admission.get("would_refuse") and not admission.get("refused"):
+        line += ("⚠️ Would be REFUSED under enforcement: "
+                 + "; ".join(c.get("message", "") for c in admission.get("hard_conflicts") or [])
+                 + "\n")
+    return line
+
+
 @mcp_server.list_tools()
 async def list_tools() -> list[Tool]:
     """List available MCP tools."""
@@ -332,6 +376,7 @@ async def list_tools() -> list[Tool]:
                                         "claims nothing. Omitted: owner if the ticket has no "
                                         "live owner; otherwise contributor when scope names "
                                         "files, reviewer when it does not.")},
+                    "admission": _ADMISSION_SCHEMA,
                 },
                 "required": ["scope", "description"],
             },
@@ -907,6 +952,7 @@ async def list_tools() -> list[Tool]:
                         "enum": ["advisory", "exclusive"],
                         "description": "Lock mode for the new patterns (default advisory).",
                     },
+                    "admission": _ADMISSION_SCHEMA,
                 },
                 "required": ["patterns"],
             },
@@ -1246,7 +1292,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                             json={"objective": description,
                                   "repo_root": arguments.get("repo_root", ""),
                                   "scope": scope, "limit": 6,
-                                  "task_id": ticket_id},
+                                  "task_id": ticket_id, "overlaps": True},
                             timeout=25,
                         )
                     except Exception as exc:  # noqa: BLE001
@@ -1338,9 +1384,17 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         "ticket_role": arguments.get("ticket_role") or None,
                         "auto_lock": True,
                         "lock_mode": "exclusive" if exclusive else "advisory",
+                        "admission": arguments.get("admission") or None,
                     },
                 )
 
+                if response.status_code in (409, 422):
+                    detail = (response.json() or {}).get("detail")
+                    if isinstance(detail, dict) and detail.get("error") in (
+                            "admission_refused", "admission_invalid"):
+                        return [TextContent(type="text", text=(
+                            f"❌ Session not started (work admission): {detail.get('message')}\n"
+                            f"structured: {json.dumps(detail)}"))]
                 if response.status_code == 409:
                     error = response.json()
                     detail = error.get("detail")
@@ -1437,7 +1491,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 msg += f"Scope: {', '.join(data['scope'])}\n"
                 msg += f"Branch: {data['branch']}\n"
                 msg += f"Locks created: {data['lock_count']}\n"
-                msg += f"Mode: {'EXCLUSIVE (blocks all overlaps)' if exclusive else 'Advisory (warns on overlaps)'}\n\n"
+                msg += f"Mode: {'EXCLUSIVE (blocks all overlaps)' if exclusive else 'Advisory (warns on overlaps)'}\n"
+                msg += format_admission(data.get("admission")) + "\n"
                 msg += "Team has been notified. Use complete_session when done."
 
                 # The claim IS the trigger for context (brief-on-claim). A worker
@@ -1456,6 +1511,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                                   "repo_root": arguments.get("repo_root", ""),
                                   "scope": scope, "limit": 6,
                                   "task_id": data.get("ticket_id"),
+                                  "overlaps": True,
                                   # The session this brief is FOR. Without it the
                                   # brief lists back the locks this very call just
                                   # created, as BLOCKERS NOW (#2757).
@@ -2713,14 +2769,21 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # a pattern this session was refused. The old order patched the
                 # merged scope, then announced "Scope extended" over refused locks.
                 created, refused = [], []
+                admission_line = ""
                 for pat in patterns:
                     lr = await client.post(
                         f"{SERVER_URL}/api/locks",
                         json={"session_id": active_session_id, "pattern": pat,
-                              "reason": "extend_scope", "mode": mode},
+                              "reason": "extend_scope", "mode": mode,
+                              "admission": arguments.get("admission") or None},
                     )
                     if lr.status_code in (200, 201):
                         created.append(pat)
+                        try:
+                            admission_line = admission_line or format_admission(
+                                (lr.json() or {}).get("admission"))
+                        except ValueError:
+                            pass
                         continue
                     # Any refusal is reported and the loop continues, so a lock
                     # already taken for an earlier pattern is never hidden by a
@@ -2767,6 +2830,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 else:
                     msg = "❌ Scope NOT extended: every requested lock was refused.\n\n"
                 msg += "Now covering:\n" + ("\n".join(f"  • {p}" for p in merged) or "  (nothing)") + "\n"
+                if admission_line:
+                    msg += admission_line
                 if refused:
                     msg += "\nRefused — not locked and not added to your scope:\n"
                     msg += "\n".join(f"  • {p}: {why}" for p, _code, why in refused) + "\n"

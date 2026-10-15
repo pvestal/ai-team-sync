@@ -43,7 +43,11 @@ def _normalize_repositories(values: Any, *, source: str) -> list[str]:
 #: Top-level tables operator.toml may carry. `restart_gate` (#3580) is read by
 #: ai_team_sync.restart_gate; an ATS install older than #3580 rejects it, so the
 #: table must be added only after every ATS install (pipx copy included) is upgraded.
-_TOP_LEVEL_KEYS = {"governance", "restart_gate"}
+#: `context` and `admission` (#3591) carry the same caveat: add them to
+#: operator.toml only after every install has this code.
+_TOP_LEVEL_KEYS = {"governance", "restart_gate", "context", "admission"}
+
+ADMISSION_MODES = ("off", "shadow", "enforce")
 
 
 def load_operator_document() -> dict:
@@ -82,3 +86,61 @@ def governed_repositories() -> list[str]:
     if unknown:
         raise OperatorConfigError(f"{path}: unknown governance key(s) {sorted(unknown)}")
     return _normalize_repositories(governance.get("repositories", []), source=str(path))
+
+
+def _table(name: str, allowed: set[str]) -> dict:
+    path = operator_config_path()
+    table = load_operator_document().get(name, {})
+    if not isinstance(table, dict):
+        raise OperatorConfigError(f"{path}: [{name}] must be a table")
+    unknown = set(table) - allowed
+    if unknown:
+        raise OperatorConfigError(f"{path}: unknown {name} key(s) {sorted(unknown)}")
+    return table
+
+
+def context_repositories() -> list[str]:
+    """Repositories that get ATS-first CONTEXT but are not governed.
+
+    Context is a brief: tickets, unfinished branches, prior work. Governance
+    is enforcement: lock and commit guards. Listing a repository here never
+    turns enforcement on for it (#3591).
+    """
+    table = _table("context", {"repositories", "aliases"})
+    return _normalize_repositories(table.get("repositories", []),
+                                   source=f"{operator_config_path()} [context]")
+
+
+def context_aliases() -> dict[str, list[str]]:
+    """Operator-listed short names per repository, e.g. {"/path": ["ats"]}."""
+    raw = _table("context", {"repositories", "aliases"}).get("aliases", {})
+    if not isinstance(raw, dict) or any(
+            not isinstance(v, list) or any(not isinstance(a, str) for a in v)
+            for v in raw.values()):
+        raise OperatorConfigError(
+            f"{operator_config_path()}: context.aliases must map paths to arrays of names")
+    return {_normalize_repositories([path], source="context.aliases")[0]: list(names)
+            for path, names in raw.items()}
+
+
+def admission_policy() -> tuple[str, list[str]]:
+    """(mode, enforce_repositories). Absent config is shadow: admission is
+    computed and recorded, and refuses nothing (#3591)."""
+    table = _table("admission", {"mode", "enforce_repositories"})
+    mode = table.get("mode", "shadow")
+    if mode not in ADMISSION_MODES:
+        raise OperatorConfigError(
+            f"{operator_config_path()}: admission.mode must be one of {ADMISSION_MODES}")
+    repos = _normalize_repositories(table.get("enforce_repositories", []),
+                                    source=f"{operator_config_path()} [admission]")
+    return mode, repos
+
+
+def admission_mode_for(repo_root: str) -> str:
+    """Enforcement applies only to repositories the operator listed; every
+    other repository stays in shadow even when the global mode is enforce."""
+    mode, repos = admission_policy()
+    if mode != "enforce":
+        return mode
+    root = os.path.realpath(repo_root).rstrip("/") if repo_root else ""
+    return "enforce" if root and root in repos else "shadow"

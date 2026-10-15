@@ -25,7 +25,9 @@ from typing import Any
 from ai_team_sync import session_pointer as sp
 from ai_team_sync.context_resolution import (
     RequestTarget,
+    context_roots,
     governed_roots,
+    is_subagent_handback,
     resolve_request_target,
 )
 from ai_team_sync.hooks.session_registration import RegistrationInput, lifecycle_session_key
@@ -58,18 +60,12 @@ def _token(session_id: str, cid: str) -> str:
     return sp.load_approval_token(session_id, cid=cid) or ""
 
 
-_HANDBACK_PREFIX = '<agent-message from="'
-_HANDBACK_MARKER = "[Subagent hand-back]"
+_is_subagent_handback = is_subagent_handback
 
-
-def _is_subagent_handback(prompt: str) -> bool:
-    """True when the harness delivered a subagent's report as the prompt.
-
-    The report names whatever repos the subagent touched; that is not the
-    operator switching projects. Only a prompt that opens with the harness
-    frame counts, so an operator pasting a report still resolves by its text.
-    """
-    return prompt.startswith(_HANDBACK_PREFIX) and _HANDBACK_MARKER in prompt[:500]
+# A turn in a governed/context working directory that names no ticket and no
+# project is usually conversation ("go ahead"). Only a substantive request gets
+# overlap candidates, so the advisory section stays worth reading (#3591).
+_OVERLAP_MIN_CHARS_FOR_CWD_ONLY = 200
 
 
 def _context_description(repo_root: str) -> str:
@@ -198,7 +194,11 @@ async def _brief(
         "recall": False,
         "limit": 6,
         "session_id": session_id,
+        # Identity is never guessed for an unnumbered request; it gets advisory
+        # overlap candidates instead (#3591).
         "resolve_task": target.task_id is not None,
+        "task_ids": list(target.task_ids),
+        "overlaps": _wants_overlaps(prompt, target),
     }
     if target.task_id is not None:
         body["task_id"] = target.task_id
@@ -264,6 +264,14 @@ async def _delegated_child_context(
     )
 
 
+def _wants_overlaps(prompt: str, target: RequestTarget) -> bool:
+    if target.reason == "subagent_handback":
+        return False
+    if target.reason in ("governed_cwd", "context_cwd"):
+        return len(prompt) >= _OVERLAP_MIN_CHARS_FOR_CWD_ONLY
+    return True
+
+
 async def resolve_prompt_context(
     server_url: str,
     client: Any,
@@ -321,12 +329,19 @@ async def resolve_prompt_context(
 
     anchored = str(session.get("repo_root") or "").rstrip("/")
     advisory = ""
-    if anchored and _is_subagent_handback(prompt):
+    if target.reason == "subagent_handback":
+        # A subagent's report names whatever it touched. It never anchors a
+        # session (#3591); an already anchored session keeps its context.
+        if not anchored:
+            return None
         target = RequestTarget(None, anchored, "subagent_handback")
     elif anchored:
         target, advisory = _hold_anchor(anchored, target)
 
-    if target.repo_root:
+    # Context-only repositories are briefed, never anchored: anchoring is how a
+    # session acquires a governed project, and these are not governed (#3591).
+    context_only = bool(target.repo_root) and target.repo_root in set(context_roots())
+    if target.repo_root and not context_only:
         session = await _anchor_session(client, server_url, session, target.repo_root, token)
 
     packet = await _brief(client, server_url, session_id, token, prompt, target)
@@ -336,7 +351,9 @@ async def resolve_prompt_context(
         "ATS-FIRST CONTEXT RESOLUTION (automatic; obtained before worker answer)\n"
         f"session: {session_id}\n"
         f"trigger: {target.reason}\n"
-        f"resolved repo: {target.repo_root or '(task context only)'}\n"
+        f"resolved repo: {target.repo_root or '(task context only)'}"
+        + (" (context only: not governed, session not anchored)" if context_only else "")
+        + "\n"
         + (f"{advisory}\n" if advisory else "")
         + "Source precedence: ATS owns coordination/scope/authority/task context; "
         "Echo is supplemental; Git/DB/live services verify mutable facts.\n\n" + rendered
@@ -399,6 +416,16 @@ def main(argv: list[str] | None = None) -> None:
     try:
         note = asyncio.run(_run())
     except Exception as exc:  # noqa: BLE001
+        # A delegated child's claim is verified or blocked, never best-effort:
+        # packets routinely name several tickets, and an unconfirmed delegation
+        # must not slip through as "added context" (#3536 review round 1).
+        if target.best_effort and not (os.environ.get("ATS_DELEGATION") or "").strip():
+            # Context added by #3591 never blocks a prompt the pre-#3591 hook
+            # let through; it reports what is missing instead.
+            print(f"ATS context unavailable for this request ({type(exc).__name__}: "
+                  f"{exc}); continuing without it.", file=sys.stderr)
+            _run_supplement(args.supplement_command, args.supplement_timeout, raw_payload)
+            raise SystemExit(0)
         print(
             "ATS-FIRST context resolution failed for governed work: "
             f"{exc}. The prompt was blocked before the worker could substitute "

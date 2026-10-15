@@ -30,6 +30,10 @@ class BriefRequest(BaseModel):
     # The session this brief is for, so its own locks are not reported back to
     # it as blockers (#2757). A claim, validated against the caller's account.
     session_id: str = ""
+    # Every ticket the request names, when it names more than one (#3591).
+    task_ids: list[int] = Field(default_factory=list, max_length=50)
+    # Include advisory candidates for existing work that may overlap (#3591).
+    overlaps: bool = False
 
 
 @router.post("")
@@ -45,7 +49,9 @@ async def post_brief(body: BriefRequest, request: Request,
             caller_identity_unresolved=caller.unresolved,
             task_id=body.task_id,
             render_task_context=body.render_task_context,
-            resolve_task=body.resolve_task)
+            resolve_task=body.resolve_task,
+            task_ids=[i for i in body.task_ids if i > 0],
+            overlaps=body.overlaps)
         packet["session_linkage"] = {"status": "not_applicable", "task_id": None}
         resolved_task_id = packet.get("task_id")
         if resolved_task_id is not None and caller.session_id is not None:

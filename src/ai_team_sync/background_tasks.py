@@ -16,6 +16,7 @@ from ai_team_sync import completion_events
 from ai_team_sync.config import settings
 from ai_team_sync.database import get_db
 from ai_team_sync.git_utils import uncommitted_for_scope
+from ai_team_sync.admission import ADMISSION_TITLE
 from ai_team_sync.models import CommitRecord, Decision, OverrideRequest, ScopeLock, Session
 from ai_team_sync.scope_paths import canonical_root
 from ai_team_sync.events import broadcast_event
@@ -153,8 +154,11 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
             select(func.max(ScopeLock.created_at)).where(ScopeLock.session_id == sess.id))
         last_commit = await db.scalar(
             select(func.max(CommitRecord.created_at)).where(CommitRecord.session_id == sess.id))
+        # A work-admission record (#3591) is part of the claim, not evidence
+        # that the worker is still active.
         last_decision = await db.scalar(
-            select(func.max(Decision.created_at)).where(Decision.session_id == sess.id))
+            select(func.max(Decision.created_at)).where(Decision.session_id == sess.id)
+            .where(Decision.title != ADMISSION_TITLE))
         last_activity = max(
             _aware(t) for t in
             (sess.started_at, last_lock, last_commit, last_decision, sess.last_heartbeat) if t)

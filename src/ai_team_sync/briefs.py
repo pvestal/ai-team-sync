@@ -207,14 +207,63 @@ _EXPLICIT_TASK_PATTERNS = (
 )
 
 
-def explicit_task_id(objective: str) -> int | None:
-    """One explicit task/ticket identity, excluding incidental ``#`` refs."""
+def explicit_task_ids(objective: str) -> list[int]:
+    """Every explicit task/ticket identity, sorted; incidental ``#`` refs count
+    only once the text names a ticket explicitly somewhere."""
     ids = {int(match.group(1)) for pattern in _EXPLICIT_TASK_PATTERNS
            for match in pattern.finditer(objective or "")}
     if ids:
         ids.update(int(value) for value in re.findall(
             r"#([1-9][0-9]*)\b", objective or ""))
-    return next(iter(ids)) if len(ids) == 1 else None
+    return sorted(ids)
+
+
+def explicit_task_id(objective: str) -> int | None:
+    """One explicit task/ticket identity, excluding incidental ``#`` refs."""
+    ids = explicit_task_ids(objective)
+    return ids[0] if len(ids) == 1 else None
+
+
+def fetch_task_overlaps(objective: str, *, exclude_ids: list[int], limit: int = 6,
+                        timeout: float = 8.0) -> tuple[list[dict[str, Any]], str | None]:
+    """Existing Tower work that may overlap `objective` (#3591), from Echo.
+
+    ADVISORY. Echo ranks by text; similarity is never proof, and nothing here
+    selects a task or blocks a claim. ([], reason) on any failure.
+    """
+    import httpx
+
+    try:
+        with httpx.Client(timeout=timeout) as c:
+            response = c.post(f"{ECHO_URL}/api/tower-tasks/resolve", json={
+                "objective": objective[:4000], "mode": "overlaps", "limit": limit,
+                "exclude_ids": [i for i in exclude_ids if i][:50]})
+    except Exception as exc:  # noqa: BLE001
+        return [], f"Echo Brain overlap lookup unavailable ({type(exc).__name__})"
+    if response.status_code >= 400:
+        return [], f"Echo Brain overlap lookup returned HTTP {response.status_code}"
+    try:
+        body = response.json()
+    except Exception:  # noqa: BLE001
+        return [], "Echo Brain overlap lookup returned non-JSON"
+    if not isinstance(body, dict) or body.get("status") != "candidates" \
+            or not isinstance(body.get("candidates"), list):
+        # An Echo without the overlaps mode answers with an identity result;
+        # never mistake that for "no overlapping work".
+        return [], "Echo Brain overlap lookup not supported by this Echo version"
+    return body["candidates"], None
+
+
+_NAMED_TASKS_CAP = 5
+
+
+def _named_task_card(env: dict[str, Any]) -> dict[str, Any]:
+    description = str(env.get("description") or "")
+    return {"id": env.get("id"), "title": env.get("title"), "status": env.get("status"),
+            "gate": env.get("gate"), "parent_id": env.get("parent_id"),
+            "recommendation": str(env.get("recommendation") or "")[:400],
+            "description_head": description[:1200],
+            "description_truncated": len(description) > 1200}
 
 
 def fetch_tower_task_envelope(task_id: str | int, *, timeout: float = 10.0
@@ -569,7 +618,9 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
                       caller_identity_unresolved: bool = False,
                       task_id: int | None = None,
                       render_task_context: bool = True,
-                      resolve_task: bool = True) -> dict[str, Any]:
+                      resolve_task: bool = True,
+                      task_ids: list[int] | None = None,
+                      overlaps: bool = False) -> dict[str, Any]:
     """Assemble the packet. ATS state is authoritative and local; Echo Brain
     recall is additive and may be absent.
 
@@ -791,7 +842,12 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
                                if handoff.created_at else None),
             })
 
+    work = await _existing_work(db, objective=objective, repo_root=repo_root, scope=scope,
+                                task_id=task_id, task_ids=task_ids or [],
+                                overlaps=overlaps and not ambiguous)
+
     packet = {
+        **work,
         "preflight_recommended": recommended,
         "preflight_reason": why,
         "objective": objective,
@@ -815,6 +871,156 @@ async def build_brief(db: AsyncSession, *, objective: str, repo_root: str = "",
     }
     packet["rendered"] = render(packet)
     return packet
+
+
+async def _live_owners(db: AsyncSession, ticket_ids: list[int]) -> dict[int, dict[str, str]]:
+    if not ticket_ids:
+        return {}
+    rows = (await db.execute(
+        select(Session).where(Session.status.in_(("active", "paused")))
+        .where(Session.ticket_id.in_(ticket_ids))
+    )).scalars().all()
+    owners: dict[int, dict[str, str]] = {}
+    for s in sorted(rows, key=lambda s: s.ticket_role != "owner"):
+        owners.setdefault(int(s.ticket_id), {
+            "session_id": s.id, "agent": s.agent, "role": s.ticket_role or "",
+            "description": (s.description or "")[:160]})
+    return owners
+
+
+async def _existing_work(db: AsyncSession, *, objective: str, repo_root: str,
+                         scope: list[str], task_id: int | None, task_ids: list[int],
+                         overlaps: bool) -> dict[str, Any]:
+    """What already exists around this work (#3591): every named ticket,
+    advisory overlap candidates, and unfinished branches. Each part degrades
+    to a stated status; none of it blocks or selects anything."""
+    from ai_team_sync.active_work import unfinished_branches
+
+    named: list[dict[str, Any]] = []
+    for tid in task_ids[:_NAMED_TASKS_CAP]:
+        env, error = await asyncio.to_thread(fetch_tower_task_data, tid)
+        named.append(_named_task_card(env) if env and not error
+                     else {"id": tid, "error": error or "no envelope"})
+    named_omitted = task_ids[_NAMED_TASKS_CAP:]
+
+    candidates: list[dict[str, Any]] = []
+    overlap_status = "not requested"
+    if overlaps:
+        exclude = [i for i in [task_id, *task_ids] if i]
+        candidates, error = await asyncio.to_thread(
+            fetch_task_overlaps, objective, exclude_ids=exclude)
+        overlap_status = error or f"ok ({len(candidates)} candidate(s))"
+
+    tickets = [i for i in [task_id, *task_ids, *(c.get("id") for c in candidates)] if i]
+    owners = await _live_owners(db, tickets)
+    for c in candidates:
+        c["live_owner"] = owners.get(int(c["id"]))
+    for card in named:
+        card["live_owner"] = owners.get(int(card["id"]))
+
+    branches: list[dict[str, Any]] = []
+    branch_status = "not requested"
+    if repo_root and (scope or tickets):
+        try:
+            found = await asyncio.to_thread(
+                unfinished_branches, repo_root, scope=scope, tickets=tickets)
+            branches = [b.as_dict() for b in found]
+            branch_status = f"ok ({len(branches)} branch(es))"
+        except Exception as exc:  # noqa: BLE001
+            branch_status = f"unavailable ({type(exc).__name__})"
+        if branches:
+            sessions = (await db.execute(
+                select(Session).where(Session.status.in_(("active", "paused"))))).scalars().all()
+            by_id = {s.id: s for s in sessions}
+            for b in branches:
+                holder = by_id.get(b["worktree_session"]) if b["worktree_session"] else None
+                holder = holder or next(
+                    (s for s in sessions if b["worktree"] and
+                     (s.repo_root or "").rstrip("/") == b["worktree"].rstrip("/")), None)
+                holder = holder or next(
+                    (owners[t] and by_id.get(owners[t]["session_id"])
+                     for t in b["tickets"] if owners.get(t)), None)
+                b["live_owner"] = ({"session_id": holder.id, "agent": holder.agent}
+                                   if holder else None)
+
+    return {"named_tasks": named, "named_tasks_omitted": named_omitted,
+            "overlaps": candidates, "overlaps_status": overlap_status,
+            "active_branches": branches, "active_branches_status": branch_status}
+
+
+def _render_existing_work(packet: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    named = packet.get("named_tasks") or []
+    if named:
+        lines += ["", "NAMED TICKETS — every ticket this request names "
+                      "(full authority: get_tower_task <id>)"]
+        for card in named:
+            if card.get("error"):
+                lines.append(f"  #{card['id']} UNAVAILABLE: {card['error']}")
+                continue
+            owner = card.get("live_owner")
+            lines.append(f"  #{card['id']} [{card.get('status')}, gate={card.get('gate')}] "
+                         f"{card.get('title')}")
+            if owner:
+                lines.append(f"      live owner: {owner['agent']} session {owner['session_id']}")
+            if card.get("recommendation"):
+                lines.append("      recommendation (legacy prose): "
+                             + card["recommendation"].replace("\n", " ")[:300])
+            head = card.get("description_head", "").replace("\n", " ")
+            lines.append(f"      {head[:600]}" + (" …" if card.get("description_truncated")
+                                                    or len(head) > 600 else ""))
+        if packet.get("named_tasks_omitted"):
+            lines.append("  also named (not expanded): "
+                         + ", ".join(f"#{i}" for i in packet["named_tasks_omitted"]))
+
+    status = packet.get("overlaps_status")
+    if status and status != "not requested":
+        lines += ["", "EXISTING WORK THAT MAY OVERLAP — ADVISORY candidates; similarity is "
+                      "not proof. Disposition each before starting: continue / duplicate / "
+                      "related / separate.",
+                  f"  lookup: {status}"]
+        for c in packet.get("overlaps") or []:
+            gate = f", gate={c['gate']}" if c.get("gate") and c["gate"] != "none" else ""
+            prior = " — recently closed: prior work to build on" if c.get("closed") else ""
+            lines.append(f"  #{c['id']} [{c.get('status')}{gate}]{prior} {c.get('title')}")
+            extra = []
+            if c.get("live_owner"):
+                extra.append(f"live owner: {c['live_owner']['agent']} "
+                             f"session {c['live_owner']['session_id']}")
+            rulings = c.get("operator_rulings") or []
+            if rulings:
+                extra.append(f"{len(rulings)} current operator ruling(s)"
+                             + (" incl. a PROHIBITION" if any(r.get("prohibition")
+                                                               for r in rulings) else ""))
+            if c.get("recommendation"):
+                extra.append("recommendation (legacy prose): "
+                             + str(c["recommendation"].get("text", ""))[:160].replace("\n", " "))
+            extra.append("terms: " + ", ".join(c.get("matched_terms", [])[:4]))
+            lines.append("      " + " | ".join(extra))
+
+    status = packet.get("active_branches_status")
+    if status and status != "not requested":
+        lines += ["", "UNFINISHED BRANCHES ON THIS WORK — informational; touching the same "
+                      "file never blocks anything",
+                  f"  census: {status}"]
+        for b in packet.get("active_branches") or []:
+            tickets = ", ".join(f"#{t}" for t in b["tickets"]) or "NO TICKET"
+            conflict = {"merges_cleanly": "merges cleanly into the default branch",
+                        "conflicts_with_default": "CONFLICTS with the default branch"}.get(
+                b["conflict"], "conflict state unknown")
+            lines.append(f"  {b['branch']} ({tickets}) {b['unique_commits']} unique commit(s), "
+                         f"last {b['last_commit']}; {conflict}")
+            detail = []
+            if b.get("live_owner"):
+                detail.append(f"live owner: {b['live_owner']['agent']} "
+                              f"session {b['live_owner']['session_id']}")
+            elif b.get("worktree"):
+                detail.append(f"worktree {b['worktree']} (no live owner found)")
+            if b.get("files_in_scope"):
+                detail.append("in your scope: " + ", ".join(b["files_in_scope"][:4]))
+            if detail:
+                lines.append("      " + " | ".join(detail))
+    return lines
 
 
 def render(packet: dict[str, Any]) -> str:
@@ -856,6 +1062,8 @@ def render(packet: dict[str, Any]) -> str:
         lines += ["", "EXACT TASK-SCOPED CONTEXT UNAVAILABLE",
                   f"  {packet.get('task_context_status')}",
                   "  Do not infer current rulings or prohibitions from semantic recall."]
+
+    lines += _render_existing_work(packet)
 
     handoff = packet.get("latest_handoff") or None
     if handoff:

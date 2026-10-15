@@ -32,6 +32,7 @@ from ai_team_sync.workers import registry
 from ai_team_sync.delegation import effective_authority
 from ai_team_sync.models import Delegation
 from ai_team_sync.config import settings
+from ai_team_sync import admission
 from ai_team_sync import peer_identity
 from ai_team_sync import ticket_roles
 from ai_team_sync.repo_files import RepoContext
@@ -1224,6 +1225,10 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
     if locking:
         repo_ctx = RepoContext()
         await asyncio.to_thread(refuse_unbacked_patterns, scope, repo_root, repo_ctx)
+    # Work admission (#3591): what the work is, decided before the claim exists.
+    admitted = (await admission.admit(body.admission, ticket_id=ticket_id, repo_root=repo_root,
+                                      scope=scope, objective=body.description)
+                if locking else None)
 
     from ai_team_sync.routers.locks import acquisition_guard
     # The ticket-role decision reads who owns the ticket, so it shares the
@@ -1293,6 +1298,9 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
             f"{session.description}",
         )
 
+        if admitted is not None:
+            await admission.record(db, session, admitted, body.admission, scope)
+
         # Backstop for a second writer the in-process guard cannot see.
         await _write_or_ticket_owned(db, ticket_id, peer_uid, commit=True)
 
@@ -1327,6 +1335,7 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
     created = _session_to_response(session)
     created.ticket_owner_session_id = (session.id if ticket_role == ticket_roles.OWNER
                                        else ticket_owner_id)
+    created.admission = admitted.as_dict() if admitted is not None else None
     return created
 
 
