@@ -1011,8 +1011,8 @@ def _render_existing_work(packet: dict[str, Any]) -> list[str]:
     status = packet.get("overlaps_status")
     if status and status != "not requested":
         lines += ["", "EXISTING WORK THAT MAY OVERLAP — ADVISORY candidates; similarity is "
-                      "not proof. Disposition each before starting: continue / duplicate / "
-                      "related / separate.",
+                      "not proof. Disposition each before starting: continuation / duplicate / "
+                      "related / separate / superseded, with evidence.",
                   f"  lookup: {status}"]
         for c in packet.get("overlaps") or []:
             gate = f", gate={c['gate']}" if c.get("gate") and c["gate"] != "none" else ""

@@ -592,3 +592,17 @@ async def test_recommendation_prose_is_never_shown_as_a_ruling(db_session, tmp_p
                                       scope=["pkg/render_admission.py"], recall=False,
                                       resolve_task=False)
     assert "CURRENT OPERATOR RULING" not in packet["rendered"]
+
+
+@pytest.mark.parametrize("prompt,wanted", [
+    ("go ahead", False),
+    ("yes, ship it, looks good", False),
+    ("Let exports follow a reference outline by adding an outline option to the primary "
+     "binding in the admission module.", True),   # ~120 chars: a length cut would miss it
+    ("fix the flaky parser test in the loader module today", True),
+])
+def test_cwd_only_prompts_get_overlaps_by_content_not_length(prompt, wanted):
+    from ai_team_sync.context_resolution import RequestTarget
+    from ai_team_sync.hooks.ats_context import _wants_overlaps
+
+    assert _wants_overlaps(prompt, RequestTarget(None, "/r", "governed_cwd")) is wanted
