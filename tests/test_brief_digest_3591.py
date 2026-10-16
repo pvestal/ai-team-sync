@@ -274,3 +274,70 @@ def test_an_index_too_large_for_the_budget_says_incomplete_with_working_paths():
     assert "task_brief(objective=..., task_id=N)" in text
     # never claims completeness it cannot establish
     assert "nothing omitted" not in text
+
+
+# ── possible ticket references (operator ruling "#3591 STAGE 3", item 11) ────
+#
+# A bare "#3528" counts as a ticket only when the request names it as one
+# ("ticket #3528", a leading "#3528", "continue #3528"; briefs.explicit_task_ids).
+# "...to finish #3528 (related: #2945)?" resolved with NO tickets, so the
+# #3528 prohibition was never fetched. The hook now lists such references as
+# advisory POSSIBLE TICKET REFERENCES with working per-ticket retrieval calls
+# -- never looked up, never anchored, never a new failure path.
+
+REAL_PHRASING = "Should I merge branch fix/3528-solo-hero-flux-pose to finish #3528 (related: #2945)?"
+
+
+@pytest.mark.asyncio
+async def test_the_real_phrasing_surfaces_both_references_with_working_calls(
+        client, tmp_path, monkeypatch, governed):
+    from tests.test_work_admission_3591 import _placeholder
+
+    def never(tid, **kw):  # not anchored, not fetched: no new fail-closed path
+        raise AssertionError(f"possible reference #{tid} must not be looked up")
+    monkeypatch.setattr(briefs, "fetch_tower_task_data", never)
+    cid = "ffff1111-1111-2222-3333-444455556666"
+    sid = await _placeholder(client, tmp_path, monkeypatch, cid)
+    note = await ats_context.resolve_prompt_context(
+        "http://test", client, {"session_id": cid, "cwd": governed, "prompt": REAL_PHRASING})
+
+    assert "POSSIBLE TICKET REFERENCES" in note
+    for t in (3528, 2945):
+        line = next(ln for ln in note.splitlines() if ln.strip().startswith(f"#{t} →"))
+        assert f"task_brief(objective=..., task_id={t})" in line
+        assert f"get_tower_task(task_id={t})" in line
+    assert len(note) <= 7300
+    session = (await client.get(f"/api/sessions/{sid}")).json()
+    assert session.get("ticket_id") in (None, 0)  # the session was not anchored to them
+
+
+@pytest.mark.asyncio
+async def test_named_tickets_are_not_repeated_as_possible_references(
+        client, tmp_path, monkeypatch):
+    envs = {t: _env_with(t, []) for t in MULTI}
+    monkeypatch.setattr(briefs, "fetch_tower_task_data", lambda tid, **kw: (envs[int(tid)], None))
+    note = await _note(client, tmp_path, monkeypatch,
+                       "Reconcile ticket #3536 with #3560 and #3517 before landing")
+    assert "POSSIBLE TICKET REFERENCES" not in note
+    for t in MULTI:  # normal multi-ticket behavior is unchanged
+        assert f"#{t} [pending, gate=verify] title of {t}" in note
+
+
+def test_possible_references_exclude_resolved_tickets_and_short_numbers():
+    packet = {"task_id": 4100, "task_context": {}, "task_envelope": {"id": 4100},
+              "named_tasks": [{"id": 4101, "title": "x", "status": "pending", "gate": "none"}],
+              "overlaps": [], "overlaps_status": "not requested", "active_branches": []}
+    text = "\n".join(ats_context._priority_digest(
+        packet, "/repo", prompt="ticket #4100, #4101, PR #12, issue #3528 and #3528 again, #99999"))
+    refs = [ln.strip().split()[0] for ln in text.splitlines() if ln.strip().startswith("#") and "→" in ln]
+    assert refs == ["#3528", "#99999"]
+
+
+def test_many_possible_references_stay_inside_the_budget_and_say_incomplete():
+    packet = {"task_id": None, "task_context": {}, "task_envelope": {}, "named_tasks": [],
+              "overlaps": [], "overlaps_status": "not requested", "active_branches": []}
+    prompt = " ".join(f"#{1000 + i}" for i in range(300))
+    text = "\n".join(ats_context._priority_digest(packet, "/repo", prompt=prompt))
+    assert len(text) <= ats_context._DIGEST_BUDGET
+    assert "CONTEXT INCOMPLETE" in text
+    assert "possible ticket references not listed: every #N in your request" in text

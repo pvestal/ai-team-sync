@@ -16,6 +16,7 @@ import asyncio
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -365,7 +366,7 @@ async def resolve_prompt_context(
         + "Source precedence: ATS owns coordination/scope/authority/task context; "
         "Echo is supplemental; Git/DB/live services verify mutable facts.\n\n"
     )
-    digest = "\n".join(_priority_digest(packet, target.repo_root)) + "\n\n"
+    digest = "\n".join(_priority_digest(packet, target.repo_root, prompt=prompt)) + "\n\n"
     rendered = _within_budget(_short_echo(str(packet["rendered"]).strip()),
                               _BRIEF_BUDGET - len(header) - len(digest))
     return header + digest + rendered
@@ -452,7 +453,22 @@ def _rulings_call(ticket: Any) -> str:
     return _GET_RULINGS.replace("task_id=N", f"task_id={ticket}")
 
 
-def _priority_digest(packet: dict, repo_root: str = "") -> list[str]:
+# Same shape the branch census reads as a ticket mention (active_work).
+_TICKET_LIKE = re.compile(r"(?<![\w/#])#(\d{3,5})\b")
+
+
+def _possible_references(prompt: str, packet: dict) -> list[str]:
+    """Ticket-like "#3528" mentions the request did not name as tickets.
+
+    A bare number counts as a ticket only when the text says so (briefs.
+    explicit_task_ids), so "...to finish #3528 (related: #2945)?" resolves to
+    no ticket and none of its rulings are fetched. These are listed, never
+    looked up and never anchored: the agent retrieves them by id."""
+    resolved = {str(packet.get("task_id"))} | {str(c.get("id")) for c in packet.get("named_tasks") or []}
+    return [t for t in dict.fromkeys(_TICKET_LIKE.findall(prompt or "")) if t not in resolved]
+
+
+def _priority_digest(packet: dict, repo_root: str = "", *, prompt: str = "") -> list[str]:
     """What controls this work, from the packet's structured fields, inside
     _DIGEST_BUDGET: binding rulings, every named ticket with gate and owner,
     unfinished branches, overlap candidates -- and every item not shown in full,
@@ -486,6 +502,9 @@ def _priority_digest(packet: dict, repo_root: str = "") -> list[str]:
         add(2, "unchecked", "  rulings NOT CHECKED for " + ", ".join(f"#{t}" for t in unchecked)
             + f" (this brief did not look them up) — check each with {_GET_RULINGS}",
             ("ruling", None))
+    for ref in _possible_references(prompt, packet):
+        add(2, "references", f"    #{ref} → {_rulings_call(ref)} | "
+            f"{_GET_TICKET.replace('task_id=N', 'task_id=' + ref)}", ("reference", ref))
     for r in rulings[_RULINGS_SHOWN:]:
         kind = "prohibition" if r["prohibition"] else "ruling"
         ident = r["id"][:8] if r["id"] else f'"{_one_line(r["text"], 60)}"'
@@ -544,6 +563,8 @@ def _priority_digest(packet: dict, repo_root: str = "") -> list[str]:
     omitted_total = sum(1 for e in entries if e[2] == "omitted")
     headers = {
         "rulings": f"  operator rulings and prohibitions (binding where they apply; {len(rulings)} current):",
+        "references": "  POSSIBLE TICKET REFERENCES — mentioned in your request but NOT resolved as tickets, "
+                      "so their rulings were NOT looked up (write \"ticket #N\" to resolve one):",
         "named": f"  named tickets (all {len(named)}):",
         "branches": f"  unfinished branches on this work (informational, never blocking; "
                     f"{len(relevant)} relevant):",
@@ -552,7 +573,7 @@ def _priority_digest(packet: dict, repo_root: str = "") -> list[str]:
         "omitted": f"  NOT SHOWN IN FULL ABOVE — {omitted_total} item(s); each identified, "
                    "with how to retrieve it:",
     }
-    order = ["rulings", "unchecked", "named", "ticket", "branch_status", "branches",
+    order = ["rulings", "unchecked", "references", "named", "ticket", "branch_status", "branches",
              "overlap_status", "overlaps", "omitted"]
     retrieve = ["  retrieve (verified tools; each takes ONE ticket):",
                 f"    a ticket's record: {_GET_TICKET}  [Echo Brain MCP]",
@@ -578,6 +599,9 @@ def _priority_digest(packet: dict, repo_root: str = "") -> list[str]:
                        + (", ".join(f"#{t}" for t in others_) + " and " if others_ else "")
                        + f"tickets in your request → for each, and every ticket number in your "
                        f"request: {_GET_RULINGS}")
+        if any(e[4][0] == "reference" for e in dropped):
+            out.append("    possible ticket references not listed: every #N in your request → "
+                       f"{_GET_RULINGS}")
         if any(e[4][0] == "named" for e in dropped):
             out.append(f"    named tickets not listed: every ticket number in your request → {_GET_TICKET}")
         lost = [str(e[4][1]) for e in dropped if e[4][0] == "overlap"]
