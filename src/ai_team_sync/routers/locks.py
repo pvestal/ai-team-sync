@@ -168,7 +168,8 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
                                     else session.description or "")
         admitted = await admission.admit(
             body.admission, ticket_id=session.ticket_id, repo_root=session.repo_root or "",
-            scope=[body.pattern], objective=objective)
+            scope=[body.pattern], objective=objective,
+            provided="admission" in body.model_fields_set)
     async with acquisition_guard(db):
         await db.refresh(session)
         if session.status not in ("active", "paused"):

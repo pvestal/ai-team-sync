@@ -1227,7 +1227,8 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
         await asyncio.to_thread(refuse_unbacked_patterns, scope, repo_root, repo_ctx)
     # Work admission (#3591): what the work is, decided before the claim exists.
     admitted = (await admission.admit(body.admission, ticket_id=ticket_id, repo_root=repo_root,
-                                      scope=scope, objective=body.description)
+                                      scope=scope, objective=body.description,
+                                      provided="admission" in body.model_fields_set)
                 if locking else None)
 
     from ai_team_sync.routers.locks import acquisition_guard

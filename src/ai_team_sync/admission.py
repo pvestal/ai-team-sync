@@ -62,6 +62,10 @@ class Verdict:
     # The worker's classification as parsed, and why it was malformed if it was.
     claim: dict | None = None
     invalid: str = ""
+    # What the request carried: "absent" (no field), "null" (explicit null) or
+    # "provided" (any other value, {} included -- an empty object is a malformed
+    # classification, never an absent one).
+    claim_input: str = "absent"
 
     @property
     def refuse(self) -> bool:
@@ -243,10 +247,11 @@ def is_governed(repo_root: str) -> bool:
 
 
 async def admit(raw: Any, *, ticket_id: int | None, repo_root: str,
-                scope: list[str], objective: str) -> Verdict | None:
+                scope: list[str], objective: str, provided: bool = True) -> Verdict | None:
     """Evaluate one claim at a claim door. None when admission is off.
     Only enforce refuses: 422 for a malformed classification, 409 for a hard
-    conflict. Shadow records a malformed classification and admits."""
+    conflict. Shadow records a malformed classification and admits.
+    `provided`: whether the request carried the field at all (absent vs null)."""
     from fastapi import HTTPException
 
     mode = mode_for(repo_root)
@@ -256,6 +261,8 @@ async def admit(raw: Any, *, ticket_id: int | None, repo_root: str,
     if error and mode == "enforce":
         raise HTTPException(422, detail={"error": "admission_invalid", "message": error})
     verdict = evaluate(claim, ticket_id=ticket_id, governed=is_governed(repo_root), mode=mode)
+    verdict.claim_input = ("provided" if raw is not None
+                           else "null" if provided else "absent")
     verdict.claim = claim.model_dump() if claim is not None else None
     if error:
         verdict.invalid = error

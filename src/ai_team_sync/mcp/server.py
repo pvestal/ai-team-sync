@@ -1391,7 +1391,10 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         "ticket_role": arguments.get("ticket_role") or None,
                         "auto_lock": True,
                         "lock_mode": "exclusive" if exclusive else "advisory",
-                        "admission": arguments.get("admission") or None,
+                        # Forwarded exactly as given ({} stays {}), and only when
+                        # given: MCP and the API judge one admission contract.
+                        **({"admission": arguments["admission"]}
+                           if "admission" in arguments else {}),
                     },
                 )
 
@@ -2782,7 +2785,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         f"{SERVER_URL}/api/locks",
                         json={"session_id": active_session_id, "pattern": pat,
                               "reason": "extend_scope", "mode": mode,
-                              "admission": arguments.get("admission") or None},
+                              **({"admission": arguments["admission"]}
+                                 if "admission" in arguments else {})},
                     )
                     if lr.status_code in (200, 201):
                         created.append(pat)

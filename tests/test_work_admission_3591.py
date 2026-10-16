@@ -692,3 +692,162 @@ async def test_blocker_f_off_and_shadow_never_refuse_a_malformed_classification(
             f'[admission]\nmode = "enforce"\nenforce_repositories = ["{governed}"]\n')
     enforced = await _start(client, governed, ["src/a.py"], ticket_id=4500, admission=bad)
     assert enforced.status_code == 422 and enforced.json()["detail"]["error"] == "admission_invalid"
+
+
+# ── one admission contract through MCP and the API (final confirmation finding) ──
+
+_ABSENT = object()
+_VALUES = {"absent": _ABSENT, "null": None, "empty": {}, "malformed": {"kind": "banana"},
+           "valid": {"kind": "new", "reason": "nothing covers this"}}
+# (admitted?, classification, invalid?, claim_input) per mode, ticketed claim (#4101).
+_EXPECTED = {
+    "off": {v: (True, None, False, None) for v in _VALUES},
+    "shadow": {"absent": (True, "continue", False, "absent"),
+               "null": (True, "continue", False, "null"),
+               "empty": (True, "continue", True, "provided"),
+               "malformed": (True, "continue", True, "provided"),
+               "valid": (True, "new", False, "provided")},
+    "enforce": {"absent": (True, "continue", False, "absent"),
+                "null": (True, "continue", False, "null"),
+                "empty": (False, None, None, None),
+                "malformed": (False, None, None, None),
+                "valid": (True, "new", False, "provided")},
+}
+
+
+def _bridge_mcp(client, monkeypatch, tmp_path):
+    """The MCP handlers' HTTP client, routed into the same in-process app."""
+    import uuid
+
+    import ai_team_sync.mcp.server as mcp
+    from httpx import AsyncClient
+
+    class _ASGIClient:
+        def __init__(self, *a, **k):
+            self._c = AsyncClient(transport=client._transport, base_url="http://localhost:8400")
+
+        async def __aenter__(self):
+            return self._c
+
+        async def __aexit__(self, *exc):
+            await self._c.aclose()
+
+    monkeypatch.setattr(mcp.httpx, "AsyncClient", _ASGIClient)
+    # Each case is a fresh MCP process: no session left in this module's pointer.
+    monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", None)
+    monkeypatch.setattr(mcp, "_IN_PROCESS_APPROVAL_TOKEN", None)
+    # A ticketed MCP start_session first fetches the exact task authority (fail
+    # closed); answer it with the suite's valid envelope for ticket 4101.
+    from tests.test_task_brief import TASK_ENVELOPE
+    monkeypatch.setattr(briefs, "fetch_tower_task_data", lambda tid, **kw: (TASK_ENVELOPE, None))
+    monkeypatch.setattr(briefs, "recall_memories", lambda *a, **kw: [])
+    state = tmp_path / f"mcp-state-{uuid.uuid4().hex[:6]}"
+    state.mkdir()
+    monkeypatch.setenv("ATS_STATE_DIR", str(state))
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", str(uuid.uuid4()))
+    return mcp
+
+
+async def _verdict_for(db_session, sid):
+    db_session.expire_all()
+    row = (await db_session.execute(
+        select(Decision).where(Decision.session_id == sid)
+        .where(Decision.record_kind == admission.ADMISSION_RECORD_KIND))).scalars().first()
+    return json.loads(row.reasoning)["verdict"] if row else None
+
+
+async def _via_api(client, door, governed, value):
+    if door == "start_session":
+        body = {"developer": "dev", "agent": "default", "scope": ["src/a.py"], "auto_lock": True,
+                "repo_root": governed, "description": "parser", "ticket_id": 4101}
+        if value is not _ABSENT:
+            body["admission"] = value
+        r = await client.post("/api/sessions", json=body)
+        return r.status_code in (200, 201), (r.json().get("id") if r.status_code == 201 else None)
+    s = await client.post("/api/sessions", json={
+        "developer": "dev", "agent": "default", "scope": [], "repo_root": governed,
+        "description": "auto-registered on SessionStart (UNSCOPED)", "ticket_id": 4101})
+    body = {"session_id": s.json()["id"], "pattern": "src/a.py"}
+    if value is not _ABSENT:
+        body["admission"] = value
+    r = await client.post("/api/locks", json=body)
+    return r.status_code in (200, 201), s.json()["id"]
+
+
+async def _via_mcp(mcp, client, monkeypatch, door, governed, value):
+    args = {"description": "parser", "scope": ["src/a.py"], "repo_root": governed,
+            "ticket_id": 4101} if door == "start_session" else {"patterns": ["src/a.py"]}
+    if door == "extend_scope":
+        s = await client.post("/api/sessions", json={
+            "developer": "dev", "agent": "default", "scope": [], "repo_root": governed,
+            "description": "auto-registered on SessionStart (UNSCOPED)", "ticket_id": 4101})
+        sid = s.json()["id"]
+        monkeypatch.setattr(mcp, "load_session_id", lambda: sid)
+    if value is not _ABSENT:
+        args["admission"] = value
+    text = (await mcp.call_tool(door, args))[0].text
+    if door == "start_session":
+        admitted = "Session started" in text
+        sid = text.split("Session ID: ")[1].split()[0] if admitted else None
+    else:
+        admitted = "Scope extended" in text
+    return admitted, sid, text
+
+
+@pytest.mark.asyncio
+async def test_codex_finding_an_explicit_empty_admission_via_mcp_is_not_absent(
+        client, tmp_path, monkeypatch, governed):
+    """The exact finding: enforce mode, a ticketed MCP start_session carrying {} was
+    admitted as an implicit continue while the API answered 422."""
+    _config(monkeypatch, tmp_path,
+            f'[governance]\nrepositories = ["{governed}"]\n'
+            f'[admission]\nmode = "enforce"\nenforce_repositories = ["{governed}"]\n')
+    api_ok, _ = await _via_api(client, "start_session", governed, {})
+    mcp = _bridge_mcp(client, monkeypatch, tmp_path)
+    mcp_ok, _, text = await _via_mcp(mcp, client, monkeypatch, "start_session", governed, {})
+    assert api_ok is False
+    assert mcp_ok is False, text
+    assert "work admission" in text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("door", ["start_session", "extend_scope"])
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("name", list(_VALUES))
+async def test_mcp_and_api_judge_one_admission_contract(
+        client, db_session, tmp_path, monkeypatch, governed, door, mode, name):
+    admission_table = f'\n[admission]\nmode = "{mode}"\n' + (
+        f'enforce_repositories = ["{governed}"]\n' if mode == "enforce" else "")
+    _config(monkeypatch, tmp_path, f'[governance]\nrepositories = ["{governed}"]\n'
+            + admission_table)
+    value = _VALUES[name]
+    admitted_exp, cls_exp, invalid_exp, input_exp = _EXPECTED[mode][name]
+
+    outcomes = {}
+    api_ok, api_sid = await _via_api(client, door, governed, value)
+    outcomes["api"] = (api_ok, await _verdict_for(db_session, api_sid) if api_ok else None)
+    if api_ok and door == "start_session":  # free the file for the MCP twin
+        from ai_team_sync.models import Session
+        db_session.expire_all()
+        row = (await db_session.execute(select(Session).where(Session.id == api_sid))).scalar_one()
+        row.status = "completed"
+        await db_session.commit()
+    elif api_ok:
+        from ai_team_sync.models import ScopeLock
+        for lock in (await db_session.execute(select(ScopeLock).where(
+                ScopeLock.session_id == api_sid))).scalars().all():
+            await db_session.delete(lock)
+        await db_session.commit()
+    mcp = _bridge_mcp(client, monkeypatch, tmp_path)
+    mcp_ok, mcp_sid, text = await _via_mcp(mcp, client, monkeypatch, door, governed, value)
+    outcomes["mcp"] = (mcp_ok, await _verdict_for(db_session, mcp_sid) if mcp_ok else None)
+
+    for path, (ok, verdict) in outcomes.items():
+        assert ok is admitted_exp, (path, name, mode, door, text if path == "mcp" else "")
+        if not ok or cls_exp is None:
+            assert verdict is None, (path, verdict)
+            continue
+        assert verdict["classification"] == cls_exp, (path, verdict)
+        assert bool(verdict["invalid"]) is invalid_exp, (path, verdict)
+        assert verdict["claim_input"] == input_exp, (path, verdict)
+        assert not verdict["refused"]
