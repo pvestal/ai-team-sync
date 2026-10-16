@@ -1299,7 +1299,7 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
         )
 
         if admitted is not None:
-            await admission.record(db, session, admitted, body.admission, scope)
+            await admission.record(db, session, admitted, scope)
 
         # Backstop for a second writer the in-process guard cannot see.
         await _write_or_ticket_owned(db, ticket_id, peer_uid, commit=True)

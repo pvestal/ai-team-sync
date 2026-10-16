@@ -138,9 +138,15 @@ def admission_policy() -> tuple[str, list[str]]:
 
 def admission_mode_for(repo_root: str) -> str:
     """Enforcement applies only to repositories the operator listed; every
-    other repository stays in shadow even when the global mode is enforce."""
+    other repository stays in shadow even when the global mode is enforce.
+    A linked worktree inherits the mode of the repository it belongs to."""
+    from ai_team_sync.git_utils import resolve_repo_roots
+
     mode, repos = admission_policy()
     if mode != "enforce":
         return mode
-    root = os.path.realpath(repo_root).rstrip("/") if repo_root else ""
-    return "enforce" if root and root in repos else "shadow"
+    if not repo_root:
+        return "shadow"
+    _worktree, shared = resolve_repo_roots(os.path.join(repo_root, ".ats-admission"))
+    roots = {os.path.realpath(r).rstrip("/") for r in (repo_root, shared) if r}
+    return "enforce" if roots & set(repos) else "shadow"

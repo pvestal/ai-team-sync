@@ -190,7 +190,7 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
         )
         db.add(lock)
         if admitted is not None:
-            await admission.record(db, session, admitted, body.admission, [body.pattern])
+            await admission.record(db, session, admitted, [body.pattern])
         await db.commit()
     await db.refresh(lock)
     response = _lock_to_response(lock, developer=session.developer, agent=session.agent,

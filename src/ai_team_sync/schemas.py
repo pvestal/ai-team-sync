@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, StrictInt, field_validator
 
@@ -59,7 +59,9 @@ class SessionCreate(BaseModel):
     # owner; otherwise contributor when scope names files, reviewer when it does
     # not. Delegation children get theirs from the mode.
     ticket_role: Literal["owner", "contributor", "reviewer"] | None = None
-    admission: AdmissionClaim | None = None
+    # Raw on purpose (#3591): admission parses it per mode, so a malformed
+    # classification is refused only in enforce -- never by request validation.
+    admission: Any = None
 
 
 class HandoffCreate(BaseModel):
@@ -168,8 +170,8 @@ class LockCreate(BaseModel):
     mode: str = "advisory"
     reason: str = ""  # human/agent-readable WHY; put prose HERE, never in `pattern`
     # Used only when this lock is the session's first claim in a governed
-    # repository and the session was never admitted (#3591).
-    admission: AdmissionClaim | None = None
+    # repository and the session was never admitted (#3591). Raw, parsed per mode.
+    admission: Any = None
 
     @field_validator("pattern")
     @classmethod

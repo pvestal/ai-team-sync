@@ -171,6 +171,10 @@ class Decision(Base):
     reasoning: Mapped[str] = mapped_column(Text, default="")
     files: Mapped[str] = mapped_column(Text, default="")  # JSON list of file paths
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+    # Set only by server code: "decision" for anything logged through the
+    # decisions API, "work_admission" for the record a claim door writes.
+    record_kind: Mapped[str] = mapped_column(
+        String(32), default="decision", nullable=False, server_default="decision")
 
     session: Mapped[Session] = relationship(back_populates="decisions")
 

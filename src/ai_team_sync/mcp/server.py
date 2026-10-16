@@ -251,8 +251,10 @@ def format_conflict_guidance(conflicts: list[dict]) -> str:
 
 # Work admission (#3591): what kind of work a claim is. Optional; with a
 # ticket_id the claim is "continue" by default.
+# Descriptive, never constraining: a client that validates tool input against
+# enums/required fields would refuse a malformed classification in every mode.
+# ATS parses it per mode -- recorded in shadow, refused only in enforce.
 _ADMISSION_SCHEMA = {
-    "type": "object",
     "description": (
         "What this work is, stated at the claim. kind: continue (your ticket_id) | new "
         "(genuinely new; reason) | related (builds on related_to tickets) | duplicate "
@@ -261,24 +263,10 @@ _ADMISSION_SCHEMA = {
         "surfaced -- ref '#3536' or 'branch:<name>', disposition continuation | duplicate | "
         "related | separate | superseded, and the evidence. Dispositions are claims: ATS "
         "records any that contradict what it observed. Similarity never blocks; only a "
-        "declared duplicate, or a ticketless governed claim with no kind, can be refused, "
-        "and only where the operator enabled enforcement."),
-    "properties": {
-        "kind": {"type": "string",
-                 "enum": ["continue", "new", "related", "duplicate", "exception"]},
-        "reason": {"type": "string"},
-        "related_to": {"type": "array", "items": {"type": "integer"}},
-        "duplicate_of": {"type": "integer", "minimum": 1},
-        "dispositions": {"type": "array", "items": {
-            "type": "object",
-            "properties": {
-                "ref": {"type": "string"},
-                "disposition": {"type": "string", "enum": [
-                    "continuation", "duplicate", "related", "separate", "superseded"]},
-                "evidence": {"type": "string"}},
-            "required": ["ref", "disposition", "evidence"]}},
-    },
-    "required": ["kind"],
+        "declared duplicate, a ticketless governed claim with no kind, or a malformed "
+        "classification can be refused, and only where the operator enabled enforcement. "
+        "Fields: kind, reason, related_to (ticket ids), duplicate_of (ticket id), "
+        "dispositions (list of {ref, disposition, evidence})."),
 }
 
 
@@ -302,7 +290,10 @@ def format_admission(admission: dict | None) -> str:
         line += f"⚠️ Contested: {c['ref']} claimed {c['claimed']}, but {c['observed']}\n"
     if review.get("unverifiable"):
         line += "Dispositioned but not observed by ATS: " + ", ".join(review["unverifiable"]) + "\n"
-    if admission.get("would_refuse") and not admission.get("refused"):
+    if admission.get("invalid"):
+        line += (f"⚠️ Malformed classification, recorded (enforcement would refuse it): "
+                 f"{admission['invalid']}\n")
+    if admission.get("hard_conflicts") and not admission.get("refused"):
         line += ("⚠️ Would be REFUSED under enforcement: "
                  + "; ".join(c.get("message", "") for c in admission.get("hard_conflicts") or [])
                  + "\n")

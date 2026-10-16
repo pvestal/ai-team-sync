@@ -254,7 +254,11 @@ def fetch_task_overlaps(objective: str, *, exclude_ids: list[int], limit: int = 
     return body["candidates"], None
 
 
-_NAMED_TASKS_CAP = 5
+# Every named ticket is fetched and gets a card; past this many, cards are
+# compact (identity, state, owner, current rulings) so the brief stays bounded
+# without dropping a ticket the request named.
+_NAMED_TASKS_FULL = 5
+_NAMED_TASKS_CONCURRENCY = 6
 
 
 def current_rulings(env: dict[str, Any]) -> list[dict[str, Any]]:
@@ -913,12 +917,17 @@ async def _existing_work(db: AsyncSession, *, objective: str, repo_root: str,
     to a stated status; none of it blocks or selects anything."""
     from ai_team_sync.active_work import unfinished_branches
 
-    named: list[dict[str, Any]] = []
-    for tid in task_ids[:_NAMED_TASKS_CAP]:
-        env, error = await asyncio.to_thread(fetch_tower_task_data, tid)
-        named.append(_named_task_card(env) if env and not error
-                     else {"id": tid, "error": error or "no envelope"})
-    named_omitted = task_ids[_NAMED_TASKS_CAP:]
+    slots = asyncio.Semaphore(_NAMED_TASKS_CONCURRENCY)
+
+    async def named_card(position: int, tid: int) -> dict[str, Any]:
+        async with slots:
+            env, error = await asyncio.to_thread(fetch_tower_task_data, tid)
+        card = (_named_task_card(env) if env and not error
+                else {"id": tid, "error": error or "no envelope"})
+        card["compact"] = position >= _NAMED_TASKS_FULL
+        return card
+
+    named = list(await asyncio.gather(*(named_card(i, t) for i, t in enumerate(task_ids))))
 
     candidates: list[dict[str, Any]] = []
     overlap_status = "not requested"
@@ -975,7 +984,7 @@ async def _existing_work(db: AsyncSession, *, objective: str, repo_root: str,
         b["ticket_rulings"] = {t: ruling_by_ticket[t] for t in b["tickets"]
                                if ruling_by_ticket.get(t)}
 
-    return {"named_tasks": named, "named_tasks_omitted": named_omitted,
+    return {"named_tasks": named,
             "overlaps": candidates, "overlaps_status": overlap_status,
             "active_branches": branches, "active_branches_status": branch_status}
 
@@ -998,15 +1007,19 @@ def _render_existing_work(packet: dict[str, Any]) -> list[str]:
             for r in card.get("operator_rulings") or []:
                 lines.append(f"      CURRENT OPERATOR RULING ({'PROHIBITION' if r['prohibition'] else r['effect']}): "
                              + r["ruling"].replace("\n", " ")[:240])
+            if card.get("compact"):
+                continue
             if card.get("recommendation"):
                 lines.append("      recommendation (legacy prose): "
                              + card["recommendation"].replace("\n", " ")[:300])
             head = card.get("description_head", "").replace("\n", " ")
             lines.append(f"      {head[:600]}" + (" …" if card.get("description_truncated")
                                                     or len(head) > 600 else ""))
-        if packet.get("named_tasks_omitted"):
-            lines.append("  also named (not expanded): "
-                         + ", ".join(f"#{i}" for i in packet["named_tasks_omitted"]))
+        compact = sum(1 for card in named if card.get("compact"))
+        if compact:
+            lines.append(f"  ({compact} ticket(s) after the first {_NAMED_TASKS_FULL} shown "
+                         "compact: state, owner and current rulings; description via "
+                         "get_tower_task <id>)")
 
     status = packet.get("overlaps_status")
     if status and status != "not requested":

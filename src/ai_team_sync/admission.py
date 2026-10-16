@@ -33,6 +33,9 @@ import asyncio
 import json
 import logging
 from dataclasses import asdict, dataclass, field
+from typing import Any
+
+from pydantic import ValidationError
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,7 +46,8 @@ from ai_team_sync.schemas import AdmissionClaim
 
 logger = logging.getLogger(__name__)
 
-ADMISSION_TITLE = "work admission (#3591)"
+ADMISSION_TITLE = "work admission (#3591)"  # display only
+ADMISSION_RECORD_KIND = "work_admission"  # identity: Decision.record_kind, server-set
 SNAPSHOT_TIMEOUT_S = 4.0
 
 
@@ -55,6 +59,9 @@ class Verdict:
     surfaced: dict = field(default_factory=dict)
     # Worker dispositions next to what admission observed (claims vs facts).
     review: dict = field(default_factory=dict)
+    # The worker's classification as parsed, and why it was malformed if it was.
+    claim: dict | None = None
+    invalid: str = ""
 
     @property
     def refuse(self) -> bool:
@@ -62,7 +69,7 @@ class Verdict:
 
     def as_dict(self) -> dict:
         out = asdict(self)
-        out["would_refuse"] = bool(self.hard_conflicts)
+        out["would_refuse"] = bool(self.hard_conflicts) or bool(self.invalid)
         out["refused"] = self.refuse
         return out
 
@@ -138,7 +145,7 @@ def cross_check(claim: AdmissionClaim | None, *, ticket_id: int | None,
 
 
 def validate(claim: AdmissionClaim | None, ticket_id: int | None) -> str | None:
-    """A malformed classification is a 422, in every mode."""
+    """Why a classification is incomplete, or None. Refused only in enforce."""
     if claim is None:
         return None
     if claim.kind == "continue" and ticket_id is None:
@@ -150,6 +157,21 @@ def validate(claim: AdmissionClaim | None, ticket_id: int | None) -> str | None:
     if claim.kind == "duplicate" and claim.duplicate_of is None:
         return "admission kind 'duplicate' needs duplicate_of"
     return None
+
+
+def parse_claim(raw: Any, ticket_id: int | None) -> tuple[AdmissionClaim | None, str]:
+    """(claim, error): the worker's classification parsed from the raw request
+    field. A shape the schema rejects yields no claim; an incomplete one keeps
+    the claim and names what is missing."""
+    if raw is None:
+        return None, ""
+    try:
+        claim = AdmissionClaim.model_validate(raw)
+    except ValidationError as exc:
+        return None, "malformed admission classification: " + "; ".join(
+            f"{'.'.join(str(p) for p in e['loc']) or 'admission'}: {e['msg']}"
+            for e in exc.errors()[:3])
+    return claim, validate(claim, ticket_id) or ""
 
 
 def mode_for(repo_root: str) -> str:
@@ -220,20 +242,24 @@ def is_governed(repo_root: str) -> bool:
         return False
 
 
-async def admit(claim: AdmissionClaim | None, *, ticket_id: int | None, repo_root: str,
+async def admit(raw: Any, *, ticket_id: int | None, repo_root: str,
                 scope: list[str], objective: str) -> Verdict | None:
     """Evaluate one claim at a claim door. None when admission is off.
-    Raises 422 for a malformed classification and 409 only for an enforced
-    hard conflict; everything else is recorded and admitted."""
+    Only enforce refuses: 422 for a malformed classification, 409 for a hard
+    conflict. Shadow records a malformed classification and admits."""
     from fastapi import HTTPException
 
-    error = validate(claim, ticket_id)
-    if error:
-        raise HTTPException(422, detail={"error": "admission_invalid", "message": error})
     mode = mode_for(repo_root)
     if mode == "off":
         return None
+    claim, error = parse_claim(raw, ticket_id)
+    if error and mode == "enforce":
+        raise HTTPException(422, detail={"error": "admission_invalid", "message": error})
     verdict = evaluate(claim, ticket_id=ticket_id, governed=is_governed(repo_root), mode=mode)
+    verdict.claim = claim.model_dump() if claim is not None else None
+    if error:
+        verdict.invalid = error
+        verdict.claim = verdict.claim or {"unparsed": str(raw)[:2000]}
     verdict.surfaced = await surfaced_work(repo_root, scope, ticket_id, objective)
     verdict.review = cross_check(claim, ticket_id=ticket_id, surfaced=verdict.surfaced)
     if verdict.refuse:
@@ -248,18 +274,18 @@ async def admit(claim: AdmissionClaim | None, *, ticket_id: int | None, repo_roo
 async def already_admitted(db: AsyncSession, session_id: str) -> bool:
     row = (await db.execute(
         select(Decision.id).where(Decision.session_id == session_id)
-        .where(Decision.title == ADMISSION_TITLE).limit(1))).first()
+        .where(Decision.record_kind == ADMISSION_RECORD_KIND).limit(1))).first()
     return row is not None
 
 
 async def record(db: AsyncSession, session: Session, verdict: Verdict,
-                 claim: AdmissionClaim | None, scope: list[str]) -> None:
+                 scope: list[str]) -> None:
     """One worker-proposal decision row per admitted session. Never an operator
     ruling: the brief renders it under WORKER PROPOSALS."""
-    reasoning = {"verdict": verdict.as_dict(),
-                 "claim": claim.model_dump() if claim else None}
+    reasoning = {"verdict": verdict.as_dict(), "claim": verdict.claim}
     db.add(Decision(
         session_id=session.id, ticket_id=session.ticket_id, title=ADMISSION_TITLE,
+        record_kind=ADMISSION_RECORD_KIND,
         chosen=verdict.classification,
         reasoning=json.dumps(reasoning, default=str)[:20000],
         files=json.dumps(scope[:50])))

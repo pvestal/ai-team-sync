@@ -62,12 +62,10 @@ def _token(session_id: str, cid: str) -> str:
 
 _is_subagent_handback = is_subagent_handback
 
-# A turn in a governed/context working directory that names no ticket and no
-# project is often conversation ("go ahead", "yes, ship it"). Only a request with
-# enough distinct content words gets overlap candidates (#3591). A length cut
-# (200 chars) was tried first and suppressed a 130-char new-work request that
-# the operator's own ruling should have surfaced.
-_OVERLAP_MIN_CONTENT_WORDS_FOR_CWD_ONLY = 6
+# Discovery runs for every request that has something to search for (#3591):
+# short work like "fix parser bug" included. Only a turn with no searchable
+# word at all ("go ahead", "yes, ship it") skips it -- an empty query, not a
+# length rule.
 _CONTENT_WORD = __import__("re").compile(r"[a-z][a-z0-9_]{2,}")
 _CHAT_WORDS = frozenset(
     "the and for you yes not this that with from are was can now then just please "
@@ -278,7 +276,7 @@ def _wants_overlaps(prompt: str, target: RequestTarget) -> bool:
     if target.reason == "subagent_handback":
         return False
     if target.reason in ("governed_cwd", "context_cwd"):
-        return len(_content_words(prompt)) >= _OVERLAP_MIN_CONTENT_WORDS_FOR_CWD_ONLY
+        return bool(_content_words(prompt))
     return True
 
 

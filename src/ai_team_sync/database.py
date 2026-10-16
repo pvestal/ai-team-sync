@@ -40,6 +40,9 @@ _COLUMN_MIGRATIONS = [
     ("sessions", "ticket_id", "INTEGER"),
     ("decisions", "ticket_id", "INTEGER"),
     ("decisions", "recipient_session_id", "VARCHAR(36)"),
+    # Server-assigned record identity (#3591). Never part of DecisionCreate, so
+    # an agent cannot make an ordinary decision look like an admission record.
+    ("decisions", "record_kind", "VARCHAR(32) NOT NULL DEFAULT 'decision'"),
     ("sessions", "delegation_id", "TEXT"),
     ("scope_locks", "authority_bearing", "BOOLEAN DEFAULT 0"),
     # What the reaper took, so resurrection can give it back (#2760). Historical

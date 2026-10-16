@@ -175,7 +175,8 @@ async def _start(client, root, scope, **extra):
 
 async def _admissions(db_session):
     rows = (await db_session.execute(
-        select(Decision).where(Decision.title == admission.ADMISSION_TITLE))).scalars().all()
+        select(Decision).where(Decision.record_kind == admission.ADMISSION_RECORD_KIND))
+    ).scalars().all()
     return [json.loads(r.reasoning) for r in rows]
 
 
@@ -606,3 +607,88 @@ def test_cwd_only_prompts_get_overlaps_by_content_not_length(prompt, wanted):
     from ai_team_sync.hooks.ats_context import _wants_overlaps
 
     assert _wants_overlaps(prompt, RequestTarget(None, "/r", "governed_cwd")) is wanted
+
+
+# ── confirmation-round regressions: one per verified Codex blocker ─────────
+
+@pytest.mark.asyncio
+async def test_blocker_a_every_named_ticket_gets_context_none_silently_omitted(
+        db_session, governed, monkeypatch):
+    ids = list(range(4401, 4409))  # eight named tickets
+    envs = {t: {"id": t, "title": f"title {t}", "status": "pending", "gate": "none",
+                "description": f"acceptance of {t}", "task_context": {"operator_rulings": {
+                    "current": [{"id": "r", "effect": "BLOCK", "prohibition": True,
+                                 "ruling": f"ruling on {t}"}] if t == 4408 else []}}}
+            for t in ids}
+    monkeypatch.setattr(briefs, "fetch_tower_task_data",
+                        lambda tid, **kw: (envs[int(tid)], None))
+    packet = await briefs.build_brief(db_session, objective="x", repo_root=governed,
+                                      recall=False, resolve_task=False, task_ids=ids)
+    text = packet["rendered"]
+    for t in ids:
+        assert f"#{t} [pending, gate=none] title {t}" in text, t
+    # The last ticket is past the full-card limit and still carries its ruling.
+    assert "CURRENT OPERATOR RULING (PROHIBITION): ruling on 4408" in text
+    assert "not expanded" not in text
+
+
+@pytest.mark.parametrize("prompt", ["fix parser bug", "rename the loader", "bump timeout"])
+def test_blocker_b_short_ticketless_work_still_runs_discovery(prompt):
+    from ai_team_sync.context_resolution import RequestTarget
+    from ai_team_sync.hooks.ats_context import _wants_overlaps
+
+    for reason in ("governed_cwd", "context_cwd"):
+        assert _wants_overlaps(prompt, RequestTarget(None, "/r", reason)) is True
+
+
+@pytest.mark.asyncio
+async def test_blocker_d_an_agent_titled_decision_is_still_activity(client, db_session, governed):
+    """An agent cannot make an ordinary decision look like an admission record:
+    the identity is server-set, not the title, and not a request field."""
+    from ai_team_sync.background_tasks import auto_complete_stale_sessions
+
+    sid = await _stale_admitted_session(client, db_session, governed)
+    resp = await client.post("/api/decisions", json={
+        "session_id": sid, "title": admission.ADMISSION_TITLE, "chosen": "ast",
+        "record_kind": "work_admission"})  # not a request field: ignored
+    assert resp.status_code == 201, resp.text
+    assert await auto_complete_stale_sessions(db_session) == 0  # still live
+
+
+@pytest.mark.asyncio
+async def test_blocker_e_a_linked_worktree_inherits_its_repository_mode(
+        client, tmp_path, monkeypatch, governed):
+    worktree = str(tmp_path / "wt-feature")
+    _git(governed, "worktree", "add", "-q", "-b", "feature", worktree)
+    _config(monkeypatch, tmp_path,
+            f'[governance]\nrepositories = ["{governed}"]\n'
+            f'[admission]\nmode = "enforce"\nenforce_repositories = ["{governed}"]\n')
+    assert admission_mode_for(worktree) == "enforce"
+    refused = await _start(client, worktree, ["src/a.py"])
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["error"] == "admission_refused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bad", [{"kind": "duplicate"}, {"kind": "new", "reason": "  "},
+                                 {"kind": "banana"}, "not an object"])
+async def test_blocker_f_off_and_shadow_never_refuse_a_malformed_classification(
+        client, db_session, tmp_path, monkeypatch, governed, bad):
+    for mode in ("shadow", "off"):
+        _config(monkeypatch, tmp_path,
+                f'[governance]\nrepositories = ["{governed}"]\n[admission]\nmode = "{mode}"\n')
+        resp = await _start(client, governed, ["src/a.py"], ticket_id=4500, admission=bad)
+        assert resp.status_code == 201, (mode, resp.text)
+        verdict = resp.json()["admission"]
+        if mode == "shadow":  # recorded as malformed, admitted
+            assert verdict["invalid"] and not verdict["refused"]
+            assert any(r["verdict"].get("invalid") for r in await _admissions(db_session))
+        else:
+            assert verdict is None
+        await client.patch(f"/api/sessions/{resp.json()['id']}", json={"status": "completed"},
+                           headers={"X-ATS-Approval-Token": resp.headers["X-ATS-Approval-Token"]})
+    _config(monkeypatch, tmp_path,
+            f'[governance]\nrepositories = ["{governed}"]\n'
+            f'[admission]\nmode = "enforce"\nenforce_repositories = ["{governed}"]\n')
+    enforced = await _start(client, governed, ["src/a.py"], ticket_id=4500, admission=bad)
+    assert enforced.status_code == 422 and enforced.json()["detail"]["error"] == "admission_invalid"
