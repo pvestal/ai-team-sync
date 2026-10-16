@@ -354,8 +354,7 @@ async def resolve_prompt_context(
 
     packet = await _brief(client, server_url, session_id, token, prompt, target)
 
-    rendered = str(packet["rendered"]).strip()
-    return (
+    header = (
         "ATS-FIRST CONTEXT RESOLUTION (automatic; obtained before worker answer)\n"
         f"session: {session_id}\n"
         f"trigger: {target.reason}\n"
@@ -364,8 +363,125 @@ async def resolve_prompt_context(
         + "\n"
         + (f"{advisory}\n" if advisory else "")
         + "Source precedence: ATS owns coordination/scope/authority/task context; "
-        "Echo is supplemental; Git/DB/live services verify mutable facts.\n\n" + rendered
+        "Echo is supplemental; Git/DB/live services verify mutable facts.\n\n"
     )
+    digest = "\n".join(_priority_digest(packet)) + "\n\n"
+    rendered = _within_budget(_short_echo(str(packet["rendered"]).strip()),
+                              _BRIEF_BUDGET - len(header) - len(digest))
+    return header + digest + rendered
+
+
+# Claude Code shows a hook's whole output inline only up to ~10 KB; past that
+# it shows the first 2 KB and saves the rest to a file the agent may never
+# open. Codex truncates by tokens near the same size. The ATS note therefore
+# stays under this budget (leaving room for the supplement), and its first
+# lines carry what controls the work.
+_BRIEF_BUDGET = 7000
+_DIGEST_ITEMS = 5
+
+
+def _one_line(text: Any, limit: int) -> str:
+    flat = " ".join(str(text or "").split())
+    return flat if len(flat) <= limit else flat[:limit - 1] + "…"
+
+
+def _owner(item: dict) -> str:
+    owner = item.get("live_owner") or {}
+    return f" | live owner: {owner['agent']}" if owner.get("agent") else ""
+
+
+def _priority_digest(packet: dict) -> list[str]:
+    """What controls this work, in priority order, from the packet's structured
+    fields: binding rulings, every named ticket, owners, relevant unfinished
+    branches, top overlap candidates, and what was left out."""
+    lines = ["PRIORITY CONTEXT — controlling records first; details follow below"]
+    named = packet.get("named_tasks") or []
+    overlaps = packet.get("overlaps") or []
+    branches = packet.get("active_branches") or []
+    envelope = packet.get("task_envelope") or {}
+
+    # Keyed by (ticket id as text, ruling): the branch census keys tickets by
+    # JSON object keys (strings), the task context by int -- one ruling, one line.
+    rulings: dict[tuple, bool] = {}
+    for r in ((packet.get("task_context") or {}).get("operator_rulings") or {}).get("current") or []:
+        rulings[(str(packet.get("task_id")), r.get("ruling"))] = bool(r.get("prohibition"))
+    for card in named:
+        for r in card.get("operator_rulings") or []:
+            rulings[(str(card.get("id")), r.get("ruling"))] = bool(r.get("prohibition"))
+    for b in branches:
+        for tid, rs in (b.get("ticket_rulings") or {}).items():
+            for r in rs:
+                rulings[(str(tid), r.get("ruling"))] = bool(r.get("prohibition"))
+    for c in overlaps:
+        for r in c.get("operator_rulings") or []:
+            rulings[(str(c.get("id")), r.get("ruling"))] = bool(r.get("prohibition"))
+    rulings = {k: v for k, v in rulings.items() if k[1]}
+    if rulings:
+        lines.append("  operator rulings (binding where they apply):")
+        for (tid, text), prohibition in list(rulings.items())[:6]:
+            kind = "PROHIBITION" if prohibition else "RULING"
+            lines.append(f"    [{kind} #{tid}] {_one_line(text, 220)}")
+        if len(rulings) > 6:
+            lines.append(f"    (+{len(rulings) - 6} more rulings in the brief below)")
+
+    if named:
+        lines.append(f"  named tickets (all {len(named)}):")
+        for card in named:
+            if card.get("error"):
+                lines.append(f"    #{card['id']} UNAVAILABLE: {_one_line(card['error'], 120)}")
+            else:
+                lines.append(f"    #{card['id']} [{card.get('status')}, gate={card.get('gate')}] "
+                             f"{_one_line(card.get('title'), 90)}{_owner(card)}")
+    elif envelope.get("id"):
+        lines.append(f"  ticket: #{envelope['id']} [{envelope.get('status')}, "
+                     f"gate={envelope.get('gate')}] {_one_line(envelope.get('title'), 90)}")
+
+    tickets = {packet.get("task_id"), *(c.get("id") for c in named)} - {None}
+    relevant = [b for b in branches if b.get("files_in_scope") or set(b.get("tickets") or []) & tickets]
+    if relevant:
+        lines.append("  unfinished branches on this work (informational, never blocking):")
+        for b in relevant[:3]:
+            state = "CONFLICTS with default" if b.get("conflict") == "conflicts_with_default" else "merges cleanly"
+            on = ", ".join(f"#{t}" for t in b.get("tickets") or []) or "no ticket"
+            lines.append(f"    {b['branch']} ({on}) {b.get('unique_commits')} commit(s), {state}"
+                         + (f"; in scope: {', '.join(b['files_in_scope'][:3])}" if b.get("files_in_scope") else "")
+                         + _owner(b))
+
+    status = str(packet.get("overlaps_status") or "")
+    if status and status != "not requested":
+        if not status.startswith("ok"):
+            lines.append(f"  existing-work lookup UNAVAILABLE ({_one_line(status, 140)}) — "
+                         "this is NOT 'no related work'")
+        elif overlaps:
+            lines.append(f"  existing work that may overlap (advisory; top {min(len(overlaps), _DIGEST_ITEMS)} "
+                         f"of {len(overlaps)}; similarity is not proof):")
+            for c in overlaps[:_DIGEST_ITEMS]:
+                closed = " closed" if c.get("closed") else ""
+                lines.append(f"    #{c['id']} [{c.get('status')}{closed}] "
+                             f"{_one_line(c.get('title'), 80)}{_owner(c)}")
+
+    lines.append("  more: the full brief follows; if it ends in a truncation note, call the "
+                 "task_brief tool (same request) or get_tower_task <id>")
+    return lines
+
+
+def _short_echo(rendered: str) -> str:
+    """The brief's first line repeats the whole request; the agent already has it."""
+    first, sep, rest = rendered.partition("\n")
+    if first.startswith("TASK BRIEF") and len(first) > 200:
+        first = first[:199] + "…"
+    return first + sep + rest
+
+
+def _within_budget(rendered: str, room: int) -> str:
+    if len(rendered) <= room:
+        return rendered
+    note_room = 260
+    cut = rendered.rfind("\n", 0, max(0, room - note_room))
+    shown = rendered[:cut if cut > 0 else max(0, room - note_room)]
+    return (shown + f"\n[brief truncated here: {len(rendered) - len(shown)} more characters "
+            "not shown. Full brief: call the task_brief tool with this request, or "
+            "get_tower_task <id> for any ticket above.]")
 
 
 def _run_supplement(command: str, timeout: int, raw_payload: str) -> None:
