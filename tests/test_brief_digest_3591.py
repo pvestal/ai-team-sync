@@ -97,7 +97,8 @@ def test_digest_order_is_rulings_named_branches_candidates_more():
     }
     text = "\n".join(ats_context._priority_digest(packet))
     order = [text.index(k) for k in ("[PROHIBITION #1] R1", "#1 [pending, gate=none] one",
-                                    "live owner: codex:x", "fix/1-a (#1)", "#9 [pending]", "more:")]
+                                    "live owner: codex:x", "fix/1-a (#1)", "#9 [pending]",
+                                    "retrieve (verified tools")]
     assert order == sorted(order)
 
 
@@ -110,3 +111,166 @@ def test_one_ruling_seen_through_the_ticket_and_its_branch_is_listed_once():
                                    "files_in_scope": [], "ticket_rulings": {"3528": [ruling]}}]}
     text = "\n".join(ats_context._priority_digest(packet))
     assert text.count("[PROHIBITION #3528] #2945 remains authoritative.") == 1
+
+
+# ── Codex confirmation blockers (review e99660fb) ───────────────────────────
+#
+# 6: the note told agents to "call task_brief (same request)", but task_brief
+#    takes ONE task_id and no overlap flag, so a multi-ticket brief cannot be
+#    reproduced that way. Only retrieval paths that work may be advertised.
+# 7: rulings and candidates past the digest caps were deferred to "the brief
+#    below", which can itself be truncated -- a ruling on an unnamed ticket
+#    then had no identifier and no working path.
+
+def _ruling(rid: str, text: str, prohibition: bool = True) -> dict:
+    return {"id": rid, "effect": "BLOCK" if prohibition else "ADVISORY",
+            "prohibition": prohibition, "ruling": text}
+
+
+def _env_with(tid: int, rulings: list[dict], *, long: bool = False) -> dict:
+    return {"id": tid, "title": f"title of {tid}", "status": "pending", "gate": "verify",
+            "description": f"acceptance of {tid}. " + ("authority text. " * (3000 if long else 5)),
+            "task_context": {"operator_rulings": {"current": rulings, "history": []}}}
+
+
+def _discoverable(note: str, ticket: int, ruling: dict) -> bool:
+    """A ruling is accounted for when its full text is shown, or its ticket and
+    stable id are listed together with a working retrieval instruction."""
+    if f"#{ticket}] {ruling['ruling']}" in note:
+        return True
+    line = next((ln for ln in note.splitlines() if ruling["id"][:8] in ln), "")
+    return f"#{ticket}" in line and f"task_brief(objective=..., task_id={ticket})" in line
+
+
+MULTI = (3536, 3560, 3517)
+
+
+@pytest.mark.asyncio
+async def test_codex_blocker_6_the_multi_ticket_note_advertises_only_paths_that_work(
+        client, tmp_path, monkeypatch):
+    envs = {t: _env_with(t, [_ruling(f"{t}aaaa-0000", f"ruling on {t}")]) for t in MULTI}
+    monkeypatch.setattr(briefs, "fetch_tower_task_data", lambda tid, **kw: (envs[int(tid)], None))
+    note = await _note(client, tmp_path, monkeypatch,
+                       "Reconcile ticket #3536 with #3560 and #3517 before landing")
+
+    assert "same request" not in note  # the broken pointer is gone
+    assert "takes ONE task_id" in note  # and the limit is stated where the tool is named
+    for t in MULTI:  # every named ticket, with gate and its retrieval paths
+        assert f"#{t} [pending, gate=verify] title of {t}" in note
+    assert "get_tower_task(task_id=N)" in note
+    assert "task_brief(objective=..., task_id=N)" in note
+
+    # Each advertised ATS instruction is executed through the real MCP handler:
+    # task_brief with one task_id returns that ticket's current rulings.
+    from tests.test_work_admission_3591 import _bridge_mcp
+    mcp = _bridge_mcp(client, monkeypatch, tmp_path)
+    monkeypatch.setattr(briefs, "fetch_tower_task_data", lambda tid, **kw: (envs[int(tid)], None))
+    schema = next(t for t in await mcp.list_tools() if t.name == "task_brief").inputSchema
+    assert schema["properties"]["task_id"]["type"] == "integer"
+    assert "task_ids" not in schema["properties"]  # why the old pointer could not work
+    for t in MULTI:
+        text = (await mcp.call_tool("task_brief", {"objective": "check rulings", "task_id": t,
+                                                   "recall": False}))[0].text
+        assert f"ruling on {t}" in text and f"{t}aaaa-0000" in text
+
+
+@pytest.mark.asyncio
+async def test_codex_blocker_7_a_ruling_past_every_cap_stays_identified_and_retrievable(
+        client, tmp_path, monkeypatch):
+    # One named ticket with two rulings, six overlap candidates (the lookup's
+    # maximum) each carrying a ruling: eight rulings, more than five related
+    # tickets. The LAST candidate's prohibition is the important one.
+    named = _env_with(4800, [_ruling("n1-000000", "named ruling one"),
+                             _ruling("n2-000000", "named ruling two", prohibition=False)],
+                      long=True)  # ~50 KB: the full brief is truncated
+    cands = [{"id": 4810 + i, "title": f"candidate {i}", "status": "pending",
+              "operator_rulings": [_ruling(f"c{i}-000000", f"candidate ruling {i}",
+                                           prohibition=(i == 5))]}
+             for i in range(6)]
+    important = cands[-1]["operator_rulings"][0]
+    monkeypatch.setattr(briefs, "fetch_tower_task_data", lambda tid, **kw: (named, None))
+    monkeypatch.setattr(briefs, "fetch_task_overlaps", lambda objective, **kw: (cands, None))
+    note = await _note(client, tmp_path, monkeypatch,
+                       "continue #4800 and the related solo pose work across the candidates")
+
+    assert len(note) <= 7300 and "brief truncated here" in note
+    assert "same request" not in note
+    assert _discoverable(note, 4800, named["task_context"]["operator_rulings"]["current"][0])
+    assert _discoverable(note, 4800, named["task_context"]["operator_rulings"]["current"][1])
+    for c in cands:  # every candidate identified, every ruling accounted for
+        assert f"#{c['id']}" in note
+        assert _discoverable(note, c["id"], c["operator_rulings"][0])
+    # prohibitions lead, so the important one is in the head, in full
+    assert f"[PROHIBITION #4815] {important['ruling']}" in note[:2000]
+    assert "CONTEXT INCOMPLETE —" not in note  # everything fit: no incompleteness marker
+
+
+def test_rulings_past_the_detail_cap_are_listed_by_ticket_and_id():
+    packet = {"task_id": None, "task_context": {}, "task_envelope": {}, "active_branches": [],
+              "overlaps_status": "not requested", "overlaps": [],
+              "named_tasks": [{"id": 5000 + i, "title": f"t{i}", "status": "pending",
+                               "gate": "none", "operator_rulings": [
+                                   _ruling(f"r{i:02d}-111111", f"ruling text {i}")]}
+                              for i in range(9)]}
+    text = "\n".join(ats_context._priority_digest(packet))
+    for i in range(9):
+        r = packet["named_tasks"][i]["operator_rulings"][0]
+        assert _discoverable(text, 5000 + i, r), i
+    assert "NOT SHOWN IN FULL ABOVE — 3 item(s)" in text
+
+
+def test_branch_tickets_the_server_never_checked_for_rulings_are_named_not_hidden():
+    from ai_team_sync.briefs import _BRANCH_TICKET_RULINGS_CAP as cap
+
+    branches = [{"branch": f"fix/{6000 + i}-x", "tickets": [6000 + i], "unique_commits": 1,
+                 "conflict": "merges_cleanly", "files_in_scope": ["a.py"], "ticket_rulings": {}}
+                for i in range(cap + 2)]
+    packet = {"task_id": None, "task_context": {}, "task_envelope": {}, "named_tasks": [],
+              "overlaps": [], "overlaps_status": "not requested", "active_branches": branches,
+              "active_branches_status": f"ok ({len(branches)} branch(es))"}
+    text = "\n".join(ats_context._priority_digest(packet, "/repo"))
+    unchecked = [6000 + cap, 6000 + cap + 1]
+    line = next(ln for ln in text.splitlines() if "NOT CHECKED" in ln)
+    assert all(f"#{t}" in line for t in unchecked)
+    assert "task_brief(objective=..., task_id=N)" in line
+    assert all(f"#{6000 + i}" not in line for i in range(cap))
+    for b in branches[3:]:  # branches past the detail cap: named, with a git path
+        assert f"{b['branch']} " in text
+    assert "git -C /repo log --oneline -10 <branch>" in text
+
+
+def test_a_failed_branch_census_is_unavailable_never_none():
+    packet = {"task_id": None, "task_context": {}, "task_envelope": {}, "named_tasks": [],
+              "overlaps": [], "overlaps_status": "not requested", "active_branches": [],
+              "active_branches_status": "unavailable (TimeoutExpired)"}
+    text = "\n".join(ats_context._priority_digest(packet, "/repo"))
+    assert "unfinished-branch census UNAVAILABLE" in text
+    assert "NOT 'no unfinished branches'" in text
+
+
+def test_an_index_too_large_for_the_budget_says_incomplete_with_working_paths():
+    named = [{"id": 7000 + i, "title": f"ticket {i}", "status": "pending", "gate": "none",
+              "operator_rulings": [_ruling(f"x{i:03d}-000000", f"ruling {i} " + "z" * 150)]}
+             for i in range(150)]
+    cands = [{"id": 7900 + i, "title": f"cand {i}", "status": "pending",
+              "operator_rulings": [_ruling(f"k{i}-000000", f"cand ruling {i}")]}
+             for i in range(6)]
+    packet = {"task_id": None, "task_context": {}, "task_envelope": {}, "named_tasks": named,
+              "overlaps": cands, "overlaps_status": "ok (6 candidate(s))",
+              "active_branches": [], "active_branches_status": "ok (0 branch(es))"}
+    lines = ats_context._priority_digest(packet, "/repo")
+    text = "\n".join(lines)
+    assert len(text) <= ats_context._DIGEST_BUDGET
+    assert "CONTEXT INCOMPLETE" in text
+    assert "does NOT establish that every controlling decision is shown" in text
+    # what could not be listed is still reachable: the tickets of unlisted
+    # rulings that the request did not name are given by id, the rest are the
+    # ticket numbers in the request itself
+    for c in cands:
+        r = c["operator_rulings"][0]
+        assert f"#{c['id']}" in text and (r["id"][:8] in text or
+                                          "rulings not listed are on" in text)
+    assert "every ticket number in your request" in text
+    assert "task_brief(objective=..., task_id=N)" in text
+    # never claims completeness it cannot establish
+    assert "nothing omitted" not in text

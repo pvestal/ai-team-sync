@@ -365,7 +365,7 @@ async def resolve_prompt_context(
         + "Source precedence: ATS owns coordination/scope/authority/task context; "
         "Echo is supplemental; Git/DB/live services verify mutable facts.\n\n"
     )
-    digest = "\n".join(_priority_digest(packet)) + "\n\n"
+    digest = "\n".join(_priority_digest(packet, target.repo_root)) + "\n\n"
     rendered = _within_budget(_short_echo(str(packet["rendered"]).strip()),
                               _BRIEF_BUDGET - len(header) - len(digest))
     return header + digest + rendered
@@ -375,9 +375,22 @@ async def resolve_prompt_context(
 # it shows the first 2 KB and saves the rest to a file the agent may never
 # open. Codex truncates by tokens near the same size. The ATS note therefore
 # stays under this budget (leaving room for the supplement), and its first
-# lines carry what controls the work.
+# lines carry what controls the work. The digest has its own cap so the full
+# brief always keeps some room after it.
 _BRIEF_BUDGET = 7000
+_DIGEST_BUDGET = 4500
+_RULINGS_SHOWN = 6
+_NAMED_FULL = 12
+_BRANCHES_SHOWN = 3
 _DIGEST_ITEMS = 5
+
+# The only retrieval paths the note may advertise. Both take ONE ticket:
+# task_brief has no ticket list and no overlap flag, so it cannot reproduce a
+# multi-ticket brief (Codex review e99660fb), but for one task_id it returns
+# that ticket's current operator rulings first. get_tower_task returns the
+# ticket record (description, status, gate), not the structured rulings.
+_GET_TICKET = "get_tower_task(task_id=N)"
+_GET_RULINGS = "task_brief(objective=..., task_id=N)"
 
 
 def _one_line(text: Any, limit: int) -> str:
@@ -390,79 +403,207 @@ def _owner(item: dict) -> str:
     return f" | live owner: {owner['agent']}" if owner.get("agent") else ""
 
 
-def _priority_digest(packet: dict) -> list[str]:
-    """What controls this work, in priority order, from the packet's structured
-    fields: binding rulings, every named ticket, owners, relevant unfinished
-    branches, top overlap candidates, and what was left out."""
-    lines = ["PRIORITY CONTEXT — controlling records first; details follow below"]
+def _rulings_of(packet: dict) -> list[dict]:
+    """Every current operator ruling the packet carries, once, prohibitions
+    first. Only the structured operator_rulings fields (the reviewed store);
+    never recommendation or notes prose."""
+    found: dict[tuple, dict] = {}
+
+    def add(tid: Any, r: dict) -> None:
+        text = str(r.get("ruling") or "")
+        if text:
+            # Keyed by ticket id as text: the branch census keys tickets by
+            # JSON object keys (strings), the task context by int.
+            found.setdefault((str(tid), str(r.get("id") or text)), {
+                "ticket": str(tid), "id": str(r.get("id") or ""), "text": text,
+                "prohibition": bool(r.get("prohibition"))})
+
+    for r in ((packet.get("task_context") or {}).get("operator_rulings") or {}).get("current") or []:
+        add(packet.get("task_id"), r)
+    for card in packet.get("named_tasks") or []:
+        for r in card.get("operator_rulings") or []:
+            add(card.get("id"), r)
+    for b in packet.get("active_branches") or []:
+        for tid, rs in (b.get("ticket_rulings") or {}).items():
+            for r in rs:
+                add(tid, r)
+    for c in packet.get("overlaps") or []:
+        for r in c.get("operator_rulings") or []:
+            add(c.get("id"), r)
+    return sorted(found.values(), key=lambda r: not r["prohibition"])
+
+
+def _unchecked_ruling_tickets(packet: dict) -> list[int]:
+    """Tickets whose rulings the brief never looked up, so "no ruling shown" is
+    not "no ruling": named tickets it could not fetch, and branch tickets past
+    the server's lookup cap (same selection as briefs._existing_work)."""
+    from ai_team_sync.briefs import _BRANCH_TICKET_RULINGS_CAP
+
+    named = packet.get("named_tasks") or []
+    known = ({int(c["id"]) for c in packet.get("overlaps") or []}
+             | {int(c["id"]) for c in named if not c.get("error")})
+    wanted = [int(t) for b in packet.get("active_branches") or []
+              for t in b.get("tickets") or [] if int(t) not in known]
+    past_cap = list(dict.fromkeys(wanted))[_BRANCH_TICKET_RULINGS_CAP:]
+    return list(dict.fromkeys([int(c["id"]) for c in named if c.get("error")] + past_cap))
+
+
+def _rulings_call(ticket: Any) -> str:
+    return _GET_RULINGS.replace("task_id=N", f"task_id={ticket}")
+
+
+def _priority_digest(packet: dict, repo_root: str = "") -> list[str]:
+    """What controls this work, from the packet's structured fields, inside
+    _DIGEST_BUDGET: binding rulings, every named ticket with gate and owner,
+    unfinished branches, overlap candidates -- and every item not shown in full,
+    by identifier, with a retrieval path that works. When even the identifiers
+    do not fit, it says CONTEXT INCOMPLETE and how to reach the rest."""
+    from ai_team_sync.active_work import MAX_BRANCHES_REPORTED, default_branch
+
     named = packet.get("named_tasks") or []
     overlaps = packet.get("overlaps") or []
     branches = packet.get("active_branches") or []
     envelope = packet.get("task_envelope") or {}
+    rulings = _rulings_of(packet)
+    unchecked = _unchecked_ruling_tickets(packet)
+    named_ids = {str(c.get("id")) for c in named}
+    repo = repo_root or "<repo>"
 
-    # Keyed by (ticket id as text, ruling): the branch census keys tickets by
-    # JSON object keys (strings), the task context by int -- one ruling, one line.
-    rulings: dict[tuple, bool] = {}
-    for r in ((packet.get("task_context") or {}).get("operator_rulings") or {}).get("current") or []:
-        rulings[(str(packet.get("task_id")), r.get("ruling"))] = bool(r.get("prohibition"))
-    for card in named:
-        for r in card.get("operator_rulings") or []:
-            rulings[(str(card.get("id")), r.get("ruling"))] = bool(r.get("prohibition"))
-    for b in branches:
-        for tid, rs in (b.get("ticket_rulings") or {}).items():
-            for r in rs:
-                rulings[(str(tid), r.get("ruling"))] = bool(r.get("prohibition"))
-    for c in overlaps:
-        for r in c.get("operator_rulings") or []:
-            rulings[(str(c.get("id")), r.get("ruling"))] = bool(r.get("prohibition"))
-    rulings = {k: v for k, v in rulings.items() if k[1]}
-    if rulings:
-        lines.append("  operator rulings (binding where they apply):")
-        for (tid, text), prohibition in list(rulings.items())[:6]:
-            kind = "PROHIBITION" if prohibition else "RULING"
-            lines.append(f"    [{kind} #{tid}] {_one_line(text, 220)}")
-        if len(rulings) > 6:
-            lines.append(f"    (+{len(rulings) - 6} more rulings in the brief below)")
+    # (priority, seq, section, line, item). When the budget binds, the highest
+    # priority number goes first: unshown rulings outrank named-ticket lines
+    # because the request itself carries its ticket numbers.
+    entries: list[tuple] = []
 
-    if named:
-        lines.append(f"  named tickets (all {len(named)}):")
-        for card in named:
-            if card.get("error"):
-                lines.append(f"    #{card['id']} UNAVAILABLE: {_one_line(card['error'], 120)}")
-            else:
-                lines.append(f"    #{card['id']} [{card.get('status')}, gate={card.get('gate')}] "
-                             f"{_one_line(card.get('title'), 90)}{_owner(card)}")
-    elif envelope.get("id"):
-        lines.append(f"  ticket: #{envelope['id']} [{envelope.get('status')}, "
-                     f"gate={envelope.get('gate')}] {_one_line(envelope.get('title'), 90)}")
+    def add(priority: int, section: str, line: str, item: tuple = ("other", None)) -> None:
+        entries.append((priority, len(entries), section, line, item))
+
+    for r in rulings[:_RULINGS_SHOWN]:
+        kind = "PROHIBITION" if r["prohibition"] else "RULING"
+        rid = f" (ruling id {r['id'][:8]})" if r["id"] else ""
+        add(1, "rulings", f"    [{kind} #{r['ticket']}] {_one_line(r['text'], 220)}{rid}",
+            ("ruling", r["ticket"]))
+    if unchecked:
+        add(2, "unchecked", "  rulings NOT CHECKED for " + ", ".join(f"#{t}" for t in unchecked)
+            + f" (this brief did not look them up) — check each with {_GET_RULINGS}",
+            ("ruling", None))
+    for r in rulings[_RULINGS_SHOWN:]:
+        kind = "prohibition" if r["prohibition"] else "ruling"
+        ident = r["id"][:8] if r["id"] else f'"{_one_line(r["text"], 60)}"'
+        add(3, "omitted", f"    {kind} {ident} on #{r['ticket']} → {_rulings_call(r['ticket'])}",
+            ("ruling", r["ticket"]))
+
+    for i, card in enumerate(named):
+        if card.get("error"):
+            line = f"    #{card['id']} UNAVAILABLE: {_one_line(card['error'], 120)}"
+        else:
+            title = f" {_one_line(card.get('title'), 90)}" if i < _NAMED_FULL else ""
+            line = (f"    #{card['id']} [{card.get('status')}, gate={card.get('gate')}]"
+                    f"{title}{_owner(card)}")
+        add(4, "named", line, ("named", card.get("id")))
+    if not named and envelope.get("id"):
+        add(4, "ticket", f"  ticket: #{envelope['id']} [{envelope.get('status')}, "
+            f"gate={envelope.get('gate')}] {_one_line(envelope.get('title'), 90)}",
+            ("named", envelope["id"]))
+
+    branch_status = str(packet.get("active_branches_status") or "")
+    if branch_status and branch_status != "not requested" and not branch_status.startswith("ok"):
+        add(5, "branch_status", f"  unfinished-branch census UNAVAILABLE ({_one_line(branch_status, 140)})"
+            " — this is NOT 'no unfinished branches'")
+    status = str(packet.get("overlaps_status") or "")
+    if status and status != "not requested" and not status.startswith("ok"):
+        add(5, "overlap_status", f"  existing-work lookup UNAVAILABLE ({_one_line(status, 140)}) — "
+            "this is NOT 'no related work'")
 
     tickets = {packet.get("task_id"), *(c.get("id") for c in named)} - {None}
     relevant = [b for b in branches if b.get("files_in_scope") or set(b.get("tickets") or []) & tickets]
-    if relevant:
-        lines.append("  unfinished branches on this work (informational, never blocking):")
-        for b in relevant[:3]:
-            state = "CONFLICTS with default" if b.get("conflict") == "conflicts_with_default" else "merges cleanly"
-            on = ", ".join(f"#{t}" for t in b.get("tickets") or []) or "no ticket"
-            lines.append(f"    {b['branch']} ({on}) {b.get('unique_commits')} commit(s), {state}"
-                         + (f"; in scope: {', '.join(b['files_in_scope'][:3])}" if b.get("files_in_scope") else "")
-                         + _owner(b))
+    others = [b for b in branches if b not in relevant]
+    for n, b in enumerate(relevant + others):
+        state = "CONFLICTS with default" if b.get("conflict") == "conflicts_with_default" else "merges cleanly"
+        on = ", ".join(f"#{t}" for t in b.get("tickets") or []) or "no ticket"
+        if n < _BRANCHES_SHOWN and b in relevant:
+            add(7, "branches", f"    {b['branch']} ({on}) {b.get('unique_commits')} commit(s), {state}"
+                + (f"; in scope: {', '.join(b['files_in_scope'][:3])}" if b.get("files_in_scope") else "")
+                + _owner(b), ("branch", b["branch"]))
+        else:
+            add(9, "omitted", f"    unfinished branch {b['branch']} ({on}, {state}){_owner(b)} → "
+                f"git -C {repo} log --oneline -10 {b['branch']}", ("branch", b["branch"]))
+    if len(branches) >= MAX_BRANCHES_REPORTED and repo_root:
+        add(9, "omitted", f"    the branch census lists at most {MAX_BRANCHES_REPORTED}; every unmerged "
+            f"branch → git -C {repo} for-each-ref --no-merged={default_branch(repo_root) or 'main'} "
+            "refs/heads", ("branch", None))
 
-    status = str(packet.get("overlaps_status") or "")
-    if status and status != "not requested":
-        if not status.startswith("ok"):
-            lines.append(f"  existing-work lookup UNAVAILABLE ({_one_line(status, 140)}) — "
-                         "this is NOT 'no related work'")
-        elif overlaps:
-            lines.append(f"  existing work that may overlap (advisory; top {min(len(overlaps), _DIGEST_ITEMS)} "
-                         f"of {len(overlaps)}; similarity is not proof):")
-            for c in overlaps[:_DIGEST_ITEMS]:
-                closed = " closed" if c.get("closed") else ""
-                lines.append(f"    #{c['id']} [{c.get('status')}{closed}] "
-                             f"{_one_line(c.get('title'), 80)}{_owner(c)}")
+    for n, c in enumerate(overlaps):
+        closed = " closed" if c.get("closed") else ""
+        if n < _DIGEST_ITEMS:
+            add(8, "overlaps", f"    #{c['id']} [{c.get('status')}{closed}] "
+                f"{_one_line(c.get('title'), 80)}{_owner(c)}", ("overlap", c["id"]))
+        else:
+            add(6, "omitted", f"    advisory overlap #{c['id']} [{c.get('status')}{closed}]{_owner(c)} → "
+                f"{_GET_TICKET.replace('task_id=N', 'task_id=' + str(c['id']))}", ("overlap", c["id"]))
 
-    lines.append("  more: the full brief follows; if it ends in a truncation note, call the "
-                 "task_brief tool (same request) or get_tower_task <id>")
-    return lines
+    omitted_total = sum(1 for e in entries if e[2] == "omitted")
+    headers = {
+        "rulings": f"  operator rulings and prohibitions (binding where they apply; {len(rulings)} current):",
+        "named": f"  named tickets (all {len(named)}):",
+        "branches": f"  unfinished branches on this work (informational, never blocking; "
+                    f"{len(relevant)} relevant):",
+        "overlaps": f"  existing work that may overlap (advisory; similarity is not proof; "
+                    f"{len(overlaps)} returned):",
+        "omitted": f"  NOT SHOWN IN FULL ABOVE — {omitted_total} item(s); each identified, "
+                   "with how to retrieve it:",
+    }
+    order = ["rulings", "unchecked", "named", "ticket", "branch_status", "branches",
+             "overlap_status", "overlaps", "omitted"]
+    retrieve = ["  retrieve (verified tools; each takes ONE ticket):",
+                f"    a ticket's record: {_GET_TICKET}  [Echo Brain MCP]",
+                f"    a ticket's current operator rulings: {_GET_RULINGS}  "
+                "[ATS MCP; takes ONE task_id, never a ticket list]"]
+    if branches:
+        retrieve.append(f"    a branch: git -C {repo} log --oneline -10 <branch>")
+
+    def incomplete(dropped: list[tuple]) -> list[str]:
+        if not dropped:
+            return []
+        dropped = sorted(dropped, key=lambda e: e[1])
+        kinds: dict[str, int] = {}
+        for e in dropped:
+            kinds[e[4][0]] = kinds.get(e[4][0], 0) + 1
+        out = [f"  CONTEXT INCOMPLETE — {len(dropped)} item(s) did not fit inline ("
+               + ", ".join(f"{v} {k}" for k, v in sorted(kinds.items()))
+               + "). This note does NOT establish that every controlling decision is shown."]
+        ruled = [e[4][1] for e in dropped if e[4][0] == "ruling"]
+        if ruled:
+            others_ = list(dict.fromkeys(t for t in ruled if t and t not in named_ids))
+            out.append("    rulings not listed are on "
+                       + (", ".join(f"#{t}" for t in others_) + " and " if others_ else "")
+                       + f"tickets in your request → for each, and every ticket number in your "
+                       f"request: {_GET_RULINGS}")
+        if any(e[4][0] == "named" for e in dropped):
+            out.append(f"    named tickets not listed: every ticket number in your request → {_GET_TICKET}")
+        lost = [str(e[4][1]) for e in dropped if e[4][0] == "overlap"]
+        if lost:
+            out.append("    overlap candidates not listed: " + ", ".join(f"#{t}" for t in lost)
+                       + f" → {_GET_TICKET}")
+        if any(e[4][0] == "branch" for e in dropped):
+            out.append(f"    unfinished branches not listed → git -C {repo} for-each-ref "
+                       f"--no-merged={(default_branch(repo_root) if repo_root else '') or 'main'} refs/heads")
+        return out
+
+    def render(kept: list[tuple], dropped: list[tuple]) -> list[str]:
+        lines = ["PRIORITY CONTEXT — controlling records first; details follow below"]
+        for section in order:
+            rows = [e[3] for e in kept if e[2] == section]
+            if rows:
+                lines += ([headers[section]] if section in headers else []) + rows
+        return lines + incomplete(dropped) + retrieve
+
+    kept = sorted(entries, key=lambda e: e[1])
+    dropped: list[tuple] = []
+    while kept and len("\n".join(render(kept, dropped))) > _DIGEST_BUDGET:
+        worst = max(kept, key=lambda e: (e[0], e[1]))
+        kept.remove(worst)
+        dropped.append(worst)
+    return render(kept, dropped)
 
 
 def _short_echo(rendered: str) -> str:
@@ -480,8 +621,9 @@ def _within_budget(rendered: str, room: int) -> str:
     cut = rendered.rfind("\n", 0, max(0, room - note_room))
     shown = rendered[:cut if cut > 0 else max(0, room - note_room)]
     return (shown + f"\n[brief truncated here: {len(rendered) - len(shown)} more characters "
-            "not shown. Full brief: call the task_brief tool with this request, or "
-            "get_tower_task <id> for any ticket above.]")
+            "not shown. PRIORITY CONTEXT above identifies every controlling item, or says "
+            f"CONTEXT INCOMPLETE. Per ticket: {_GET_TICKET} for the record, {_GET_RULINGS} "
+            "for its current rulings.]")
 
 
 def _run_supplement(command: str, timeout: int, raw_payload: str) -> None:
