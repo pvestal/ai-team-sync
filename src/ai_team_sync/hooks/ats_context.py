@@ -41,6 +41,10 @@ class ContextResolutionError(RuntimeError):
     """A governed prompt could not obtain its mandatory ATS context."""
 
 
+class AnchorRefused(ContextResolutionError):
+    """The session may not move to the cwd's repository. Advisory, never a block."""
+
+
 def _response_error(response: Any) -> str:
     try:
         body = response.json()
@@ -119,9 +123,10 @@ def _hold_anchor(
     A project named in the prompt is context routing: the anchor stays and the
     worker is told how to switch explicitly. Only the worker's physical
     location -- a cwd inside a different governed repository -- still goes to
-    _anchor_session, which refuses it for a session that holds work. Project
-    authority itself is enforced where operations happen (edit, Bash, git and
-    restart guards), not here.
+    _anchor_session, which moves a placeholder and otherwise refuses; that
+    refusal is advisory too (_location_advisory). Project authority itself is
+    enforced where operations happen (edit, Bash, git and restart guards), not
+    here.
     """
     # cwd_repo maps a linked worktree to its shared checkout; a session
     # anchored to the worktree itself is already where its cwd is.
@@ -143,6 +148,21 @@ def _hold_anchor(
         "fast-forward merges and --no-verify are not checked) need the committing "
         "session's own live locks on those files and are refused on other sessions' "
         "conflicting locks."
+    )
+
+
+def _location_advisory(anchored: str, cwd_repo: str, refusal: str) -> str:
+    """A cwd in another governed repository is briefed, never blocked (2026-10-22).
+
+    Refusing the prompt protected nothing the operation guards do not already
+    enforce, and it stranded operators in sessions they had not chosen to end.
+    """
+    return (
+        f"LOCATION (advisory, not a switch): the cwd is in {cwd_repo} but this session "
+        f"stays anchored to {anchored or '(no repository)'} ({refusal}). Context below is "
+        f"for {cwd_repo}. To work there, start an ATS session there explicitly "
+        f"(start_session with repo_root={cwd_repo} and its scope); edits, Bash writes "
+        "and commits there need locks held by that session."
     )
 
 
@@ -181,15 +201,15 @@ async def _anchor_session(
     if current == requested:
         return session
     if current and not _is_context_only_placeholder(session):
-        raise ContextResolutionError(
-            f"ATS session {session['id']} is already anchored to {current}; "
-            f"start a new session before switching governed project to {requested}"
-        )
+        raise AnchorRefused("the session holds work there")
     response = await client.patch(
         f"{server_url}/api/sessions/{session['id']}",
         json={"repo_root": requested, "description": _context_description(requested)},
         headers={"X-ATS-Approval-Token": token} if token else {},
     )
+    if 400 <= response.status_code < 500:
+        # e.g. 409: the session holds locks under its current anchor.
+        raise AnchorRefused(f"ATS kept it: {_one_line(_response_error(response), 160)}")
     if response.status_code != 200:
         raise ContextResolutionError(
             f"ATS refused project attachment for session {session['id']}: "
@@ -361,8 +381,13 @@ async def resolve_prompt_context(
     # Context-only repositories are briefed, never anchored: anchoring is how a
     # session acquires a governed project, and these are not governed (#3591).
     context_only = bool(target.repo_root) and target.repo_root in set(context_roots())
+    held_elsewhere = False
     if target.repo_root and not context_only:
-        session = await _anchor_session(client, server_url, session, target.repo_root, token)
+        try:
+            session = await _anchor_session(client, server_url, session, target.repo_root, token)
+        except AnchorRefused as exc:
+            held_elsewhere = True
+            advisory = _location_advisory(anchored, target.repo_root, str(exc))
 
     packet = await _brief(client, server_url, session_id, token, prompt, target)
 
@@ -372,6 +397,7 @@ async def resolve_prompt_context(
         f"trigger: {target.reason}\n"
         f"resolved repo: {target.repo_root or '(task context only)'}"
         + (" (context only: not governed, session not anchored)" if context_only else "")
+        + (" (cwd context only: session not moved)" if held_elsewhere else "")
         + "\n"
         + (f"{advisory}\n" if advisory else "")
         + "Source precedence: ATS owns coordination/scope/authority/task context; "

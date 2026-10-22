@@ -310,12 +310,11 @@ async def test_prompt_mention_never_moves_an_anchored_placeholder(
 
 
 @pytest.mark.asyncio
-async def test_cwd_inside_another_governed_repo_still_blocks_a_claimed_session(
+async def test_cwd_inside_another_governed_repo_is_briefed_not_blocked(
     client, tmp_path, monkeypatch
 ):
-    """The physical switch (not keyword inference) keeps its existing refusal."""
-    from ai_team_sync.hooks import ats_context
-
+    """Operator 2026-10-22: the physical location never blocks a prompt either.
+    The anchor is kept; the cwd's repository is briefed as context."""
     repo = tmp_path / "anime-studio"
     (repo / ".git").mkdir(parents=True)
     (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
@@ -323,19 +322,16 @@ async def test_cwd_inside_another_governed_repo_still_blocks_a_claimed_session(
     sid = await _claimed_session(client, tmp_path, monkeypatch, cid, ECHO_ROOT)
     monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{repo}:{ECHO_ROOT}")
 
-    with pytest.raises(ats_context.ContextResolutionError, match="start a new session"):
-        await _prompt(client, cid, repo / "packages", "Run the tests here.")
+    note = await _prompt(client, cid, repo / "packages", "Run the tests here.")
 
-    assert (await _row(client, sid))["repo_root"] == ECHO_ROOT
+    assert f"resolved repo: {repo} (cwd context only: session not moved)" in note
+    assert "LOCATION (advisory, not a switch)" in note
+    assert f"start_session with repo_root={repo}" in note
+    row = await _row(client, sid)
+    assert (row["repo_root"], row["scope"]) == (ECHO_ROOT, ["src/**"])
 
 
-@pytest.mark.asyncio
-async def test_cwd_inside_the_anchored_linked_worktree_is_not_a_switch(
-    client, tmp_path, monkeypatch
-):
-    """Replay of 2026-10-22 00:05Z: a session anchored to its own linked worktree
-    was refused on every prompt, because cwd_repo maps the worktree to the shared
-    checkout and that differed from the anchor."""
+def _repo_with_worktree(tmp_path):
     import subprocess
 
     repo = tmp_path / "anime-studio"
@@ -347,6 +343,66 @@ async def test_cwd_inside_the_anchored_linked_worktree_is_not_a_switch(
     subprocess.run([*git, "-C", str(repo), "worktree", "add", "-q", "-b", "feat",
                     str(worktree)], check=True)
     (worktree / "packages").mkdir()
+    (repo / "packages").mkdir()
+    return repo, worktree
+
+
+@pytest.mark.asyncio
+async def test_cwd_in_the_main_checkout_of_the_anchored_worktree_is_not_blocked(
+    client, tmp_path, monkeypatch
+):
+    """Replay of 2026-10-22 06:03Z: session 2887fb67 was anchored to its linked
+    worktree and every prompt from the /opt/anime-studio checkout was refused."""
+    repo, worktree = _repo_with_worktree(tmp_path)
+    cid = "75757575-1111-2222-3333-444455556666"
+    sid = await _claimed_session(client, tmp_path, monkeypatch, cid, str(worktree))
+    monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{repo}:{ECHO_ROOT}")
+
+    note = await _prompt(client, cid, repo / "packages", "what is wrong with this now?")
+
+    assert "LOCATION (advisory, not a switch)" in note
+    assert (await _row(client, sid))["repo_root"] == str(worktree)
+
+
+@pytest.mark.asyncio
+async def test_server_refused_reanchor_of_a_locked_session_is_not_blocked(
+    client, tmp_path, monkeypatch
+):
+    """Replay of 2026-10-22 18:13Z: an unanchored session holding a live lock got
+    HTTP 409 from the re-anchor PATCH and the prompt was blocked."""
+    from ai_team_sync import session_pointer as sp
+
+    repo = tmp_path / "anime-studio"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "HEAD").write_text("ref: refs/heads/main\n")
+    cid = "77777777-1111-2222-3333-444455556666"
+    _env(monkeypatch, tmp_path, cid)
+    monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{repo}:{ECHO_ROOT}")
+    made = await client.post(
+        "/api/sessions",
+        json={"developer": "patrick", "agent": f"claude-code:{cid[:8]}", "scope": ["notes.md"],
+              "description": "unanchored, holds a lock", "auto_lock": True},
+    )
+    assert made.status_code == 201, made.text
+    sid = made.json()["id"]
+    sp.save_pointer(sid)
+    sp.save_approval_token(sid, made.headers.get("X-ATS-Approval-Token", ""))
+    monkeypatch.setenv("ATS_SESSION_ID", sid)
+
+    note = await _prompt(client, cid, repo, "fix the gateway")
+
+    assert "LOCATION (advisory, not a switch)" in note and "ATS kept it" in note
+    assert not (await _row(client, sid))["repo_root"]
+
+
+@pytest.mark.asyncio
+async def test_cwd_inside_the_anchored_linked_worktree_is_not_a_switch(
+    client, tmp_path, monkeypatch
+):
+    """Replay of 2026-10-22 00:05Z: a session anchored to its own linked worktree
+    was refused on every prompt, because cwd_repo maps the worktree to the shared
+    checkout and that differed from the anchor."""
+    repo, worktree = _repo_with_worktree(tmp_path)
     cid = "74747474-1111-2222-3333-444455556666"
     sid = await _claimed_session(client, tmp_path, monkeypatch, cid, str(worktree))
     monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{repo}:{ECHO_ROOT}")
