@@ -114,9 +114,15 @@ def world(live_ats, tmp_path):  # noqa: F811
 
 
 def _cache_dir() -> str:
-    d = Path.home() / ".cache"
-    d.mkdir(exist_ok=True)
-    return str(d)
+    # The edit guard skips scratch paths (/tmp/...). Under the isolated
+    # HOME=$(mktemp -d) run in AGENTS.md, ~/.cache is one of them.
+    from ai_team_sync.hooks.pre_tool_use_lockcheck import _is_noise
+
+    for d in (Path.home() / ".cache", ROOT / ".pytest_cache"):
+        if not _is_noise(f"{d.resolve()}/repo/f.txt"):
+            d.mkdir(exist_ok=True)
+            return str(d)
+    raise RuntimeError("no directory the edit guard would check; run outside /tmp")
 
 
 def _dead_url() -> str:

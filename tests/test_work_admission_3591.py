@@ -803,6 +803,8 @@ async def test_codex_finding_an_explicit_empty_admission_via_mcp_is_not_absent(
             f'[governance]\nrepositories = ["{governed}"]\n'
             f'[admission]\nmode = "enforce"\nenforce_repositories = ["{governed}"]\n')
     api_ok, _ = await _via_api(client, "start_session", governed, {})
+    # The MCP twin claims scope, so it must be a worker with edit authority.
+    monkeypatch.setenv("ATS_AGENT", "claude-code")
     mcp = _bridge_mcp(client, monkeypatch, tmp_path)
     mcp_ok, _, text = await _via_mcp(mcp, client, monkeypatch, "start_session", governed, {})
     assert api_ok is False
@@ -838,6 +840,8 @@ async def test_mcp_and_api_judge_one_admission_contract(
                 ScopeLock.session_id == api_sid))).scalars().all():
             await db_session.delete(lock)
         await db_session.commit()
+    # The MCP twin claims scope, so it must be a worker with edit authority.
+    monkeypatch.setenv("ATS_AGENT", "claude-code")
     mcp = _bridge_mcp(client, monkeypatch, tmp_path)
     mcp_ok, mcp_sid, text = await _via_mcp(mcp, client, monkeypatch, door, governed, value)
     outcomes["mcp"] = (mcp_ok, await _verdict_for(db_session, mcp_sid) if mcp_ok else None)
