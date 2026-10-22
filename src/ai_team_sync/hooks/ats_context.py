@@ -105,7 +105,15 @@ def _is_context_only_placeholder(session: dict[str, Any]) -> bool:
     )
 
 
-def _hold_anchor(anchored: str, target: RequestTarget) -> tuple[RequestTarget, str]:
+def _within(path: str, root: str) -> bool:
+    current = os.path.realpath(path).rstrip("/")
+    base = os.path.realpath(root).rstrip("/")
+    return bool(current and base) and (current == base or current.startswith(base + "/"))
+
+
+def _hold_anchor(
+    anchored: str, target: RequestTarget, cwd: str = ""
+) -> tuple[RequestTarget, str]:
     """Prompt text never moves or blocks an anchored session (ruling 2026-10-14).
 
     A project named in the prompt is context routing: the anchor stays and the
@@ -115,7 +123,10 @@ def _hold_anchor(anchored: str, target: RequestTarget) -> tuple[RequestTarget, s
     authority itself is enforced where operations happen (edit, Bash, git and
     restart guards), not here.
     """
-    if target.cwd_repo and target.cwd_repo != anchored:
+    # cwd_repo maps a linked worktree to its shared checkout; a session
+    # anchored to the worktree itself is already where its cwd is.
+    in_anchor = bool(cwd) and _within(cwd, anchored)
+    if target.cwd_repo and target.cwd_repo != anchored and not in_anchor:
         return replace(target, repo_root=target.cwd_repo), ""
     held = replace(target, repo_root=anchored)
     others = [root for root in target.mentioned if root != anchored]
@@ -345,7 +356,7 @@ async def resolve_prompt_context(
             return None
         target = RequestTarget(None, anchored, "subagent_handback")
     elif anchored:
-        target, advisory = _hold_anchor(anchored, target)
+        target, advisory = _hold_anchor(anchored, target, cwd)
 
     # Context-only repositories are briefed, never anchored: anchoring is how a
     # session acquires a governed project, and these are not governed (#3591).

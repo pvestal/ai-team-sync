@@ -330,6 +330,34 @@ async def test_cwd_inside_another_governed_repo_still_blocks_a_claimed_session(
 
 
 @pytest.mark.asyncio
+async def test_cwd_inside_the_anchored_linked_worktree_is_not_a_switch(
+    client, tmp_path, monkeypatch
+):
+    """Replay of 2026-10-22 00:05Z: a session anchored to its own linked worktree
+    was refused on every prompt, because cwd_repo maps the worktree to the shared
+    checkout and that differed from the anchor."""
+    import subprocess
+
+    repo = tmp_path / "anime-studio"
+    worktree = tmp_path / "elsewhere" / "line-delivery-mode"
+    git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
+    subprocess.run([*git, "init", "-q", "-b", "main", str(repo)], check=True)
+    subprocess.run([*git, "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "i"],
+                   check=True)
+    subprocess.run([*git, "-C", str(repo), "worktree", "add", "-q", "-b", "feat",
+                    str(worktree)], check=True)
+    (worktree / "packages").mkdir()
+    cid = "74747474-1111-2222-3333-444455556666"
+    sid = await _claimed_session(client, tmp_path, monkeypatch, cid, str(worktree))
+    monkeypatch.setenv("ATS_COORDINATED_REPOS", f"{repo}:{ECHO_ROOT}")
+
+    note = await _prompt(client, cid, worktree / "packages", "what is wrong with this now?")
+
+    assert f"resolved repo: {worktree}" in note
+    assert (await _row(client, sid))["repo_root"] == str(worktree)
+
+
+@pytest.mark.asyncio
 async def test_structured_start_session_is_the_switch(client, tmp_path, monkeypatch):
     """Switching projects = a new ATS session anchored there (what MCP start_session does)."""
     from ai_team_sync import session_pointer as sp
