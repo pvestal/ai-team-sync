@@ -204,35 +204,138 @@ def session_pointer_path(cid: str) -> Path:
     return _state_dir() / f"{GLOBAL_FILE_NAME}_{cid[:8]}"
 
 
+# Capabilities kept per client id (#3593). One Claude session -- and every
+# subagent it runs, which share its id and its one stdio MCP process -- may hold
+# several ATS sessions at once, so the file is a MAP {session_id: token}. It used
+# to hold one pair, written with O_TRUNC, so a second start_session destroyed
+# the first session's capability and that session could no longer be completed.
+# Bounded: the oldest entries are dropped past this many.
+APPROVAL_TOKEN_MAX = 32
+
+
+def _approval_path(cid: str) -> Path:
+    return _state_dir() / f"{APPROVAL_TOKEN_PREFIX}{cid[:8]}"
+
+
+def _read_approval_map(path: Path) -> dict[str, str]:
+    """{session_id: token}, oldest first. Reads both shapes: the map, and the
+    single {'session_id', 'token'} pair pre-#3593 code still writes."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out: dict[str, str] = {}
+    sessions = data.get("sessions")
+    if isinstance(sessions, dict):
+        for sid, token in sessions.items():
+            if isinstance(sid, str) and isinstance(token, str) and sid and token:
+                out[sid] = token
+    sid, token = data.get("session_id"), data.get("token")
+    if isinstance(sid, str) and isinstance(token, str) and sid and token:
+        out.pop(sid, None)
+        out[sid] = token  # the pair is the most recent save
+    return out
+
+
+def _write_approval_map(path: Path, tokens: dict[str, str]) -> None:
+    """Atomically replace the file (0600). The top-level pair names the most
+    recent entry so a reader still running pre-#3593 code finds it."""
+    if not tokens:
+        path.unlink(missing_ok=True)
+        return
+    latest_sid, latest_token = next(reversed(tokens.items()))
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"session_id": latest_sid, "token": latest_token,
+                       "sessions": tokens}, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
+class _approval_lock:
+    """Serialize read-modify-write of one client's map across processes (the
+    MCP server and the hooks of one Claude session both write it)."""
+
+    def __init__(self, path: Path):
+        self._path = path.with_name(f"{path.name}.lock")
+        self._fd: int | None = None
+
+    def __enter__(self):
+        try:
+            import fcntl
+
+            self._fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
+            fcntl.flock(self._fd, fcntl.LOCK_EX)
+        except Exception:
+            self._fd = None  # no flock (non-POSIX): the replace is still atomic
+        return self
+
+    def __exit__(self, *exc):
+        if self._fd is not None:
+            try:
+                os.close(self._fd)  # closing releases the flock
+            except Exception:
+                pass
+
+
 def save_approval_token(session_id: str, token: str, cid: str | None = None) -> None:
-    """Keep an approval capability private to this Claude session's pointer key."""
+    """Keep an approval capability private to this Claude session's pointer key.
+
+    Adds to this client's map; never discards another session's entry except
+    to stay within APPROVAL_TOKEN_MAX."""
     cid = cid or claude_session_id()
     if not cid or not session_id or not token:
         return
     try:
         sd = _state_dir()
         sd.mkdir(parents=True, exist_ok=True)
-        path = sd / f"{APPROVAL_TOKEN_PREFIX}{cid[:8]}"
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump({"session_id": session_id, "token": token}, stream)
+        path = _approval_path(cid)
+        with _approval_lock(path):
+            tokens = _read_approval_map(path)
+            tokens.pop(session_id, None)
+            tokens[session_id] = token
+            while len(tokens) > APPROVAL_TOKEN_MAX:
+                tokens.pop(next(iter(tokens)))
+            _write_approval_map(path, tokens)
     except Exception:
         pass  # hook storage is best-effort; a missing token fails closed
 
 
+def forget_approval_token(session_id: str, cid: str | None = None) -> None:
+    """Drop one session's capability (its owner completed it). Best-effort."""
+    cid = cid or claude_session_id()
+    if not cid or not session_id:
+        return
+    try:
+        path = _approval_path(cid)
+        if not path.exists():
+            return
+        with _approval_lock(path):
+            tokens = _read_approval_map(path)
+            if tokens.pop(session_id, None) is not None:
+                _write_approval_map(path, tokens)
+    except Exception:
+        pass
+
+
 def load_approval_token(session_id: str, cid: str | None = None) -> str:
+    """The capability for exactly `session_id`, or ''. Never another row's."""
     cid = cid or claude_session_id()
     if not session_id:
         return ""
     if cid:
-        try:
-            path = _state_dir() / f"{APPROVAL_TOKEN_PREFIX}{cid[:8]}"
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if data.get("session_id") == session_id and data.get("token"):
-                return str(data["token"])
-        except Exception:
-            pass
+        token = _read_approval_map(_approval_path(cid)).get(session_id)
+        if token:
+            return token
     delegated = load_delegated_capability()
     return delegated[1] if delegated and delegated[0] == session_id else ""
 

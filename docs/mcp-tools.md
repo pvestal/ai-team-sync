@@ -18,8 +18,8 @@ nothing here should be treated as one.
 |---|---|---|
 | `start_session` | mutates | Declares scope and takes advisory locks. Returns a context brief when one is available. Pass `repo_root` so patterns anchor to a repo and `ticket_id` when working a Tower ticket. `ticket_role` (`owner` / `contributor` / `reviewer`, #3585): one live owner per ticket per OS account receives the ticket's general mailbox; a contributor needs an explicit scope; a reviewer claims nothing. Omitted: owner if the ticket has no live owner; otherwise contributor when files are named, reviewer when none are. A refused owner claim names the ticket's live owner. See docs/collaboration-contract.md. |
 | `complete_session` | mutates | Pass `session_id`: it is authoritative for the call and is echoed back with the prior and resulting status, so you can see which row changed. Omitting it uses the legacy pointer path. Releases locks. A ticket-linked session may attach a structured `handoff`; it goes to the ticket's live owner, or the next owner. Refused while a child delegation is still open, and refused on a session you do not own. |
-| `pause_session` / `resume_session` | mutates | Pauses work while keeping locks. |
-| `extend_scope` | mutates | Adds patterns to the current session mid-flight. |
+| `pause_session` / `resume_session` | mutates | Pauses work while keeping locks. Optional `session_id` names one of this process's own sessions. |
+| `extend_scope` | mutates | Adds patterns to the current session mid-flight. Optional `session_id` names one of this process's own sessions. |
 | `get_session_details` | reads | Locks, decisions and commits for your session. |
 | `team_status` | reads | Who is active, their scope, and staleness. |
 
@@ -33,6 +33,16 @@ locks and unread ticket mail; another session's valid capability cannot close
 it. Existence and ownership are checked first, and only then is a pointer that
 speaks for *this* caller allowed to refuse a mismatch. See
 [Authority model](authority-model.md).
+
+One MCP process may hold several sessions at once — two repositories or two
+tickets in one client, or parallel subagents of one Claude session, which share
+that session's single MCP process (#3593). Each keeps its own capability, in
+memory and in the client's private capability file (a map keyed by session id).
+The most recently started session is the default; `complete_session`,
+`pause_session`, `resume_session`, `log_decision` and `extend_scope` accept a
+`session_id` naming any session this process started, and refuse any other.
+Completing a session drops only its own capability; if it was the default, the
+most recently started session still open becomes the default again.
 
 ## Locks and presence
 
@@ -50,7 +60,7 @@ speaks for *this* caller allowed to refuse a mismatch. See
 
 | Tool | Effect | Notes |
 |---|---|---|
-| `log_decision` | mutates | Records what was chosen and why, for later readers. |
+| `log_decision` | mutates | Records what was chosen and why, for later readers. Optional `session_id` names one of this process's own sessions. |
 | `get_decision_history` | reads | Cross-agent decisions on your current ticket or repo by default; supports `team_wide`, `ticket_id`, `repo_root`, `session_id`, and `since` filters. |
 | `request_override` | mutates | Ask the lock holder for permission to cross their claim. |
 | `respond_to_request` | mutates | Owner-bound: only the session the request is addressed to may answer. |

@@ -126,7 +126,51 @@ def session_agent_label() -> str:
 # global file, which is exactly how it completed a delegated child's row on
 # 2026-09-11 while reporting that its own session had completed.
 _IN_PROCESS_SESSION_ID: str | None = None
-_IN_PROCESS_APPROVAL_TOKEN: str | None = None
+# Every session this process opened -> its capability (#3593). One MCP process
+# may hold several at once: two repositories or two tickets in one Claude
+# session, and every parallel subagent of that session (they share this one
+# stdio process). A single token slot let each start_session destroy the
+# previous session's capability, so that session could no longer be completed,
+# paused or resumed and was left to the reaper. _IN_PROCESS_SESSION_ID stays
+# the DEFAULT target (the most recently opened); a tool that takes session_id
+# may name any session in this map, and no other.
+_IN_PROCESS_TOKENS: dict[str, str] = {}
+
+# Tools whose `session_id` argument selects which of this process's own
+# sessions acts. complete_session has its own targeting (session_target).
+_IN_PROCESS_TARGETING_TOOLS = frozenset({
+    "log_decision", "pause_session", "resume_session", "extend_scope"})
+
+
+def _remember_in_process(session_id: str, token: str) -> None:
+    """Record a session this process opened and make it the default target."""
+    global _IN_PROCESS_SESSION_ID
+    _IN_PROCESS_TOKENS.pop(session_id, None)
+    if token:
+        _IN_PROCESS_TOKENS[session_id] = token
+    _IN_PROCESS_SESSION_ID = session_id
+
+
+def _forget_in_process(session_id: str) -> str | None:
+    """Drop a session this process finished. Returns the new default target:
+    the most recently opened session still held, or None."""
+    global _IN_PROCESS_SESSION_ID
+    _IN_PROCESS_TOKENS.pop(session_id, None)
+    if _IN_PROCESS_SESSION_ID == session_id:
+        _IN_PROCESS_SESSION_ID = next(reversed(_IN_PROCESS_TOKENS), None)
+    return _IN_PROCESS_SESSION_ID
+
+
+def _capability_for(session_id: str | None) -> str:
+    """The capability for EXACTLY `session_id`: this process's own first, then
+    this client's private capability file. Never another row's."""
+    if not session_id:
+        return ""
+    token = _IN_PROCESS_TOKENS.get(session_id)
+    if token:
+        return token
+    from ai_team_sync import session_pointer as sp
+    return sp.load_approval_token(session_id)
 
 
 def resolve_identity() -> tuple[str | None, str]:
@@ -248,6 +292,17 @@ def format_conflict_guidance(conflicts: list[dict]) -> str:
 
     return msg
 
+
+# Which of THIS process's own sessions acts (#3593). One MCP process can hold
+# several (two repositories, two tickets, parallel subagents of one Claude
+# session); without it the most recently started one acts.
+_OWN_SESSION_SCHEMA = {
+    "type": "string",
+    "description": (
+        "Optional: the exact session to act as. Must be a session THIS MCP process "
+        "started (start_session returned it); any other id is refused. Omit to act "
+        "as the most recently started session."),
+}
 
 # Work admission (#3591): what kind of work a claim is. Optional; with a
 # ticket_id the claim is "continue" by default.
@@ -824,6 +879,7 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional exact peer session to notify and require acknowledgement from.",
                     },
+                    "session_id": _OWN_SESSION_SCHEMA,
                 },
                 "required": ["title", "chosen", "reasoning"],
             },
@@ -835,7 +891,7 @@ async def list_tools() -> list[Tool]:
             description="Pause your current session while keeping locks. Use when switching tasks temporarily.",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {"session_id": _OWN_SESSION_SCHEMA},
             },
         ),
         Tool(
@@ -843,7 +899,7 @@ async def list_tools() -> list[Tool]:
             description="Resume a paused session. Reactivates your locks and session.",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {"session_id": _OWN_SESSION_SCHEMA},
             },
         ),
         Tool(
@@ -960,6 +1016,7 @@ async def list_tools() -> list[Tool]:
                         "description": "Lock mode for the new patterns (default advisory).",
                     },
                     "admission": _ADMISSION_SCHEMA,
+                    "session_id": _OWN_SESSION_SCHEMA,
                 },
                 "required": ["patterns"],
             },
@@ -1003,9 +1060,7 @@ async def _incoming_message_nudge(client: httpx.AsyncClient,
                                   session_id: str | None) -> str | None:
     if not session_id:
         return None
-    from ai_team_sync import session_pointer as sp
-    token = (_IN_PROCESS_APPROVAL_TOKEN
-             if session_id == _IN_PROCESS_SESSION_ID else None) or sp.load_approval_token(session_id)
+    token = _capability_for(session_id)
     if not token:
         return None
     try:
@@ -1170,10 +1225,25 @@ async def _delegation_child(client) -> str | None:
 
 async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle MCP tool calls."""
-    global _IN_PROCESS_SESSION_ID, _IN_PROCESS_APPROVAL_TOKEN
+    global _IN_PROCESS_SESSION_ID
     # Identity AND where it came from. A read may use any of it; a mutation may
     # not use the shared pointer (see mutation_refusal).
     active_session_id, identity_source = resolve_identity()
+
+    # Naming one of THIS process's own sessions selects it (#3593). Only a
+    # session this process opened -- one whose capability it holds in memory --
+    # can be named: anything else is refused here, so the argument can narrow
+    # which of our own rows acts but never reach a row we did not open.
+    if name in _IN_PROCESS_TARGETING_TOOLS:
+        requested = str(arguments.get("session_id") or "").strip()
+        if requested and requested != active_session_id:
+            if requested not in _IN_PROCESS_TOKENS:
+                return [TextContent(type="text", text=(
+                    f"❌ Refusing to act as session {requested}: this MCP process did not "
+                    f"open it and holds no capability for it. Omit session_id to act as "
+                    f"{active_session_id or '(no session)'}, or name a session this "
+                    f"process started."))]
+            active_session_id, identity_source = requested, "in_process"
 
     async def deny_mutation(client) -> str | None:
         """Refusal text for a session-mutating call, or None to proceed."""
@@ -1219,10 +1289,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 refusal = await deny_mutation(client)
                 if refusal:
                     return [TextContent(type="text", text=f"❌ {refusal}")]
-                from ai_team_sync import session_pointer as sp
-                token = (_IN_PROCESS_APPROVAL_TOKEN
-                         if active_session_id == _IN_PROCESS_SESSION_ID else None) or \
-                        sp.load_approval_token(active_session_id)
+                token = _capability_for(active_session_id)
                 if not token:
                     return [TextContent(type="text", text="❌ Session capability missing; restart your ATS session/MCP client.")]
                 headers = {"X-ATS-Approval-Token": token}
@@ -1351,8 +1418,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                             f"{env_sid or '(none)'} (binding or capability missing). "
                             "A delegated child never opens a second session; return "
                             "to your parent."))]
-                    _IN_PROCESS_SESSION_ID = bound
-                    _IN_PROCESS_APPROVAL_TOKEN = capability[1]
+                    _remember_in_process(bound, capability[1])
                     msg = (f"✅ Delegated session already open: {bound}\n"
                            f"Delegation: {os.environ['ATS_DELEGATION']}\n"
                            "No new session was created; this process acts as the "
@@ -1439,9 +1505,11 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 response.raise_for_status()
                 data = response.json()
                 save_session_id(data["id"])
-                _IN_PROCESS_SESSION_ID = data["id"]
-                _IN_PROCESS_APPROVAL_TOKEN = response.headers.get("X-ATS-Approval-Token", "")
-                sp.save_approval_token(data["id"], _IN_PROCESS_APPROVAL_TOKEN)
+                new_token = response.headers.get("X-ATS-Approval-Token", "")
+                # ADDED beside any session this process already holds, never in
+                # place of it (#3593).
+                _remember_in_process(data["id"], new_token)
+                sp.save_approval_token(data["id"], new_token)
 
                 # Adopt-or-complete the SessionStart auto-registration
                 # (ats-sessionstart-orphan-adoption-p01): the hook registers a
@@ -1476,6 +1544,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                                     if s["id"] == placeholder_session_id else "")})
                             if 200 <= adoption.status_code < 300:
                                 adopted += 1
+                                if s["id"] == placeholder_session_id:
+                                    sp.forget_approval_token(s["id"], cid=live_cid)
                             else:
                                 adoption_warnings.append(
                                     f"placeholder {s['id']} was not completed "
@@ -1526,7 +1596,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                                   # brief lists back the locks this very call just
                                   # created, as BLOCKERS NOW (#2757).
                                   "session_id": data["id"]},
-                            headers={"X-ATS-Approval-Token": _IN_PROCESS_APPROVAL_TOKEN},
+                            headers={"X-ATS-Approval-Token": new_token},
                             timeout=25,
                         )
                         brief_resp.raise_for_status()
@@ -1767,10 +1837,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
             elif name == "respond_to_request":
                 if not active_session_id:
                     return [TextContent(type="text", text="❌ Start an ATS session before answering an override.")]
-                from ai_team_sync import session_pointer as sp
-                token = ((_IN_PROCESS_APPROVAL_TOKEN
-                          if _IN_PROCESS_SESSION_ID == active_session_id else "")
-                         or sp.load_approval_token(active_session_id)
+                token = (_capability_for(active_session_id)
                          or os.environ.get("ATS_APPROVAL_TOKEN", ""))
                 if not token:
                     return [TextContent(type="text", text=(
@@ -2042,10 +2109,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 brief_session_id = load_session_id() or ""
                 brief_headers = {}
                 if brief_session_id:
-                    from ai_team_sync import session_pointer as sp
-                    brief_token = ((_IN_PROCESS_APPROVAL_TOKEN
-                                    if brief_session_id == _IN_PROCESS_SESSION_ID else "")
-                                   or sp.load_approval_token(brief_session_id))
+                    brief_token = _capability_for(brief_session_id)
                     if brief_token:
                         brief_headers["X-ATS-Approval-Token"] = brief_token
                 response = await client.post(
@@ -2283,6 +2347,14 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # — guessing which of two live sessions was meant is exactly the
                 # 2026-09-11 wrong-session completion.
                 pointer_id, pointer_source = resolve_identity()
+                default_pointer_id = pointer_id
+                # This process's in-process identity is the SET of sessions it
+                # opened (#3593). Naming one of them is not a disagreement with
+                # another of them -- no guessing is involved -- so it is that
+                # session's own pointer. Any other explicit id still meets the
+                # conflict rule below against this process's default session.
+                if explicit_id and explicit_id in _IN_PROCESS_TOKENS:
+                    pointer_id, pointer_source = explicit_id, "in_process"
 
                 # ORDER MATTERS, and a live canary is what taught us so. The
                 # pointer-conflict rule used to run first, so naming a
@@ -2355,13 +2427,12 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         f"was changed.\n\n  existing summary: "
                         f"{((row or {}).get('summary') or '')[:300]}"))]
 
-                if handoff and target.session_id != active_session_id:
+                if (handoff and target.session_id != active_session_id
+                        and target.session_id not in _IN_PROCESS_TOKENS):
                     return [TextContent(type="text", text=(
-                        "❌ A handoff must come from this MCP process's exact active session."))]
+                        "❌ A handoff must come from one of this MCP process's own sessions."))]
                 from ai_team_sync import session_pointer as sp
-                token = (_IN_PROCESS_APPROVAL_TOKEN
-                         if target.session_id == _IN_PROCESS_SESSION_ID else None) or \
-                        sp.load_approval_token(target.session_id)
+                token = _capability_for(target.session_id)
                 if not token:
                     return [TextContent(type="text", text="❌ Session capability missing for completion.")]
                 headers = {"X-ATS-Approval-Token": token}
@@ -2390,10 +2461,24 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 lines += ["", f"  Summary: {summary}", "",
                           "  All locks released. Team has been notified."]
 
+                # The finished session's capability is spent: drop it from this
+                # process and from this client's file (#3593), leaving every
+                # other session's entry in place.
+                was_default = target.session_id == _IN_PROCESS_SESSION_ID
+                held = was_default or target.session_id in _IN_PROCESS_TOKENS
+                next_default = _forget_in_process(target.session_id) if held else None
+                sp.forget_approval_token(target.session_id)
+
                 # Only drop the pointer when it was OUR session; clearing it after
                 # completing some other row would strand this process's own id.
-                if not explicit_id or explicit_id == pointer_id:
+                if not explicit_id or explicit_id == default_pointer_id:
                     clear_session_id()
+                    # Another session this process opened is still live: it is
+                    # now the default, so point this client's pointer at it
+                    # rather than at the row just completed.
+                    if was_default and next_default:
+                        save_session_id(next_default)
+                        lines += ["", f"  This process's default session is now {next_default}."]
                 return [TextContent(type="text", text="\n".join(lines))]
 
             elif name == "log_decision":
@@ -2410,10 +2495,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 recipient_id = arguments.get("recipient_session_id")
                 headers = {}
                 if recipient_id:
-                    from ai_team_sync import session_pointer as sp
-                    token = (_IN_PROCESS_APPROVAL_TOKEN
-                             if active_session_id == _IN_PROCESS_SESSION_ID else None) or \
-                            sp.load_approval_token(active_session_id)
+                    token = _capability_for(active_session_id)
                     if not token:
                         return [TextContent(type="text", text="❌ Session capability missing for addressed decision.")]
                     headers["X-ATS-Approval-Token"] = token
@@ -2451,10 +2533,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 if not active_session_id:
                     return [TextContent(type="text", text="❌ No active session to pause.")]
 
-                from ai_team_sync import session_pointer as sp
-                token = (_IN_PROCESS_APPROVAL_TOKEN
-                         if active_session_id == _IN_PROCESS_SESSION_ID else None) or \
-                        sp.load_approval_token(active_session_id)
+                token = _capability_for(active_session_id)
                 if not token:
                     return [TextContent(type="text", text="❌ Session capability missing for pause.")]
 
@@ -2480,10 +2559,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 if not active_session_id:
                     return [TextContent(type="text", text="❌ No session to resume.")]
 
-                from ai_team_sync import session_pointer as sp
-                token = (_IN_PROCESS_APPROVAL_TOKEN
-                         if active_session_id == _IN_PROCESS_SESSION_ID else None) or \
-                        sp.load_approval_token(active_session_id)
+                token = _capability_for(active_session_id)
                 if not token:
                     return [TextContent(type="text", text="❌ Session capability missing for resume.")]
 

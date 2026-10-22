@@ -735,7 +735,7 @@ def _bridge_mcp(client, monkeypatch, tmp_path):
     monkeypatch.setattr(mcp.httpx, "AsyncClient", _ASGIClient)
     # Each case is a fresh MCP process: no session left in this module's pointer.
     monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", None)
-    monkeypatch.setattr(mcp, "_IN_PROCESS_APPROVAL_TOKEN", None)
+    monkeypatch.setattr(mcp, "_IN_PROCESS_TOKENS", {})
     # A ticketed MCP start_session first fetches the exact task authority (fail
     # closed); answer it with the suite's valid envelope for ticket 4101.
     from tests.test_task_brief import TASK_ENVELOPE
