@@ -159,8 +159,12 @@ def _shared_root_from_gitfile(gitfile: str, worktree_root: str) -> str:
     """The repo a LINKED WORKTREE belongs to; `worktree_root` for anything else.
 
     A `.git` file also appears in submodules ('gitdir: ../.git/modules/<name>'),
-    which are their own project — only the '/.git/worktrees/' form is a second
-    checkout of one repo.
+    which are their own project — only '<main>/.git/worktrees/<id>' is a second
+    checkout of one repo. Exactly that: one path component after the marker.
+    A submodule checked out INSIDE a linked worktree has its gitdir under that
+    worktree's admin dir ('<main>/.git/worktrees/<id>/modules/<name>') and is
+    still its own project; matching the marker anywhere in the path collapsed
+    it to <main> (Codex review of #3593, round 1).
     """
     try:
         with open(gitfile, encoding="utf-8", errors="replace") as fh:
@@ -181,8 +185,13 @@ def _shared_root_from_gitfile(gitfile: str, worktree_root: str) -> str:
     gitdir = os.path.normpath(gitdir)
 
     marker = f"{os.sep}.git{os.sep}worktrees{os.sep}"
-    idx = gitdir.find(marker)
-    return gitdir[:idx] if idx > 0 else worktree_root
+    idx = gitdir.rfind(marker)
+    if idx <= 0:
+        return worktree_root
+    worktree_id = gitdir[idx + len(marker):]
+    if not worktree_id or os.sep in worktree_id:
+        return worktree_root  # e.g. a submodule under a worktree's admin dir
+    return gitdir[:idx]
 
 
 def shared_repo_root(root: str | None) -> str:

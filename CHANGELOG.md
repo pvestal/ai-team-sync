@@ -28,21 +28,30 @@
   keyed by session id, written atomically under a lock (0600) and still
   readable by and for pre-#3593 code; the server keeps a map of the sessions
   it opened. `complete_session`, `pause_session`, `resume_session`,
-  `log_decision` and `extend_scope` take a `session_id` naming one of this
-  process's own sessions, and refuse any other. Completing a session drops only
-  its own capability. A capability still authorizes only its own row.
+  `log_decision`, `extend_scope`, `readdress_message` and `message_status` take
+  a `session_id` naming one of this process's own sessions, and refuse any
+  other. Completing a session keeps its capability, so a completed sender can
+  still readdress an unread direct message; the map's bound limits growth. A
+  capability still authorizes only its own row.
 - **Parallel subagents of one Claude session can edit under their own locks
   (#3593).** They share one cid and one per-session pointer, so the edit guard
   judged subagent A's edit as whichever subagent started last and refused it.
   When the pointer session holds no covering lock, a live lock held by another
   ACTIVE session whose label is exactly this Claude session's canonical label
   (`claude-code:<cid8>`, string equality, never containment) now grants the
-  edit and is not reported as a foreign conflict. Scope still never grants.
+  edit and is not reported as a foreign conflict. The base is fixed and the
+  cid8 comes from the hook payload; no environment variable (such as
+  `ATS_AGENT`) chooses what the rule matches. Scope still never grants.
 - **Locks anchored to a linked worktree count as their main checkout in the
   edit guard.** The guard maps a worktree file to the main checkout's root but
   compared a lock's recorded root as a string, so a lock taken with
   `repo_root=<worktree>` could never satisfy it, and a foreign one was skipped
   as "another repository" although the server calls it a conflict.
+- **A submodule checked out inside a linked worktree is its own repository.**
+  Its gitdir lives under the worktree's admin dir
+  (`<main>/.git/worktrees/<id>/modules/<name>`), and treating any
+  `/.git/worktrees/` segment as a linked worktree mapped it to the main
+  checkout. Only `<main>/.git/worktrees/<id>` itself is a linked worktree now.
 - **A heartbeat racing a reaper sweep can no longer leave the answer and the row
   disagreeing (#2811).** Both sides wrote unconditionally after deciding from an
   earlier read. A heartbeat that loaded an active session before the reaper
