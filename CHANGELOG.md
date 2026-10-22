@@ -17,6 +17,32 @@
   not an OS boundary: see `docs/restart-gate.md`.
 
 ### Fixed
+- **One MCP process can hold several sessions without losing any capability
+  (#3593).** The client capability file held one `{session_id, token}` pair,
+  rewritten in place, and the MCP server one in-process token, so a second
+  `start_session` destroyed the first session's capability: it could no longer
+  be completed ("Session capability missing for completion."), paused or
+  resumed, and was left to the reaper (observed 2026-10-15 with two
+  repositories, and 2026-10-22 with four parallel subagents of one Claude
+  session, which share its single MCP process). The file is now a bounded map
+  keyed by session id, written atomically under a lock (0600) and still
+  readable by and for pre-#3593 code; the server keeps a map of the sessions
+  it opened. `complete_session`, `pause_session`, `resume_session`,
+  `log_decision` and `extend_scope` take a `session_id` naming one of this
+  process's own sessions, and refuse any other. Completing a session drops only
+  its own capability. A capability still authorizes only its own row.
+- **Parallel subagents of one Claude session can edit under their own locks
+  (#3593).** They share one cid and one per-session pointer, so the edit guard
+  judged subagent A's edit as whichever subagent started last and refused it.
+  When the pointer session holds no covering lock, a live lock held by another
+  ACTIVE session whose label is exactly this Claude session's canonical label
+  (`claude-code:<cid8>`, string equality, never containment) now grants the
+  edit and is not reported as a foreign conflict. Scope still never grants.
+- **Locks anchored to a linked worktree count as their main checkout in the
+  edit guard.** The guard maps a worktree file to the main checkout's root but
+  compared a lock's recorded root as a string, so a lock taken with
+  `repo_root=<worktree>` could never satisfy it, and a foreign one was skipped
+  as "another repository" although the server calls it a conflict.
 - **A heartbeat racing a reaper sweep can no longer leave the answer and the row
   disagreeing (#2811).** Both sides wrote unconditionally after deciding from an
   earlier read. A heartbeat that loaded an active session before the reaper

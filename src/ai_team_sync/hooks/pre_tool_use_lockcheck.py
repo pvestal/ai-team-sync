@@ -23,6 +23,7 @@ import os
 import sys
 
 from ai_team_sync.git_utils import resolve_repo_roots as _roots
+from ai_team_sync.git_utils import shared_repo_root as _shared_root
 from ai_team_sync.operator_config import OperatorConfigError, governed_repositories
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
@@ -92,20 +93,29 @@ def scope_matches(rel: str, pattern: str, repo_root: str = "") -> bool:
 def find_conflicts(rel: str, sessions: list, my_session_id: str,
                    file_repo_root: str = "", *, locks: list,
                    approved_lock_ids: set[str] | None = None,
-                   my_ats_session_id: str = "") -> list:
+                   my_ats_session_id: str = "",
+                   sibling_session_ids: set[str] | None = None) -> list:
     """OTHER sessions' live locks covering `rel`, with their modes.
 
     `locks` is the response from GET /api/locks, which filters out expired locks
     and dead owners. Exclude the exact ATS session when resolved; the Claude
     session label is only a fallback for legacy sessions.
 
+    `sibling_session_ids` (#3593): ACTIVE sessions whose label is EXACTLY this
+    Claude session's own (see sibling_session_ids()). They are this same Claude
+    session -- its parallel subagents share one cid, one pointer and one MCP
+    process -- so their locks are not another session's. Empty by default, so a
+    caller that does not opt in keeps exact-session identity.
+
     Repo anchoring (ats-lockcheck-repo-anchoring-p01): lock patterns are
     repo-RELATIVE, so a lock anchored to a DIFFERENT repo_root than the
     target file's git root cannot conflict — its 'tests/**' means ITS tests/.
-    Either side unanchored ('') falls back to legacy match-everywhere."""
+    Either side unanchored ('') falls back to legacy match-everywhere. A root
+    that is a linked worktree compares as its main checkout (_shared_root)."""
     mine = (my_session_id or "")[:8]
-    froot = (file_repo_root or "").rstrip("/")
+    froot = _shared_root(file_repo_root)
     owners = {str(s.get("id", "")): s for s in sessions or []}
+    siblings = sibling_session_ids or set()
     out = []
     for lk in locks:
         if str(lk.get("id", "")) in (approved_lock_ids or set()):
@@ -117,9 +127,11 @@ def find_conflicts(rel: str, sessions: list, my_session_id: str,
                     (lk.get("agent") or lk.get("session_id", "")))
         if my_ats_session_id and str(lk.get("session_id", "")) == my_ats_session_id:
             continue
+        if str(lk.get("session_id", "")) in siblings:
+            continue
         if not my_ats_session_id and mine and mine in agent:
             continue
-        sroot = str((s.get("repo_root") if s else lk.get("repo_root")) or "").rstrip("/")
+        sroot = _shared_root(str((s.get("repo_root") if s else lk.get("repo_root")) or ""))
         if froot and sroot and froot != sroot:
             continue                        # anchored to a different repo
         pat = str(lk.get("pattern", ""))
@@ -138,8 +150,76 @@ def _coordinated_roots() -> list[str]:
     return governed_repositories()
 
 
+def canonical_sibling_label(cid: str | None) -> str:
+    """This Claude session's canonical agent label, or '' when it has none.
+
+    Built by session_pointer.agent_label -- the one builder every registrar
+    uses -- from the hook payload's cid, so it is exactly the text the MCP
+    server and SessionStart wrote on this Claude session's rows. '' when the
+    label would carry no cid suffix: a delegated child (bare base by design)
+    and an unidentified agent would otherwise match every bare-labeled row.
+    """
+    cid = (cid or "").strip()
+    if not cid:
+        return ""
+    try:
+        from ai_team_sync import session_pointer as sp
+
+        label = sp.agent_label(cid=cid)
+    except Exception:
+        return ""
+    return label if label.endswith(f":{cid[:8]}") else ""
+
+
+def sibling_session_ids(sessions: list, label: str, my_sid: str | None = None) -> set[str]:
+    """ACTIVE sessions whose agent label EQUALS `label` (#3593), excluding my_sid.
+
+    Exact string equality, never containment: substring attribution is the
+    open decision on #2893 and is not widened here."""
+    if not label:
+        return set()
+    return {str(s.get("id", "")) for s in sessions or []
+            if str(s.get("agent", "")) == label
+            and str(s.get("status", "")).lower() == "active"
+            and str(s.get("id", "")) and str(s.get("id", "")) != (my_sid or "")}
+
+
+def _covered_by(rel: str, froot: str, holder_ids: set[str], locks: list) -> bool:
+    """Does a live lock held by one of `holder_ids` cover `rel` in `froot`?"""
+    for lk in locks or []:
+        if str(lk.get("session_id", "")) not in holder_ids:
+            continue
+        lroot = _shared_root(str(lk.get("repo_root") or ""))
+        if lroot and froot and lroot != froot:
+            continue
+        if scope_matches(rel, str(lk.get("pattern", "")), froot):
+            return True
+    return False
+
+
 def claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,
-                sessions: list, locks: list) -> tuple[bool, str]:
+                sessions: list, locks: list, *,
+                sibling_label: str = "") -> tuple[bool, str]:
+    """(ok, reason) — does this Claude session hold a live claim covering `rel`?
+
+    First the pointer session's own claim (_own_claim_check, unchanged). When
+    that refuses and `sibling_label` is given, a live LOCK covering `rel` held
+    by another ACTIVE session whose label is exactly `sibling_label` grants the
+    edit (#3593): parallel subagents of one Claude session share its cid, its
+    pointer and its MCP process, so the pointer names whichever of them started
+    last and the guard cannot tell them apart. Scope never grants (#2813), and
+    every refusal message is the pointer session's own."""
+    froot = _shared_root(froot)
+    ok, reason = _own_claim_check(rel, froot, my_sid, my_cid8, sessions, locks)
+    if ok or not sibling_label:
+        return ok, reason
+    if _covered_by(rel, froot, sibling_session_ids(sessions, sibling_label, my_sid), locks):
+        return True, ""
+    return ok, reason
+
+
+def _own_claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,
+                     sessions: list, locks: list) -> tuple[bool, str]:
     """(ok, reason) — do *I* hold a live claim covering `rel`? The CLAIM half
     of coordination (2026-08-17). find_conflicts asks "is someone ELSE here?";
     nothing asked "is my own session alive and does it claim this file?" — so
@@ -170,20 +250,14 @@ def claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,
                        "with scope before editing this repo.")
 
     my_ids = {str(s.get("id", "")) for s in mine_active}
-    for lk in locks or []:
-        if str(lk.get("session_id", "")) not in my_ids:
-            continue
-        lroot = str(lk.get("repo_root") or "").rstrip("/")
-        if lroot and froot and lroot != froot:
-            continue
-        if scope_matches(rel, str(lk.get("pattern", "")), froot):
-            return True, ""
+    if _covered_by(rel, froot, my_ids, locks):
+        return True, ""
     # A refused restoration gives a more useful diagnostic than a generic
     # missing-lock message (#2760). The lock loop above already granted every
     # lane genuinely held. Scope itself never grants the edit (#2813).
     lost: list[str] = []
     for s in mine_active:
-        sroot = str(s.get("repo_root") or "").rstrip("/")
+        sroot = _shared_root(str(s.get("repo_root") or ""))
         if sroot and froot and sroot != froot:
             continue
         not_restored = s.get("locks_not_restored") or []
@@ -314,10 +388,15 @@ def main() -> None:
             print(f"ATS LOCK GUARD: ignoring session identity ({problem}); judging as an "
                   f"unidentified editor.", file=sys.stderr)
             my_sid, approved_lock_ids = None, set()
+    # Parallel subagents of this Claude session (#3593): same cid, so the same
+    # canonical label, one shared pointer. Their live locks are this session's.
+    sibling_label = canonical_sibling_label(payload.get("session_id") or "")
+    siblings = sibling_session_ids(sessions, sibling_label, my_sid)
     conflicts = find_conflicts(rel, sessions, payload.get("session_id", ""),
                                file_repo_root=froot, locks=locks,
                                approved_lock_ids=approved_lock_ids,
-                               my_ats_session_id=my_sid or "")
+                               my_ats_session_id=my_sid or "",
+                               sibling_session_ids=siblings)
 
     # In coordinated repos, explain a lost #2760 lane before a foreign lock's
     # diagnostic can hide it. The same claim guard still decides edit authority.
@@ -330,7 +409,8 @@ def main() -> None:
         sys.exit(2)
     if froot in coordinated:
         my_cid8 = str(payload.get("session_id", ""))[:8]
-        ok, reason = claim_check(rel, froot, my_sid, my_cid8, sessions, locks)
+        ok, reason = claim_check(rel, froot, my_sid, my_cid8, sessions, locks,
+                                 sibling_label=sibling_label)
         if not ok:
             print(f"ATS CLAIM GUARD: {reason}", file=sys.stderr)
             if os.environ.get("ATS_CLAIMCHECK", "1") != "0":

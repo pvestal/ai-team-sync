@@ -185,6 +185,28 @@ def _shared_root_from_gitfile(gitfile: str, worktree_root: str) -> str:
     return gitdir[:idx] if idx > 0 else worktree_root
 
 
+def shared_repo_root(root: str | None) -> str:
+    """A recorded repo_root as the SHARED root the edit guard compares by.
+
+    A session or lock anchored to a LINKED WORKTREE records the worktree's own
+    path, while resolve_repo_roots() maps every file in that worktree to the
+    main checkout. Compared as strings the two never matched, so such a lock
+    could not satisfy the claim guard and a foreign one was skipped as
+    "another repository" -- although the server treats a worktree as its main
+    checkout. Only a root that IS a linked worktree (its `.git` is a
+    '/.git/worktrees/' gitfile) is mapped; anything else, including a path that
+    no longer exists, is returned as given (trailing '/' dropped). No walk up:
+    a recorded root is never re-anchored to some ancestor repository.
+    """
+    r = (os.fspath(root) if root else "").rstrip("/")
+    if not r:
+        return ""
+    dot_git = os.path.join(r, ".git")
+    if os.path.isfile(dot_git):
+        return _shared_root_from_gitfile(dot_git, r).rstrip("/")
+    return r
+
+
 def resolve_repo_roots(path: str | Path) -> tuple[str | None, str | None]:
     """(worktree_root, repo_root) for `path` — worktree-aware, no subprocess.
 
