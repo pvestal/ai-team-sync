@@ -216,6 +216,55 @@ def test_a_delegated_child_gets_no_sibling_grant(monkeypatch, capsys):
     assert code == 2
 
 
+# Codex review round 1, finding 1: the base came from $ATS_AGENT through
+# agent_label(), so ATS_AGENT=codex made 'codex:<cid8>' rows siblings.
+_AGENT_ENVS = ["codex", "cursor", "claude-code", "claude-code:7951905d", "", None]
+
+
+def _set_agent_env(monkeypatch, value):
+    if value is None:
+        for var in ("ATS_AGENT", "CLAUDECODE", "CLAUDE_CODE"):
+            monkeypatch.delenv(var, raising=False)
+    else:
+        monkeypatch.setenv("ATS_AGENT", value)
+
+
+@pytest.mark.parametrize("ats_agent", _AGENT_ENVS)
+def test_the_canonical_label_never_comes_from_the_environment(monkeypatch, ats_agent):
+    _set_agent_env(monkeypatch, ats_agent)
+    assert guard.canonical_sibling_label(CID) == LABEL
+    assert guard.canonical_sibling_label("") == ""
+    assert guard.canonical_sibling_label("short") == ""
+
+
+@pytest.mark.parametrize("ats_agent", _AGENT_ENVS)
+@pytest.mark.parametrize("base", ["codex", "cursor", "unknown", "claude"])
+def test_an_overridden_ats_agent_cannot_make_another_base_a_sibling(
+        monkeypatch, capsys, ats_agent, base):
+    """The probe from the review: ATS_AGENT=codex, a 'codex:<cid8>' session's
+    lock -> claim=(True, ''). It must refuse, whatever ATS_AGENT says."""
+    _set_agent_env(monkeypatch, ats_agent)
+    sessions = [_sess(SUB_A, agent=f"{base}:{CID8}"), _sess(SUB_B)]
+    locks = [_lock(SUB_A)]
+    code, _out, err = _run_hook(monkeypatch, capsys, sessions=sessions, locks=locks,
+                                file_path=f"{REPO}/{REL}", roots=(REPO, REPO))
+    assert code == 2 and "holds no live lock" in err
+    ok, _reason = claim_check(REL, REPO, SUB_B, CID8, sessions, locks,
+                              sibling_label=guard.canonical_sibling_label(CID))
+    assert not ok
+
+
+@pytest.mark.parametrize("ats_agent", _AGENT_ENVS)
+def test_the_claude_code_sibling_grant_does_not_depend_on_ats_agent(
+        monkeypatch, capsys, ats_agent):
+    _set_agent_env(monkeypatch, ats_agent)
+    sessions = [_sess(SUB_A), _sess(SUB_B)]
+    code, _out, err = _run_hook(monkeypatch, capsys, sessions=sessions,
+                                locks=[_lock(SUB_A)], file_path=f"{REPO}/{REL}",
+                                roots=(REPO, REPO))
+    assert code == 0, err
+
+
 def test_the_reaped_pointer_message_is_kept_when_no_sibling_lock_covers(monkeypatch, capsys):
     sessions = [_sess(SUB_A), _sess(SUB_B, status="completed")]
     code, _out, err = _run_hook(monkeypatch, capsys, sessions=sessions, locks=[],
@@ -323,3 +372,84 @@ def test_a_lock_in_an_unrelated_repository_still_does_not_cover(worktree, tmp_pa
                                 file_path=os.path.join(linked, "packages", "x.py"),
                                 pointer=SUB_B, coordinated=(main,))
     assert code == 2 and "holds no live lock" in err
+
+
+# ── Codex review round 1, finding 2: a submodule inside a linked worktree ────
+
+@pytest.fixture
+def submodule_in_worktree(tmp_path):
+    """main checkout -> linked worktree -> submodule checked out in it.
+
+    Git keeps that submodule's repository under the WORKTREE's admin dir,
+    '<main>/.git/worktrees/<id>/modules/<name>', so its gitfile contains the
+    '/.git/worktrees/' segment although it is a separate project."""
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    _git(lib, "init", "-q", "-b", "main")
+    (lib / "core.py").write_text("core = 1\n")
+    _git(lib, "add", "-A")
+    _git(lib, "commit", "-q", "-m", "lib")
+
+    main = tmp_path / "main"
+    main.mkdir()
+    _git(main, "init", "-q", "-b", "main")
+    (main / "packages").mkdir()
+    (main / "packages" / "x.py").write_text("x = 1\n")
+    _git(main, "-c", "protocol.file.allow=always", "submodule", "add", "-q",
+         str(lib), "vendor/lib")
+    _git(main, "add", "-A")
+    _git(main, "commit", "-q", "-m", "init")
+
+    linked = tmp_path / "wt" / "feature"
+    _git(main, "worktree", "add", "-q", "-b", "feature", str(linked))
+    _git(linked, "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init")
+    sub = linked / "vendor" / "lib"
+    gitfile = (sub / ".git").read_text()
+    assert "/.git/worktrees/" in gitfile and "/modules/" in gitfile, gitfile
+    return str(main.resolve()), str(linked.resolve()), str(sub.resolve())
+
+
+def test_a_submodule_inside_a_linked_worktree_keeps_its_own_root(submodule_in_worktree):
+    from ai_team_sync.git_utils import resolve_repo_roots, shared_repo_root
+
+    main, linked, sub = submodule_in_worktree
+    assert resolve_repo_roots(os.path.join(sub, "core.py")) == (sub, sub)
+    assert shared_repo_root(sub) == sub
+    # The linked worktree itself still maps to its main checkout.
+    assert resolve_repo_roots(os.path.join(linked, "packages", "x.py")) == (linked, main)
+    assert shared_repo_root(linked) == main
+
+
+def test_a_lock_on_the_main_repo_does_not_cover_a_submodule_file_in_a_worktree(
+        submodule_in_worktree, monkeypatch, capsys):
+    """'core.py' locked in the superproject is not the submodule's core.py."""
+    main, _linked, sub = submodule_in_worktree
+    sessions = [_sess(SUB_B, repo_root=main)]
+    locks = [_lock(SUB_B, pattern="core.py", repo_root=main)]
+    code, _out, err = _run_hook(monkeypatch, capsys, sessions=sessions, locks=locks,
+                                file_path=os.path.join(sub, "core.py"),
+                                coordinated=(main, sub))
+    assert code == 2 and "holds no live lock" in err
+
+
+def test_a_lock_on_the_submodule_covers_its_file_in_a_worktree(
+        submodule_in_worktree, monkeypatch, capsys):
+    main, _linked, sub = submodule_in_worktree
+    sessions = [_sess(SUB_B, repo_root=sub)]
+    locks = [_lock(SUB_B, pattern="core.py", repo_root=sub)]
+    code, _out, err = _run_hook(monkeypatch, capsys, sessions=sessions, locks=locks,
+                                file_path=os.path.join(sub, "core.py"),
+                                coordinated=(main, sub))
+    assert code == 0, err
+
+
+def test_a_foreign_superproject_lock_does_not_block_the_submodule(
+        submodule_in_worktree, monkeypatch, capsys):
+    main, _linked, sub = submodule_in_worktree
+    other = "cccccccc-0000-4000-8000-00000000000c"
+    sessions = [_sess(other, agent="codex:0badf00d", repo_root=main)]
+    locks = [_lock(other, pattern="core.py", mode="exclusive", repo_root=main)]
+    code, _out, err = _run_hook(monkeypatch, capsys, sessions=sessions, locks=locks,
+                                file_path=os.path.join(sub, "core.py"), coordinated=())
+    assert code == 0, err
+    assert "LIVE EXCLUSIVE" not in err

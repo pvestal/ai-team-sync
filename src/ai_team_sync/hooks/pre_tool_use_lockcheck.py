@@ -150,25 +150,27 @@ def _coordinated_roots() -> list[str]:
     return governed_repositories()
 
 
-def canonical_sibling_label(cid: str | None) -> str:
-    """This Claude session's canonical agent label, or '' when it has none.
+# The one base the sibling rule accepts. This hook is the Claude Code
+# PreToolUse edit guard, and the payload's session_id is the Claude session id.
+CLAUDE_CODE_BASE = "claude-code"
 
-    Built by session_pointer.agent_label -- the one builder every registrar
-    uses -- from the hook payload's cid, so it is exactly the text the MCP
-    server and SessionStart wrote on this Claude session's rows. '' when the
-    label would carry no cid suffix: a delegated child (bare base by design)
-    and an unidentified agent would otherwise match every bare-labeled row.
+
+def canonical_sibling_label(cid: str | None) -> str:
+    """'claude-code:<cid8>' for the hook payload's Claude session, or ''.
+
+    The base is FIXED, never taken from the environment: deriving it through
+    session_pointer.agent_label() read $ATS_AGENT, so ATS_AGENT=codex made every
+    'codex:<cid8>' row a sibling and its lock granted the edit (Codex review of
+    #3593, round 1). The cid8 comes only from the payload Claude Code supplies,
+    which is the same text every registrar appends to this Claude session's
+    rows. '' when the payload names no usable session id, and inside a
+    delegated child, whose rows carry the bare '<worker>:delegate' label: the
+    environment can only switch the rule OFF, never choose what it matches.
     """
     cid = (cid or "").strip()
-    if not cid:
+    if len(cid) < 8 or (os.environ.get("ATS_DELEGATION") or "").strip():
         return ""
-    try:
-        from ai_team_sync import session_pointer as sp
-
-        label = sp.agent_label(cid=cid)
-    except Exception:
-        return ""
-    return label if label.endswith(f":{cid[:8]}") else ""
+    return f"{CLAUDE_CODE_BASE}:{cid[:8]}"
 
 
 def sibling_session_ids(sessions: list, label: str, my_sid: str | None = None) -> set[str]:
