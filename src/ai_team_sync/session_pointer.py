@@ -209,7 +209,10 @@ def session_pointer_path(cid: str) -> Path:
 # several ATS sessions at once, so the file is a MAP {session_id: token}. It used
 # to hold one pair, written with O_TRUNC, so a second start_session destroyed
 # the first session's capability and that session could no longer be completed.
-# Bounded: the oldest entries are dropped past this many.
+# Entries are NOT removed when a session completes: a completed sender keeps
+# its authority to readdress an unread direct message after turnover
+# (routers/messages.readdress_message), and that authority is this capability.
+# Bounded instead: the oldest entries are dropped past this many.
 APPROVAL_TOKEN_MAX = 32
 
 
@@ -308,23 +311,6 @@ def save_approval_token(session_id: str, token: str, cid: str | None = None) -> 
             _write_approval_map(path, tokens)
     except Exception:
         pass  # hook storage is best-effort; a missing token fails closed
-
-
-def forget_approval_token(session_id: str, cid: str | None = None) -> None:
-    """Drop one session's capability (its owner completed it). Best-effort."""
-    cid = cid or claude_session_id()
-    if not cid or not session_id:
-        return
-    try:
-        path = _approval_path(cid)
-        if not path.exists():
-            return
-        with _approval_lock(path):
-            tokens = _read_approval_map(path)
-            if tokens.pop(session_id, None) is not None:
-                _write_approval_map(path, tokens)
-    except Exception:
-        pass
 
 
 def load_approval_token(session_id: str, cid: str | None = None) -> str:

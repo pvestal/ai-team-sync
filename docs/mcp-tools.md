@@ -41,8 +41,11 @@ memory and in the client's private capability file (a map keyed by session id).
 The most recently started session is the default; `complete_session`,
 `pause_session`, `resume_session`, `log_decision` and `extend_scope` accept a
 `session_id` naming any session this process started, and refuse any other.
-Completing a session drops only its own capability; if it was the default, the
-most recently started session still open becomes the default again.
+Completing a session keeps its capability, because a completed sender may still
+`readdress_message` an unread direct message (pass its `session_id`; it is
+accepted there and by `message_status`); the map is bounded instead. If the
+completed session was the default, the most recently started session still open
+becomes the default again.
 
 ## Locks and presence
 

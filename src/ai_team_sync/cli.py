@@ -211,9 +211,8 @@ def session_complete(summary, session_id):
                 json={"status": "completed", "summary": summary},
                 headers={"X-ATS-Approval-Token": token})
     after = resp.json()
-    # The completed session's capability is spent; drop only its entries (#3593).
-    sp.forget_approval_token(sid, cid=sid)
-    sp.forget_approval_token(sid)
+    # The capability is deliberately KEPT: a completed sender may still
+    # readdress its unread direct message (routers/messages.readdress_message).
     # Only drop the pointer when it was OUR session; clearing it after completing
     # some other row would strand this process's own id.
     if not session_id or session_id == pointer_id:

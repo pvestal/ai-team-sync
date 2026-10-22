@@ -28,6 +28,7 @@ import ai_team_sync.mcp.server as mcp
 from ai_team_sync import session_pointer as sp
 from ai_team_sync.database import get_db
 from ai_team_sync.server import create_app
+from tests.test_hook_delivery_live import live_ats  # noqa: F401  (fixture)
 
 
 # ── the per-cid capability map ───────────────────────────────────────────────
@@ -79,18 +80,6 @@ def test_old_readers_still_find_the_most_recent_capability(state):
     sp.save_approval_token("sess-b", "tok-b", cid=CID)
     data = json.loads((state / f"{sp.APPROVAL_TOKEN_PREFIX}{CID[:8]}").read_text())
     assert (data["session_id"], data["token"]) == ("sess-b", "tok-b")
-
-
-def test_completing_a_session_prunes_only_its_entry(state):
-    sp.save_approval_token("sess-a", "tok-a", cid=CID)
-    sp.save_approval_token("sess-b", "tok-b", cid=CID)
-    sp.forget_approval_token("sess-b", cid=CID)
-    assert sp.load_approval_token("sess-b", cid=CID) == ""
-    assert sp.load_approval_token("sess-a", cid=CID) == "tok-a"
-    data = json.loads((state / f"{sp.APPROVAL_TOKEN_PREFIX}{CID[:8]}").read_text())
-    assert (data["session_id"], data["token"]) == ("sess-a", "tok-a")
-    sp.forget_approval_token("sess-a", cid=CID)
-    assert not (state / f"{sp.APPROVAL_TOKEN_PREFIX}{CID[:8]}").exists()
 
 
 def test_the_map_is_bounded(state):
@@ -157,6 +146,7 @@ def _fresh_process(monkeypatch, tmp_path, cid):
     """A new MCP process: no in-process sessions, its own client id and state."""
     monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", None)
     monkeypatch.setattr(mcp, "_IN_PROCESS_TOKENS", {}, raising=False)
+    monkeypatch.setattr(mcp, "_IN_PROCESS_CLOSED", set(), raising=False)
     d = tmp_path / f"state-{uuid.uuid4().hex[:6]}"
     d.mkdir()
     monkeypatch.setenv("ATS_STATE_DIR", str(d))
@@ -320,3 +310,130 @@ async def test_a_session_id_this_process_did_not_open_is_refused_for_use(
     text = (await mcp.call_tool("log_decision", {
         "session_id": foreign, "title": "t", "chosen": "c", "reasoning": "r"}))[0].text
     assert text.startswith("❌") and foreign in text, text
+
+
+# ── a COMPLETED sender keeps its readdress authority (Codex review round 1) ──
+#
+# routers/messages.readdress_message lets the original sender move an unread
+# direct message after turnover "even if that sender session has since
+# completed but its capability remains available"
+# (tests/test_message_turnover_2907.py). Pruning the capability on completion
+# took that away from every MCP and CLI sender.
+
+async def _rest_session(transport, agent):
+    async with AsyncClient(transport=transport, base_url="http://localhost:8400") as c:
+        r = await c.post("/api/sessions", json={
+            "developer": "dev", "agent": agent, "scope": [], "description": agent})
+        assert r.status_code == 201, r.text
+        return r.json()["id"], r.headers["X-ATS-Approval-Token"]
+
+
+async def _end(transport, sid, token):
+    async with AsyncClient(transport=transport, base_url="http://localhost:8400") as c:
+        r = await c.patch(f"/api/sessions/{sid}", json={"status": "completed"},
+                          headers={"X-ATS-Approval-Token": token})
+        assert r.status_code == 200, r.text
+
+
+async def _send_and_turn_over(transport, sender):
+    """sender (the default session) -> old; then old ends and next appears."""
+    old, old_token = await _rest_session(transport, "claude-code:old")
+    text = (await mcp.call_tool("send_message", {
+        "recipient_session_id": old, "body": "direct"}))[0].text
+    assert "Message queued" in text, text
+    mid = text.split("Message ID: ")[1].split(".")[0].strip()
+    text = (await mcp.call_tool("complete_session", {
+        "session_id": sender, "summary": "sent and done"}))[0].text
+    assert "Session completed" in text, text
+    await _end(transport, old, old_token)
+    nxt, _ = await _rest_session(transport, "claude-code:next")
+    return mid, old, nxt
+
+
+@pytest.mark.asyncio
+async def test_a_completed_mcp_sender_readdresses_as_the_default_session(wired, tmp_path):
+    """One session: after completing it, it is still this process's session."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    sender = await _start(3591, str(repo), "sender")
+    mid, old, nxt = await _send_and_turn_over(wired, sender)
+    text = (await mcp.call_tool("readdress_message", {
+        "message_id": mid, "recipient_session_id": nxt}))[0].text
+    assert "readdressed" in text and old in text and nxt in text, text
+
+
+@pytest.mark.asyncio
+async def test_a_completed_mcp_sender_readdresses_by_name_beside_an_open_session(
+        wired, tmp_path):
+    """Two sessions: the open one becomes the default, and the completed sender
+    is named with session_id. Its capability is still held."""
+    other_repo, repo = tmp_path / "other", tmp_path / "repo"
+    other_repo.mkdir()
+    repo.mkdir()
+    other = await _start(4242, str(other_repo), "still working")
+    sender = await _start(3591, str(repo), "sender")
+    mid, old, nxt = await _send_and_turn_over(wired, sender)
+    assert mcp._IN_PROCESS_SESSION_ID == other
+    text = (await mcp.call_tool("readdress_message", {
+        "session_id": sender, "message_id": mid, "recipient_session_id": nxt}))[0].text
+    assert "readdressed" in text and old in text and nxt in text, text
+    text = (await mcp.call_tool("message_status", {
+        "session_id": sender, "message_id": mid}))[0].text
+    assert "queued, unacknowledged" in text, text
+
+
+def test_a_completed_cli_sender_keeps_the_capability_it_readdresses_with(
+        live_ats, tmp_path, monkeypatch):
+    """`ats session complete` must leave the capability the CLI's own lookup
+    (load_approval_token(sid, cid=sid) or load_approval_token(sid)) finds."""
+    from click.testing import CliRunner
+
+    from ai_team_sync.cli import cli
+
+    url, client, _env = live_ats
+    state = tmp_path / "cli-state"
+    state.mkdir()
+    env = {"ATS_SERVER_URL": url, "ATS_STATE_DIR": str(state), "ATS_AGENT": "claude-code",
+           "CLAUDE_CODE_SESSION_ID": "c1100000-0000-4000-8000-000000000001",
+           "ATS_DEVELOPER": "dev", "ATS_SESSION_ID": None, "ATS_SESSION": None,
+           "ATS_DELEGATION": None}
+    for key, value in env.items():
+        if value is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, value)
+    monkeypatch.chdir(tmp_path)
+    runner = CliRunner()
+
+    started = runner.invoke(cli, ["session", "start", "-s", "docs/**", "-d", "sender"])
+    assert started.exit_code == 0, started.output
+    sender = started.output.split("Session started: ")[1].split()[0]
+
+    def token_for(sid):
+        return sp.load_approval_token(sid, cid=sid) or sp.load_approval_token(sid)
+
+    def session(agent):
+        r = client.post("/api/sessions", json={"developer": "dev", "agent": agent,
+                                                "scope": [], "description": agent})
+        assert r.status_code == 201, r.text
+        return r.json()["id"], r.headers["X-ATS-Approval-Token"]
+
+    old, old_token = session("claude-code:old")
+    sent = client.post("/api/messages", json={
+        "sender_session_id": sender, "recipient_session_id": old, "body": "direct"},
+        headers={"X-ATS-Approval-Token": token_for(sender)})
+    assert sent.status_code == 201, sent.text
+
+    done = runner.invoke(cli, ["session", "complete", "--session-id", sender, "-m", "done"])
+    assert done.exit_code == 0, done.output
+    assert client.patch(f"/api/sessions/{old}", json={"status": "completed"},
+                        headers={"X-ATS-Approval-Token": old_token}).status_code == 200
+    nxt, _ = session("claude-code:next")
+
+    token = token_for(sender)
+    assert token, "the completed CLI sender lost its capability"
+    moved = client.post(f"/api/messages/{sent.json()['id']}/readdress", json={
+        "sender_session_id": sender, "recipient_session_id": nxt},
+        headers={"X-ATS-Approval-Token": token})
+    assert moved.status_code == 200, moved.text
+    assert moved.json()["original_recipient_session_id"] == old

@@ -135,29 +135,51 @@ _IN_PROCESS_SESSION_ID: str | None = None
 # the DEFAULT target (the most recently opened); a tool that takes session_id
 # may name any session in this map, and no other.
 _IN_PROCESS_TOKENS: dict[str, str] = {}
+# Sessions in _IN_PROCESS_TOKENS that this process has completed. Their
+# capability is KEPT: a completed sender may still readdress its unread direct
+# message after turnover (routers/messages.readdress_message), and that
+# authority is exactly its own capability. They are only never chosen as the
+# default target while an open session remains.
+_IN_PROCESS_CLOSED: set[str] = set()
 
 # Tools whose `session_id` argument selects which of this process's own
 # sessions acts. complete_session has its own targeting (session_target).
 _IN_PROCESS_TARGETING_TOOLS = frozenset({
-    "log_decision", "pause_session", "resume_session", "extend_scope"})
+    "log_decision", "pause_session", "resume_session", "extend_scope",
+    "readdress_message", "message_status"})
 
 
 def _remember_in_process(session_id: str, token: str) -> None:
-    """Record a session this process opened and make it the default target."""
+    """Record a session this process opened and make it the default target.
+    Bounded like the capability file: past the cap, the oldest completed
+    session is dropped first, then the oldest open one."""
     global _IN_PROCESS_SESSION_ID
+    from ai_team_sync.session_pointer import APPROVAL_TOKEN_MAX
+
     _IN_PROCESS_TOKENS.pop(session_id, None)
+    _IN_PROCESS_CLOSED.discard(session_id)
     if token:
         _IN_PROCESS_TOKENS[session_id] = token
     _IN_PROCESS_SESSION_ID = session_id
+    while len(_IN_PROCESS_TOKENS) > APPROVAL_TOKEN_MAX:
+        victims = [sid for sid in _IN_PROCESS_TOKENS
+                   if sid in _IN_PROCESS_CLOSED and sid != session_id] or \
+                  [sid for sid in _IN_PROCESS_TOKENS if sid != session_id]
+        _IN_PROCESS_TOKENS.pop(victims[0], None)
+        _IN_PROCESS_CLOSED.discard(victims[0])
 
 
-def _forget_in_process(session_id: str) -> str | None:
-    """Drop a session this process finished. Returns the new default target:
-    the most recently opened session still held, or None."""
+def _retire_in_process(session_id: str) -> str | None:
+    """Mark a session this process completed. Its capability stays (see
+    _IN_PROCESS_CLOSED). If it was the default, the most recently opened
+    session still open becomes the default; with none open the default is left
+    as it was, exactly as before #3593. Returns the default afterwards."""
     global _IN_PROCESS_SESSION_ID
-    _IN_PROCESS_TOKENS.pop(session_id, None)
+    _IN_PROCESS_CLOSED.add(session_id)
     if _IN_PROCESS_SESSION_ID == session_id:
-        _IN_PROCESS_SESSION_ID = next(reversed(_IN_PROCESS_TOKENS), None)
+        still_open = [sid for sid in _IN_PROCESS_TOKENS if sid not in _IN_PROCESS_CLOSED]
+        if still_open:
+            _IN_PROCESS_SESSION_ID = still_open[-1]
     return _IN_PROCESS_SESSION_ID
 
 
@@ -385,14 +407,16 @@ async def list_tools() -> list[Tool]:
             description="Check whether the recipient has acknowledged a message sent by your current ATS session.",
             inputSchema={"type": "object", "properties": {
                 "message_id": {"type": "string"},
+                "session_id": _OWN_SESSION_SCHEMA,
             }, "required": ["message_id"]},
         ),
         Tool(
             name="readdress_message",
-            description="As the original sender, move an unread direct message from an ended session to one active session. Preserves its ID and delivery history.",
+            description="As the original sender, move an unread direct message from an ended session to one active session. Preserves its ID and delivery history. A sender that has since completed keeps this authority; name it with session_id when it is no longer this process's default session.",
             inputSchema={"type": "object", "properties": {
                 "message_id": {"type": "string"},
                 "recipient_session_id": {"type": "string"},
+                "session_id": _OWN_SESSION_SCHEMA,
             }, "required": ["message_id", "recipient_session_id"]},
         ),
         # Original 8 tools
@@ -1544,8 +1568,6 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                                     if s["id"] == placeholder_session_id else "")})
                             if 200 <= adoption.status_code < 300:
                                 adopted += 1
-                                if s["id"] == placeholder_session_id:
-                                    sp.forget_approval_token(s["id"], cid=live_cid)
                             else:
                                 adoption_warnings.append(
                                     f"placeholder {s['id']} was not completed "
@@ -2431,7 +2453,6 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         and target.session_id not in _IN_PROCESS_TOKENS):
                     return [TextContent(type="text", text=(
                         "❌ A handoff must come from one of this MCP process's own sessions."))]
-                from ai_team_sync import session_pointer as sp
                 token = _capability_for(target.session_id)
                 if not token:
                     return [TextContent(type="text", text="❌ Session capability missing for completion.")]
@@ -2461,13 +2482,16 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 lines += ["", f"  Summary: {summary}", "",
                           "  All locks released. Team has been notified."]
 
-                # The finished session's capability is spent: drop it from this
-                # process and from this client's file (#3593), leaving every
-                # other session's entry in place.
+                # The capability is KEPT, in memory and in this client's file: a
+                # completed sender may still readdress its unread direct message
+                # after turnover (routers/messages.readdress_message). The
+                # session only stops being the default while another open
+                # session of this process remains (#3593).
                 was_default = target.session_id == _IN_PROCESS_SESSION_ID
                 held = was_default or target.session_id in _IN_PROCESS_TOKENS
-                next_default = _forget_in_process(target.session_id) if held else None
-                sp.forget_approval_token(target.session_id)
+                next_default = _retire_in_process(target.session_id) if held else None
+                if next_default == target.session_id:
+                    next_default = None
 
                 # Only drop the pointer when it was OUR session; clearing it after
                 # completing some other row would strand this process's own id.
