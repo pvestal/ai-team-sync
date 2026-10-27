@@ -96,7 +96,8 @@ mandatory for a landing claim.
 ## Conventions
 - **Security:** `ATS_HOST` defaults to `127.0.0.1`; never default a bind to
   `0.0.0.0` — the write API is unauthenticated. Never commit secrets; use
-  `.env` (gitignored) or environment variables.
+  `~/.config/ai-team-sync/ats.env` (or `$ATS_ENV_FILE`) or environment
+  variables. Settings never read a `.env` from the CWD (#3586).
 - **Versioning:** keep `src/ai_team_sync/__init__.py`, the FastAPI `version=`,
   and `pyproject.toml` in sync.
 - **Agent identity — two different questions.** `ATS_AGENT` (explicit, any

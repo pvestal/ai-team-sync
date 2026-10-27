@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import os
 import tomllib
 from pathlib import Path
 from typing import Any
 
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _ats_env_file() -> Path:
+    """The one env file ATS reads: $ATS_ENV_FILE, else ~/.config/ai-team-sync/ats.env.
+
+    Never a bare ".env": that resolves against the caller's CWD, so running `ats`
+    inside another repo loaded that repo's secrets (#3586).
+    """
+    explicit = os.environ.get("ATS_ENV_FILE")
+    if explicit:
+        return Path(explicit).expanduser()
+    return Path.home() / ".config" / "ai-team-sync" / "ats.env"
 
 
 class Settings(BaseSettings):
@@ -47,7 +60,14 @@ class Settings(BaseSettings):
     # falsely reaped.
     session_heartbeat_timeout_minutes: int = 20
 
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8"}
+    # Keys ATS does not declare are ignored, and validation errors never echo
+    # the rejected value (#3586).
+    model_config = SettingsConfigDict(
+        env_file=_ats_env_file(),
+        env_file_encoding="utf-8",
+        extra="ignore",
+        hide_input_in_errors=True,
+    )
 
 
 def load_team_config(repo_root: Path | None = None) -> dict[str, Any]:

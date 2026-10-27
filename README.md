@@ -313,7 +313,7 @@ across a *trusted* network, set `ATS_HOST=0.0.0.0` deliberately before starting
 
   `ATS_OPERATOR_CONFIG` may point every ATS client at a different shared file.
   `ATS_COORDINATED_REPOS` remains only as a legacy explicit override.
-- **Slack/Telegram**: Edit `.env` with webhook URLs for push notifications
+- **Slack/Telegram**: Put webhook URLs in `~/.config/ai-team-sync/ats.env` (or the file `$ATS_ENV_FILE` names) for push notifications
 - **GitHub Action**: Auto-appends session context to PR descriptions
 
 ## License
