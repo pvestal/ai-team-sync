@@ -55,6 +55,9 @@ Dashboard: `http://localhost:8400/dashboard`. For Claude Code, wire up the [MCP 
 ```
 
 That's it. Installs everything, starts the server, installs the VS Code extension.
+Settings live in `~/.config/ai-team-sync/ats.env` (created from `.env.example`;
+an absolute `$ATS_ENV_FILE` overrides it). ATS never reads a `.env` from the
+current directory.
 
 ### Manual install (from source)
 

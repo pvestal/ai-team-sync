@@ -137,3 +137,25 @@ def test_default_ats_owned_env_file_is_honored(tmp_path):
 
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert proc.stdout.strip() == "8511"
+
+
+def test_relative_ats_env_file_is_not_read_from_cwd(tmp_path):
+    """Review r1 item 1: ATS_ENV_FILE=.env would resolve against the CWD again."""
+    sentinel = _sentinel()
+    cwd = tmp_path / "other_repo"
+    cwd.mkdir()
+    (cwd / ".env").write_text(f"ATS_PORT={sentinel}\nJWT_SECRET={sentinel}\n")
+
+    proc = _run_ats(cwd, tmp_path / "home", {"ATS_ENV_FILE": ".env"})
+
+    _assert_settings_loaded(proc)
+    _assert_not_echoed(proc, sentinel)
+
+
+def test_setup_script_never_creates_a_cwd_dotenv():
+    """Review r1 item 4: setup.sh wrote a repo-root .env the settings no longer read."""
+    script = (Path(__file__).resolve().parents[1] / "setup.sh").read_text()
+    code = [ln.split("#", 1)[0] for ln in script.splitlines()]
+
+    assert not any("cp .env.example .env" in ln for ln in code)
+    assert any(".config/ai-team-sync/ats.env" in ln for ln in code)

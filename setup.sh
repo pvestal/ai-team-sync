@@ -13,8 +13,12 @@ if [ ! -d ".venv" ]; then
 fi
 .venv/bin/pip install -e . -q 2>&1 | tail -1
 
-# Config
-[ ! -f ".env" ] && cp .env.example .env
+# Config: ATS reads only its own env file, never a CWD .env (#3586)
+ATS_ENV="${HOME}/.config/ai-team-sync/ats.env"
+if [ ! -f "$ATS_ENV" ]; then
+    mkdir -p "$(dirname "$ATS_ENV")"
+    (umask 077 && cp .env.example "$ATS_ENV")
+fi
 
 # VS Code extension
 cd "$DIR/vscode-extension"

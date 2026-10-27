@@ -11,14 +11,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 def _ats_env_file() -> Path:
-    """The one env file ATS reads: $ATS_ENV_FILE, else ~/.config/ai-team-sync/ats.env.
+    """The one env file ATS reads: an absolute $ATS_ENV_FILE, else
+    ~/.config/ai-team-sync/ats.env.
 
-    Never a bare ".env": that resolves against the caller's CWD, so running `ats`
-    inside another repo loaded that repo's secrets (#3586).
+    Never a CWD-relative path: a bare ".env" made running `ats` inside another
+    repo load that repo's secrets (#3586), so a relative $ATS_ENV_FILE is ignored.
     """
-    explicit = os.environ.get("ATS_ENV_FILE")
-    if explicit:
-        return Path(explicit).expanduser()
+    explicit = Path(os.environ.get("ATS_ENV_FILE", "")).expanduser()
+    if explicit.is_absolute():
+        return explicit
     return Path.home() / ".config" / "ai-team-sync" / "ats.env"
 
 
