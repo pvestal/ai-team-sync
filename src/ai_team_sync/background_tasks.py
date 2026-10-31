@@ -202,12 +202,14 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
         #
         # We still reap. Holding a dead session's locks is worse than
         # reaping it — the lane stays blocked for everyone. What changes is
-        # that the stranded work is COUNTED in the summary (durable) and NAMED
-        # on the event (live), instead of vanishing silently (#2810).
+        # that the stranded work is COUNTED in the summary and NAMED, verbatim,
+        # in the stored completion event (durable) and on the live event (#2810).
         stranded: list[str] = []
+        measured = False
         try:
             scope = json.loads(raw_scope) if raw_scope else []
             stranded = uncommitted_for_scope(repo_root, scope, uncommitted_cache)
+            measured = True
         except Exception:  # noqa: BLE001 — never let the sweep die on a git call
             stranded = []
 
@@ -304,15 +306,18 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
             note = f"[auto-completed: {reason}]"
             # A COUNT, never the names (#2810): a filename is arbitrary text,
             # and one containing ']' ended the marker early and grafted the rest
-            # onto the summary. The names go on the event below, as a list.
+            # onto the summary. The names go on the events below, as a list.
             if stranded:
                 note += f" [STRANDED {len(stranded)} uncommitted file(s) in scope]"
                 logger.warning("session %s reaped with %d uncommitted file(s) in scope: %r",
                                sess.id, len(stranded), stranded)
             sess.summary = replace_lifecycle_marker(sess.summary, note)
             # A reaped session is a completed session: same v1 event, same
-            # outbox, reason 'reaped' (#3537). It used to emit nothing.
-            await completion_events.record_completion(db, sess, completion_events.REAPED)
+            # outbox, reason 'reaped' (#3537). It used to emit nothing. The
+            # stranded names ride in it (#2810); a failed scope check omits them.
+            await completion_events.record_completion(
+                db, sess, completion_events.REAPED,
+                uncommitted_in_scope=stranded if measured else None)
             await db.commit()
         # Told only once it is durable, and outside the writer lock.
         await broadcast_event(session_id, "session.auto_completed", {

@@ -134,6 +134,89 @@ async def test_the_count_marker_dedups_across_reap_cycles(db_session, tmp_path):
     assert summary.startswith(NARRATIVE), summary
 
 
+# ── the stored completion event is the DURABLE copy of the names ────────
+# The websocket event is not stored. The v1 completion event in the outbox is,
+# so the names are kept there, verbatim, under the payload's own sha256.
+
+BRACKET_PAIR = "b[1].py"
+
+
+async def _fresh_outbox_rows(db_engine, sid):
+    """Read the outbox through a NEW database session: what was committed, not
+    what this process still holds in memory."""
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+    from ai_team_sync.models import CompletionOutbox
+    async with async_sessionmaker(db_engine, class_=AsyncSession)() as fresh:
+        return (await fresh.execute(select(CompletionOutbox)
+                                    .where(CompletionOutbox.session_id == sid))).scalars().all()
+
+
+async def test_reaped_event_stores_the_exact_stranded_names(db_engine, db_session, tmp_path):
+    from ai_team_sync import completion_events as ce
+    repo = _repo_with_dirty(tmp_path, [BRACKETED, BRACKET_PAIR, "docs/out.md"])
+    sess = await _silent_session(db_session, repo)
+    sess.scope = json.dumps(["src/**", "*.py"])
+    await db_session.commit()
+
+    assert await auto_complete_stale_sessions(db_session) == 1
+    (row,) = await _fresh_outbox_rows(db_engine, sess.id)
+    assert row.completion_reason == "reaped"
+    for name in (BRACKETED, BRACKET_PAIR):
+        assert json.dumps(name) in row.payload, f"{name!r} not in the stored payload text"
+    event = json.loads(row.payload)
+    assert event["uncommitted_in_scope"] == [BRACKET_PAIR, BRACKETED]
+    assert row.payload_sha256 == ce.sha256(event)
+    # The field is additive: the id still derives from session + completed_at.
+    assert event["event_id"] == ce.event_id_for(sess.id, event["completed_at"])
+
+
+async def test_reaped_event_with_nothing_stranded_carries_an_empty_list(
+        db_engine, db_session, tmp_path):
+    repo = _repo_with_dirty(tmp_path, ["docs/out.md"])
+    sess = await _silent_session(db_session, repo)
+    assert await auto_complete_stale_sessions(db_session) == 1
+    (row,) = await _fresh_outbox_rows(db_engine, sess.id)
+    assert json.loads(row.payload)["uncommitted_in_scope"] == []
+
+
+async def test_a_failed_scope_check_omits_the_field_rather_than_claim_none(
+        db_engine, db_session, tmp_path, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("git exploded")
+    monkeypatch.setattr(background_tasks, "uncommitted_for_scope", boom)
+    sess = await _silent_session(db_session, _repo_with_dirty(tmp_path, [BRACKETED]))
+    assert await auto_complete_stale_sessions(db_session) == 1
+    (row,) = await _fresh_outbox_rows(db_engine, sess.id)
+    assert "uncommitted_in_scope" not in json.loads(row.payload)
+
+
+def test_owner_completed_and_default_events_carry_no_field():
+    from ai_team_sync import completion_events as ce
+    s = Session(id="s", developer="x", agent="a",
+                completed_at=datetime(2026, 10, 9, 20, 0, 0, 1))
+    owner = ce.build_event(s, None, ce.OWNER_COMPLETED, source={})
+    assert "uncommitted_in_scope" not in owner
+    with_field = ce.build_event(s, None, ce.REAPED, source={},
+                                uncommitted_in_scope=[BRACKETED])
+    assert with_field.pop("uncommitted_in_scope") == [BRACKETED]
+    assert with_field == ce.build_event(s, None, ce.REAPED, source={})
+
+
+async def test_owner_completion_outbox_event_has_no_field(client, db_engine):
+    r = await client.post("/api/sessions", json={
+        "developer": "pvestal", "agent": "claude-code:test", "scope": [],
+        "repo_root": "/repo", "ticket_id": 2810})
+    assert r.status_code == 201, r.text
+    sid, token = r.json()["id"], r.headers["X-ATS-Approval-Token"]
+    r = await client.patch(f"/api/sessions/{sid}", json={"status": "completed",
+                                                         "summary": "done"},
+                           headers={"X-ATS-Approval-Token": token})
+    assert r.status_code == 200, r.text
+    (row,) = await _fresh_outbox_rows(db_engine, sid)
+    assert row.completion_reason == "owner_completed"
+    assert "uncommitted_in_scope" not in json.loads(row.payload)
+
+
 # ── legacy summaries written before #2810 ───────────────────────────────
 
 LEGACY_AUTO = "[auto-completed: silent >20m (heartbeat lost)]"

@@ -170,7 +170,9 @@ async def test_reaped_session_emits_a_v1_event(db_session, completion_capture):
     (row,) = await _outbox(db_session, sess.id)
     ev = json.loads(row.payload)
     assert ev["completion_reason"] == "reaped" and ev["handoff"] is None
-    assert ev["event_version"] == 1 and set(ev) == set(FIXTURE["event"])
+    assert ev["event_version"] == 1
+    assert set(ev) == set(FIXTURE["event"]) | {"uncommitted_in_scope"}
+    assert ev["uncommitted_in_scope"] == []
     await ce.deliver_pending(db_session)
     assert [p["event_id"] for _u, p in completion_capture] == [ev["event_id"]]
 

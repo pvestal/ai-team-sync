@@ -106,13 +106,18 @@ def _source() -> dict[str, Any]:
 
 
 def build_event(session: Session, handoff: Handoff | None, reason: str,
-                *, source: dict[str, Any] | None = None) -> dict[str, Any]:
+                *, source: dict[str, Any] | None = None,
+                uncommitted_in_scope: list[str] | None = None) -> dict[str, Any]:
+    """``uncommitted_in_scope`` (#2810) is OPTIONAL and additive: the key is
+    present only when the caller measured it -- the live reaper, which passes
+    [] when nothing was stranded -- and absent otherwise (owner completions,
+    replay, a reap whose scope check failed). The paths are kept verbatim."""
     if reason not in (OWNER_COMPLETED, REAPED):
         raise ValueError(f"unknown completion reason {reason!r}")
     if session.completed_at is None:
         raise ValueError(f"session {session.id} has no completed_at")
     completed_at = iso_utc(session.completed_at)
-    return {
+    event = {
         "event_type": EVENT_TYPE,
         "event_version": EVENT_VERSION,
         "event_id": event_id_for(session.id, completed_at),
@@ -127,6 +132,9 @@ def build_event(session: Session, handoff: Handoff | None, reason: str,
         "handoff": handoff_payload(handoff) if handoff is not None else None,
         "source": source if source is not None else _source(),
     }
+    if uncommitted_in_scope is not None:
+        event["uncommitted_in_scope"] = [str(p) for p in uncommitted_in_scope]
+    return event
 
 
 # ── outbox ────────────────────────────────────────────────────────────────
@@ -148,16 +156,18 @@ def ephemeral_database() -> bool:
     return url.startswith("sqlite") and (url.endswith("://") or ":memory:" in url)
 
 
-async def record_completion(db: AsyncSession, session: Session, reason: str) -> str | None:
+async def record_completion(db: AsyncSession, session: Session, reason: str, *,
+                            uncommitted_in_scope: list[str] | None = None) -> str | None:
     """Add this completion's event to the outbox, inside the caller's transaction.
 
     Call it after the completion fields (and any handoff) are set and before the
     commit, so the event and the state it describes land together or not at all.
     Recording never depends on delivery being switched on. Returns the event_id.
+    ``uncommitted_in_scope``: see build_event.
     """
     handoff = (await db.execute(
         select(Handoff).where(Handoff.source_session_id == session.id))).scalar_one_or_none()
-    event = build_event(session, handoff, reason)
+    event = build_event(session, handoff, reason, uncommitted_in_scope=uncommitted_in_scope)
     if await db.get(CompletionOutbox, event["event_id"]) is None:
         db.add(CompletionOutbox(
             event_id=event["event_id"], session_id=session.id, completion_reason=reason,
