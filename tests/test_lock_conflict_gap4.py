@@ -95,7 +95,10 @@ async def test_an_unanchored_session_still_conflicts_conservatively(client):
 async def test_a_session_may_extend_its_own_exclusive_scope(client):
     me = await _session(client, ["src/auth/**"], mode="exclusive")
     assert (await _lock(client, me, "src/auth/jwt.py", "exclusive")).status_code == 201
-    assert (await _lock(client, me, "src/auth/**", "advisory")).status_code == 201
+    # re-claiming a lane it already holds live is refused, not stacked (#2765)
+    held = await _lock(client, me, "src/auth/**", "advisory")
+    assert held.status_code == 409
+    assert held.json()["detail"]["error"] == "lane_already_held"
     assert (await _lock(client, me, "src/other/**", "exclusive")).status_code == 201
 
 
