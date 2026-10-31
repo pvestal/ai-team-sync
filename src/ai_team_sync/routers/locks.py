@@ -131,6 +131,60 @@ def _cross_repo(caller_repo_root: str, lock_repo_root: str) -> bool:
     return bool(a) and bool(b) and a != b
 
 
+def lane_key(pattern: str, repo_root: str) -> str:
+    """The lane a pattern names for a session: its canonical form under the
+    session's anchor, so 'src/**' and './src/**' are one lane (#2765)."""
+    return canonical_pattern(pattern, repo_root or "")
+
+
+async def _own_lane_rows(db: AsyncSession, session: Session,
+                         pattern: str) -> tuple[list[ScopeLock], list[ScopeLock]]:
+    """This session's rows for the lane `pattern` names (#2765), as
+    (live, replaceable): live = unexpired, strongest first; replaceable = expired
+    and not authority-bearing. An expired row never blocks a re-claim, and an
+    authority-bearing row is never this door's to rewrite or remove."""
+    now = datetime.now(timezone.utc)
+    lane = lane_key(pattern, session.repo_root)
+    rows = (await db.execute(
+        select(ScopeLock).where(ScopeLock.session_id == session.id))).scalars().all()
+    same = [r for r in rows if lane_key(r.pattern, session.repo_root) == lane]
+    live = sorted((r for r in same if _aware(r.expires_at) > now),
+                  key=lambda r: (r.mode == "exclusive", bool(r.authority_bearing),
+                                 _aware(r.expires_at)),
+                  reverse=True)
+    replaceable = [r for r in same
+                   if _aware(r.expires_at) <= now and not r.authority_bearing]
+    return live, replaceable
+
+
+def _lane_already_held_detail(session: Session, live: list[ScopeLock],
+                              requested_mode: str) -> dict:
+    """The 409 body for a re-claim of a lane the session already holds live."""
+    held = live[0]
+    expires = _aware(held.expires_at).isoformat()
+    message = (f"Session {session.id} already holds '{held.pattern}' as {held.mode} "
+               f"(lock {held.id}, expires {expires}). Nothing was changed.")
+    if requested_mode != held.mode:
+        message += (f" You asked for {requested_mode}; the mode was NOT changed. To change "
+                    f"it, delete_lock {held.id} and claim the lane again.")
+    if held.authority_bearing:
+        message += (" This row is the session's creation-time authority-bearing claim: "
+                    "deleting it gives up that authority, and no lock made through "
+                    "POST /api/locks can restore it.")
+    return {
+        "error": "lane_already_held",
+        "message": message,
+        "lock_id": held.id,
+        "pattern": held.pattern,
+        "mode": held.mode,
+        "expires_at": expires,
+        "requested_mode": requested_mode,
+        "authority_bearing": bool(held.authority_bearing),
+        "held": [{"lock_id": r.id, "pattern": r.pattern, "mode": r.mode,
+                  "expires_at": _aware(r.expires_at).isoformat()} for r in live],
+    }
+
+
 @router.post("", response_model=LockResponse, status_code=201)
 async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Depends(get_db)):
     # Verify session exists and is active
@@ -174,6 +228,10 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
         await db.refresh(session)
         if session.status not in ("active", "paused"):
             raise HTTPException(400, "Session is not active")
+        live_twins, expired_twins = await _own_lane_rows(db, session, body.pattern)
+        if live_twins:
+            raise HTTPException(409, detail=_lane_already_held_detail(
+                session, live_twins, body.mode))
         conflicts = await _check_scope_conflicts(
             db, [body.pattern], session.developer, repo_root=session.repo_root or "",
             exclude_session_id=session.id, requester_session_id=session.id,
@@ -189,6 +247,11 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
             session_id=body.session_id, pattern=body.pattern, mode=body.mode,
             reason=body.reason, authority_bearing=False,
         )
+        # The new row replaces this session's expired rows for the lane (#2765),
+        # in the same commit, so the lane is never held twice. Authority-bearing
+        # rows are not this door's to remove; _own_lane_rows leaves them out.
+        for twin in expired_twins:
+            await db.delete(twin)
         db.add(lock)
         if admitted is not None:
             await admission.record(db, session, admitted, [body.pattern])

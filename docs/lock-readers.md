@@ -225,6 +225,24 @@ their session's anchor (never honoured by the edit guard, yet now conflicting),
 that are `unplaceable`, or that match no file. It changes nothing and exits 1
 when it finds any; clearing them is the holders' decision.
 
+**One live row per lane (#2765).** A lane is a session plus the canonical form
+of a pattern under that session's `repo_root` (`src/**` and `./src/**` are one
+lane; an absolute pattern outside the anchor is its own). `POST /api/locks` for a
+lane the session already holds with an unexpired row is refused 409
+`lane_already_held`, naming that row (`lock_id`, `mode`, `expires_at`,
+`authority_bearing`, plus every live row in `held`); nothing is written. A
+request for another mode changes nothing: delete the lock and claim again, which
+goes through the overlap check above. Expired rows never block and are never
+returned: the re-claim is a new row with a fresh TTL, and it replaces the
+session's expired rows for that lane in the same commit. Authority-bearing rows
+are never rewritten or removed here; an expired one stays beside the new row.
+MCP `extend_scope` reports a held lane as "already held", keeps it in scope, and
+is not an error. Rows written before this are cleared by
+`scripts/dedupe_scope_locks.py`: a read-only counted dry run by default (exit 1
+when it would remove anything), `--apply` to remove; it keeps the strongest row
+per lane and never removes an authority-bearing row. There is no database
+constraint: uniqueness depends on expiry, which an index cannot express.
+
 **Ownership report.** `GET /api/locks/ownership?repo_root=R&paths=a,b&session_id=S`
 (MCP `lock_ownership`) lists, per path, every live session whose lock covers it
 with its mode, and `conflict: true` when one of them is not `S`, after the same

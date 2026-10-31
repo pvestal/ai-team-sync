@@ -2778,7 +2778,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # Locks FIRST, scope second (#2756): the board must never declare
                 # a pattern this session was refused. The old order patched the
                 # merged scope, then announced "Scope extended" over refused locks.
-                created, refused = [], []
+                created, refused, held = [], [], []
                 admission_line = ""
                 for pat in patterns:
                     lr = await client.post(
@@ -2804,6 +2804,13 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         detail = body.get("detail") if isinstance(body, dict) else body
                     except ValueError:
                         detail = lr.text
+                    # This session already holds the lane live (#2765): nothing
+                    # to take, nothing to report as an error. The lane is locked,
+                    # so it belongs in the declared scope like a new one.
+                    if lr.status_code == 409 and isinstance(detail, dict) \
+                            and detail.get("error") == "lane_already_held":
+                        held.append((pat, detail))
+                        continue
                     why = str((detail.get("message") if isinstance(detail, dict) else detail)
                               or "refused")[:300]
                     refused.append((pat, lr.status_code,
@@ -2814,8 +2821,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 sess.raise_for_status()
                 sess_data = sess.json()
                 current = sess_data.get("scope") or []
-                merged = list(dict.fromkeys([*current, *created]))
-                if created:
+                merged = list(dict.fromkeys([*current, *created, *(p for p, _d in held)]))
+                if created or merged != current:
                     patch_body: dict[str, Any] = {"scope": merged}
                     # Adoption variant (ats-sessionstart-orphan-adoption-p01): a
                     # session taking real locks must not keep the placeholder
@@ -2833,16 +2840,30 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     )
                     patch.raise_for_status()
 
-                if not refused:
+                if not refused and not created and held:
+                    msg = "✅ Already held: no new lock needed.\n\n"
+                elif not refused:
                     msg = f"✅ Scope extended (+{len(created)} {mode} lock(s)).\n\n"
-                elif created:
+                elif created or held:
                     msg = (f"⚠️ Scope PARTIALLY extended: +{len(created)} {mode} lock(s), "
+                           f"{len(held)} already held, {len(refused)} refused.\n\n"
+                           if held else
+                           f"⚠️ Scope PARTIALLY extended: +{len(created)} {mode} lock(s), "
                            f"{len(refused)} refused.\n\n")
                 else:
                     msg = "❌ Scope NOT extended: every requested lock was refused.\n\n"
                 msg += "Now covering:\n" + ("\n".join(f"  • {p}" for p in merged) or "  (nothing)") + "\n"
                 if admission_line:
                     msg += admission_line
+                if held:
+                    msg += "\nAlready held by this session (no new lock taken):\n"
+                    for pat, d in held:
+                        line = (f"  • {pat}: {d.get('mode')} lock {d.get('lock_id')}, "
+                                f"expires {d.get('expires_at')}")
+                        if d.get("mode") != mode:
+                            line += (f" (you asked for {mode}; mode NOT changed. To change "
+                                     f"it, delete_lock {d.get('lock_id')} then extend_scope again)")
+                        msg += line + "\n"
                 if refused:
                     msg += "\nRefused — not locked and not added to your scope:\n"
                     msg += "\n".join(f"  • {p}: {why}" for p, _code, why in refused) + "\n"
