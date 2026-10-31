@@ -97,7 +97,14 @@ async def test_anchor_is_stored_without_a_trailing_slash(client, tmp_path):
 # ── Link 3: the reaper looks before it completes ────────────────────────────
 
 @pytest.mark.asyncio
-async def test_reaper_names_the_files_it_strands(db_session, tmp_path):
+async def test_reaper_names_the_files_it_strands(db_session, tmp_path, monkeypatch):
+    from ai_team_sync import background_tasks
+    seen: list[tuple[str, dict]] = []
+
+    async def fake_broadcast(session_id, event_type, data):
+        seen.append((event_type, data))
+
+    monkeypatch.setattr(background_tasks, "broadcast_event", fake_broadcast)
     repo = _repo_with_dirty(tmp_path, ["src/keep.py", "src/also.py", "docs/out.md"])
     stale = _utcnow() - timedelta(hours=settings.session_inactivity_hours + 1)
 
@@ -113,10 +120,11 @@ async def test_reaper_names_the_files_it_strands(db_session, tmp_path):
     assert row.status == "completed"
     # Reap anyway — holding a dead session's locks blocks the lane for everyone.
     # What must change is that the stranded work is NAMED.
+    # The summary COUNTS them; the event NAMES them, as a list (#2810).
     assert "STRANDED 2 uncommitted file(s)" in (row.summary or "")
-    assert "src/keep.py" in row.summary and "src/also.py" in row.summary
+    (data,) = [d for t, d in seen if t == "session.auto_completed"]
     # Out of scope is not this session's to claim.
-    assert "docs/out.md" not in row.summary
+    assert data["uncommitted_in_scope"] == ["src/also.py", "src/keep.py"]
 
 
 @pytest.mark.asyncio

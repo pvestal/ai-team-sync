@@ -47,8 +47,19 @@ logger = logging.getLogger(__name__)
 # arbitrary fnmatch syntax and no amount of bracket-matching here makes prose a
 # safe container for it. The structured fields on the heartbeat response and the
 # session.resurrected event are where a pattern is read.
+# The same holds for FILENAMES (#2810): the STRANDED marker carries a count, and
+# the names are read from the session.auto_completed event.
+_MARKER_START = r"\[(?:auto-completed|resurrected|STRANDED)\b"
+# LEGACY (#2810). Rows written before that fix hold the old filename-bearing
+# STRANDED marker, whose names may contain ']'. It is matched through the last
+# ']' that is followed only by another marker or the end of the summary -- where
+# the reaper always wrote it -- without crossing a line or a " [", so text after
+# it that is not a marker stays the operator's. Anything else falls through to
+# the first-']' form below, which is no worse than before.
+_LEGACY_STRANDED = (r"\[STRANDED \d+ uncommitted file\(s\) in scope: "
+                    r"(?:(?!\s\[)[^\n])*?\](?=\s*(?:" + _MARKER_START + r"|$))")
 _LIFECYCLE_MARKER_RE = re.compile(
-    r"\s*\[(?:auto-completed|resurrected|STRANDED)\b[^\]]*\]")
+    r"\s*(?:" + _LEGACY_STRANDED + "|" + _MARKER_START + r"[^\]]*\])")
 
 
 def replace_lifecycle_marker(summary: str | None, note: str) -> str:
@@ -191,8 +202,8 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
         #
         # We still reap. Holding a dead session's locks is worse than
         # reaping it — the lane stays blocked for everyone. What changes is
-        # that the stranded work is NAMED, in the summary (durable) and on
-        # the event (live), instead of vanishing silently.
+        # that the stranded work is COUNTED in the summary (durable) and NAMED
+        # on the event (live), instead of vanishing silently (#2810).
         stranded: list[str] = []
         try:
             scope = json.loads(raw_scope) if raw_scope else []
@@ -291,9 +302,13 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
                       if heartbeated else
                       f"inactive >{settings.session_inactivity_hours}h")
             note = f"[auto-completed: {reason}]"
+            # A COUNT, never the names (#2810): a filename is arbitrary text,
+            # and one containing ']' ended the marker early and grafted the rest
+            # onto the summary. The names go on the event below, as a list.
             if stranded:
-                note += (f" [STRANDED {len(stranded)} uncommitted file(s) in scope: "
-                         + ", ".join(stranded) + "]")
+                note += f" [STRANDED {len(stranded)} uncommitted file(s) in scope]"
+                logger.warning("session %s reaped with %d uncommitted file(s) in scope: %r",
+                               sess.id, len(stranded), stranded)
             sess.summary = replace_lifecycle_marker(sess.summary, note)
             # A reaped session is a completed session: same v1 event, same
             # outbox, reason 'reaped' (#3537). It used to emit nothing.
