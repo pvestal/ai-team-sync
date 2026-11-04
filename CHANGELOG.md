@@ -17,30 +17,50 @@
   not an OS boundary: see `docs/restart-gate.md`.
 
 ### Fixed
-- **One MCP process can hold several sessions without losing any capability
-  (#3593).** The client capability file held one `{session_id, token}` pair,
-  rewritten in place, and the MCP server one in-process token, so a second
-  `start_session` destroyed the first session's capability: it could no longer
-  be completed ("Session capability missing for completion."), paused or
-  resumed, and was left to the reaper (observed 2026-10-15 with two
-  repositories, and 2026-10-22 with four parallel subagents of one Claude
-  session, which share its single MCP process). The file is now a bounded map
-  keyed by session id, written atomically under a lock (0600) and still
-  readable by and for pre-#3593 code; the server keeps a map of the sessions
-  it opened. `complete_session`, `pause_session`, `resume_session`,
-  `log_decision`, `extend_scope`, `readdress_message` and `message_status` take
-  a `session_id` naming one of this process's own sessions, and refuse any
-  other. Completing a session keeps its capability, so a completed sender can
-  still readdress an unread direct message; the map's bound limits growth. A
-  capability still authorizes only its own row.
+- **Every session keeps its own capability: a second `start_session` no
+  longer destroys the first one's (#3593).** The client capability file held
+  one `{session_id, token}` pair, rewritten in place and keyed by `cid[:8]`, and
+  the MCP server one in-process token, so a second session in the same Claude
+  process (a second repository, a second ticket, a parallel subagent) left the
+  first one impossible to complete, pause, or release its own locks, and the
+  reaper took it (observed 2026-10-15 and 2026-10-22). Capabilities now live in
+  a per-client keyring, `<state>/.ats_capabilities/<full client id>.json`
+  (directory 0700, file 0600), one entry per session with its state (`open`,
+  `completed`, `revoked`) and an optional `parent`; every update runs under an
+  exclusive flock (a lock that cannot be taken is an error, never an unlocked
+  write) and is written temp-file + fsync + rename. A malformed keyring is
+  refused, never read as empty and overwritten. Only non-open entries are ever
+  evicted; when all are open the keyring grows. Pointers are keyed by the FULL
+  client id too, so two Claude sessions sharing eight characters no longer share
+  state; the old eight-character files are read only, as a migration path, and
+  a legacy capability is used only for the session the file itself names.
+  Operations that name a session use exactly that session's capability, from
+  memory or the keyring, and never the pointer's: `complete_session`,
+  `pause_session`, `resume_session`, `log_decision`, `extend_scope`, the
+  message tools, `delete_lock` and `reconcile_delegation` take `session_id`;
+  `delete_lock` and `reconcile_delegation` act as the lock's / delegation's own
+  session when this client holds its capability. `ats session pause` gains
+  `--session-id`, and `ats session complete --session-id` accepts any session
+  whose capability this shell holds. A missing or revoked capability is refused
+  explicitly. Completing a session keeps its capability (a completed sender may
+  still readdress an unread direct message). Server-side checks are unchanged.
+- **Registered subagents (#3593).** `start_session(parent_session_id=...)`
+  registers a subagent: its own session and capability, recorded with its
+  parent, added beside the parent's. The parent stays the MCP process's default
+  and keeps the pointer; the subagent names `session_id` on its calls. The
+  parent must be an open session this client holds. Locks are never
+  transferred, and completing either one leaves the other's capability,
+  pointer and locks as they were.
 - **Parallel subagents of one Claude session can edit under their own locks
   (#3593).** They share one cid and one per-session pointer, so the edit guard
-  judged subagent A's edit as whichever subagent started last and refused it.
-  When the pointer session holds no covering lock, a live lock held by another
-  ACTIVE session whose label is exactly this Claude session's canonical label
-  (`claude-code:<cid8>`, string equality, never containment) now grants the
-  edit and is not reported as a foreign conflict. The base is fixed and the
-  cid8 comes from the hook payload; no environment variable (such as
+  judged subagent A's edit as whichever session the pointer named. When the
+  pointer session holds no covering lock, a live lock held by a SIBLING grants
+  the edit and is not reported as a foreign conflict. A sibling is an ACTIVE
+  session whose label is exactly this Claude session's canonical label
+  (`claude-code:<cid8>`, string equality, never containment) AND whose own
+  capability this Claude session's keyring holds: the label alone is the shared
+  cid8, which a colliding or forged row can carry. The base is fixed and the
+  cid comes from the hook payload; no environment variable (such as
   `ATS_AGENT`) chooses what the rule matches. Scope still never grants.
 - **Locks anchored to a linked worktree count as their main checkout in the
   edit guard.** The guard maps a worktree file to the main checkout's root but

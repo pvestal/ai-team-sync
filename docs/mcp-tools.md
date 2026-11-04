@@ -16,7 +16,7 @@ nothing here should be treated as one.
 
 | Tool | Effect | Notes |
 |---|---|---|
-| `start_session` | mutates | Declares scope and takes advisory locks. Returns a context brief when one is available. Pass `repo_root` so patterns anchor to a repo and `ticket_id` when working a Tower ticket. `ticket_role` (`owner` / `contributor` / `reviewer`, #3585): one live owner per ticket per OS account receives the ticket's general mailbox; a contributor needs an explicit scope; a reviewer claims nothing. Omitted: owner if the ticket has no live owner; otherwise contributor when files are named, reviewer when none are. A refused owner claim names the ticket's live owner. See docs/collaboration-contract.md. |
+| `start_session` | mutates | Declares scope and takes advisory locks. Returns a context brief when one is available. Pass `repo_root` so patterns anchor to a repo and `ticket_id` when working a Tower ticket. `ticket_role` (`owner` / `contributor` / `reviewer`, #3585): one live owner per ticket per OS account receives the ticket's general mailbox; a contributor needs an explicit scope; a reviewer claims nothing. Omitted: owner if the ticket has no live owner; otherwise contributor when files are named, reviewer when none are. A refused owner claim names the ticket's live owner. See docs/collaboration-contract.md. `parent_session_id` registers a subagent of an open session this client holds (#3593; see below). |
 | `complete_session` | mutates | Pass `session_id`: it is authoritative for the call and is echoed back with the prior and resulting status, so you can see which row changed. Omitting it uses the legacy pointer path. Releases locks. A ticket-linked session may attach a structured `handoff`; it goes to the ticket's live owner, or the next owner. Refused while a child delegation is still open, and refused on a session you do not own. |
 | `pause_session` / `resume_session` | mutates | Pauses work while keeping locks. Optional `session_id` names one of this process's own sessions. |
 | `extend_scope` | mutates | Adds patterns to the current session mid-flight. Optional `session_id` names one of this process's own sessions. |
@@ -35,17 +35,25 @@ speaks for *this* caller allowed to refuse a mismatch. See
 [Authority model](authority-model.md).
 
 One MCP process may hold several sessions at once — two repositories or two
-tickets in one client, or parallel subagents of one Claude session, which share
-that session's single MCP process (#3593). Each keeps its own capability, in
-memory and in the client's private capability file (a map keyed by session id).
-The most recently started session is the default; `complete_session`,
-`pause_session`, `resume_session`, `log_decision` and `extend_scope` accept a
-`session_id` naming any session this process started, and refuse any other.
-Completing a session keeps its capability, because a completed sender may still
-`readdress_message` an unread direct message (pass its `session_id`; it is
-accepted there and by `message_status`); the map is bounded instead. If the
-completed session was the default, the most recently started session still open
-becomes the default again.
+tickets in one client, or a parent and its subagents, which share one Claude
+session's single MCP process (#3593). Each keeps its own capability, in memory
+and in the client's private keyring (`<state>/.ats_capabilities/<client
+id>.json`). The pointer is only the DEFAULT selector: the most recently started
+session that is not a registered subagent. Tools that act as a session accept
+`session_id` naming any session whose capability this process or client holds,
+use exactly that session's capability, and refuse any other id — another
+session's capability is never used in its place. `delete_lock` and
+`reconcile_delegation` act as the lock's or delegation's own session when its
+capability is held. Completing a session keeps its capability, because a
+completed sender may still `readdress_message` an unread direct message; if the
+completed session was the default, the most recently started open session that
+is not a subagent becomes the default.
+
+A **subagent** registers with `start_session(parent_session_id=<parent>)`, the
+id its parent hands it. It gets its own session and capability; the parent
+stays the default and keeps the pointer, and the subagent passes its own
+`session_id` on every later call. Nothing is inferred from the shared Claude
+session id, and no lock moves between parent and subagent.
 
 ## Locks and presence
 
