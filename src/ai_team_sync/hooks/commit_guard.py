@@ -123,7 +123,7 @@ def resolve_identity(cid: str | None = None) -> Identity:
 
     1. When a Claude session id is known (the hook payload's, else
        $CLAUDE_CODE_SESSION_ID / the live-cid record) and its per-session
-       pointer ~/.ats_session_<cid8> exists, the POINTER wins. A different
+       pointer ~/.ats_session_<client id> exists, the POINTER wins. A different
        $ATS_SESSION_ID is a conflict: the caller refuses and names both.
     2. Otherwise $ATS_SESSION_ID, then a delegated child's capability file --
        both self-asserted, so the caller must validate them with
@@ -136,10 +136,8 @@ def resolve_identity(cid: str | None = None) -> Identity:
     env = (os.environ.get("ATS_SESSION_ID") or "").strip()
     cid = (cid or sp.claude_session_id() or "").strip()
     if cid:
-        try:
-            pointer = sp.session_pointer_path(cid).read_text().strip()
-        except OSError:
-            pointer = ""
+        # Full-id pointer, or a pre-#3593-r2 eight-character one (read only).
+        pointer = sp.read_session_pointer(cid) or ""
         if pointer:
             conflict = ""
             if env and env != pointer:

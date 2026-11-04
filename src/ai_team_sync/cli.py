@@ -151,19 +151,52 @@ def session_start(scope, desc, agent, no_lock, exclusive):
     # Save session ID for other commands
     _save_active_session(data["id"])
     token = resp.headers.get("X-ATS-Approval-Token", "")
-    sp.save_approval_token(data["id"], token, cid=data["id"])
-    sp.save_approval_token(data["id"], token)
+    # ADDED to the keyring beside any capability already held (#3593): a
+    # second `ats session start` never invalidates the first session's.
+    try:
+        sp.save_approval_token(data["id"], token, cid=data["id"])
+        sp.save_approval_token(data["id"], token)
+    except sp.CapabilityStoreError as exc:
+        click.echo(f"error: session {data['id']} was created, but its capability could "
+                   f"not be saved ({exc}); this shell cannot pause or complete it.", err=True)
+        raise SystemExit(1)
+
+
+def _session_capability(sid: str) -> str:
+    """The capability for EXACTLY `sid` (#3593), or an explicit refusal. Never
+    another session's, and never an empty header sent in hope."""
+    from ai_team_sync import session_pointer as sp
+    try:
+        token = sp.load_approval_token(sid, cid=sid) or sp.load_approval_token(sid)
+    except sp.CapabilityStoreError as exc:
+        click.echo(f"Capability keyring refused for session {sid}: {exc}", err=True)
+        raise SystemExit(1)
+    if not token:
+        click.echo(f"No capability for session {sid} is held by this client; another "
+                   f"session's capability is never used in its place.", err=True)
+        raise SystemExit(1)
+    return token
+
+
+def _holds_capability(sid: str) -> bool:
+    from ai_team_sync import session_pointer as sp
+    try:
+        return bool(sp.load_approval_token(sid, cid=sid) or sp.load_approval_token(sid))
+    except sp.CapabilityStoreError:
+        return False
 
 
 @session.command("pause")
-def session_pause():
+@click.option("--session-id", default="", help=(
+    "The exact session to pause; it must be one whose capability this client "
+    "holds. Omit to pause the pointer's session."))
+def session_pause(session_id):
     """Pause the current session (keeps locks)."""
-    sid = _load_active_session()
+    sid = session_id or _load_active_session()
     if not sid:
         click.echo("No active session. Start one with: ats session start", err=True)
         raise SystemExit(1)
-    from ai_team_sync import session_pointer as sp
-    token = sp.load_approval_token(sid, cid=sid) or sp.load_approval_token(sid)
+    token = _session_capability(sid)
     _api("patch", f"/sessions/{sid}", json={"status": "paused"},
          headers={"X-ATS-Approval-Token": token})
     click.echo(f"Session {sid[:8]}... paused (locks retained)")
@@ -184,6 +217,12 @@ def session_complete(summary, session_id):
     from ai_team_sync.session_target import resolve_completion_target
 
     pointer_id, pointer_source = sp.resolve_pointer_source()
+    default_pointer_id = pointer_id
+    # A session whose own capability this client holds is this client's own
+    # (#3593): naming it is not a disagreement with the pointer, which only
+    # selects a default. Any other explicit id still meets the conflict rule.
+    if session_id and pointer_id != session_id and _holds_capability(session_id):
+        pointer_id, pointer_source = session_id, "per_session"
     live = None
     if session_id and pointer_id and pointer_id != session_id:
         try:
@@ -206,16 +245,22 @@ def session_complete(summary, session_id):
     if summary is None:
         summary = click.prompt("Session summary (what did you accomplish?)", default="")
 
-    token = sp.load_approval_token(sid, cid=sid) or sp.load_approval_token(sid)
+    token = _session_capability(sid)
     resp = _api("patch", f"/sessions/{sid}",
                 json={"status": "completed", "summary": summary},
                 headers={"X-ATS-Approval-Token": token})
     after = resp.json()
     # The capability is deliberately KEPT: a completed sender may still
     # readdress its unread direct message (routers/messages.readdress_message).
+    # It is marked completed, which only makes it evictable (#3593).
+    for cid in (sid, None):
+        try:
+            sp.mark_capability_state(sid, sp.CAP_COMPLETED, cid=cid)
+        except sp.CapabilityStoreError as exc:
+            click.echo(f"note: capability keyring not updated ({exc})", err=True)
     # Only drop the pointer when it was OUR session; clearing it after completing
     # some other row would strand this process's own id.
-    if not session_id or session_id == pointer_id:
+    if not session_id or session_id == default_pointer_id:
         _clear_active_session()
     click.echo(f"Session completed: {after.get('id')} "
                f"(agent {after.get('agent')}, status {after.get('status')}, "

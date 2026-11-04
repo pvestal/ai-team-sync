@@ -201,21 +201,26 @@ def _covered_by(rel: str, froot: str, holder_ids: set[str], locks: list) -> bool
 
 def claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,
                 sessions: list, locks: list, *,
-                sibling_label: str = "") -> tuple[bool, str]:
+                sibling_label: str = "",
+                held_session_ids: set[str] | None = None) -> tuple[bool, str]:
     """(ok, reason) — does this Claude session hold a live claim covering `rel`?
 
     First the pointer session's own claim (_own_claim_check, unchanged). When
-    that refuses and `sibling_label` is given, a live LOCK covering `rel` held
-    by another ACTIVE session whose label is exactly `sibling_label` grants the
-    edit (#3593): parallel subagents of one Claude session share its cid, its
-    pointer and its MCP process, so the pointer names whichever of them started
-    last and the guard cannot tell them apart. Scope never grants (#2813), and
-    every refusal message is the pointer session's own."""
+    that refuses, a live LOCK covering `rel` held by a SIBLING grants the edit
+    (#3593): parallel subagents of one Claude session share its cid and its MCP
+    process, and the hook payload names only that cid, so the guard cannot tell
+    which of them is editing. A sibling is an ACTIVE session whose label is
+    exactly `sibling_label` AND whose own capability this Claude session's
+    private keyring holds (`held_session_ids`) -- the label alone is the shared
+    cid, which a colliding or forged row can carry too. No held set, no sibling.
+    Scope never grants (#2813), and every refusal message is the pointer
+    session's own."""
     froot = _shared_root(froot)
     ok, reason = _own_claim_check(rel, froot, my_sid, my_cid8, sessions, locks)
-    if ok or not sibling_label:
+    if ok or not sibling_label or not held_session_ids:
         return ok, reason
-    if _covered_by(rel, froot, sibling_session_ids(sessions, sibling_label, my_sid), locks):
+    siblings = sibling_session_ids(sessions, sibling_label, my_sid) & set(held_session_ids)
+    if _covered_by(rel, froot, siblings, locks):
         return True, ""
     return ok, reason
 
@@ -392,8 +397,21 @@ def main() -> None:
             my_sid, approved_lock_ids = None, set()
     # Parallel subagents of this Claude session (#3593): same cid, so the same
     # canonical label, one shared pointer. Their live locks are this session's.
+    # Since #3593 r2 a sibling must ALSO be a session whose own capability this
+    # Claude session's keyring holds (registered by this Claude session's own
+    # MCP process, CLI or hooks): the label is only the shared cid8.
     sibling_label = canonical_sibling_label(payload.get("session_id") or "")
-    siblings = sibling_session_ids(sessions, sibling_label, my_sid)
+    held: set[str] = set()
+    if sibling_label:
+        try:
+            from ai_team_sync import session_pointer as sp
+
+            held = sp.held_capability_sessions(str(payload.get("session_id") or ""))
+        except Exception as exc:  # noqa: BLE001 — no proven sibling, no grant
+            print(f"ATS LOCK GUARD: capability keyring unreadable ({exc}); no sibling "
+                  f"session is trusted.", file=sys.stderr)
+            held = set()
+    siblings = sibling_session_ids(sessions, sibling_label, my_sid) & held
     conflicts = find_conflicts(rel, sessions, payload.get("session_id", ""),
                                file_repo_root=froot, locks=locks,
                                approved_lock_ids=approved_lock_ids,
@@ -412,7 +430,7 @@ def main() -> None:
     if froot in coordinated:
         my_cid8 = str(payload.get("session_id", ""))[:8]
         ok, reason = claim_check(rel, froot, my_sid, my_cid8, sessions, locks,
-                                 sibling_label=sibling_label)
+                                 sibling_label=sibling_label, held_session_ids=held)
         if not ok:
             print(f"ATS CLAIM GUARD: {reason}", file=sys.stderr)
             if os.environ.get("ATS_CLAIMCHECK", "1") != "0":

@@ -62,7 +62,14 @@ def _session_id(cid: str) -> str:
 
 
 def _token(session_id: str, cid: str) -> str:
-    return sp.load_approval_token(session_id, cid=cid) or ""
+    """This exact session's capability, or ''. A keyring that cannot be read
+    safely is refused and reported, never read as another session's (#3593)."""
+    try:
+        return sp.load_approval_token(session_id, cid=cid) or ""
+    except sp.CapabilityStoreError as exc:
+        print(f"ATS: capability keyring refused ({exc}); acting without a capability.",
+              file=sys.stderr)
+        return ""
 
 
 _is_subagent_handback = is_subagent_handback

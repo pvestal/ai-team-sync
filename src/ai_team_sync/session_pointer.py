@@ -14,16 +14,23 @@ but the per-session file always wins on resolve.
 
 Resolution order (resolve_pointer):
   1. $ATS_SESSION_ID  — explicit operator override, always wins.
-  2. ~/.ats_session_<cid8>  — this session's own pointer (concurrency-safe).
+  2. ~/.ats_session_<client id>  — this session's own pointer, keyed by the
+     FULL client id (#3593 r2); a pre-r2 ~/.ats_session_<cid8> is read only
+     when no full-id file exists (see read_session_pointer).
   3. ~/.ats_session  — legacy global (single-session fallback).
 
 State dir is $ATS_STATE_DIR if set (tests), else $HOME.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
+import stat
+import tempfile
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 GLOBAL_FILE_NAME = ".ats_session"
@@ -200,130 +207,401 @@ def global_pointer_path() -> Path:
     return _state_dir() / GLOBAL_FILE_NAME
 
 
+# ── client keys (#3593 review r2, blocker 2) ─────────────────────────────────
+#
+# Per-client files used to be keyed by cid[:8]. Two DISTINCT Claude sessions
+# whose ids share eight characters then shared one pointer and one capability
+# file. Every file is now keyed by the FULL client id; the eight-character
+# names are only ever READ, as a migration path for files written by older
+# code (see legacy_session_pointer_path / _load_legacy_approval).
+_SAFE_CLIENT_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def client_key(cid: str) -> str:
+    """The filename-safe key for a client id: the id itself when it is a plain
+    token (every Claude session id is a UUID), else a digest, so a hostile or
+    odd id can never name a path outside the state directory."""
+    cid = (cid or "").strip()
+    if _SAFE_CLIENT_KEY.fullmatch(cid):
+        return cid
+    return "h-" + hashlib.sha256(cid.encode("utf-8")).hexdigest()[:40]
+
+
 def session_pointer_path(cid: str) -> Path:
-    return _state_dir() / f"{GLOBAL_FILE_NAME}_{cid[:8]}"
+    """THIS client's pointer, keyed by its full id."""
+    return _state_dir() / f"{GLOBAL_FILE_NAME}_{client_key(cid)}"
 
 
-# Capabilities kept per client id (#3593). One Claude session -- and every
-# subagent it runs, which share its id and its one stdio MCP process -- may hold
-# several ATS sessions at once, so the file is a MAP {session_id: token}. It used
-# to hold one pair, written with O_TRUNC, so a second start_session destroyed
-# the first session's capability and that session could no longer be completed.
-# Entries are NOT removed when a session completes: a completed sender keeps
-# its authority to readdress an unread direct message after turnover
-# (routers/messages.readdress_message), and that authority is this capability.
-# Bounded instead: the oldest entries are dropped past this many.
-APPROVAL_TOKEN_MAX = 32
+def legacy_session_pointer_path(cid: str) -> Path | None:
+    """The pre-r2 '<GLOBAL_FILE_NAME>_<cid8>' pointer, or None when it is the
+    same file as session_pointer_path (an id of eight characters or fewer)."""
+    cid = (cid or "").strip()
+    legacy = _state_dir() / f"{GLOBAL_FILE_NAME}_{cid[:8]}"
+    return None if not cid or legacy == session_pointer_path(cid) else legacy
 
 
-def _approval_path(cid: str) -> Path:
-    return _state_dir() / f"{APPROVAL_TOKEN_PREFIX}{cid[:8]}"
+def read_session_pointer(cid: str) -> str | None:
+    """The session this client's pointer names, or None.
 
-
-def _read_approval_map(path: Path) -> dict[str, str]:
-    """{session_id: token}, oldest first. Reads both shapes: the map, and the
-    single {'session_id', 'token'} pair pre-#3593 code still writes."""
+    The full-id file is authoritative whenever it EXISTS, even empty: an empty
+    file is the tombstone clear_pointer leaves, so a stale legacy pointer cannot
+    resurface after this client completed its session. Only when no full-id
+    file exists is the legacy eight-character file read -- the rollout path for
+    sessions whose pointer older code wrote. The pointer is a DEFAULT SELECTOR
+    only: it never carries a capability."""
+    if not cid:
+        return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        return session_pointer_path(cid).read_text().strip() or None
+    except FileNotFoundError:
+        pass
     except Exception:
+        return None
+    legacy = legacy_session_pointer_path(cid)
+    if legacy is None:
+        return None
+    try:
+        return legacy.read_text().strip() or None
+    except Exception:
+        return None
+
+
+# ── the capability keyring (#3593) ───────────────────────────────────────────
+#
+# One Claude session -- and every subagent it runs, which share its id and its
+# one stdio MCP process -- may hold several ATS sessions at once: two
+# repositories, two tickets, a parent and its registered subagents. Each keeps
+# its OWN capability here. The file used to hold one pair written with O_TRUNC,
+# so a second start_session destroyed the first session's capability and that
+# session could no longer be completed (2026-10-15, 2026-10-22).
+#
+# Layout:  <state>/.ats_capabilities/            0700, owned by this user
+#          <state>/.ats_capabilities/<key>.json  0600, one per FULL client id
+#          <state>/.ats_capabilities/<key>.lock  flock for read-modify-write
+#
+#   {"version": 2, "client_id": "<full client id>",
+#    "sessions": {"<session id>": {"token": "...", "state": "open",
+#                                   "parent": "<session id>" | null,
+#                                   "saved_at": <epoch>, "state_at": <epoch>}}}
+#
+# `state` is what THIS client learned from its own results: "open" when the
+# capability was minted, "completed" after its own successful completion,
+# "revoked" when the server refused the capability itself. It is bookkeeping
+# for eviction and default selection, never authority: the server decides
+# every lifecycle question, and a "completed" entry is never made "open" again.
+#
+# A completed entry's token is KEPT: a completed sender may still readdress its
+# unread direct message after turnover (routers/messages.readdress_message),
+# and that authority is exactly its own capability.
+CAPABILITY_DIR_NAME = ".ats_capabilities"
+CAPABILITY_STORE_VERSION = 2
+CAP_OPEN, CAP_COMPLETED, CAP_REVOKED = "open", "completed", "revoked"
+_CAP_STATES = frozenset({CAP_OPEN, CAP_COMPLETED, CAP_REVOKED})
+# Eviction (review r2, blocker 1): past this many entries the OLDEST NON-OPEN
+# entry is dropped. An open entry is never evicted: when every entry is open
+# the keyring grows instead. Refusing would not help -- the server has already
+# created the row by the time its capability arrives, so a refused save is
+# exactly the orphan this ticket exists to stop -- and the store is per FULL
+# client id, so its growth is bounded by what one Claude session itself opens.
+APPROVAL_TOKEN_MAX = 32
+_LOCK_TIMEOUT_S = 10.0
+
+
+class CapabilityStoreError(RuntimeError):
+    """The keyring could not be read or updated SAFELY. Never swallowed into
+    'no capabilities': a malformed store is refused, not overwritten, and an
+    update that cannot take the lock does not run unlocked."""
+
+
+def _capability_dir(create: bool) -> Path:
+    d = _state_dir() / CAPABILITY_DIR_NAME
+    if create:
+        try:
+            _state_dir().mkdir(parents=True, exist_ok=True)
+            os.mkdir(d, 0o700)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise CapabilityStoreError(f"cannot create {d}: {exc}") from exc
+    try:
+        st = os.lstat(d)
+    except FileNotFoundError:
+        if create:
+            raise CapabilityStoreError(f"{d} vanished while being created")
+        return d
+    except OSError as exc:
+        raise CapabilityStoreError(f"cannot stat {d}: {exc}") from exc
+    if not stat.S_ISDIR(st.st_mode):
+        raise CapabilityStoreError(f"{d} is not a directory (symlink or file); refusing it")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise CapabilityStoreError(f"{d} is owned by uid {st.st_uid}, not this user")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        try:
+            os.chmod(d, 0o700)
+        except OSError as exc:
+            raise CapabilityStoreError(f"cannot make {d} private: {exc}") from exc
+    return d
+
+
+def capability_store_path(cid: str) -> Path:
+    return _state_dir() / CAPABILITY_DIR_NAME / f"{client_key(cid)}.json"
+
+
+def _read_store(path: Path, cid: str) -> dict[str, dict]:
+    """{session_id: entry}, oldest first. {} only when the file does not exist.
+    Anything else that is not a well-formed store FOR THIS CLIENT raises."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
         return {}
-    if not isinstance(data, dict):
-        return {}
-    out: dict[str, str] = {}
+    except OSError as exc:
+        raise CapabilityStoreError(f"cannot read {path.name}: {exc}") from exc
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise CapabilityStoreError(f"{path.name} is malformed (not JSON); refusing it") from exc
+    if not isinstance(data, dict) or data.get("version") != CAPABILITY_STORE_VERSION:
+        raise CapabilityStoreError(f"{path.name} is not a version-{CAPABILITY_STORE_VERSION} "
+                                   "capability store; refusing it")
+    if data.get("client_id") != cid:
+        raise CapabilityStoreError(f"{path.name} names another client id; refusing it")
     sessions = data.get("sessions")
-    if isinstance(sessions, dict):
-        for sid, token in sessions.items():
-            if isinstance(sid, str) and isinstance(token, str) and sid and token:
-                out[sid] = token
-    sid, token = data.get("session_id"), data.get("token")
-    if isinstance(sid, str) and isinstance(token, str) and sid and token:
-        out.pop(sid, None)
-        out[sid] = token  # the pair is the most recent save
+    if not isinstance(sessions, dict):
+        raise CapabilityStoreError(f"{path.name} has no session map; refusing it")
+    out: dict[str, dict] = {}
+    for sid, entry in sessions.items():
+        if not (isinstance(sid, str) and sid and isinstance(entry, dict)
+                and isinstance(entry.get("token"), str) and entry["token"]
+                and entry.get("state") in _CAP_STATES
+                and (entry.get("parent") is None or isinstance(entry.get("parent"), str))):
+            raise CapabilityStoreError(f"{path.name} has a malformed entry; refusing it")
+        out[sid] = entry
     return out
 
 
-def _write_approval_map(path: Path, tokens: dict[str, str]) -> None:
-    """Atomically replace the file (0600). The top-level pair names the most
-    recent entry so a reader still running pre-#3593 code finds it."""
-    if not tokens:
-        path.unlink(missing_ok=True)
-        return
-    latest_sid, latest_token = next(reversed(tokens.items()))
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+def _write_store(path: Path, cid: str, entries: dict[str, dict]) -> None:
+    """Atomically replace the store: a 0600 temp file in the same directory,
+    fsync, rename over the old file, fsync the directory. On any failure the
+    previous store is left exactly as it was and the error is raised."""
+    d = path.parent
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.stem}.", suffix=".tmp", dir=d)
+    except OSError as exc:
+        raise CapabilityStoreError(f"cannot write in {d}: {exc}") from exc
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
-            json.dump({"session_id": latest_sid, "token": latest_token,
-                       "sessions": tokens}, stream)
+            json.dump({"version": CAPABILITY_STORE_VERSION, "client_id": cid,
+                       "sessions": entries}, stream)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-
-
-class _approval_lock:
-    """Serialize read-modify-write of one client's map across processes (the
-    MCP server and the hooks of one Claude session both write it)."""
-
-    def __init__(self, path: Path):
-        self._path = path.with_name(f"{path.name}.lock")
-        self._fd: int | None = None
-
-    def __enter__(self):
+    except BaseException as exc:
         try:
-            import fcntl
+            os.unlink(tmp)
+        except OSError:
+            pass
+        if isinstance(exc, Exception):
+            raise CapabilityStoreError(f"could not update {path.name}: {exc}") from exc
+        raise
+    try:
+        dfd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass  # the rename is done; a directory fsync is durability, not atomicity
 
-            self._fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
-            fcntl.flock(self._fd, fcntl.LOCK_EX)
-        except Exception:
-            self._fd = None  # no flock (non-POSIX): the replace is still atomic
-        return self
 
-    def __exit__(self, *exc):
-        if self._fd is not None:
+@contextmanager
+def _store_lock(path: Path, timeout: float = _LOCK_TIMEOUT_S):
+    """Exclusive flock for one client's read-modify-write (the MCP server and
+    the hooks of one Claude session all write it). A lock that cannot be taken
+    is an ERROR: the update never proceeds unlocked."""
+    try:
+        import fcntl
+    except ImportError as exc:  # non-POSIX
+        raise CapabilityStoreError("no flock on this platform; refusing an unlocked "
+                                   "capability update") from exc
+    lock_path = path.with_suffix(".lock")
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise CapabilityStoreError(f"cannot open {lock_path.name}: {exc}") from exc
+    try:
+        deadline = time.monotonic() + timeout
+        while True:
             try:
-                os.close(self._fd)  # closing releases the flock
-            except Exception:
-                pass
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise CapabilityStoreError(
+                        f"timed out after {timeout:.0f}s waiting for {lock_path.name}")
+                time.sleep(0.01)
+            except OSError as exc:
+                raise CapabilityStoreError(f"flock on {lock_path.name} failed: {exc}") from exc
+        yield
+    finally:
+        os.close(fd)  # closing releases the flock
 
 
-def save_approval_token(session_id: str, token: str, cid: str | None = None) -> None:
-    """Keep an approval capability private to this Claude session's pointer key.
+def _evict(entries: dict[str, dict]) -> None:
+    """Drop the oldest NON-open entries past APPROVAL_TOKEN_MAX. Never an open
+    one: with every entry open, the keyring grows (see APPROVAL_TOKEN_MAX)."""
+    while len(entries) > APPROVAL_TOKEN_MAX:
+        victim = next((sid for sid, e in entries.items() if e.get("state") != CAP_OPEN), None)
+        if victim is None:
+            return
+        entries.pop(victim)
 
-    Adds to this client's map; never discards another session's entry except
-    to stay within APPROVAL_TOKEN_MAX."""
-    cid = cid or claude_session_id()
+
+def save_approval_token(session_id: str, token: str, cid: str | None = None, *,
+                        parent_session_id: str | None = None) -> None:
+    """Add `session_id`'s capability to this client's keyring as an OPEN entry.
+
+    Never replaces or invalidates another session's entry. Raises
+    CapabilityStoreError when the keyring cannot be updated safely (malformed
+    store, lock not taken, write failed): the caller decides how loud to be, and
+    nothing is overwritten on the way. A no-op without a client id or token."""
+    cid = (cid or claude_session_id() or "").strip()
     if not cid or not session_id or not token:
         return
+    _capability_dir(create=True)
+    path = capability_store_path(cid)
+    with _store_lock(path):
+        entries = _read_store(path, cid)
+        entries.pop(session_id, None)
+        now = time.time()
+        entries[session_id] = {"token": token, "state": CAP_OPEN,
+                               "parent": parent_session_id or None,
+                               "saved_at": now, "state_at": now}
+        _evict(entries)
+        _write_store(path, cid, entries)
+
+
+def mark_capability_state(session_id: str, state: str, cid: str | None = None) -> bool:
+    """Record what this client learned about `session_id` (completed/revoked).
+
+    Monotone: an entry that is no longer open never becomes open again, and a
+    revoked one stays revoked. Returns whether an entry was changed. Raises
+    CapabilityStoreError like save_approval_token."""
+    if state not in (CAP_COMPLETED, CAP_REVOKED):
+        raise ValueError(f"not a terminal capability state: {state!r}")
+    cid = (cid or claude_session_id() or "").strip()
+    if not cid or not session_id:
+        return False
+    path = capability_store_path(cid)
+    if not path.exists():
+        return False
+    _capability_dir(create=True)
+    with _store_lock(path):
+        entries = _read_store(path, cid)
+        entry = entries.get(session_id)
+        if entry is None or entry["state"] == state or entry["state"] == CAP_REVOKED:
+            return False
+        entry["state"], entry["state_at"] = state, time.time()
+        _evict(entries)
+        _write_store(path, cid, entries)
+        return True
+
+
+def capability_entries(cid: str | None = None) -> dict[str, dict]:
+    """{session_id: {'state', 'parent'}} held in this client's keyring -- no
+    tokens. Raises CapabilityStoreError for a malformed store."""
+    cid = (cid or claude_session_id() or "").strip()
+    if not cid:
+        return {}
+    entries = _read_store(capability_store_path(cid), cid)
+    return {sid: {"state": e["state"], "parent": e.get("parent")}
+            for sid, e in entries.items()}
+
+
+def _load_legacy_approval(session_id: str, cid: str) -> str:
+    """Migration read of the pre-r2 '.ats_approval_<cid8>' file.
+
+    Used only when the session association is VERIFIABLE FROM THE FILE ITSELF:
+    the file must pair exactly `session_id` with a token -- either as its
+    top-level {'session_id','token'} (pre-#3593) or inside its 'sessions' map
+    (the never-deployed first #3593 shape) -- and, if it names a client id at
+    all, that id must be ours. The pointer is never consulted: a token is never
+    attributed to whichever session the pointer happens to name. The file is
+    never written or deleted here (a running pre-r2 process may still use it)."""
+    path = _state_dir() / f"{APPROVAL_TOKEN_PREFIX}{cid[:8]}"
     try:
-        sd = _state_dir()
-        sd.mkdir(parents=True, exist_ok=True)
-        path = _approval_path(cid)
-        with _approval_lock(path):
-            tokens = _read_approval_map(path)
-            tokens.pop(session_id, None)
-            tokens[session_id] = token
-            while len(tokens) > APPROVAL_TOKEN_MAX:
-                tokens.pop(next(iter(tokens)))
-            _write_approval_map(path, tokens)
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
-        pass  # hook storage is best-effort; a missing token fails closed
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    named = data.get("client_id", data.get("cid"))
+    if named is not None and named != cid:
+        return ""
+    if data.get("session_id") == session_id and isinstance(data.get("token"), str):
+        return data["token"]
+    sessions = data.get("sessions")
+    if isinstance(sessions, dict):
+        token = sessions.get(session_id)
+        if isinstance(token, str):
+            return token
+    return ""
 
 
 def load_approval_token(session_id: str, cid: str | None = None) -> str:
-    """The capability for exactly `session_id`, or ''. Never another row's."""
-    cid = cid or claude_session_id()
+    """The capability for EXACTLY `session_id`, or ''. Never another row's.
+
+    Order: this client's keyring (a revoked entry answers ''), then the legacy
+    eight-character file under the rule in _load_legacy_approval, then a
+    delegated child's own capability file. Raises CapabilityStoreError for a
+    malformed keyring rather than reading it as empty."""
+    cid = (cid or claude_session_id() or "").strip()
     if not session_id:
         return ""
     if cid:
-        token = _read_approval_map(_approval_path(cid)).get(session_id)
+        entry = _read_store(capability_store_path(cid), cid).get(session_id)
+        if entry is not None:
+            return "" if entry["state"] == CAP_REVOKED else entry["token"]
+        token = _load_legacy_approval(session_id, cid)
         if token:
             return token
     delegated = load_delegated_capability()
     return delegated[1] if delegated and delegated[0] == session_id else ""
+
+
+def legacy_capability_sessions(cid: str) -> set[str]:
+    """Session ids the legacy eight-character file itself pairs with a token."""
+    path = _state_dir() / f"{APPROVAL_TOKEN_PREFIX}{(cid or '')[:8]}"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    named = data.get("client_id", data.get("cid"))
+    if named is not None and named != cid:
+        return set()
+    out = set()
+    if isinstance(data.get("session_id"), str) and isinstance(data.get("token"), str) \
+            and data["session_id"] and data["token"]:
+        out.add(data["session_id"])
+    if isinstance(data.get("sessions"), dict):
+        out |= {s for s, t in data["sessions"].items() if isinstance(s, str) and isinstance(t, str)
+                and s and t}
+    return out
+
+
+def held_capability_sessions(cid: str | None = None) -> set[str]:
+    """Sessions whose OWN capability this client holds: keyring entries that
+    are not revoked, plus the pairs the legacy eight-character file itself
+    names (_load_legacy_approval's rule). Raises CapabilityStoreError for a
+    malformed keyring."""
+    cid = (cid or claude_session_id() or "").strip()
+    if not cid:
+        return set()
+    entries = _read_store(capability_store_path(cid), cid)
+    held = {sid for sid, e in entries.items() if e["state"] != CAP_REVOKED}
+    return held | (legacy_capability_sessions(cid) - set(entries))
 
 
 # A delegated child's capability for the row its supervisor registered. It is a
@@ -401,12 +679,9 @@ def resolve_pointer(cid: str | None = None, allow_global: bool = True) -> str | 
         return env
     cid = cid or claude_session_id()
     if cid:
-        try:
-            content = session_pointer_path(cid).read_text().strip()
-            if content:
-                return content
-        except Exception:
-            pass
+        content = read_session_pointer(cid)
+        if content:
+            return content
     if not allow_global:
         return None
     try:
@@ -424,7 +699,7 @@ def resolve_pointer_source(cid: str | None = None) -> tuple[str | None, str]:
     the three sources differ:
 
       env          $ATS_SESSION_ID — set by whoever launched this process.
-      per_session  ~/.ats_session_<cid8> — keyed to THIS Claude session.
+      per_session  ~/.ats_session_<client id> — keyed to THIS Claude session.
       global       ~/.ats_session — SHARED. Names whichever session wrote it
                    last, across every agent on the box.
 
@@ -439,12 +714,9 @@ def resolve_pointer_source(cid: str | None = None) -> tuple[str | None, str]:
 
     cid = cid or claude_session_id()
     if cid:
-        try:
-            content = session_pointer_path(cid).read_text().strip()
-            if content:
-                return content, "per_session"
-        except Exception:
-            pass
+        content = read_session_pointer(cid)
+        if content:
+            return content, "per_session"
 
     try:
         content = global_pointer_path().read_text().strip()
@@ -461,7 +733,14 @@ def clear_pointer(cid: str | None = None) -> None:
     cid = cid or claude_session_id()
     if not cid:
         return
+    legacy = legacy_session_pointer_path(cid)
     try:
-        session_pointer_path(cid).unlink()
+        if legacy is not None and legacy.exists():
+            # Tombstone, not unlink: with the full-id file gone, a legacy
+            # eight-character pointer written by older code would resurface
+            # and name a session this client already left (read_session_pointer).
+            session_pointer_path(cid).write_text("")
+        else:
+            session_pointer_path(cid).unlink()
     except Exception:
         pass

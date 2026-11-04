@@ -116,7 +116,11 @@ def main() -> None:
                 params={"session_id": session_id, "status": "pending"},
             ).json()
             from ai_team_sync import session_pointer as sp
-            token = sp.load_approval_token(session_id, cid)
+            try:
+                token = sp.load_approval_token(session_id, cid)
+            except sp.CapabilityStoreError as exc:
+                print(f"ATS: capability keyring refused ({exc}).", file=sys.stderr)
+                token = ""
             messages = []
             missing_capability = False
             if token:

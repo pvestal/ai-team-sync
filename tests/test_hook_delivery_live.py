@@ -69,11 +69,18 @@ def _hook(module, env, cid):
 
 
 def _pointer(state, cid):
+    """The pointer as session_pointer.read_session_pointer reads it (#3593 r2):
+    the FULL-client-id file, else a legacy eight-character one."""
+    full = state / f".ats_session_{cid}"
+    if full.exists():
+        return full.read_text().strip()
     return (state / f".ats_session_{cid[:8]}").read_text().strip()
 
 
 def _token(state, cid):
-    return json.loads((state / f".ats_approval_{cid[:8]}").read_text())["token"]
+    """The capability this client's keyring holds for its pointer's session."""
+    store = json.loads((state / ".ats_capabilities" / f"{cid}.json").read_text())
+    return store["sessions"][_pointer(state, cid)]["token"]
 
 
 def _new_session(client, agent):
@@ -204,6 +211,7 @@ def test_stale_claude_session_warns_and_needs_new_address(live_ats, tmp_path):
     _hook("ai_team_sync.hooks.session_autostart", env, old_cid)
     assert _pointer(state, old_cid) == stale
     assert not (state / ".ats_approval_cccccccc").exists()
+    assert not (state / ".ats_capabilities" / f"{old_cid}.json").exists()
 
     completed = client.post(f"/api/sessions/{stale}/complete", json={
         "summary": "old client finished at safe pause"}, headers={

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 import subprocess
 from dataclasses import dataclass
 from typing import Any
@@ -153,7 +154,14 @@ async def ensure_session(server_url: str, client: Any, data: RegistrationInput) 
         if response.status_code in (200, 201):
             sid = response.json()["id"]
             sp.save_pointer(sid, cid)
-            sp.save_approval_token(sid, response.headers.get("X-ATS-Approval-Token", ""), cid)
+            try:
+                # Added beside every capability this client already holds;
+                # never replaces one (#3593).
+                sp.save_approval_token(sid, response.headers.get("X-ATS-Approval-Token", ""),
+                                       cid)
+            except sp.CapabilityStoreError as exc:
+                print(f"ATS: session {sid} registered, but its capability was not saved "
+                      f"({exc}); lifecycle calls for it will be refused.", file=sys.stderr)
             return sid
     except Exception:  # noqa: BLE001 - callers choose startup/prompt failure policy
         pass

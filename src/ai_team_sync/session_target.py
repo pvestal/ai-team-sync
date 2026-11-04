@@ -30,7 +30,7 @@ it wrong would break the isolation that was just proven:
     env          $ATS_SESSION_ID, set by whoever launched this process — which,
                  for a delegated child, is ATS naming that child's own row.
                  Represents the caller.
-    per_session  ~/.ats_session_<cid8>, keyed to THIS agent session. Represents
+    per_session  ~/.ats_session_<client id>, keyed to THIS agent session. Represents
                  the caller.
     global       ~/.ats_session — SHARED. Names whichever session wrote it last,
                  across every agent on the box. Does NOT represent the caller.

@@ -135,49 +135,91 @@ _IN_PROCESS_SESSION_ID: str | None = None
 # the DEFAULT target (the most recently opened); a tool that takes session_id
 # may name any session in this map, and no other.
 _IN_PROCESS_TOKENS: dict[str, str] = {}
-# Sessions in _IN_PROCESS_TOKENS that this process has completed. Their
+# What this process learned about a session it holds, from ITS OWN results:
+# "completed" after its own successful completion, "revoked" when the server
+# refused the capability itself. Absent means open. A completed session's
 # capability is KEPT: a completed sender may still readdress its unread direct
 # message after turnover (routers/messages.readdress_message), and that
-# authority is exactly its own capability. They are only never chosen as the
-# default target while an open session remains.
-_IN_PROCESS_CLOSED: set[str] = set()
+# authority is exactly its own capability. Non-open sessions are only never
+# chosen as the default target while an open one remains, and only they are
+# ever evicted (#3593 review r2, blocker 1).
+_IN_PROCESS_STATE: dict[str, str] = {}
+# Registered subagents (start_session with parent_session_id): child -> parent.
+# The relationship is explicit registration context, never inferred from the
+# Claude session id every subagent of one Claude session shares.
+_IN_PROCESS_PARENT: dict[str, str] = {}
+# Why the last capability lookup for a session came back empty, for refusals
+# that say WHY instead of a bare "missing".
+_CAPABILITY_PROBLEMS: dict[str, str] = {}
 
 # Tools whose `session_id` argument selects which of this process's own
 # sessions acts. complete_session has its own targeting (session_target).
 _IN_PROCESS_TARGETING_TOOLS = frozenset({
     "log_decision", "pause_session", "resume_session", "extend_scope",
-    "readdress_message", "message_status"})
+    "readdress_message", "message_status", "send_message", "message_inbox",
+    "acknowledge_message", "delete_lock", "reconcile_delegation"})
 
 
-def _remember_in_process(session_id: str, token: str) -> None:
-    """Record a session this process opened and make it the default target.
-    Bounded like the capability file: past the cap, the oldest completed
-    session is dropped first, then the oldest open one."""
+class _SkipAdoption(Exception):
+    """start_session control flow: a subagent adopts no placeholder."""
+
+
+def _remember_in_process(session_id: str, token: str, *, make_default: bool = True,
+                         parent: str | None = None) -> None:
+    """Record a session this process opened; by default make it the default
+    target. A registered subagent (make_default=False) is added BESIDE the
+    default and never replaces it. Bounded like the keyring: past the cap the
+    oldest NON-open session is dropped; an open one never is (the map grows)."""
     global _IN_PROCESS_SESSION_ID
     from ai_team_sync.session_pointer import APPROVAL_TOKEN_MAX
 
     _IN_PROCESS_TOKENS.pop(session_id, None)
-    _IN_PROCESS_CLOSED.discard(session_id)
+    _IN_PROCESS_STATE.pop(session_id, None)
+    _IN_PROCESS_PARENT.pop(session_id, None)
+    _CAPABILITY_PROBLEMS.pop(session_id, None)
     if token:
         _IN_PROCESS_TOKENS[session_id] = token
-    _IN_PROCESS_SESSION_ID = session_id
+    if parent:
+        _IN_PROCESS_PARENT[session_id] = parent
+    if make_default or not _IN_PROCESS_SESSION_ID:
+        _IN_PROCESS_SESSION_ID = session_id
     while len(_IN_PROCESS_TOKENS) > APPROVAL_TOKEN_MAX:
-        victims = [sid for sid in _IN_PROCESS_TOKENS
-                   if sid in _IN_PROCESS_CLOSED and sid != session_id] or \
-                  [sid for sid in _IN_PROCESS_TOKENS if sid != session_id]
-        _IN_PROCESS_TOKENS.pop(victims[0], None)
-        _IN_PROCESS_CLOSED.discard(victims[0])
+        victim = next((sid for sid in _IN_PROCESS_TOKENS
+                       if sid in _IN_PROCESS_STATE and sid != _IN_PROCESS_SESSION_ID), None)
+        if victim is None:
+            break  # every held session is open: grow, never drop one
+        _IN_PROCESS_TOKENS.pop(victim, None)
+        _IN_PROCESS_STATE.pop(victim, None)
+        _IN_PROCESS_PARENT.pop(victim, None)
+
+
+def _record_capability_state(session_id: str, state: str) -> str | None:
+    """Mark a session completed/revoked in memory AND in this client's keyring.
+    Monotone (revoked stays revoked). Returns a warning when the keyring could
+    not record it; the in-memory mark stands either way."""
+    if _IN_PROCESS_STATE.get(session_id) != "revoked":
+        if session_id in _IN_PROCESS_TOKENS:
+            _IN_PROCESS_STATE[session_id] = state
+    from ai_team_sync import session_pointer as sp
+    try:
+        sp.mark_capability_state(session_id, state)
+    except sp.CapabilityStoreError as exc:
+        return f"capability keyring not updated ({exc})"
+    return None
 
 
 def _retire_in_process(session_id: str) -> str | None:
     """Mark a session this process completed. Its capability stays (see
-    _IN_PROCESS_CLOSED). If it was the default, the most recently opened
-    session still open becomes the default; with none open the default is left
-    as it was, exactly as before #3593. Returns the default afterwards."""
+    _IN_PROCESS_STATE). If it was the default, the most recently opened session
+    still open becomes the default -- never a registered subagent, which only
+    ever acts when named; with none the default is left as it was, exactly as
+    before #3593. Returns the default afterwards."""
     global _IN_PROCESS_SESSION_ID
-    _IN_PROCESS_CLOSED.add(session_id)
+    if _IN_PROCESS_STATE.get(session_id) != "revoked":
+        _IN_PROCESS_STATE[session_id] = "completed"
     if _IN_PROCESS_SESSION_ID == session_id:
-        still_open = [sid for sid in _IN_PROCESS_TOKENS if sid not in _IN_PROCESS_CLOSED]
+        still_open = [sid for sid in _IN_PROCESS_TOKENS
+                      if sid not in _IN_PROCESS_STATE and sid not in _IN_PROCESS_PARENT]
         if still_open:
             _IN_PROCESS_SESSION_ID = still_open[-1]
     return _IN_PROCESS_SESSION_ID
@@ -185,14 +227,48 @@ def _retire_in_process(session_id: str) -> str | None:
 
 def _capability_for(session_id: str | None) -> str:
     """The capability for EXACTLY `session_id`: this process's own first, then
-    this client's private capability file. Never another row's."""
+    this client's private keyring. Never another row's, never the pointer's
+    session's in place of the named one. '' when none is held; the reason is
+    kept for _missing_capability."""
     if not session_id:
+        return ""
+    if _IN_PROCESS_STATE.get(session_id) == "revoked":
+        _CAPABILITY_PROBLEMS[session_id] = "the server refused this session's capability"
         return ""
     token = _IN_PROCESS_TOKENS.get(session_id)
     if token:
         return token
     from ai_team_sync import session_pointer as sp
-    return sp.load_approval_token(session_id)
+    try:
+        token = sp.load_approval_token(session_id)
+    except sp.CapabilityStoreError as exc:
+        _CAPABILITY_PROBLEMS[session_id] = f"capability keyring refused: {exc}"
+        return ""
+    if not token:
+        _CAPABILITY_PROBLEMS[session_id] = (
+            "neither this MCP process nor this client's keyring holds it")
+    return token
+
+
+def _holds_capability(session_id: str | None) -> bool:
+    return bool(_capability_for(session_id))
+
+
+def _missing_capability(what: str, session_id: str | None) -> str:
+    why = _CAPABILITY_PROBLEMS.get(session_id or "", "")
+    return (f"❌ Session capability missing for {what} ({session_id or 'no session'})"
+            + (f": {why}" if why else "") + ". Another session's capability is never "
+            "used in its place; restart your ATS session/MCP client if it should be held.")
+
+
+def _note_capability_refusal(session_id: str, response) -> None:
+    """A 403 that names the capability itself means this token no longer
+    authorizes its row: record it as revoked so it is never presented again."""
+    try:
+        if response.status_code == 403 and "capability" in response.text.lower():
+            _record_capability_state(session_id, "revoked")
+    except Exception:  # noqa: BLE001 — bookkeeping only
+        pass
 
 
 def resolve_identity() -> tuple[str | None, str]:
@@ -235,9 +311,11 @@ def mutation_refusal(session_id: str | None, source: str,
                 f"({session_id}), not necessarily yours. Start a session in "
                 "this process, or set ATS_SESSION_ID explicitly.")
 
-    if source in ("in_process", "explicit"):
+    if source in ("in_process", "explicit", "keyring"):
         # in_process: this process started it, nothing else can have written it.
         # explicit: it came from the caller, not from a file another agent shares.
+        # keyring: the caller NAMED it and this client's private keyring holds
+        # its capability (#3593) -- possession, not a pointer.
         return None
 
     # env / per_session: the id is process-local, but a process can be handed
@@ -322,8 +400,10 @@ _OWN_SESSION_SCHEMA = {
     "type": "string",
     "description": (
         "Optional: the exact session to act as. Must be a session THIS MCP process "
-        "started (start_session returned it); any other id is refused. Omit to act "
-        "as the most recently started session."),
+        "started (start_session returned it), or one whose capability this client's "
+        "private keyring holds; any other id is refused and no other session's "
+        "capability is used in its place. Omit to act as this process's default "
+        "session (the most recently started one that is not a registered subagent)."),
 }
 
 # Work admission (#3591): what kind of work a claim is. Optional; with a
@@ -388,18 +468,20 @@ async def list_tools() -> list[Tool]:
                 "recipient_session_id": {"type": "string"},
                 "ticket_id": {"type": "integer", "minimum": 1},
                 "body": {"type": "string", "minLength": 1, "maxLength": 4000},
+                "session_id": _OWN_SESSION_SCHEMA,
             }, "required": ["body"]},
         ),
         Tool(
             name="message_inbox",
             description="Read messages addressed to your current ATS session; messages remain pending until you acknowledge them.",
-            inputSchema={"type": "object", "properties": {}},
+            inputSchema={"type": "object", "properties": {"session_id": _OWN_SESSION_SCHEMA}},
         ),
         Tool(
             name="acknowledge_message",
             description="Confirm that you received one message addressed to your current ATS session.",
             inputSchema={"type": "object", "properties": {
                 "message_id": {"type": "string"},
+                "session_id": _OWN_SESSION_SCHEMA,
             }, "required": ["message_id"]},
         ),
         Tool(
@@ -439,6 +521,18 @@ async def list_tools() -> list[Tool]:
                         "type": "boolean",
                         "description": "If true, blocks all overlapping work (use for critical changes)",
                         "default": False,
+                    },
+                    "parent_session_id": {
+                        "type": "string",
+                        "description": (
+                            "Register this session as a SUBAGENT of that parent: pass "
+                            "the parent's session id, which a parent hands to the "
+                            "subagent it spawns. The subagent gets its own session and "
+                            "capability; the parent keeps its capability, stays this "
+                            "process's default and keeps the pointer, so the subagent "
+                            "names session_id=<its own id> on later calls. The parent "
+                            "must be an open session this process or client holds. "
+                            "Locks are never transferred between them."),
                     },
                     "repo_root": {
                         "type": "string",
@@ -704,6 +798,10 @@ async def list_tools() -> list[Tool]:
                               "description": "'closed' = accepted, 'rejected' = not satisfied."},
                     "verdict": {"type": "string",
                                 "description": "What YOU verified, and how. Not a restatement of the child's claim."},
+                    "session_id": {**_OWN_SESSION_SCHEMA, "description": (
+                        "Optional: the parent session reconciling. Omitted, the "
+                        "delegation's own parent acts when this process holds its "
+                        "capability, else this process's default session.")},
                 },
                 "required": ["delegation_id", "state", "verdict"],
             },
@@ -1014,6 +1112,10 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "The lock ID to delete",
                     },
+                    "session_id": {**_OWN_SESSION_SCHEMA, "description": (
+                        "Optional: the session releasing its own lock. Omitted, the "
+                        "lock's owner acts when this process holds that owner's "
+                        "capability, else this process's default session.")},
                 },
                 "required": ["lock_id"],
             },
@@ -1258,16 +1360,27 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
     # session this process opened -- one whose capability it holds in memory --
     # can be named: anything else is refused here, so the argument can narrow
     # which of our own rows acts but never reach a row we did not open.
+    # A session whose capability only this client's private keyring holds (an
+    # MCP restart lost the in-memory copy) can be named too: possession of its
+    # own capability is the proof, and the pointer is never consulted for it.
+    named_session = ""
     if name in _IN_PROCESS_TARGETING_TOOLS:
         requested = str(arguments.get("session_id") or "").strip()
+        named_session = requested
         if requested and requested != active_session_id:
-            if requested not in _IN_PROCESS_TOKENS:
+            if requested in _IN_PROCESS_TOKENS:
+                source = "in_process"
+            elif _holds_capability(requested):
+                source = "keyring"
+            else:
+                why = _CAPABILITY_PROBLEMS.get(requested, "")
                 return [TextContent(type="text", text=(
                     f"❌ Refusing to act as session {requested}: this MCP process did not "
-                    f"open it and holds no capability for it. Omit session_id to act as "
+                    f"open it and holds no capability for it"
+                    + (f" ({why})" if why else "") + ". Omit session_id to act as "
                     f"{active_session_id or '(no session)'}, or name a session this "
                     f"process started."))]
-            active_session_id, identity_source = requested, "in_process"
+            active_session_id, identity_source = requested, source
 
     async def deny_mutation(client) -> str | None:
         """Refusal text for a session-mutating call, or None to proceed."""
@@ -1315,7 +1428,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     return [TextContent(type="text", text=f"❌ {refusal}")]
                 token = _capability_for(active_session_id)
                 if not token:
-                    return [TextContent(type="text", text="❌ Session capability missing; restart your ATS session/MCP client.")]
+                    return [TextContent(type="text", text=_missing_capability(name, active_session_id))]
                 headers = {"X-ATS-Approval-Token": token}
                 if name == "send_message":
                     response = await client.post(f"{SERVER_URL}/api/messages", json={
@@ -1455,18 +1568,47 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         msg += "\n" + "-" * 60 + "\n" + prebuilt_brief
                     return [TextContent(type="text", text=msg)]
 
+                # A REGISTERED SUBAGENT (#3593 ITEM 2): the parent names itself
+                # explicitly. The child gets its own row and its own capability,
+                # added beside the parent's; the parent stays this process's
+                # default and keeps the pointer. Parent and child share one
+                # Claude session id, so that id is never what tells them apart.
+                parent_sid = str(arguments.get("parent_session_id") or "").strip()
+                if parent_sid:
+                    if _IN_PROCESS_STATE.get(parent_sid) or not _holds_capability(parent_sid):
+                        why = (f"this process recorded it as {_IN_PROCESS_STATE[parent_sid]}"
+                               if _IN_PROCESS_STATE.get(parent_sid) else
+                               _CAPABILITY_PROBLEMS.get(parent_sid, "no capability held"))
+                        return [TextContent(type="text", text=(
+                            f"❌ Subagent session not started: parent {parent_sid} is not an "
+                            f"open session this MCP process or client holds ({why}). A "
+                            "subagent registers under its own parent's session only."))]
+                    try:
+                        prow = await client.get(f"{SERVER_URL}/api/sessions/{parent_sid}")
+                        pstatus = prow.json().get("status") if prow.status_code == 200 else None
+                    except Exception:  # noqa: BLE001 — unknown parent is refused
+                        pstatus = None
+                    if pstatus not in ("active", "paused"):
+                        return [TextContent(type="text", text=(
+                            f"❌ Subagent session not started: parent {parent_sid} is "
+                            f"{pstatus or 'not readable on the server'}, not open."))]
+
                 # SessionStart may already have registered a placeholder for
-                # this exact client id. Capture its capability before saving
-                # the new session below overwrites the per-client capability
-                # file. A session capability authorizes only its own row.
+                # this exact client id. Capture its capability for adoption
+                # below. A session capability authorizes only its own row.
                 from ai_team_sync import session_pointer as sp
                 live_cid = sp.claude_session_id()
                 placeholder_session_id = (
                     sp.resolve_pointer(cid=live_cid, allow_global=False)
-                    if live_cid else None)
-                placeholder_approval_token = (
-                    sp.load_approval_token(placeholder_session_id, cid=live_cid)
-                    if placeholder_session_id else "")
+                    if live_cid and not parent_sid else None)
+                try:
+                    placeholder_approval_token = (
+                        sp.load_approval_token(placeholder_session_id, cid=live_cid)
+                        if placeholder_session_id else "")
+                except sp.CapabilityStoreError:
+                    placeholder_approval_token = ""
+                if parent_sid:
+                    description = f"{description} [subagent of session {parent_sid}]"
 
                 response = await client.post(
                     f"{SERVER_URL}/api/sessions",
@@ -1528,12 +1670,23 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
                 response.raise_for_status()
                 data = response.json()
-                save_session_id(data["id"])
                 new_token = response.headers.get("X-ATS-Approval-Token", "")
                 # ADDED beside any session this process already holds, never in
-                # place of it (#3593).
-                _remember_in_process(data["id"], new_token)
-                sp.save_approval_token(data["id"], new_token)
+                # place of it (#3593). A subagent never takes the default or
+                # the pointer: those stay its parent's.
+                if not parent_sid:
+                    save_session_id(data["id"])
+                _remember_in_process(data["id"], new_token, make_default=not parent_sid,
+                                     parent=parent_sid or None)
+                keyring_warning = ""
+                try:
+                    sp.save_approval_token(data["id"], new_token,
+                                           parent_session_id=parent_sid or None)
+                except sp.CapabilityStoreError as exc:
+                    keyring_warning = (
+                        f"capability NOT saved to this client's keyring ({exc}); this MCP "
+                        "process holds it in memory only, so hooks and a restarted MCP "
+                        "process cannot act as this session")
 
                 # Adopt-or-complete the SessionStart auto-registration
                 # (ats-sessionstart-orphan-adoption-p01): the hook registers a
@@ -1541,8 +1694,12 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # creates a sibling and the placeholder lingers 'active'
                 # forever (orphan class observed 2x on 2026-07-02).
                 adopted = 0
-                adoption_warnings = []
+                adoption_warnings = [keyring_warning] if keyring_warning else []
                 try:
+                    if parent_sid:
+                        # A subagent never completes anything: the placeholder,
+                        # if any, is its parent's lifecycle record.
+                        raise _SkipAdoption
                     sess_resp = await client.get(f"{SERVER_URL}/api/sessions")
                     sess_resp.raise_for_status()
                     my_label = session_agent_label()
@@ -1572,6 +1729,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                                 adoption_warnings.append(
                                     f"placeholder {s['id']} was not completed "
                                     f"(HTTP {adoption.status_code})")
+                except _SkipAdoption:
+                    pass
                 except Exception as exc:  # noqa: BLE001 — start remains best-effort
                     adoption_warnings.append(
                         f"placeholder adoption check failed ({type(exc).__name__})")
@@ -1582,6 +1741,11 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 for warning in adoption_warnings:
                     msg += f"⚠️ {warning}; session start continued.\n"
                 msg += f"Session ID: {data['id']}\n"
+                if parent_sid:
+                    msg += (f"Registered as a SUBAGENT of session {parent_sid}: the parent "
+                            f"stays this process's default session and keeps the pointer. "
+                            f"Name session_id={data['id']} on every call made as this "
+                            f"subagent (complete_session included).\n")
                 if data.get("ticket_id") is not None:
                     msg += f"Ticket: #{data['ticket_id']}"
                     if data.get("ticket_role"):
@@ -1982,10 +2146,28 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 return [TextContent(type="text", text=msg)]
 
             elif name == "reconcile_delegation":
+                # Reconciling is the PARENT's act (routers/delegations
+                # close_delegation). With several sessions held, the parent is
+                # the session the delegation itself names -- used when this
+                # process holds that session's own capability -- never simply
+                # whichever session started last (#3593).
+                actor = active_session_id or ""
+                if not named_session:
+                    try:
+                        dr = await client.get(
+                            f"{SERVER_URL}/api/delegations/{arguments['delegation_id']}")
+                        owner = (dr.json() or {}).get("parent_owner_session_id") \
+                            if dr.status_code == 200 else None
+                    except Exception:  # noqa: BLE001 — fall back to the default
+                        owner = None
+                    if owner and owner != actor and _holds_capability(owner):
+                        actor = owner
+                token = _capability_for(actor) if actor else ""
                 response = await client.post(
                     f"{SERVER_URL}/api/delegations/{arguments['delegation_id']}/close",
                     json={"state": arguments["state"], "verdict": arguments["verdict"],
-                          "actor_session_id": active_session_id or ""})
+                          "actor_session_id": actor},
+                    headers={"X-ATS-Approval-Token": token} if token else {})
                 if response.status_code >= 400:
                     return [TextContent(type="text", text=f"Refused: {response.text}")]
                 d = response.json()
@@ -2375,7 +2557,12 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # another of them -- no guessing is involved -- so it is that
                 # session's own pointer. Any other explicit id still meets the
                 # conflict rule below against this process's default session.
+                # The same holds for a session whose capability this client's
+                # private keyring holds (e.g. after an MCP restart): possession
+                # of its own capability, never the pointer, makes it ours.
                 if explicit_id and explicit_id in _IN_PROCESS_TOKENS:
+                    pointer_id, pointer_source = explicit_id, "in_process"
+                elif explicit_id and _holds_capability(explicit_id):
                     pointer_id, pointer_source = explicit_id, "in_process"
 
                 # ORDER MATTERS, and a live canary is what taught us so. The
@@ -2450,12 +2637,12 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         f"{((row or {}).get('summary') or '')[:300]}"))]
 
                 if (handoff and target.session_id != active_session_id
-                        and target.session_id not in _IN_PROCESS_TOKENS):
+                        and not _holds_capability(target.session_id)):
                     return [TextContent(type="text", text=(
                         "❌ A handoff must come from one of this MCP process's own sessions."))]
                 token = _capability_for(target.session_id)
                 if not token:
-                    return [TextContent(type="text", text="❌ Session capability missing for completion.")]
+                    return [TextContent(type="text", text=_missing_capability("completion", target.session_id))]
                 headers = {"X-ATS-Approval-Token": token}
                 response = await client.patch(
                     f"{SERVER_URL}/api/sessions/{target.session_id}",
@@ -2463,6 +2650,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                           "handoff": handoff}, headers=headers,
                 )
                 if response.status_code >= 400:
+                    _note_capability_refusal(target.session_id, response)
                     return [TextContent(type="text", text=(
                         f"❌ Completion refused for {target.session_id}: "
                         f"HTTP {response.status_code} {response.text[:400]}"))]
@@ -2492,6 +2680,11 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 next_default = _retire_in_process(target.session_id) if held else None
                 if next_default == target.session_id:
                     next_default = None
+                # Completed, as this process's own result shows: the entry is
+                # now evictable, and is never made open again.
+                warning = _record_capability_state(target.session_id, "completed")
+                if warning:
+                    lines += ["", f"  ⚠ {warning}"]
 
                 # Only drop the pointer when it was OUR session; clearing it after
                 # completing some other row would strand this process's own id.
@@ -2521,7 +2714,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 if recipient_id:
                     token = _capability_for(active_session_id)
                     if not token:
-                        return [TextContent(type="text", text="❌ Session capability missing for addressed decision.")]
+                        return [TextContent(type="text", text=_missing_capability("addressed decision", active_session_id))]
                     headers["X-ATS-Approval-Token"] = token
 
                 response = await client.post(
@@ -2559,13 +2752,14 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
                 token = _capability_for(active_session_id)
                 if not token:
-                    return [TextContent(type="text", text="❌ Session capability missing for pause.")]
+                    return [TextContent(type="text", text=_missing_capability("pause", active_session_id))]
 
                 response = await client.patch(
                     f"{SERVER_URL}/api/sessions/{active_session_id}",
                     json={"status": "paused"},
                     headers={"X-ATS-Approval-Token": token},
                 )
+                _note_capability_refusal(active_session_id, response)
                 response.raise_for_status()
                 data = response.json()
 
@@ -2585,13 +2779,14 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
                 token = _capability_for(active_session_id)
                 if not token:
-                    return [TextContent(type="text", text="❌ Session capability missing for resume.")]
+                    return [TextContent(type="text", text=_missing_capability("resume", active_session_id))]
 
                 response = await client.patch(
                     f"{SERVER_URL}/api/sessions/{active_session_id}",
                     json={"status": "active"},
                     headers={"X-ATS-Approval-Token": token},
                 )
+                _note_capability_refusal(active_session_id, response)
                 response.raise_for_status()
                 data = response.json()
 
@@ -2854,9 +3049,28 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # is never named; the call then acts as before, reaping only
                 # locks of sessions that are no longer live.
                 actor = "" if await deny_mutation(client) else (active_session_id or "")
+                # The lock's OWN session acts when this process holds that
+                # session's capability (#3593): with several sessions held, the
+                # most recently started one is not the owner of every lock.
+                # Only a session whose capability is held can be named, so this
+                # never reaches a lock this process could not release as its
+                # owner. A named session_id is used exactly as given.
+                if not named_session:
+                    try:
+                        lr = await client.get(f"{SERVER_URL}/api/locks")
+                        owner = next((str(lk.get("session_id") or "") for lk in
+                                      (lr.json() if lr.status_code == 200 else [])
+                                      if str(lk.get("id")) == str(lock_id)), "")
+                    except Exception:  # noqa: BLE001 — fall back to the default
+                        owner = ""
+                    if owner and owner != actor and _IN_PROCESS_STATE.get(owner) is None \
+                            and _holds_capability(owner):
+                        actor = owner
+                token = _capability_for(actor) if actor else ""
                 response = await client.delete(
                     f"{SERVER_URL}/api/locks/{lock_id}",
-                    params={"actor_session_id": actor})
+                    params={"actor_session_id": actor},
+                    headers={"X-ATS-Approval-Token": token} if token else {})
                 response.raise_for_status()
 
                 msg = f"🗑️ Lock deleted!\n\n"

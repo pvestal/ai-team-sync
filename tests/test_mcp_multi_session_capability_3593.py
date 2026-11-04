@@ -53,43 +53,34 @@ def test_two_sessions_under_one_client_keep_both_capabilities(state):
     assert sp.load_approval_token("sess-c", cid=CID) == ""
 
 
-def test_the_capability_file_is_private_and_written_atomically(state):
+def test_the_keyring_is_private_and_written_atomically(state):
     sp.save_approval_token("sess-a", "tok-a", cid=CID)
     sp.save_approval_token("sess-b", "tok-b", cid=CID)
-    path = state / f"{sp.APPROVAL_TOKEN_PREFIX}{CID[:8]}"
+    d = state / sp.CAPABILITY_DIR_NAME
+    path = sp.capability_store_path(CID)
+    assert path.parent == d and path.name == f"{CID}.json"   # the FULL client id
+    assert stat.S_IMODE(d.stat().st_mode) == 0o700
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    leftovers = [p.name for p in state.iterdir()
-                 if p.name.startswith(f".{path.name}") or p.name.endswith(".tmp")]
+    leftovers = [p.name for p in d.iterdir() if p.name.endswith(".tmp")]
     assert leftovers == [], leftovers
-    json.loads(path.read_text())   # a complete document, never a torn write
+    data = json.loads(path.read_text())   # a complete document, never a torn write
+    assert data["version"] == 2 and data["client_id"] == CID
+    assert {sid: e["state"] for sid, e in data["sessions"].items()} == {
+        "sess-a": "open", "sess-b": "open"}
 
 
-def test_a_legacy_single_entry_file_is_still_read(state):
-    """A process still running pre-#3593 code writes the old shape."""
+def test_a_legacy_single_entry_file_is_still_read_and_never_written(state):
+    """A process still running pre-#3593 code writes the old shape, at the old
+    eight-character name. It is read for exactly the session it names, and
+    never rewritten by the new code."""
     path = state / f"{sp.APPROVAL_TOKEN_PREFIX}{CID[:8]}"
     path.write_text(json.dumps({"session_id": "old", "token": "tok-old"}))
+    before = path.read_text()
     assert sp.load_approval_token("old", cid=CID) == "tok-old"
     sp.save_approval_token("new", "tok-new", cid=CID)
     assert sp.load_approval_token("old", cid=CID) == "tok-old"
     assert sp.load_approval_token("new", cid=CID) == "tok-new"
-
-
-def test_old_readers_still_find_the_most_recent_capability(state):
-    """Pre-#3593 readers parse {'session_id','token'}; keep that pair current."""
-    sp.save_approval_token("sess-a", "tok-a", cid=CID)
-    sp.save_approval_token("sess-b", "tok-b", cid=CID)
-    data = json.loads((state / f"{sp.APPROVAL_TOKEN_PREFIX}{CID[:8]}").read_text())
-    assert (data["session_id"], data["token"]) == ("sess-b", "tok-b")
-
-
-def test_the_map_is_bounded(state):
-    for i in range(sp.APPROVAL_TOKEN_MAX + 10):
-        sp.save_approval_token(f"sess-{i}", f"tok-{i}", cid=CID)
-    data = json.loads((state / f"{sp.APPROVAL_TOKEN_PREFIX}{CID[:8]}").read_text())
-    assert len(data["sessions"]) == sp.APPROVAL_TOKEN_MAX
-    newest = sp.APPROVAL_TOKEN_MAX + 9
-    assert sp.load_approval_token(f"sess-{newest}", cid=CID) == f"tok-{newest}"
-    assert sp.load_approval_token("sess-0", cid=CID) == ""
+    assert path.read_text() == before
 
 
 def test_another_clients_file_never_answers(state):
@@ -145,8 +136,10 @@ def wired(db_engine, monkeypatch, tmp_path):
 def _fresh_process(monkeypatch, tmp_path, cid):
     """A new MCP process: no in-process sessions, its own client id and state."""
     monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", None)
-    monkeypatch.setattr(mcp, "_IN_PROCESS_TOKENS", {}, raising=False)
-    monkeypatch.setattr(mcp, "_IN_PROCESS_CLOSED", set(), raising=False)
+    monkeypatch.setattr(mcp, "_IN_PROCESS_TOKENS", {})
+    monkeypatch.setattr(mcp, "_IN_PROCESS_STATE", {})
+    monkeypatch.setattr(mcp, "_IN_PROCESS_PARENT", {})
+    monkeypatch.setattr(mcp, "_CAPABILITY_PROBLEMS", {})
     d = tmp_path / f"state-{uuid.uuid4().hex[:6]}"
     d.mkdir()
     monkeypatch.setenv("ATS_STATE_DIR", str(d))

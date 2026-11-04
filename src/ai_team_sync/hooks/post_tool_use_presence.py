@@ -155,7 +155,10 @@ def main() -> None:
             if activity:
                 from ai_team_sync import session_pointer as sp
                 cid = payload.get("session_id") or env.get("CLAUDE_CODE_SESSION_ID")
-                token = sp.load_approval_token(activity["session_id"], cid)
+                try:
+                    token = sp.load_approval_token(activity["session_id"], cid)
+                except sp.CapabilityStoreError:
+                    token = ""  # refused, never read as another session's (#3593)
                 if token:
                     client.post(f"{server}/api/file-activities", json=activity,
                                 headers={"X-ATS-Approval-Token": token})

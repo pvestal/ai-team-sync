@@ -53,12 +53,23 @@ def _lock(sid, pattern=REL, mode="advisory", repo_root=REPO, lock_id=None):
 
 
 @pytest.fixture(autouse=True)
-def _claude_identity(monkeypatch):
-    """This hook runs as a Claude Code session; declared here, never inherited."""
+def _claude_identity(monkeypatch, tmp_path):
+    """This hook runs as a Claude Code session; declared here, never inherited.
+
+    Since #3593 r2 a sibling is also a session whose own capability this Claude
+    session's keyring holds: both subagents registered through this Claude
+    session's MCP process, so both capabilities are in its keyring."""
     monkeypatch.setenv("ATS_AGENT", "claude-code")
     for var in ("ATS_DELEGATION", "ATS_SESSION_ID", "ATS_LOCKCHECK_BLOCK",
                 "ATS_CLAIMCHECK", "CLAUDE_CODE_SESSION_ID", "ATS_SESSION"):
         monkeypatch.delenv(var, raising=False)
+    state = tmp_path / "ats-state"
+    state.mkdir()
+    monkeypatch.setenv("ATS_STATE_DIR", str(state))
+    from ai_team_sync import session_pointer as sp
+
+    for sid in (SUB_A, SUB_B):
+        sp.save_approval_token(sid, f"tok-{sid[:8]}", cid=CID)
 
 
 def _pointer_identity(monkeypatch, sid):
@@ -250,7 +261,8 @@ def test_an_overridden_ats_agent_cannot_make_another_base_a_sibling(
                                 file_path=f"{REPO}/{REL}", roots=(REPO, REPO))
     assert code == 2 and "holds no live lock" in err
     ok, _reason = claim_check(REL, REPO, SUB_B, CID8, sessions, locks,
-                              sibling_label=guard.canonical_sibling_label(CID))
+                              sibling_label=guard.canonical_sibling_label(CID),
+                              held_session_ids={SUB_A, SUB_B})
     assert not ok
 
 
@@ -279,7 +291,10 @@ def test_the_pure_functions_keep_exact_identity_without_a_sibling_label():
     locks = [_lock(SUB_A, mode="exclusive")]
     assert find_conflicts(REL, sessions, CID8, REPO, locks=locks, my_ats_session_id=SUB_B)
     assert not claim_check(REL, REPO, SUB_B, CID8, sessions, locks)[0]
-    ok, reason = claim_check(REL, REPO, SUB_B, CID8, sessions, locks, sibling_label=LABEL)
+    # The label alone grants nothing: the sibling's capability must be held.
+    assert not claim_check(REL, REPO, SUB_B, CID8, sessions, locks, sibling_label=LABEL)[0]
+    ok, reason = claim_check(REL, REPO, SUB_B, CID8, sessions, locks, sibling_label=LABEL,
+                             held_session_ids={SUB_A, SUB_B})
     assert ok, reason
     assert find_conflicts(REL, sessions, CID8, REPO, locks=locks, my_ats_session_id=SUB_B,
                           sibling_session_ids={SUB_A}) == []
