@@ -23,6 +23,7 @@ State dir is $ATS_STATE_DIR if set (tests), else $HOME.
 """
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -347,15 +348,58 @@ def capability_store_path(cid: str) -> Path:
     return _state_dir() / CAPABILITY_DIR_NAME / f"{client_key(cid)}.json"
 
 
+def _check_private_file(fd: int, name: str, *, tighten: bool) -> None:
+    """The open file must be a regular file owned by this user and private.
+    Checked on the DESCRIPTOR (opened with O_NOFOLLOW), so it cannot be swapped
+    between the check and the use. A loose store is refused (this code only ever
+    writes 0600, so a readable store is not ours to trust); a loose lock file,
+    which holds nothing, is tightened when `tighten`."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise CapabilityStoreError(f"{name} is not a regular file; refusing it")
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        raise CapabilityStoreError(f"{name} is owned by uid {st.st_uid}, not this user; refusing it")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        if not tighten:
+            raise CapabilityStoreError(f"{name} is readable by others (mode "
+                                       f"{stat.S_IMODE(st.st_mode):o}); refusing it")
+        os.fchmod(fd, 0o600)
+
+
+def _open_nofollow(path: Path, flags: int, mode: int = 0o600) -> int:
+    """os.open that refuses a symlink at the final component."""
+    try:
+        return os.open(path, flags | getattr(os, "O_NOFOLLOW", 0), mode)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise CapabilityStoreError(f"{path.name} is a symlink; refusing it") from exc
+        raise
+
+
 def _read_store(path: Path, cid: str) -> dict[str, dict]:
     """{session_id: entry}, oldest first. {} only when the file does not exist.
-    Anything else that is not a well-formed store FOR THIS CLIENT raises."""
+    Anything else that is not a well-formed store FOR THIS CLIENT raises,
+    including a store reached through a symlinked or foreign-owned directory, a
+    symlinked store file, a foreign-owned one, or one readable by others."""
+    _capability_dir(create=False)
     try:
-        raw = path.read_text(encoding="utf-8")
+        fd = _open_nofollow(path, os.O_RDONLY)
     except FileNotFoundError:
         return {}
+    except CapabilityStoreError:
+        raise
     except OSError as exc:
         raise CapabilityStoreError(f"cannot read {path.name}: {exc}") from exc
+    try:
+        _check_private_file(fd, path.name, tighten=False)
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            fd = -1
+            raw = stream.read()
+    except OSError as exc:
+        raise CapabilityStoreError(f"cannot read {path.name}: {exc}") from exc
+    finally:
+        if fd != -1:
+            os.close(fd)
     try:
         data = json.loads(raw)
     except ValueError as exc:
@@ -426,10 +470,16 @@ def _store_lock(path: Path, timeout: float = _LOCK_TIMEOUT_S):
                                    "capability update") from exc
     lock_path = path.with_suffix(".lock")
     try:
-        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+        fd = _open_nofollow(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    except CapabilityStoreError:
+        raise
     except OSError as exc:
         raise CapabilityStoreError(f"cannot open {lock_path.name}: {exc}") from exc
     try:
+        try:
+            _check_private_file(fd, lock_path.name, tighten=True)
+        except OSError as exc:
+            raise CapabilityStoreError(f"cannot secure {lock_path.name}: {exc}") from exc
         deadline = time.monotonic() + timeout
         while True:
             try:

@@ -457,6 +457,120 @@ def test_item1_a_symlinked_keyring_dir_is_refused(tmp_path, monkeypatch):
     assert list(elsewhere.iterdir()) == []
 
 
+# r1 review (Codex BLOCK, contract point 5): reads and the lock file are held to
+# the same rules as the directory -- no symlink, this user's, private.
+
+def _held(tmp_path, monkeypatch):
+    monkeypatch.setenv("ATS_STATE_DIR", str(tmp_path))
+    sp.save_approval_token("a", "tok-a", cid=CID)
+    return sp.capability_store_path(CID)
+
+
+@pytest.mark.parametrize("read", ["load", "entries"])
+def test_r1_a_load_through_a_symlinked_keyring_dir_is_refused(tmp_path, monkeypatch, read):
+    store = _held(tmp_path, monkeypatch)
+    d = store.parent
+    moved = tmp_path / "moved"
+    d.rename(moved)
+    d.symlink_to(moved)
+    with pytest.raises(sp.CapabilityStoreError):
+        sp.load_approval_token("a", cid=CID) if read == "load" else sp.capability_entries(CID)
+
+
+@pytest.mark.parametrize("op", ["load", "entries", "save", "mark"])
+def test_r1_a_symlinked_store_file_is_refused_on_every_path(tmp_path, monkeypatch, op):
+    store = _held(tmp_path, monkeypatch)
+    real = tmp_path / "planted.json"
+    real.write_bytes(store.read_bytes())
+    os.chmod(real, 0o600)
+    store.unlink()
+    store.symlink_to(real)
+    before = real.read_bytes()
+    with pytest.raises(sp.CapabilityStoreError):
+        {"load": lambda: sp.load_approval_token("a", cid=CID),
+         "entries": lambda: sp.capability_entries(CID),
+         "save": lambda: sp.save_approval_token("b", "tok-b", cid=CID),
+         "mark": lambda: sp.mark_capability_state("a", sp.CAP_COMPLETED, cid=CID)}[op]()
+    assert real.read_bytes() == before and store.is_symlink()
+
+
+def test_r1_a_symlinked_lock_file_is_refused_and_its_target_untouched(tmp_path, monkeypatch):
+    store = _held(tmp_path, monkeypatch)
+    lock = store.with_suffix(".lock")
+    target = tmp_path / "victim"
+    target.write_text("keep")
+    os.chmod(target, 0o644)
+    lock.unlink()
+    lock.symlink_to(target)
+    before = store.read_bytes()
+    with pytest.raises(sp.CapabilityStoreError):
+        sp.save_approval_token("b", "tok-b", cid=CID)
+    assert store.read_bytes() == before
+    assert target.read_text() == "keep" and stat.S_IMODE(target.stat().st_mode) == 0o644
+
+
+@pytest.mark.parametrize("op", ["load", "save"])
+def test_r1_a_foreign_owned_store_or_lock_is_refused(tmp_path, monkeypatch, op):
+    store = _held(tmp_path, monkeypatch)
+    me = os.getuid()
+    real_fstat = os.fstat
+
+    class _St:
+        def __init__(self, st):
+            self._st = st
+
+        def __getattr__(self, k):
+            return me + 1 if k == "st_uid" else getattr(self._st, k)
+
+    # the directory stays ours (lstat is untouched); every opened FILE reports a
+    # foreign owner, as a store/lock planted by another user would
+    monkeypatch.setattr(sp.os, "fstat", lambda fd: _St(real_fstat(fd)))
+    before = store.read_bytes()
+    with pytest.raises(sp.CapabilityStoreError, match="owned by uid"):
+        sp.load_approval_token("a", cid=CID) if op == "load" else \
+            sp.save_approval_token("b", "tok-b", cid=CID)
+    assert store.read_bytes() == before
+
+
+@pytest.mark.parametrize("read", ["load", "entries", "save"])
+def test_r1_a_store_readable_by_others_is_refused_not_used(tmp_path, monkeypatch, read):
+    store = _held(tmp_path, monkeypatch)
+    os.chmod(store, 0o644)
+    before = store.read_bytes()
+    with pytest.raises(sp.CapabilityStoreError, match="readable by others"):
+        {"load": lambda: sp.load_approval_token("a", cid=CID),
+         "entries": lambda: sp.capability_entries(CID),
+         "save": lambda: sp.save_approval_token("b", "tok-b", cid=CID)}[read]()
+    assert store.read_bytes() == before
+
+
+def test_r1_a_loose_existing_lock_file_is_tightened_and_the_save_proceeds(tmp_path, monkeypatch):
+    store = _held(tmp_path, monkeypatch)
+    lock = store.with_suffix(".lock")
+    os.chmod(lock, 0o666)
+    sp.save_approval_token("b", "tok-b", cid=CID)
+    assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+    assert sp.load_approval_token("b", cid=CID) == "tok-b"
+
+
+def test_r1_a_store_under_a_foreign_owned_dir_is_refused_on_read(tmp_path, monkeypatch):
+    store = _held(tmp_path, monkeypatch)
+    real_lstat = os.lstat
+    d = str(store.parent)
+
+    class _St:
+        def __init__(self, st):
+            self._st = st
+
+        def __getattr__(self, k):
+            return os.getuid() + 1 if k == "st_uid" else getattr(self._st, k)
+
+    monkeypatch.setattr(sp.os, "lstat",
+                        lambda p, *a, **k: _St(real_lstat(p)) if str(p) == d else real_lstat(p))
+    with pytest.raises(sp.CapabilityStoreError, match="owned by uid"):
+        sp.load_approval_token("a", cid=CID)
+
+
 def test_item1_a_failed_atomic_write_leaves_the_store_intact(tmp_path, monkeypatch):
     monkeypatch.setenv("ATS_STATE_DIR", str(tmp_path))
     sp.save_approval_token("a", "tok-a", cid=CID)
