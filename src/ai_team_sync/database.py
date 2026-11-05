@@ -34,6 +34,7 @@ _COLUMN_MIGRATIONS = [
     # binding can be read as a grant.
     ("sessions", "creator_uid", "INTEGER"),
     ("sessions", "approval_token_hash", "VARCHAR(64) DEFAULT ''"),
+    ("sessions", "lifecycle_key", "VARCHAR(64)"),
     ("sessions", "bound_worker", "TEXT DEFAULT ''"),
     ("sessions", "bound_uid", "INTEGER"),
     ("sessions", "task_id", "INTEGER"),
@@ -60,6 +61,12 @@ _COLUMN_MIGRATIONS = [
     ("agent_messages", "original_recipient_session_id", "VARCHAR(36)"),
     ("agent_messages", "addressing_mode", "VARCHAR(20) DEFAULT 'legacy'"),
     ("agent_messages", "delivery_history", "TEXT DEFAULT '[]'"),
+    ("agent_messages", "first_surfaced_at", "TIMESTAMP"),
+    ("agent_messages", "last_surfaced_at", "TIMESTAMP"),
+    ("agent_messages", "surface_count", "INTEGER NOT NULL DEFAULT 0"),
+    ("agent_messages", "surfaced_recipient_session_id", "VARCHAR(36)"),
+    ("agent_messages", "surfaced_channel", "VARCHAR(80) NOT NULL DEFAULT ''"),
+    ("agent_messages", "last_surface_id", "VARCHAR(100) NOT NULL DEFAULT ''"),
     # Ticket roles and structured VERIFY verdicts (#3585). Existing sessions
     # backfill to NULL (no role: they neither own nor claim a ticket mailbox),
     # existing delegations to '' (no structured verdict was recorded).
@@ -78,6 +85,12 @@ _OWNER_INDEX_SQL = (
     "CREATE UNIQUE INDEX {concurrently}IF NOT EXISTS ux_sessions_live_ticket_owner "
     "ON sessions (ticket_id, creator_uid) "
     "WHERE ticket_role = 'owner' AND status IN ('active', 'paused')"
+)
+
+_LIFECYCLE_INDEX_SQL = (
+    "CREATE UNIQUE INDEX {concurrently}IF NOT EXISTS ux_sessions_live_lifecycle "
+    "ON sessions (creator_uid, lifecycle_key) "
+    "WHERE lifecycle_key IS NOT NULL AND status IN ('active', 'paused')"
 )
 
 # Existing databases need the composite lifecycle indexes declared in models.py;
@@ -173,6 +186,7 @@ async def init_db():
                     )
                 )
             await conn.execute(text(_OWNER_INDEX_SQL.format(concurrently="CONCURRENTLY ")))
+            await conn.execute(text(_LIFECYCLE_INDEX_SQL.format(concurrently="CONCURRENTLY ")))
     else:
         async with engine.begin() as conn:
             for name, table, columns in _INDEX_MIGRATIONS:
@@ -180,3 +194,4 @@ async def init_db():
                     text(f"CREATE INDEX IF NOT EXISTS {name} ON {table} ({columns})")
                 )
             await conn.execute(text(_OWNER_INDEX_SQL.format(concurrently="")))
+            await conn.execute(text(_LIFECYCLE_INDEX_SQL.format(concurrently="")))

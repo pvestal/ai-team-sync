@@ -62,6 +62,10 @@ class SessionCreate(BaseModel):
     # Raw on purpose (#3591): admission parses it per mode, so a malformed
     # classification is refused only in enforce -- never by request validation.
     admission: Any = None
+    # Set by lifecycle adapters.  start_session also names the row it is
+    # claiming, proving possession with that row's capability header.
+    lifecycle_key: str | None = Field(default=None, min_length=8, max_length=64)
+    adopt_session_id: str | None = None
 
 
 class HandoffCreate(BaseModel):
@@ -93,6 +97,7 @@ class SessionResponse(BaseModel):
     id: str
     developer: str
     agent: str
+    lifecycle_key: str | None = None
     scope: list[str]
     description: str
     status: str

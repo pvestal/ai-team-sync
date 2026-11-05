@@ -20,6 +20,7 @@ import re
 import shlex
 import subprocess
 import sys
+import uuid
 from dataclasses import replace
 from typing import Any
 
@@ -35,6 +36,7 @@ from ai_team_sync.hooks.session_registration import RegistrationInput, lifecycle
 from ai_team_sync.hooks.session_registration import ensure_session as ensure_registered_session
 from ai_team_sync.operator_config import OperatorConfigError
 from ai_team_sync.session_marker import AUTOREG_DESCRIPTION, is_autoregistered
+from ai_team_sync.hooks.override_inbox import format_message_inbox
 
 
 class ContextResolutionError(RuntimeError):
@@ -416,6 +418,59 @@ async def resolve_prompt_context(
     return header + digest + rendered
 
 
+async def _codex_inbox(server_url: str, client: Any, payload: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the real Codex lifecycle and fetch its durable pending inbox."""
+    cid = str(payload.get("session_id") or os.environ.get("ATS_SESSION") or "").strip()
+    cwd = str(payload.get("cwd") or os.getcwd())
+    cid_key = lifecycle_session_key("codex", cid)
+    session_id = _session_id(cid_key)
+    if cid and not (os.environ.get("ATS_SESSION_ID") or "").strip():
+        registered = await ensure_registered_session(
+            server_url, client, RegistrationInput(
+                lifecycle_session_id=cid, agent="codex", cwd=cwd,
+                hook_event_name=str(payload.get("hook_event_name") or "UserPromptSubmit"),
+                model=str(payload.get("model") or ""),
+                source=str(payload.get("source") or "")))
+        if registered:
+            session_id = registered
+    if not session_id:
+        return {}
+    token = _token(session_id, cid_key)
+    if not token:
+        return {}
+    response = await client.get(
+        f"{server_url}/api/sessions/{session_id}/messages",
+        headers={"X-ATS-Approval-Token": token}, timeout=3)
+    if response.status_code != 200:
+        return {}
+    rows = response.json()
+    rows = rows if isinstance(rows, list) else []
+    note = format_message_inbox(rows)
+    if not note:
+        return {}
+    prompt_id = str(payload.get("turn_id") or payload.get("prompt_id")
+                    or payload.get("hook_event_id") or uuid.uuid4())
+    return {"note": note, "rows": rows, "session_id": session_id,
+            "token": token, "surface_id": f"codex-prompt-{prompt_id}"}
+
+
+async def _mark_codex_inbox(server_url: str, delivery: dict[str, Any]) -> None:
+    if not delivery:
+        return
+    import httpx
+    async with httpx.AsyncClient(timeout=3) as client:
+        for row in delivery["rows"]:
+            try:
+                await client.post(
+                    f"{server_url}/api/messages/{row['id']}/surface",
+                    json={"recipient_session_id": delivery["session_id"],
+                          "channel": "codex_user_prompt_submit",
+                          "surface_id": delivery["surface_id"]},
+                    headers={"X-ATS-Approval-Token": delivery["token"]})
+            except Exception:
+                pass
+
+
 # Claude Code shows a hook's whole output inline only up to ~10 KB; past that
 # it shows the first 2 KB and saves the rest to a file the agent may never
 # open. Codex truncates by tokens near the same size. The ATS note therefore
@@ -735,20 +790,28 @@ def main(argv: list[str] | None = None) -> None:
     except OperatorConfigError as exc:
         print(f"ATS-FIRST blocked: operator config is invalid: {exc}", file=sys.stderr)
         raise SystemExit(2)
-    if target is None:
+    if target is None and args.agent != "codex":
         _run_supplement(args.supplement_command, args.supplement_timeout, raw_payload)
         raise SystemExit(0)
 
     server = os.environ.get("ATS_SERVER_URL", "http://localhost:8400")
 
-    async def _run() -> str | None:
+    async def _run() -> tuple[str | None, dict[str, Any]]:
         import httpx
 
         async with httpx.AsyncClient(timeout=25) as client:
-            return await resolve_prompt_context(server, client, payload, agent=args.agent)
+            delivery = {}
+            if args.agent == "codex":
+                try:
+                    delivery = await _codex_inbox(server, client, payload)
+                except Exception:
+                    delivery = {}  # delivery is retryable and never blocks a prompt
+            note = (await resolve_prompt_context(server, client, payload, agent=args.agent)
+                    if target is not None else None)
+            return note, delivery
 
     try:
-        note = asyncio.run(_run())
+        note, delivery = asyncio.run(_run())
     except Exception as exc:  # noqa: BLE001
         # A delegated child's claim is verified or blocked, never best-effort:
         # packets routinely name several tickets, and an unconfirmed delegation
@@ -769,6 +832,12 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(2)
     if note:
         print(note)
+    if delivery:
+        print(delivery["note"])
+        sys.stdout.flush()
+        # Mark only after stdout was handed to the client. A crash before this
+        # point leaves the message pending and un-surfaced for the next prompt.
+        asyncio.run(_mark_codex_inbox(server, delivery))
     # The supplement starts only after ATS succeeded. Keeping it in this same
     # process avoids Claude's parallel hook execution reordering the sources.
     _run_supplement(args.supplement_command, args.supplement_timeout, raw_payload)

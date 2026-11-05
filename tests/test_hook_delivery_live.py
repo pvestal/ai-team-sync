@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import socket
@@ -53,16 +54,25 @@ def live_ats(tmp_path):
 
 def _client_env(base, state, url, cid, agent="claude-code"):
     state.mkdir(mode=0o700)
-    env = dict(base, ATS_STATE_DIR=str(state), ATS_SERVER_URL=url,
-               CLAUDE_CODE_SESSION_ID=cid, ATS_AGENT=agent)
+    env = dict(base, ATS_STATE_DIR=str(state), ATS_SERVER_URL=url, ATS_AGENT=agent)
+    if agent == "claude-code":
+        env["CLAUDE_CODE_SESSION_ID"] = cid
+    else:
+        # Real Codex hook payloads carry session_id; they do not fabricate a
+        # Claude lifecycle environment variable.
+        env.pop("CLAUDE_CODE_SESSION_ID", None)
     env.pop("ATS_SESSION_ID", None)
     env.pop("ATS_SESSION", None)
     return env
 
 
-def _hook(module, env, cid):
+def _hook(module, env, cid, *, prompt="", extra_args=(), cwd=None):
     result = subprocess.run(
-        [sys.executable, "-m", module], input=json.dumps({"session_id": cid}),
+        [sys.executable, "-m", module, *extra_args], input=json.dumps({
+            "session_id": cid, "hook_event_name": (
+                "UserPromptSubmit" if prompt else "SessionStart"),
+            "prompt": prompt, "cwd": str(cwd or ROOT),
+            "turn_id": f"turn-{cid}-{prompt}"}),
         text=True, capture_output=True, env=env, timeout=10)
     assert result.returncode == 0, result.stderr
     return result.stdout
@@ -74,12 +84,21 @@ def _pointer(state, cid):
     full = state / f".ats_session_{cid}"
     if full.exists():
         return full.read_text().strip()
+    hashed = hashlib.sha256(cid.encode()).hexdigest()
+    hashed_full = state / f".ats_session_{hashed}"
+    if hashed_full.exists():
+        return hashed_full.read_text().strip()
     return (state / f".ats_session_{cid[:8]}").read_text().strip()
 
 
 def _token(state, cid):
     """The capability this client's keyring holds for its pointer's session."""
-    store = json.loads((state / ".ats_capabilities" / f"{cid}.json").read_text())
+    key = cid
+    path = state / ".ats_capabilities" / f"{key}.json"
+    if not path.exists():
+        key = hashlib.sha256(cid.encode()).hexdigest()
+        path = state / ".ats_capabilities" / f"{key}.json"
+    store = json.loads(path.read_text())
     return store["sessions"][_pointer(state, cid)]["token"]
 
 
@@ -282,6 +301,8 @@ def test_fresh_codex_mcp_nudge_and_ack(live_ats, tmp_path):
     state = tmp_path / "codex-state"
     env = _client_env(base, state, url, "fffffff0-0000-0000-0000-000000000006",
                       agent="codex")
+    _hook("ai_team_sync.hooks.codex_session_autostart", env,
+          "fffffff0-0000-0000-0000-000000000006")
     mcp = McpClient(env)
     try:
         start = mcp.tool("start_session", {"scope": [],
@@ -299,6 +320,143 @@ def test_fresh_codex_mcp_nudge_and_ack(live_ats, tmp_path):
         assert message_id not in mcp.tool("message_inbox")
     finally:
         mcp.close()
+
+
+def test_codex_normal_prompt_keeps_one_identity_surfaces_then_acks(
+        live_ats, tmp_path):
+    """The deployed lifecycle shape: no fabricated Claude environment."""
+    url, client, base = live_ats
+    sender, sender_token = _new_session(client, "claude-code:sender")
+    cid = "019a4e62-1111-7777-8888-000000000001"
+    state = tmp_path / "real-codex-state"
+    env = _client_env(base, state, url, cid, agent="codex")
+    env["ATS_DEVELOPER"] = "session-start-user-different-from-git"
+    assert "CLAUDE_CODE_SESSION_ID" not in env
+
+    _hook("ai_team_sync.hooks.codex_session_autostart", env, cid, cwd=tmp_path)
+    lifecycle_session = _pointer(state, cid)
+    token = _token(state, cid)
+    before = client.get(f"/api/sessions/{lifecycle_session}").json()
+    original_started_at = before["started_at"]
+
+    # Repeated SessionStart and start_session both converge on the original row.
+    _hook("ai_team_sync.hooks.codex_session_autostart", env, cid, cwd=tmp_path)
+    mcp = McpClient(env)
+    try:
+        started = mcp.tool("start_session", {
+            "scope": [], "description": "Codex lifecycle canary"})
+        assert f"Session ID: {lifecycle_session}" in started
+        assert "claimed in place" in started
+        rows = client.get("/api/sessions", params={"status": "active"}).json()
+        same_lifecycle = [row for row in rows if row.get("lifecycle_key") ==
+                          hashlib.sha256(cid.encode()).hexdigest()]
+        assert [row["id"] for row in same_lifecycle] == [lifecycle_session]
+        assert same_lifecycle[0]["started_at"] == original_started_at
+
+        message_id = _send(client, sender, sender_token, lifecycle_session,
+                           "surface through the ordinary Codex prompt")
+        shown = _hook(
+            "ai_team_sync.hooks.ats_context", env, cid,
+            prompt="Tell me a harmless joke", extra_args=("--agent", "codex"),
+            cwd=tmp_path)
+        assert message_id in shown
+        status = client.get(f"/api/messages/{message_id}", params={
+            "sender_session_id": sender}, headers={
+                "X-ATS-Approval-Token": sender_token}).json()
+        assert status["acknowledged_at"] is None
+        assert status["first_surfaced_at"] and status["last_surfaced_at"]
+        assert status["surface_count"] == 1
+        assert status["surfaced_recipient_session_id"] == lifecycle_session
+        assert status["surfaced_channel"] == "codex_user_prompt_submit"
+
+        assert "acknowledged" in mcp.tool(
+            "acknowledge_message", {"message_id": message_id})
+        final = client.get(f"/api/messages/{message_id}", params={
+            "sender_session_id": sender}, headers={
+                "X-ATS-Approval-Token": sender_token}).json()
+        assert final["acknowledged_at"]
+        after = client.get(f"/api/sessions/{lifecycle_session}").json()
+        assert after["id"] == lifecycle_session
+        assert after["last_heartbeat"]
+        assert _token(state, cid) == token
+    finally:
+        mcp.close()
+
+
+def test_codex_prompt_failure_retries_without_false_ack(live_ats, tmp_path):
+    url, client, base = live_ats
+    sender, sender_token = _new_session(client, "claude-code:sender")
+    cid = "019a4e62-2222-7777-8888-000000000002"
+    state = tmp_path / "retry-codex-state"
+    env = _client_env(base, state, url, cid, agent="codex")
+    _hook("ai_team_sync.hooks.codex_session_autostart", env, cid, cwd=tmp_path)
+    recipient = _pointer(state, cid)
+    message_id = _send(client, sender, sender_token, recipient, "retry me after outage")
+
+    offline = dict(env, ATS_SERVER_URL="http://127.0.0.1:1")
+    assert message_id not in _hook(
+        "ai_team_sync.hooks.ats_context", offline, cid, prompt="ordinary prompt",
+        extra_args=("--agent", "codex"), cwd=tmp_path)
+    queued = client.get(f"/api/messages/{message_id}", params={
+        "sender_session_id": sender}, headers={
+            "X-ATS-Approval-Token": sender_token}).json()
+    assert queued["surface_count"] == 0 and queued["acknowledged_at"] is None
+
+    shown = _hook("ai_team_sync.hooks.ats_context", env, cid,
+                  prompt="ordinary retry", extra_args=("--agent", "codex"),
+                  cwd=tmp_path)
+    assert message_id in shown
+    surfaced = client.get(f"/api/messages/{message_id}", params={
+        "sender_session_id": sender}, headers={
+            "X-ATS-Approval-Token": sender_token}).json()
+    assert surfaced["surface_count"] == 1 and surfaced["acknowledged_at"] is None
+
+
+def test_codex_session_turnover_does_not_reassign_unread_mail(live_ats, tmp_path):
+    url, client, base = live_ats
+    sender, sender_token = _new_session(client, "claude-code:sender")
+    cid = "019a4e62-3333-7777-8888-000000000003"
+    state = tmp_path / "turnover-state"
+    env = _client_env(base, state, url, cid, agent="codex")
+    _hook("ai_team_sync.hooks.codex_session_autostart", env, cid, cwd=tmp_path)
+    old = _pointer(state, cid)
+    message_id = _send(client, sender, sender_token, old, "stay with old session")
+    assert client.post(f"/api/sessions/{old}/complete", json={
+        "summary": "explicit turnover"}, headers={
+            "X-ATS-Approval-Token": _token(state, cid)}).status_code == 200
+
+    _hook("ai_team_sync.hooks.codex_session_autostart", env, cid, cwd=tmp_path)
+    new = _pointer(state, cid)
+    assert new != old
+    status = client.get(f"/api/messages/{message_id}", params={
+        "sender_session_id": sender}, headers={
+            "X-ATS-Approval-Token": sender_token}).json()
+    assert status["recipient_session_id"] == old
+    assert status["acknowledged_at"] is None
+    assert message_id not in _hook(
+        "ai_team_sync.hooks.ats_context", env, cid, prompt="new lifecycle turn",
+        extra_args=("--agent", "codex"), cwd=tmp_path)
+
+
+def test_concurrent_codex_registration_creates_one_row(live_ats, tmp_path):
+    url, client, base = live_ats
+    cid = "019a4e62-4444-7777-8888-000000000004"
+    state = tmp_path / "concurrent-state"
+    env = _client_env(base, state, url, cid, agent="codex")
+    payload = json.dumps({"session_id": cid, "hook_event_name": "SessionStart",
+                          "cwd": str(tmp_path)})
+    procs = [subprocess.Popen(
+        [sys.executable, "-m", "ai_team_sync.hooks.codex_session_autostart"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, env=env) for _ in range(2)]
+    results = [proc.communicate(payload, timeout=10) + (proc.returncode,) for proc in procs]
+    assert [result[2] for result in results] == [0, 0], results
+    key = hashlib.sha256(cid.encode()).hexdigest()
+    rows = client.get("/api/sessions", params={"status": "active"}).json()
+    matched = [row for row in rows if row.get("lifecycle_key") == key]
+    assert len(matched) == 1
+    assert _pointer(state, cid) == matched[0]["id"]
+    assert _token(state, cid)
 
 
 def test_mcp_placeholder_adoption_authorizes_and_reports_refusal(
@@ -331,17 +489,17 @@ def test_mcp_placeholder_adoption_authorizes_and_reports_refusal(
 
     accepted_id, accepted, accepted_output = start_from_placeholder(
         "abc00001-0000-0000-0000-000000000001", "adopt-accepted")
-    assert accepted["status"] == "completed", (
-        "the real server accepts only the placeholder's own capability")
-    assert "auto-registered placeholder session completed: 1" in accepted_output
+    assert accepted["status"] == "active"
+    assert f"Session ID: {accepted_id}" in accepted_output
+    assert "claimed in place" in accepted_output
+    assert accepted["description"] == "replace SessionStart placeholder"
 
     rejected_id, rejected, rejected_output = start_from_placeholder(
         "abc00002-0000-0000-0000-000000000002", "adopt-rejected",
         corrupt_capability=True)
     assert rejected["status"] == "active", "the real server must reject the bad token"
-    assert "HTTP 403" in rejected_output and rejected_id in rejected_output
-    assert "auto-registered placeholder session completed: 1" not in rejected_output
-    assert "Session ID:" in rejected_output, "best-effort adoption must not block start"
+    assert "lifecycle" in rejected_output.lower() or "403" in rejected_output
+    assert "Session ID:" not in rejected_output
 
 
 def test_mcp_placeholder_adoption_survives_live_cid_rotation(live_ats, tmp_path):
@@ -361,7 +519,8 @@ def test_mcp_placeholder_adoption_survives_live_cid_rotation(live_ats, tmp_path)
         })
         assert "Session ID:" in first_output
         assert client.get(
-            f"/api/sessions/{first_placeholder}").json()["status"] == "completed"
+            f"/api/sessions/{first_placeholder}").json()["status"] == "active"
+        assert f"Session ID: {first_placeholder}" in first_output
 
         second_env = dict(first_env, CLAUDE_CODE_SESSION_ID=second_cid)
         _hook("ai_team_sync.hooks.session_autostart", second_env, second_cid)
@@ -372,15 +531,40 @@ def test_mcp_placeholder_adoption_survives_live_cid_rotation(live_ats, tmp_path)
         })
         assert "Session ID:" in second_output
         assert client.get(
-            f"/api/sessions/{second_placeholder}").json()["status"] == "completed"
+            f"/api/sessions/{second_placeholder}").json()["status"] == "active"
+        assert f"Session ID: {second_placeholder}" in second_output
 
         sender, sender_token = _new_session(client, "codex:sender")
-        refused = client.post("/api/messages", json={
+        delivered = client.post("/api/messages", json={
             "sender_session_id": sender,
             "recipient_session_id": second_placeholder,
             "body": "must not enter the completed placeholder",
         }, headers={"X-ATS-Approval-Token": sender_token})
-        assert refused.status_code == 409, refused.text
+        assert delivered.status_code == 201, delivered.text
+    finally:
+        mcp.close()
+
+
+def test_completed_lifecycle_placeholder_starts_a_fresh_session(live_ats, tmp_path):
+    url, client, base = live_ats
+    cid = "abc00005-0000-0000-0000-000000000005"
+    state = tmp_path / "completed-placeholder"
+    env = _client_env(base, state, url, cid, agent="claude-code")
+    _hook("ai_team_sync.hooks.session_autostart", env, cid)
+    old = _pointer(state, cid)
+    completed = client.post(f"/api/sessions/{old}/complete", json={
+        "summary": "explicitly completed before MCP start"}, headers={
+            "X-ATS-Approval-Token": _token(state, cid)})
+    assert completed.status_code == 200, completed.text
+
+    mcp = McpClient(env)
+    try:
+        output = mcp.tool("start_session", {
+            "scope": [], "description": "fresh work after completed lifecycle"})
+        new = re.search(r"Session ID: ([a-f0-9-]{36})", output).group(1)
+        assert new != old
+        assert client.get(f"/api/sessions/{old}").json()["status"] == "completed"
+        assert client.get(f"/api/sessions/{new}").json()["status"] == "active"
     finally:
         mcp.close()
 

@@ -73,6 +73,10 @@ class Session(Base):
     # task_id: the one Tower task this session may close, declared at creation.
     creator_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     approval_token_hash: Mapped[str] = mapped_column(String(64), default="")
+    # Stable client-lifecycle identity.  It is deliberately separate from the
+    # display label and from the ATS row id: SessionStart creates the row, then
+    # start_session claims that SAME row in place.
+    lifecycle_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     bound_worker: Mapped[str] = mapped_column(String(100), default="")
     bound_uid: Mapped[int | None] = mapped_column(Integer, nullable=True)
     task_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -202,6 +206,14 @@ class AgentMessage(Base):
     body: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
     acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Delivery is evidence that a client rendered a message into a turn; it is
+    # not an acknowledgement.  A retry key makes one hook invocation idempotent.
+    first_surfaced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_surfaced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    surface_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False, server_default="0")
+    surfaced_recipient_session_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    surfaced_channel: Mapped[str] = mapped_column(String(80), default="", nullable=False, server_default="")
+    last_surface_id: Mapped[str] = mapped_column(String(100), default="", nullable=False, server_default="")
 
 
 class Handoff(Base):

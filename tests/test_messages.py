@@ -56,6 +56,35 @@ async def test_message_requires_sender_capability_and_recipient_ack(client):
 
 
 @pytest.mark.asyncio
+async def test_surfacing_is_idempotent_delivery_evidence_not_ack(client):
+    sender, sender_token = await _session(client, "claude-code:sender")
+    recipient, recipient_token = await _session(client, "codex:recipient")
+    sent = await client.post("/api/messages", json={
+        "sender_session_id": sender, "recipient_session_id": recipient,
+        "body": "surface separately from receipt"}, headers={
+            "X-ATS-Approval-Token": sender_token})
+    message_id = sent.json()["id"]
+    endpoint = f"/api/messages/{message_id}/surface"
+    body = {"recipient_session_id": recipient,
+            "channel": "codex_user_prompt_submit", "surface_id": "prompt-1"}
+    first = await client.post(endpoint, json=body, headers={
+        "X-ATS-Approval-Token": recipient_token})
+    assert first.status_code == 200, first.text
+    assert first.json()["surface_count"] == 1
+    assert first.json()["first_surfaced_at"] == first.json()["last_surfaced_at"]
+    assert first.json()["acknowledged_at"] is None
+    again = await client.post(endpoint, json=body, headers={
+        "X-ATS-Approval-Token": recipient_token})
+    assert again.json()["surface_count"] == 1
+    next_prompt = await client.post(endpoint, json={**body, "surface_id": "prompt-2"},
+                                    headers={"X-ATS-Approval-Token": recipient_token})
+    assert next_prompt.json()["surface_count"] == 2
+    assert next_prompt.json()["surfaced_recipient_session_id"] == recipient
+    assert next_prompt.json()["surfaced_channel"] == "codex_user_prompt_submit"
+    assert next_prompt.json()["acknowledged_at"] is None
+
+
+@pytest.mark.asyncio
 async def test_completed_recipient_cannot_be_messaged(client):
     sender, token = await _session(client, "codex:one")
     recipient, recipient_token = await _session(client, "claude-code:two")

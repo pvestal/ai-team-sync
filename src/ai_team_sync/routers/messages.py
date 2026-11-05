@@ -11,11 +11,11 @@ import contextlib
 import hashlib
 import hmac
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, StrictInt, field_validator
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_team_sync import peer_identity, ticket_roles
@@ -39,6 +39,12 @@ class MessageAck(BaseModel):
     recipient_session_id: str
 
 
+class MessageSurface(BaseModel):
+    recipient_session_id: str
+    channel: str = Field(min_length=1, max_length=80)
+    surface_id: str = Field(min_length=1, max_length=100)
+
+
 class MessageReaddress(BaseModel):
     sender_session_id: str
     recipient_session_id: str
@@ -60,6 +66,11 @@ class MessageResponse(BaseModel):
     body: str
     created_at: datetime
     acknowledged_at: datetime | None
+    first_surfaced_at: datetime | None
+    last_surfaced_at: datetime | None
+    surface_count: int
+    surfaced_recipient_session_id: str | None
+    surfaced_channel: str
 
     model_config = {"from_attributes": True}
 
@@ -214,6 +225,7 @@ async def ticket_handoffs(ticket_id: int, db: AsyncSession = Depends(get_db)):
 @router.get("/sessions/{session_id}/messages", response_model=list[MessageResponse])
 async def message_inbox(session_id: str, request: Request,
                         pending_only: bool = True,
+                        exclude_surfaced_within_seconds: int = Query(0, ge=0, le=300),
                         limit: int = Query(20, ge=1, le=100),
                         db: AsyncSession = Depends(get_db)):
     reader = await _actor(session_id, request, db)
@@ -231,9 +243,48 @@ async def message_inbox(session_id: str, request: Request,
     query = select(AgentMessage).where(AgentMessage.recipient_session_id == session_id)
     if pending_only:
         query = query.where(AgentMessage.acknowledged_at.is_(None))
+    if exclude_surfaced_within_seconds:
+        cutoff = datetime.now(timezone.utc) - timedelta(
+            seconds=exclude_surfaced_within_seconds)
+        query = query.where(
+            (AgentMessage.last_surfaced_at.is_(None))
+            | (AgentMessage.last_surfaced_at < cutoff))
     rows = (await db.execute(query.order_by(AgentMessage.created_at, AgentMessage.id)
                              .limit(limit))).scalars().all()
     return rows
+
+
+@router.post("/messages/{message_id}/surface", response_model=MessageResponse)
+async def surface_message(message_id: str, body: MessageSurface, request: Request,
+                          db: AsyncSession = Depends(get_db)):
+    """Record rendering into a recipient turn without acknowledging receipt.
+
+    ``surface_id`` identifies one hook invocation. Retrying that invocation is
+    idempotent, while a later prompt records another attempt. Messages survive
+    a crash between rendering and this write and are surfaced again later.
+    """
+    await _actor(body.recipient_session_id, request, db)
+    row = await db.get(AgentMessage, message_id)
+    if row is None or row.recipient_session_id != body.recipient_session_id:
+        raise HTTPException(404, "Message not found in this session inbox")
+    if row.last_surface_id != body.surface_id:
+        now = datetime.now(timezone.utc)
+        surfaced = await db.execute(update(AgentMessage).where(
+            AgentMessage.id == message_id,
+            AgentMessage.recipient_session_id == body.recipient_session_id,
+            AgentMessage.last_surface_id != body.surface_id,
+        ).values(
+            first_surfaced_at=func.coalesce(AgentMessage.first_surfaced_at, now),
+            last_surfaced_at=now,
+            surface_count=AgentMessage.surface_count + 1,
+            surfaced_recipient_session_id=body.recipient_session_id,
+            surfaced_channel=body.channel,
+            last_surface_id=body.surface_id,
+        ).execution_options(synchronize_session=False))
+        if surfaced.rowcount:
+            await db.commit()
+            await db.refresh(row)
+    return row
 
 
 @router.post("/messages/{message_id}/acknowledge", response_model=MessageResponse)

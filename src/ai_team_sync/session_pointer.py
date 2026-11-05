@@ -115,6 +115,21 @@ def publish_live_cid(cid: str, pid: str | None = None) -> None:
         pass
 
 
+@contextmanager
+def lifecycle_registration_lock(cid: str):
+    """Serialize one client's pointer/create/capability sequence.
+
+    The database unique index is the cross-process backstop; this lock also
+    ensures a local concurrent hook observes the winner's saved capability
+    instead of racing it and creating an unusable sibling.
+    """
+    digest = hashlib.sha256(cid.encode("utf-8")).hexdigest()
+    path = _state_dir() / f".ats_registration_{digest}"
+    _state_dir().mkdir(parents=True, exist_ok=True)
+    with _store_lock(path):
+        yield
+
+
 def live_claude_session_id() -> str | None:
     """The cid most recently published by a hook of THIS Claude process.
 

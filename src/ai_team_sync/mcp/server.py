@@ -17,7 +17,6 @@ from mcp.types import Tool, TextContent
 from ai_team_sync.session_target import (ownership_refusal,
                                          resolve_completion_target)
 from ai_team_sync.session_marker import (
-    adopted_summary,
     derived_working_description,
     is_autoregistered,
 )
@@ -158,10 +157,6 @@ _IN_PROCESS_TARGETING_TOOLS = frozenset({
     "log_decision", "pause_session", "resume_session", "extend_scope",
     "readdress_message", "message_status", "send_message", "message_inbox",
     "acknowledge_message", "delete_lock", "reconcile_delegation"})
-
-
-class _SkipAdoption(Exception):
-    """start_session control flow: a subagent adopts no placeholder."""
 
 
 def _remember_in_process(session_id: str, token: str, *, make_default: bool = True,
@@ -1192,12 +1187,26 @@ async def _incoming_message_nudge(client: httpx.AsyncClient,
     try:
         response = await client.get(
             f"{SERVER_URL}/api/sessions/{session_id}/messages",
+            params={"exclude_surfaced_within_seconds": 30},
             headers={"X-ATS-Approval-Token": token}, timeout=2.0)
         response.raise_for_status()
         rows = response.json()
     except Exception:
         return None
-    return format_message_nudge(rows if isinstance(rows, list) else [])
+    rows = rows if isinstance(rows, list) else []
+    note = format_message_nudge(rows)
+    if note:
+        surface_id = f"mcp-{secrets.token_hex(16)}"
+        for row in rows:
+            try:
+                await client.post(
+                    f"{SERVER_URL}/api/messages/{row['id']}/surface",
+                    json={"recipient_session_id": session_id,
+                          "channel": "mcp_response", "surface_id": surface_id},
+                    headers={"X-ATS-Approval-Token": token}, timeout=2.0)
+            except Exception:
+                pass
+    return note
 
 
 def format_override_nudge(requests: list, session_id: str) -> str | None:
@@ -1451,8 +1460,21 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         f"{SERVER_URL}/api/sessions/{active_session_id}/messages",
                         headers=headers)
                     response.raise_for_status()
-                    return [TextContent(type="text", text=(
-                        format_message_nudge(response.json()) or "📭 No pending ATS messages."))]
+                    rows = response.json()
+                    note = format_message_nudge(rows)
+                    if note:
+                        surface_id = f"mcp-inbox-{secrets.token_hex(16)}"
+                        for row in rows:
+                            try:
+                                await client.post(
+                                    f"{SERVER_URL}/api/messages/{row['id']}/surface",
+                                    json={"recipient_session_id": active_session_id,
+                                          "channel": "mcp_inbox",
+                                          "surface_id": surface_id},
+                                    headers=headers)
+                            except Exception:
+                                pass
+                    return [TextContent(type="text", text=(note or "📭 No pending ATS messages."))]
                 if name == "acknowledge_message":
                     response = await client.post(
                         f"{SERVER_URL}/api/messages/{arguments['message_id']}/acknowledge",
@@ -1607,6 +1629,20 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         if placeholder_session_id else "")
                 except sp.CapabilityStoreError:
                     placeholder_approval_token = ""
+                placeholder_is_autoreg = False
+                if placeholder_session_id:
+                    try:
+                        placeholder_row = await client.get(
+                            f"{SERVER_URL}/api/sessions/{placeholder_session_id}")
+                        placeholder_data = (placeholder_row.json()
+                                            if placeholder_row.status_code == 200 else {})
+                        placeholder_is_autoreg = (
+                            placeholder_data.get("status") in ("active", "paused")
+                            and is_autoregistered(placeholder_data.get("description")))
+                    except Exception:
+                        # Unknown is handled as an attempted lifecycle claim,
+                        # never as permission to mint a silent sibling.
+                        placeholder_is_autoreg = True
                 if parent_sid:
                     description = f"{description} [subagent of session {parent_sid}]"
 
@@ -1623,11 +1659,19 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         "ticket_role": arguments.get("ticket_role") or None,
                         "auto_lock": True,
                         "lock_mode": "exclusive" if exclusive else "advisory",
+                        "lifecycle_key": (live_cid if not parent_sid
+                                          and (not placeholder_session_id
+                                               or placeholder_is_autoreg) else None),
+                        "adopt_session_id": (placeholder_session_id if not parent_sid
+                                             and placeholder_is_autoreg else None),
                         # Forwarded exactly as given ({} stays {}), and only when
                         # given: MCP and the API judge one admission contract.
                         **({"admission": arguments["admission"]}
                            if "admission" in arguments else {}),
                     },
+                    headers={"X-ATS-Approval-Token": placeholder_approval_token}
+                    if placeholder_approval_token and not parent_sid
+                    and placeholder_is_autoreg else {},
                 )
 
                 if response.status_code in (409, 422):
@@ -1688,58 +1732,12 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         "process holds it in memory only, so hooks and a restarted MCP "
                         "process cannot act as this session")
 
-                # Adopt-or-complete the SessionStart auto-registration
-                # (ats-sessionstart-orphan-adoption-p01): the hook registers a
-                # placeholder session per agent; without this, start_session
-                # creates a sibling and the placeholder lingers 'active'
-                # forever (orphan class observed 2x on 2026-07-02).
-                adopted = 0
-                adoption_warnings = [keyring_warning] if keyring_warning else []
-                try:
-                    if parent_sid:
-                        # A subagent never completes anything: the placeholder,
-                        # if any, is its parent's lifecycle record.
-                        raise _SkipAdoption
-                    sess_resp = await client.get(f"{SERVER_URL}/api/sessions")
-                    sess_resp.raise_for_status()
-                    my_label = session_agent_label()
-                    for s in sess_resp.json():
-                        # Prefix match via the SSOT predicate, NOT string equality.
-                        # The old `== "auto-registered on SessionStart"` could never
-                        # be true — the hook writes a guidance tail after that
-                        # prefix — so adoption never fired and every agent
-                        # accumulated a permanent ghost row alongside its real
-                        # session (observed 2026-08-24: agent claude-code:7bb1e161
-                        # active as both cf21607b and 4215bbc3).
-                        if (s.get("status") == "active"
-                                and s.get("id") != data["id"]
-                                and s.get("agent") == my_label
-                                and is_autoregistered(s.get("description"))
-                                and not s.get("lock_count")):
-                            adoption = await client.patch(
-                                f"{SERVER_URL}/api/sessions/{s['id']}",
-                                json={"status": "completed",
-                                      "summary": adopted_summary(data["id"])},
-                                headers={"X-ATS-Approval-Token": (
-                                    placeholder_approval_token
-                                    if s["id"] == placeholder_session_id else "")})
-                            if 200 <= adoption.status_code < 300:
-                                adopted += 1
-                            else:
-                                adoption_warnings.append(
-                                    f"placeholder {s['id']} was not completed "
-                                    f"(HTTP {adoption.status_code})")
-                except _SkipAdoption:
-                    pass
-                except Exception as exc:  # noqa: BLE001 — start remains best-effort
-                    adoption_warnings.append(
-                        f"placeholder adoption check failed ({type(exc).__name__})")
-
                 msg = f"✅ Session started!\n\n"
-                if adopted:
-                    msg += f"(auto-registered placeholder session completed: {adopted})\n"
-                for warning in adoption_warnings:
-                    msg += f"⚠️ {warning}; session start continued.\n"
+                if (placeholder_is_autoreg and placeholder_session_id
+                        and data["id"] == placeholder_session_id):
+                    msg += "(SessionStart lifecycle session claimed in place)\n"
+                if keyring_warning:
+                    msg += f"⚠️ {keyring_warning}; session start continued.\n"
                 msg += f"Session ID: {data['id']}\n"
                 if parent_sid:
                     msg += (f"Registered as a SUBAGENT of session {parent_sid}: the parent "

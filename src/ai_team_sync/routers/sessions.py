@@ -38,6 +38,7 @@ from ai_team_sync import ticket_roles
 from ai_team_sync.repo_files import RepoContext
 from ai_team_sync.scope_paths import (UnsafePath, canonical_claim, canonical_pattern,
                                       canonical_root)
+from ai_team_sync.session_marker import is_autoregistered
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +90,13 @@ async def _write_or_ticket_owned(db: AsyncSession, ticket_id: int | None,
     try:
         await (db.commit() if commit else db.flush())
     except IntegrityError as exc:
+        if ("ux_sessions_live_lifecycle" in str(exc)
+                or "sessions.creator_uid, sessions.lifecycle_key" in str(exc)):
+            await db.rollback()
+            raise HTTPException(409, detail={
+                "error": "lifecycle_exists",
+                "message": "this client lifecycle already has an active ATS session",
+            }) from exc
         if not ticket_roles.is_owner_conflict(exc):
             raise
         await db.rollback()
@@ -324,6 +332,7 @@ def _session_to_response(s: Session, uncommitted_cache: dict[str, list[str]] | N
         id=s.id,
         developer=s.developer,
         agent=s.agent,
+        lifecycle_key=getattr(s, "lifecycle_key", None),
         scope=json.loads(s.scope) if s.scope else [],
         description=s.description,
         status=s.status,
@@ -1119,10 +1128,19 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
     # request re-derives identity from the label.
     peer_uid = peer_identity.peer_uid_for_request(request)
     worker, bound_uid, binding_refusal = registry().resolve_at_create(body.agent, peer_uid)
+    lifecycle_candidate = None
+    if body.lifecycle_key:
+        lifecycle_candidate = (await db.execute(select(Session).where(
+            Session.creator_uid == peer_uid,
+            Session.lifecycle_key == body.lifecycle_key,
+            Session.status.in_(("active", "paused")),
+        ))).scalar_one_or_none()
     active_for_worker = (
         await _active_sessions_for_worker(db, worker.name)
         if worker.concurrency is not None else 0
     )
+    if lifecycle_candidate is not None and worker.concurrency is not None:
+        active_for_worker = max(0, active_for_worker - 1)
     _authority_gate(body, active_for_worker, worker, binding_refusal)
 
     # A bound session's claims are what a later grant is measured against, so
@@ -1235,11 +1253,68 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
     # The ticket-role decision reads who owns the ticket, so it shares the
     # acquisition guard with the insert: two sessions asking to own one ticket
     # get one owner and one 409 (#3585). The partial unique index is the backstop.
-    guarded = locking or ticket_id is not None
+    guarded = locking or ticket_id is not None or body.lifecycle_key is not None
     async with (acquisition_guard(db) if guarded else contextlib.nullcontext()):
+        adopted = None
+        if body.lifecycle_key:
+            # Re-read while registration/claim insertion is serialized. The
+            # partial unique index is the cross-process backstop.
+            lifecycle_candidate = (await db.execute(select(Session).where(
+                Session.creator_uid == peer_uid,
+                Session.lifecycle_key == body.lifecycle_key,
+                Session.status.in_(("active", "paused")),
+            ))).scalar_one_or_none()
+            if body.adopt_session_id:
+                if lifecycle_candidate is None or lifecycle_candidate.id != body.adopt_session_id:
+                    raise HTTPException(409, detail={
+                        "error": "lifecycle_session_mismatch",
+                        "message": "the named lifecycle row is not this client's active row",
+                    })
+                token = request.headers.get("X-ATS-Approval-Token", "")
+                expected = lifecycle_candidate.approval_token_hash or ""
+                if not token or not expected or not hmac.compare_digest(
+                        hashlib.sha256(token.encode()).hexdigest(), expected):
+                    raise HTTPException(403, detail={
+                        "error": "lifecycle_capability_required",
+                        "message": "claiming a SessionStart row requires its capability",
+                    })
+                if lifecycle_candidate.agent != body.agent:
+                    raise HTTPException(409, detail={
+                        "error": "lifecycle_identity_mismatch",
+                        "message": "start_session cannot change lifecycle agent identity",
+                    })
+                if not is_autoregistered(lifecycle_candidate.description):
+                    same_claim = (
+                        json.loads(lifecycle_candidate.scope or "[]") == scope
+                        and lifecycle_candidate.description == body.description
+                        and (lifecycle_candidate.repo_root or "") == (repo_root or "")
+                        and lifecycle_candidate.ticket_id == ticket_id
+                    )
+                    if not same_claim:
+                        raise HTTPException(409, detail={
+                            "error": "lifecycle_already_claimed",
+                            "message": "this lifecycle row was already claimed by start_session",
+                        })
+                    # Exact retry: the original claim already created its locks.
+                    result = await db.execute(select(Session).where(
+                        Session.id == lifecycle_candidate.id).options(
+                            selectinload(Session.locks), selectinload(Session.decisions),
+                            selectinload(Session.commits)))
+                    session = result.scalar_one()
+                    response.status_code = 200
+                    response.headers["X-ATS-Approval-Token"] = token
+                    return _session_to_response(session)
+                adopted = lifecycle_candidate
+            elif lifecycle_candidate is not None:
+                raise HTTPException(409, detail={
+                    "error": "lifecycle_exists",
+                    "message": "this client lifecycle already has an active ATS session",
+                    "session_id": lifecycle_candidate.id,
+                })
         if locking:
             conflicts = await _check_scope_conflicts(
-                db, scope, body.developer, repo_root=repo_root, repo_ctx=repo_ctx)
+                db, scope, body.developer, repo_root=repo_root, repo_ctx=repo_ctx,
+                exclude_session_id=adopted.id if adopted is not None else "")
             new_lock_mode = getattr(body, 'lock_mode', settings.lock_default_mode)
             conflict = blocking_conflict(conflicts, new_lock_mode)
             if conflict is not None:
@@ -1255,32 +1330,46 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
         except ticket_roles.RoleRefused as exc:
             raise HTTPException(exc.status, detail=exc.detail) from exc
 
-        import hashlib
         import secrets
-        approval_token = secrets.token_urlsafe(32)
-        session = Session(
-            developer=body.developer,
-            agent=body.agent,
-            scope=json.dumps(scope),
-            description=body.description,
-            branch=body.branch,
-            repo_root=repo_root,
-            creator_uid=peer_uid,
-            approval_token_hash=hashlib.sha256(approval_token.encode()).hexdigest(),
-            bound_worker=worker.name if bound else "",
-            bound_uid=bound_uid,
-            task_id=body.task_id,
-            ticket_id=ticket_id,
-            ticket_role=ticket_role,
-            delegation_id=delegation.id if delegation is not None else None,
-        )
-        db.add(session)
+        approval_token = (request.headers.get("X-ATS-Approval-Token", "")
+                          if adopted is not None else secrets.token_urlsafe(32))
+        if adopted is None:
+            session = Session(
+                developer=body.developer,
+                agent=body.agent,
+                scope=json.dumps(scope),
+                description=body.description,
+                branch=body.branch,
+                repo_root=repo_root,
+                creator_uid=peer_uid,
+                approval_token_hash=hashlib.sha256(approval_token.encode()).hexdigest(),
+                lifecycle_key=body.lifecycle_key,
+                bound_worker=worker.name if bound else "",
+                bound_uid=bound_uid,
+                task_id=body.task_id,
+                ticket_id=ticket_id,
+                ticket_role=ticket_role,
+                delegation_id=delegation.id if delegation is not None else None,
+            )
+            db.add(session)
+        else:
+            # Preserve id, capability, timestamps, heartbeat and inbox ownership.
+            session = adopted
+            session.scope = json.dumps(scope)
+            session.description = body.description
+            session.branch = body.branch
+            session.repo_root = repo_root
+            session.bound_worker = worker.name if bound else ""
+            session.bound_uid = bound_uid
+            session.task_id = body.task_id
+            session.ticket_id = ticket_id
+            session.ticket_role = ticket_role
+            session.delegation_id = delegation.id if delegation is not None else None
         # Ensure session.id is populated; the owner index can refuse here.
         await _write_or_ticket_owned(db, ticket_id, peer_uid, commit=False)
         # An owner claims the ticket's pooled mail atomically with its creation
         # (#3585). The ticket is coordination metadata; this grants no task authority.
-        await _claim_deferred_ticket_messages(
-            db, session, claim_before=session.started_at)
+        await _claim_deferred_ticket_messages(db, session, claim_before=session.started_at)
         if delegation is not None:
             delegation.child_session_id = session.id
 
@@ -1333,6 +1422,8 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
     })
 
     response.headers["X-ATS-Approval-Token"] = approval_token
+    if adopted is not None:
+        response.status_code = 200
     created = _session_to_response(session)
     created.ticket_owner_session_id = (session.id if ticket_role == ticket_roles.OWNER
                                        else ticket_owner_id)

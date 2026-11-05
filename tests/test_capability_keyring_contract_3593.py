@@ -828,9 +828,11 @@ def test_item1_cli_refuses_a_session_whose_capability_it_does_not_hold(
 @pytest.mark.asyncio
 async def test_item1_sessionstart_registration_keeps_every_earlier_capability(
         wired, tmp_path):
-    """A SessionStart re-registration for this same client (pointer cleared,
-    e.g. after the default session completed) adds its placeholder's capability
-    beside A's and B's; it used to O_TRUNC the file down to the placeholder."""
+    """Pointer loss recovers the lifecycle row whose capability is still held.
+
+    SessionStart must not mint a sibling merely because a local pointer was
+    cleared; the keyring proves A still belongs to this client.
+    """
     from ai_team_sync.hooks import session_registration as reg
 
     a, b = await _a_then_b(tmp_path)
@@ -838,8 +840,8 @@ async def test_item1_sessionstart_registration_keeps_every_earlier_capability(
     async with AsyncClient(transport=wired, base_url="http://localhost:8400") as c:
         placeholder = await reg.ensure_session("http://localhost:8400", c, reg.RegistrationInput(
             lifecycle_session_id=CID, agent="claude-code", cwd=str(tmp_path)))
-    assert placeholder and placeholder not in (a, b)
-    for sid in (a, b, placeholder):
+    assert placeholder == a
+    for sid in (a, b):
         assert sp.load_approval_token(sid, cid=CID), sid
     await _op_complete(wired, a, b)
 

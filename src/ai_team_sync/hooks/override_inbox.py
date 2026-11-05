@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import json
 import sys
+import uuid
 from pathlib import Path
 
 # Resolved through session_pointer so $ATS_STATE_DIR isolates a process
@@ -141,6 +142,20 @@ def main() -> None:
     message_note = format_message_inbox(messages if isinstance(messages, list) else [])
     if message_note:
         print(message_note)
+        sys.stdout.flush()
+        surface_id = f"claude-prompt-{payload.get('turn_id') or payload.get('prompt_id') or uuid.uuid4()}"
+        try:
+            import httpx
+            with httpx.Client(timeout=2) as client:
+                for row in messages:
+                    client.post(
+                        f"{server}/api/messages/{row['id']}/surface",
+                        json={"recipient_session_id": session_id,
+                              "channel": "claude_user_prompt_submit",
+                              "surface_id": surface_id},
+                        headers={"X-ATS-Approval-Token": token})
+        except Exception:
+            pass  # a later prompt retries; surfacing never fabricates receipt
     if missing_capability:
         print(format_missing_capability(session_id))
     sys.exit(0)

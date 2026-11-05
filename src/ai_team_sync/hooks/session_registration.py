@@ -129,40 +129,67 @@ async def ensure_session(server_url: str, client: Any, data: RegistrationInput) 
     if not cid:
         return None
 
-    # Per-lifecycle pointers only. The legacy global pointer may belong to a
-    # concurrent Claude/Codex process and must never transfer identity.
-    existing = sp.resolve_pointer(cid, allow_global=False)
-    if existing:
-        reused = await _reuse_existing(server_url, client, existing, cid)
-        if reused:
-            return reused
+    # The hook and the long-lived MCP process share their host pid even when
+    # Codex has no CLAUDE_CODE_SESSION_ID. Publish the SAME hashed lifecycle key
+    # used by pointers and registration.
+    sp.publish_live_cid(cid)
 
     try:
-        target = resolve_request_target("", cwd=data.cwd, governed_roots=governed_roots())
-        repo_root = target.repo_root if target else ""
-        response = await client.post(
-            f"{server_url}/api/sessions",
-            json={
-                "developer": developer(),
-                "agent": sp.agent_label(data.agent, cid),
-                "scope": [],
-                "description": _description(data),
-                "repo_root": repo_root,
-                "auto_lock": False,
-            },
-        )
-        if response.status_code in (200, 201):
-            sid = response.json()["id"]
-            sp.save_pointer(sid, cid)
-            try:
-                # Added beside every capability this client already holds;
-                # never replaces one (#3593).
-                sp.save_approval_token(sid, response.headers.get("X-ATS-Approval-Token", ""),
-                                       cid)
-            except sp.CapabilityStoreError as exc:
-                print(f"ATS: session {sid} registered, but its capability was not saved "
-                      f"({exc}); lifecycle calls for it will be refused.", file=sys.stderr)
-            return sid
+        with sp.lifecycle_registration_lock(cid):
+            # Per-lifecycle pointers only. The legacy global pointer may belong
+            # to a concurrent client and must never transfer identity.
+            existing = sp.resolve_pointer(cid, allow_global=False)
+            if existing:
+                reused = await _reuse_existing(server_url, client, existing, cid)
+                if reused:
+                    return reused
+
+            # Pointer loss must not mint a sibling. Recover the lifecycle row
+            # only when this client still holds that exact row's capability.
+            # Public row metadata alone never transfers inbox ownership.
+            listing = await client.get(f"{server_url}/api/sessions", params={"status": "active"})
+            if listing.status_code == 200:
+                for row in listing.json():
+                    if row.get("lifecycle_key") != cid:
+                        continue
+                    sid = str(row.get("id") or "")
+                    try:
+                        token = sp.load_approval_token(sid, cid=cid) or ""
+                    except sp.CapabilityStoreError:
+                        token = ""
+                    if not token:
+                        continue
+                    proof = await client.get(
+                        f"{server_url}/api/sessions/{sid}/messages", params={"limit": 1},
+                        headers={"X-ATS-Approval-Token": token})
+                    if proof.status_code == 200:
+                        sp.save_pointer(sid, cid)
+                        return sid
+
+            target = resolve_request_target("", cwd=data.cwd, governed_roots=governed_roots())
+            repo_root = target.repo_root if target else ""
+            response = await client.post(
+                f"{server_url}/api/sessions",
+                json={
+                    "developer": developer(),
+                    "agent": sp.agent_label(data.agent, cid),
+                    "scope": [],
+                    "description": _description(data),
+                    "repo_root": repo_root,
+                    "auto_lock": False,
+                    "lifecycle_key": cid,
+                },
+            )
+            if response.status_code in (200, 201):
+                sid = response.json()["id"]
+                sp.save_pointer(sid, cid)
+                try:
+                    sp.save_approval_token(
+                        sid, response.headers.get("X-ATS-Approval-Token", ""), cid)
+                except sp.CapabilityStoreError as exc:
+                    print(f"ATS: session {sid} registered, but its capability was not saved "
+                          f"({exc}); lifecycle calls for it will be refused.", file=sys.stderr)
+                return sid
     except Exception:  # noqa: BLE001 - callers choose startup/prompt failure policy
         pass
     return None
