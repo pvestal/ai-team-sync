@@ -9,7 +9,10 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 COMMIT="$(git rev-parse --short HEAD)"
-DIRTY=false; [ -n "$(git status --porcelain)" ] && DIRTY=true
+# Deployment identity describes tracked source. Local worktree directories and
+# other untracked operator files are not part of the installed package and must
+# not make an exact committed build report itself as dirty.
+DIRTY=false; [ -n "$(git status --porcelain --untracked-files=no)" ] && DIRTY=true
 cat > src/ai_team_sync/_build_stamp.py <<PY
 """Generated at deploy time. Not source; see .gitignore."""
 COMMIT = "${COMMIT}"
