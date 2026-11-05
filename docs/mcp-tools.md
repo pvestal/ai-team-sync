@@ -60,6 +60,7 @@ session id, and no lock moves between parent and subagent.
 | Tool | Effect | Notes |
 |---|---|---|
 | `check_locks` | reads | Ask before editing. Anchored by repo so identical patterns in different repos do not collide. |
+| `lock_ownership` | reads | Final integration check: every live holder covering each path, with modes and whether another session owns it. Worktrees resolve to their shared checkout. |
 | `list_all_locks` | reads | Every active lock, with ids so a stale one can be reaped. |
 | `whos_editing` | reads | Live presence: who has these files open right now. |
 | `recent_file_activities` | reads | File reads and edits actually reported by instrumented clients, attributed to an ATS session. Absence is not proof of no activity. |
@@ -87,9 +88,12 @@ session id, and no lock moves between parent and subagent.
 | `message_status` | reads | Sender checks whether its message has an `acknowledged_at` receipt. |
 | `readdress_message` | mutates | Original sender moves one unread direct message from a completed session to an active recipient with the same OS owner, developer, worker class, ticket, and repo. The message ID and sender stay the same; `original_recipient_session_id` and `delivery_history` show the transfer. The recipient must acknowledge it. |
 
-The Claude `UserPromptSubmit` hook shows pending addressed messages in the next
-turn. A fresh Codex MCP process shows them in `message_inbox` and on ATS MCP
-responses. Both paths require the recipient session's saved capability. A client
+The Claude and Codex `UserPromptSubmit` paths show pending addressed messages in
+the next ordinary turn, including prompts unrelated to ATS. A fresh MCP process
+also shows them in `message_inbox` and on ATS MCP responses. Surfacing records
+delivery telemetry but is never an acknowledgement; only
+`acknowledge_message` confirms receipt. All paths require the recipient
+session's saved capability. A client
 that created its ATS session before capability persistence cannot recover that
 secret from the server: at a safe pause, finish that ATS session, refresh the MCP
 client, start a new ATS session, and have the sender address its new session ID.
