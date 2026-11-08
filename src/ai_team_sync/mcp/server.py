@@ -14,6 +14,7 @@ import httpx
 from mcp.server import Server
 from mcp.types import Tool, TextContent
 
+from ai_team_sync.mcp import caller_context as caller_ctx
 from ai_team_sync.session_target import (ownership_refusal,
                                          resolve_completion_target)
 from ai_team_sync.session_marker import (
@@ -108,6 +109,10 @@ def session_agent_label() -> str:
     session block its own edits (#2003). session_pointer.claude_session_id()
     prefers the cid the SessionStart hook published for this Claude process.
     """
+    bound = caller_ctx.bound_caller()
+    if bound is not None:
+        return bound.agent_label
+
     from ai_team_sync import session_pointer as sp
 
     base = detect_agent()
@@ -151,6 +156,46 @@ _IN_PROCESS_PARENT: dict[str, str] = {}
 # that say WHY instead of a bare "missing".
 _CAPABILITY_PROBLEMS: dict[str, str] = {}
 
+
+def _default_session_id() -> str | None:
+    bound = caller_ctx.bound_caller()
+    return bound.default_session_id if bound is not None else _IN_PROCESS_SESSION_ID
+
+
+def _set_default_session_id(session_id: str | None) -> None:
+    global _IN_PROCESS_SESSION_ID
+    bound = caller_ctx.bound_caller()
+    if bound is not None:
+        bound.default_session_id = session_id
+    else:  # direct-call compatibility for the established unit-test seam
+        _IN_PROCESS_SESSION_ID = session_id
+
+
+def _tokens() -> dict[str, str]:
+    bound = caller_ctx.bound_caller()
+    return bound.tokens if bound is not None else _IN_PROCESS_TOKENS
+
+
+def _states() -> dict[str, str]:
+    bound = caller_ctx.bound_caller()
+    return bound.states if bound is not None else _IN_PROCESS_STATE
+
+
+def _parents() -> dict[str, str]:
+    bound = caller_ctx.bound_caller()
+    return bound.parents if bound is not None else _IN_PROCESS_PARENT
+
+
+def _capability_problems() -> dict[str, str]:
+    bound = caller_ctx.bound_caller()
+    return (bound.capability_problems if bound is not None
+            else _CAPABILITY_PROBLEMS)
+
+
+def _client_id() -> str | None:
+    bound = caller_ctx.bound_caller()
+    return bound.client_id if bound is not None else None
+
 # Tools whose `session_id` argument selects which of this process's own
 # sessions acts. complete_session has its own targeting (session_target).
 _IN_PROCESS_TARGETING_TOOLS = frozenset({
@@ -165,39 +210,41 @@ def _remember_in_process(session_id: str, token: str, *, make_default: bool = Tr
     target. A registered subagent (make_default=False) is added BESIDE the
     default and never replaces it. Bounded like the keyring: past the cap the
     oldest NON-open session is dropped; an open one never is (the map grows)."""
-    global _IN_PROCESS_SESSION_ID
     from ai_team_sync.session_pointer import APPROVAL_TOKEN_MAX
 
-    _IN_PROCESS_TOKENS.pop(session_id, None)
-    _IN_PROCESS_STATE.pop(session_id, None)
-    _IN_PROCESS_PARENT.pop(session_id, None)
-    _CAPABILITY_PROBLEMS.pop(session_id, None)
+    tokens, states, parents = _tokens(), _states(), _parents()
+    problems = _capability_problems()
+    tokens.pop(session_id, None)
+    states.pop(session_id, None)
+    parents.pop(session_id, None)
+    problems.pop(session_id, None)
     if token:
-        _IN_PROCESS_TOKENS[session_id] = token
+        tokens[session_id] = token
     if parent:
-        _IN_PROCESS_PARENT[session_id] = parent
-    if make_default or not _IN_PROCESS_SESSION_ID:
-        _IN_PROCESS_SESSION_ID = session_id
-    while len(_IN_PROCESS_TOKENS) > APPROVAL_TOKEN_MAX:
-        victim = next((sid for sid in _IN_PROCESS_TOKENS
-                       if sid in _IN_PROCESS_STATE and sid != _IN_PROCESS_SESSION_ID), None)
+        parents[session_id] = parent
+    if make_default or not _default_session_id():
+        _set_default_session_id(session_id)
+    while len(tokens) > APPROVAL_TOKEN_MAX:
+        victim = next((sid for sid in tokens
+                       if sid in states and sid != _default_session_id()), None)
         if victim is None:
             break  # every held session is open: grow, never drop one
-        _IN_PROCESS_TOKENS.pop(victim, None)
-        _IN_PROCESS_STATE.pop(victim, None)
-        _IN_PROCESS_PARENT.pop(victim, None)
+        tokens.pop(victim, None)
+        states.pop(victim, None)
+        parents.pop(victim, None)
 
 
 def _record_capability_state(session_id: str, state: str) -> str | None:
     """Mark a session completed/revoked in memory AND in this client's keyring.
     Monotone (revoked stays revoked). Returns a warning when the keyring could
     not record it; the in-memory mark stands either way."""
-    if _IN_PROCESS_STATE.get(session_id) != "revoked":
-        if session_id in _IN_PROCESS_TOKENS:
-            _IN_PROCESS_STATE[session_id] = state
+    states, tokens = _states(), _tokens()
+    if states.get(session_id) != "revoked":
+        if session_id in tokens:
+            states[session_id] = state
     from ai_team_sync import session_pointer as sp
     try:
-        sp.mark_capability_state(session_id, state)
+        sp.mark_capability_state(session_id, state, cid=_client_id())
     except sp.CapabilityStoreError as exc:
         return f"capability keyring not updated ({exc})"
     return None
@@ -209,15 +256,15 @@ def _retire_in_process(session_id: str) -> str | None:
     still open becomes the default -- never a registered subagent, which only
     ever acts when named; with none the default is left as it was, exactly as
     before #3593. Returns the default afterwards."""
-    global _IN_PROCESS_SESSION_ID
-    if _IN_PROCESS_STATE.get(session_id) != "revoked":
-        _IN_PROCESS_STATE[session_id] = "completed"
-    if _IN_PROCESS_SESSION_ID == session_id:
-        still_open = [sid for sid in _IN_PROCESS_TOKENS
-                      if sid not in _IN_PROCESS_STATE and sid not in _IN_PROCESS_PARENT]
+    states, tokens, parents = _states(), _tokens(), _parents()
+    if states.get(session_id) != "revoked":
+        states[session_id] = "completed"
+    if _default_session_id() == session_id:
+        still_open = [sid for sid in tokens
+                      if sid not in states and sid not in parents]
         if still_open:
-            _IN_PROCESS_SESSION_ID = still_open[-1]
-    return _IN_PROCESS_SESSION_ID
+            _set_default_session_id(still_open[-1])
+    return _default_session_id()
 
 
 def _capability_for(session_id: str | None) -> str:
@@ -227,21 +274,22 @@ def _capability_for(session_id: str | None) -> str:
     kept for _missing_capability."""
     if not session_id:
         return ""
-    if _IN_PROCESS_STATE.get(session_id) == "revoked":
-        _CAPABILITY_PROBLEMS[session_id] = "the server refused this session's capability"
+    states, tokens, problems = _states(), _tokens(), _capability_problems()
+    if states.get(session_id) == "revoked":
+        problems[session_id] = "the server refused this session's capability"
         return ""
-    token = _IN_PROCESS_TOKENS.get(session_id)
+    token = tokens.get(session_id)
     if token:
         return token
     from ai_team_sync import session_pointer as sp
     try:
-        token = sp.load_approval_token(session_id)
+        token = sp.load_approval_token(session_id, cid=_client_id())
     except sp.CapabilityStoreError as exc:
-        _CAPABILITY_PROBLEMS[session_id] = f"capability keyring refused: {exc}"
+        problems[session_id] = f"capability keyring refused: {exc}"
         return ""
     if not token:
-        _CAPABILITY_PROBLEMS[session_id] = (
-            "neither this MCP process nor this client's keyring holds it")
+        problems[session_id] = (
+            "neither this caller context nor this client's keyring holds it")
     return token
 
 
@@ -250,7 +298,7 @@ def _holds_capability(session_id: str | None) -> bool:
 
 
 def _missing_capability(what: str, session_id: str | None) -> str:
-    why = _CAPABILITY_PROBLEMS.get(session_id or "", "")
+    why = _capability_problems().get(session_id or "", "")
     return (f"❌ Session capability missing for {what} ({session_id or 'no session'})"
             + (f": {why}" if why else "") + ". Another session's capability is never "
             "used in its place; restart your ATS session/MCP client if it should be held.")
@@ -274,8 +322,18 @@ def resolve_identity() -> tuple[str | None, str]:
     no pointer file we can see did not come from shared state, so it is
     'explicit' — a caller handed it to us directly.
     """
-    if _IN_PROCESS_SESSION_ID:
-        return _IN_PROCESS_SESSION_ID, "in_process"
+    current = _default_session_id()
+    if current:
+        return current, "in_process"
+
+    bound = caller_ctx.bound_caller()
+    if bound is not None:
+        try:
+            from ai_team_sync import session_pointer as sp
+            found = sp.resolve_pointer(cid=bound.client_id, allow_global=False)
+        except Exception:
+            found = None
+        return (found, "per_session") if found else (None, "none")
 
     sid = load_session_id()
     if not sid:
@@ -327,13 +385,18 @@ def mutation_refusal(session_id: str | None, source: str,
 
 
 def save_session_id(session_id: str):
-    """Save active session ID for persistence. Writes the legacy global file AND a
-    per-session pointer keyed by CLAUDE_CODE_SESSION_ID so concurrent sessions
-    don't clobber each other's pointer (Gap 3)."""
-    _session_file().write_text(session_id)
+    """Save the caller's default session selector.
+
+    Request-bound callers write only their per-client pointer. Legacy direct
+    callers retain the historical global-file compatibility path.
+    """
+    bound = caller_ctx.bound_caller()
+    if bound is None:
+        _session_file().write_text(session_id)
     try:
         from ai_team_sync import session_pointer as sp
-        sp.save_pointer(session_id)
+        sp.save_pointer(session_id, cid=(bound.client_id if bound else None),
+                        write_global=bound is None)
     except Exception:
         pass  # back-compat: global file alone still works for a single session
 
@@ -343,11 +406,15 @@ def load_session_id() -> str | None:
     falls back to the legacy global file."""
     try:
         from ai_team_sync import session_pointer as sp
-        sid = sp.resolve_pointer()
+        bound = caller_ctx.bound_caller()
+        sid = sp.resolve_pointer(cid=(bound.client_id if bound else None),
+                                 allow_global=bound is None)
         if sid:
             return sid
     except Exception:
         pass
+    if caller_ctx.bound_caller() is not None:
+        return None
     f = _session_file()
     if f.exists():
         content = f.read_text().strip()
@@ -357,6 +424,11 @@ def load_session_id() -> str | None:
 
 def clear_session_id():
     """Clear saved session ID."""
+    bound = caller_ctx.bound_caller()
+    if bound is not None:
+        from ai_team_sync import session_pointer as sp
+        sp.clear_pointer(cid=bound.client_id)
+        return
     f = _session_file()
     if f.exists():
         f.unlink()
@@ -394,8 +466,8 @@ def format_conflict_guidance(conflicts: list[dict]) -> str:
 _OWN_SESSION_SCHEMA = {
     "type": "string",
     "description": (
-        "Optional: the exact session to act as. Must be a session THIS MCP process "
-        "started (start_session returned it), or one whose capability this client's "
+        "Optional: the exact session to act as. Must be a session THIS caller context "
+        "started (start_session returned it), or one whose capability this caller's "
         "private keyring holds; any other id is refused and no other session's "
         "capability is used in its place. Omit to act as this process's default "
         "session (the most recently started one that is not a registered subagent)."),
@@ -1323,6 +1395,24 @@ async def _incoming_override_nudge(client: httpx.AsyncClient, tool_name: str,
 @mcp_server.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle MCP tool calls, then surface pending coordination requests."""
+    try:
+        context = caller_ctx.context_for_request(mcp_server, detect_agent())
+    except LookupError:
+        # Unit tests and internal callers invoke this decorated function without
+        # an MCP RequestContext.  Production always has one.
+        context = None
+    except caller_ctx.CallerContextError as exc:
+        return [TextContent(type="text", text=f"❌ {exc}")]
+
+    if context is None:
+        return await _call_tool_with_nudges(name, arguments)
+    with caller_ctx.bind_caller(context):
+        return await _call_tool_with_nudges(name, arguments)
+
+
+async def _call_tool_with_nudges(
+        name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    """Execute one call while its caller ContextVar remains bound."""
     result = await _call_tool_impl(name, arguments)
     try:
         session_id, source = resolve_identity()
@@ -1360,7 +1450,6 @@ async def _delegation_child(client) -> str | None:
 
 async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     """Handle MCP tool calls."""
-    global _IN_PROCESS_SESSION_ID
     # Identity AND where it came from. A read may use any of it; a mutation may
     # not use the shared pointer (see mutation_refusal).
     active_session_id, identity_source = resolve_identity()
@@ -1377,18 +1466,18 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
         requested = str(arguments.get("session_id") or "").strip()
         named_session = requested
         if requested and requested != active_session_id:
-            if requested in _IN_PROCESS_TOKENS:
+            if requested in _tokens():
                 source = "in_process"
             elif _holds_capability(requested):
                 source = "keyring"
             else:
-                why = _CAPABILITY_PROBLEMS.get(requested, "")
+                why = _capability_problems().get(requested, "")
                 return [TextContent(type="text", text=(
-                    f"❌ Refusing to act as session {requested}: this MCP process did not "
+                    f"❌ Refusing to act as session {requested}: this caller context did not "
                     f"open it and holds no capability for it"
                     + (f" ({why})" if why else "") + ". Omit session_id to act as "
                     f"{active_session_id or '(no session)'}, or name a session this "
-                    f"process started."))]
+                    f"caller context started."))]
             active_session_id, identity_source = requested, source
 
     async def deny_mutation(client) -> str | None:
@@ -1413,15 +1502,25 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 row = r.json() if r.status_code == 200 else None
             except Exception:
                 row = None
-        return mutation_refusal(active_session_id, identity_source, row,
-                                session_agent_label())
+        refusal = mutation_refusal(active_session_id, identity_source, row,
+                                   session_agent_label())
+        if refusal:
+            return refusal
+        if active_session_id and not _holds_capability(active_session_id):
+            why = _capability_problems().get(active_session_id, "")
+            return (f"Session capability missing for mutation ({active_session_id})"
+                    + (f": {why}" if why else "")
+                    + ". Caller metadata and a target session id do not grant "
+                    "authority; restart this ATS session/MCP client if it should "
+                    "hold the capability.")
+        return None
 
     async with httpx.AsyncClient(timeout=10.0) as client:
         # Liveness on ANY tool use (ats-sessionstart-orphan-adoption-p01): a
         # session that only ever talks through tools previously never
         # heartbeated, so live sessions looked orphaned on the board.
         # Fire-and-forget; a failed beat must never break the actual call.
-        if active_session_id:
+        if active_session_id and _holds_capability(active_session_id):
             try:
                 await client.post(
                     f"{SERVER_URL}/api/sessions/{active_session_id}/heartbeat")
@@ -1597,13 +1696,13 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # Claude session id, so that id is never what tells them apart.
                 parent_sid = str(arguments.get("parent_session_id") or "").strip()
                 if parent_sid:
-                    if _IN_PROCESS_STATE.get(parent_sid) or not _holds_capability(parent_sid):
-                        why = (f"this process recorded it as {_IN_PROCESS_STATE[parent_sid]}"
-                               if _IN_PROCESS_STATE.get(parent_sid) else
-                               _CAPABILITY_PROBLEMS.get(parent_sid, "no capability held"))
+                    if _states().get(parent_sid) or not _holds_capability(parent_sid):
+                        why = (f"this process recorded it as {_states()[parent_sid]}"
+                               if _states().get(parent_sid) else
+                               _capability_problems().get(parent_sid, "no capability held"))
                         return [TextContent(type="text", text=(
                             f"❌ Subagent session not started: parent {parent_sid} is not an "
-                            f"open session this MCP process or client holds ({why}). A "
+                            f"open session this caller context or client holds ({why}). A "
                             "subagent registers under its own parent's session only."))]
                     try:
                         prow = await client.get(f"{SERVER_URL}/api/sessions/{parent_sid}")
@@ -1619,7 +1718,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # this exact client id. Capture its capability for adoption
                 # below. A session capability authorizes only its own row.
                 from ai_team_sync import session_pointer as sp
-                live_cid = sp.claude_session_id()
+                live_cid = _client_id() or sp.claude_session_id()
                 placeholder_session_id = (
                     sp.resolve_pointer(cid=live_cid, allow_global=False)
                     if live_cid and not parent_sid else None)
@@ -1725,6 +1824,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 keyring_warning = ""
                 try:
                     sp.save_approval_token(data["id"], new_token,
+                                           cid=live_cid,
                                            parent_session_id=parent_sid or None)
                 except sp.CapabilityStoreError as exc:
                     keyring_warning = (
@@ -2558,7 +2658,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # The same holds for a session whose capability this client's
                 # private keyring holds (e.g. after an MCP restart): possession
                 # of its own capability, never the pointer, makes it ours.
-                if explicit_id and explicit_id in _IN_PROCESS_TOKENS:
+                if explicit_id and explicit_id in _tokens():
                     pointer_id, pointer_source = explicit_id, "in_process"
                 elif explicit_id and _holds_capability(explicit_id):
                     pointer_id, pointer_source = explicit_id, "in_process"
@@ -2637,7 +2737,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 if (handoff and target.session_id != active_session_id
                         and not _holds_capability(target.session_id)):
                     return [TextContent(type="text", text=(
-                        "❌ A handoff must come from one of this MCP process's own sessions."))]
+                        "❌ A handoff must come from one of this caller context's own sessions."))]
                 token = _capability_for(target.session_id)
                 if not token:
                     return [TextContent(type="text", text=_missing_capability("completion", target.session_id))]
@@ -2673,8 +2773,8 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # after turnover (routers/messages.readdress_message). The
                 # session only stops being the default while another open
                 # session of this process remains (#3593).
-                was_default = target.session_id == _IN_PROCESS_SESSION_ID
-                held = was_default or target.session_id in _IN_PROCESS_TOKENS
+                was_default = target.session_id == _default_session_id()
+                held = was_default or target.session_id in _tokens()
                 next_default = _retire_in_process(target.session_id) if held else None
                 if next_default == target.session_id:
                     next_default = None
@@ -3061,7 +3161,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                                       if str(lk.get("id")) == str(lock_id)), "")
                     except Exception:  # noqa: BLE001 — fall back to the default
                         owner = ""
-                    if owner and owner != actor and _IN_PROCESS_STATE.get(owner) is None \
+                    if owner and owner != actor and _states().get(owner) is None \
                             and _holds_capability(owner):
                         actor = owner
                 token = _capability_for(actor) if actor else ""

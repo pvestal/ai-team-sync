@@ -121,11 +121,11 @@ async def test_an_absolute_pattern_outside_the_repo_root_is_refused(
 
 @pytest.mark.asyncio
 async def test_mcp_extend_scope_reports_an_outside_pattern(client, repo, tmp_path, monkeypatch):
-    from tests.test_ownership_enforcement_3581 import _route_mcp_into
+    from tests.test_ownership_enforcement_3581 import _bind_mcp_caller, _route_mcp_into
 
     mcp = _route_mcp_into(client, monkeypatch)
     me = await _sid(client, repo, ["docs/a.md"])
-    monkeypatch.setattr(mcp, "load_session_id", lambda: me)
+    _bind_mcp_caller(mcp, monkeypatch, client, me)
     out = (await mcp.call_tool("extend_scope", {"patterns": ["/somewhere/else.py"]}))[0].text
     assert "HTTP 422" in out and "outside this session's repo_root" in out
     assert (await client.get(f"/api/sessions/{me}")).json()["scope"] == ["docs/a.md"]

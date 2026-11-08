@@ -133,7 +133,7 @@ def test_lock_guard_no_longer_self_blocks_after_clear(monkeypatch):
         "packages/core/migrations/scene_cohort.py", [my_row],
         my_session_id=LIVE, file_repo_root="/opt/anime-studio",
         locks=[{"session_id": "mine", "pattern": "packages/core/migrations/**",
-                "mode": "exclusive"}],
+                "mode": "exclusive"}], sibling_session_ids={"mine"},
     )
     assert conflicts == []
 

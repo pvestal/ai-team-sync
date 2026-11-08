@@ -94,7 +94,8 @@ def test_hook_attributes_a_cli_registered_session(monkeypatch):
     out = find_conflicts("packages/scene_generation/x.py", sessions, CID, "",
                          locks=[{"session_id": "mine",
                                  "pattern": "packages/scene_generation/*",
-                                 "mode": "exclusive"}])
+                                 "mode": "exclusive"}],
+                         sibling_session_ids={"mine"})
     assert out == []
 
 

@@ -44,6 +44,10 @@ def spawned(monkeypatch, tmp_path):
                 "CLAUDE_CODE_SESSION_ID"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", None)
+    monkeypatch.setattr(mcp, "_IN_PROCESS_TOKENS", {})
+    monkeypatch.setattr(mcp, "_IN_PROCESS_STATE", {})
+    monkeypatch.setattr(mcp, "_IN_PROCESS_PARENT", {})
+    monkeypatch.setattr(mcp, "_CAPABILITY_PROBLEMS", {})
     monkeypatch.setattr(mcp.httpx, "AsyncClient", _NoNetwork)
     calls = []
 
@@ -70,6 +74,7 @@ async def test_delegate_refuses_a_parent_taken_from_the_shared_pointer(monkeypat
 
 async def test_delegate_passes_its_own_session_as_the_explicit_parent(monkeypatch, spawned):
     monkeypatch.setattr(mcp, "resolve_identity", lambda: ("my-sid", "in_process"))
+    mcp._remember_in_process("my-sid", "my-capability")
 
     await mcp._call_tool_impl("delegate", dict(ARGS))
 

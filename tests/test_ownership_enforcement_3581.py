@@ -393,12 +393,19 @@ def _route_mcp_into(app_client, monkeypatch):
     return mcp
 
 
+def _bind_mcp_caller(mcp, monkeypatch, app_client, sid):
+    monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", sid)
+    monkeypatch.setattr(mcp, "_IN_PROCESS_TOKENS", {sid: app_client.tokens[sid]})
+    monkeypatch.setattr(mcp, "_IN_PROCESS_STATE", {})
+    monkeypatch.setattr(mcp, "_CAPABILITY_PROBLEMS", {})
+
+
 @pytest.mark.asyncio
 async def test_mcp_extend_scope_and_lock_ownership(client, repo, monkeypatch):
     mcp = _route_mcp_into(client, monkeypatch)
     holder = await _sid(client, repo, ["frontend/**"], agent="claude-code:holder01")
     me = await _sid(client, repo, ["docs/a.md"], agent="claude-code:me000001")
-    monkeypatch.setattr(mcp, "load_session_id", lambda: me)
+    _bind_mcp_caller(mcp, monkeypatch, client, me)
 
     out = (await mcp.call_tool("extend_scope", {
         "patterns": ["frontend/components/X.vue", "frontend/src/**/Nope.vue"]}))[0].text

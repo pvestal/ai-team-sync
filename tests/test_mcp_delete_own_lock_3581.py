@@ -49,9 +49,17 @@ async def _session_with_lock(transport, pattern):
             "developer": "patrick", "agent": "claude-code",
             "scope": [pattern], "auto_lock": True})
         sid = r.json()["id"]
+        token = r.headers["X-ATS-Approval-Token"]
         locks = (await c.get("/api/locks")).json()
         lock_id = next(lk["id"] for lk in locks if lk["session_id"] == sid)
-    return sid, lock_id
+    return sid, lock_id, token
+
+
+def _bind_caller(monkeypatch, sid, token):
+    monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", sid)
+    monkeypatch.setattr(mcp, "_IN_PROCESS_TOKENS", {sid: token})
+    monkeypatch.setattr(mcp, "_IN_PROCESS_STATE", {})
+    monkeypatch.setattr(mcp, "_CAPABILITY_PROBLEMS", {})
 
 
 async def _live_lock_ids(transport):
@@ -61,8 +69,8 @@ async def _live_lock_ids(transport):
 
 @pytest.mark.asyncio
 async def test_the_holder_releases_its_own_lock_through_mcp(wired, monkeypatch):
-    sid, lock_id = await _session_with_lock(wired, "src/a/**")
-    monkeypatch.setattr(mcp, "load_session_id", lambda: sid)
+    sid, lock_id, token = await _session_with_lock(wired, "src/a/**")
+    _bind_caller(monkeypatch, sid, token)
 
     out = await mcp.call_tool("delete_lock", {"lock_id": lock_id})
 
@@ -74,7 +82,9 @@ async def test_the_holder_releases_its_own_lock_through_mcp(wired, monkeypatch):
 async def test_a_shared_pointer_naming_the_holder_cannot_drop_its_lock(wired, monkeypatch):
     """The shared ~/.ats_session names whichever session wrote it last; an MCP
     process resolving its identity there must not act as that session."""
-    holder, lock_id = await _session_with_lock(wired, "src/a/**")
+    holder, lock_id, _token = await _session_with_lock(wired, "src/a/**")
+    monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", None)
+    monkeypatch.setattr(mcp, "_IN_PROCESS_TOKENS", {})
     monkeypatch.setattr(mcp, "resolve_identity", lambda: (holder, "global"))
 
     out = await mcp.call_tool("delete_lock", {"lock_id": lock_id})
@@ -85,9 +95,9 @@ async def test_a_shared_pointer_naming_the_holder_cannot_drop_its_lock(wired, mo
 
 @pytest.mark.asyncio
 async def test_another_live_session_still_cannot_drop_it_through_mcp(wired, monkeypatch):
-    _owner, lock_id = await _session_with_lock(wired, "src/a/**")
-    stranger, _ = await _session_with_lock(wired, "src/b/**")
-    monkeypatch.setattr(mcp, "load_session_id", lambda: stranger)
+    _owner, lock_id, _owner_token = await _session_with_lock(wired, "src/a/**")
+    stranger, _stranger_lock, stranger_token = await _session_with_lock(wired, "src/b/**")
+    _bind_caller(monkeypatch, stranger, stranger_token)
 
     out = await mcp.call_tool("delete_lock", {"lock_id": lock_id})
 

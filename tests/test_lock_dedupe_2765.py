@@ -43,7 +43,18 @@ async def _session(client, scope=None, auto_lock=False, **extra) -> str:
         "developer": "patrick", "agent": "claude-code", "scope": scope or [],
         "auto_lock": auto_lock, **extra})
     assert resp.status_code == 201, resp.text
-    return resp.json()["id"]
+    sid = resp.json()["id"]
+    if not hasattr(client, "tokens"):
+        client.tokens = {}
+    client.tokens[sid] = resp.headers["X-ATS-Approval-Token"]
+    return sid
+
+
+def _bind_mcp_caller(monkeypatch, sid, token):
+    monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", sid)
+    monkeypatch.setattr(mcp, "_IN_PROCESS_TOKENS", {sid: token})
+    monkeypatch.setattr(mcp, "_IN_PROCESS_STATE", {})
+    monkeypatch.setattr(mcp, "_CAPABILITY_PROBLEMS", {})
 
 
 async def _rows(db_session, sid, pattern=None):
@@ -225,7 +236,8 @@ async def test_extend_scope_on_an_already_held_lane_is_a_non_fatal_no_op(
         mcp_app, monkeypatch, db_session):
     async with mcp_app() as c:
         sid = await _session(c, scope=["src/a/**"], auto_lock=True)
-    monkeypatch.setattr(mcp, "load_session_id", lambda: sid)
+        token = c.tokens[sid]
+    _bind_mcp_caller(monkeypatch, sid, token)
 
     text = (await mcp.call_tool("extend_scope", {"patterns": ["src/a/**"]}))[0].text
     assert "NOT extended" not in text and "refused" not in text.lower(), text
@@ -248,7 +260,8 @@ async def test_extend_scope_asking_another_mode_says_the_mode_was_not_changed(
         mcp_app, monkeypatch, db_session):
     async with mcp_app() as c:
         sid = await _session(c, scope=["src/a/**"], auto_lock=True)
-    monkeypatch.setattr(mcp, "load_session_id", lambda: sid)
+        token = c.tokens[sid]
+    _bind_mcp_caller(monkeypatch, sid, token)
 
     text = (await mcp.call_tool("extend_scope", {"patterns": ["src/a/**"], "mode": "exclusive"}))[0].text
     assert "already held" in text.lower()

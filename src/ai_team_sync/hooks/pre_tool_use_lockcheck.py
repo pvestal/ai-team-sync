@@ -98,8 +98,9 @@ def find_conflicts(rel: str, sessions: list, my_session_id: str,
     """OTHER sessions' live locks covering `rel`, with their modes.
 
     `locks` is the response from GET /api/locks, which filters out expired locks
-    and dead owners. Exclude the exact ATS session when resolved; the Claude
-    session label is only a fallback for legacy sessions.
+    and dead owners. Exclude the exact ATS session when resolved, or an exact
+    sibling session id that the caller's capability keyring validates. Agent
+    labels are display metadata, never ownership authority.
 
     `sibling_session_ids` (#3593): ACTIVE sessions whose label is EXACTLY this
     Claude session's own (see sibling_session_ids()). They are this same Claude
@@ -112,7 +113,6 @@ def find_conflicts(rel: str, sessions: list, my_session_id: str,
     target file's git root cannot conflict — its 'tests/**' means ITS tests/.
     Either side unanchored ('') falls back to legacy match-everywhere. A root
     that is a linked worktree compares as its main checkout (_shared_root)."""
-    mine = (my_session_id or "")[:8]
     froot = _shared_root(file_repo_root)
     owners = {str(s.get("id", "")): s for s in sessions or []}
     siblings = sibling_session_ids or set()
@@ -128,8 +128,6 @@ def find_conflicts(rel: str, sessions: list, my_session_id: str,
         if my_ats_session_id and str(lk.get("session_id", "")) == my_ats_session_id:
             continue
         if str(lk.get("session_id", "")) in siblings:
-            continue
-        if not my_ats_session_id and mine and mine in agent:
             continue
         sroot = _shared_root(str((s.get("repo_root") if s else lk.get("repo_root")) or ""))
         if froot and sroot and froot != sroot:
@@ -168,7 +166,9 @@ def canonical_sibling_label(cid: str | None) -> str:
     environment can only switch the rule OFF, never choose what it matches.
     """
     cid = (cid or "").strip()
-    if len(cid) < 8 or (os.environ.get("ATS_DELEGATION") or "").strip():
+    if (len(cid) < 8 or len(cid) > 255
+            or not all(ch.isalnum() or ch in "._:-" for ch in cid)
+            or (os.environ.get("ATS_DELEGATION") or "").strip()):
         return ""
     return f"{CLAUDE_CODE_BASE}:{cid[:8]}"
 
@@ -216,7 +216,10 @@ def claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,
     Scope never grants (#2813), and every refusal message is the pointer
     session's own."""
     froot = _shared_root(froot)
-    ok, reason = _own_claim_check(rel, froot, my_sid, my_cid8, sessions, locks)
+    ok, reason = _own_claim_check(
+        rel, froot, my_sid, my_cid8, sessions, locks,
+        held_session_ids=held_session_ids,
+    )
     if ok or not sibling_label or not held_session_ids:
         return ok, reason
     siblings = sibling_session_ids(sessions, sibling_label, my_sid) & set(held_session_ids)
@@ -226,22 +229,28 @@ def claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,
 
 
 def _own_claim_check(rel: str, froot: str, my_sid: str | None, my_cid8: str,
-                     sessions: list, locks: list) -> tuple[bool, str]:
+                     sessions: list, locks: list, *,
+                     held_session_ids: set[str] | None = None) -> tuple[bool, str]:
     """(ok, reason) — do *I* hold a live claim covering `rel`? The CLAIM half
     of coordination (2026-08-17). find_conflicts asks "is someone ELSE here?";
     nothing asked "is my own session alive and does it claim this file?" — so
     a session reaped mid-turn (Stop-only heartbeats vs a 25-minute render
     turn) kept editing coordinated repos lock-less all day with zero warning.
 
-    My session resolves pointer-first (concurrency-safe, Gap 3), falling back
-    to agent-match on the hook payload's Claude session id. Only a live LOCK
-    covering `rel` grants an edit; session scope is intent metadata. `locks`
-    comes from GET /api/locks, which serves only live locks. Pure function of
-    its inputs, for tests."""
+    My session resolves pointer-first (concurrency-safe, Gap 3). With no pointer,
+    an exact agent-label match is only a candidate and must also be present in
+    this caller's capability-backed keyring. Only a live LOCK covering `rel`
+    grants an edit; session scope is intent metadata. `locks` comes from GET
+    /api/locks, which serves only live locks. Pure function of its inputs, for
+    tests."""
+    held = held_session_ids or set()
+
     def _mine(s) -> bool:
         if my_sid:
             return str(s.get("id", "")) == my_sid
-        return bool(my_cid8) and my_cid8 in str(s.get("agent", ""))
+        label = canonical_sibling_label(my_cid8)
+        sid = str(s.get("id", ""))
+        return bool(label) and sid in held and str(s.get("agent", "")) == label
 
     mine_active = [s for s in sessions or []
                    if _mine(s) and str(s.get("status", "")).lower() == "active"]

@@ -86,11 +86,60 @@ def test_another_sessions_lock_never_satisfies_my_claim():
     assert not ok
 
 
-def test_agent_match_fallback_when_pointer_missing():
+def test_capability_backed_exact_agent_match_when_pointer_missing():
     """Pointer file absent (my_sid=None): the payload's Claude session id
-    prefix still identifies my session by agent string."""
-    ok, _ = claim_check(REL, REPO, None, MY_CID8, [_sess()], [_lock()])
+    identifies only the exact canonical agent label whose capability is held."""
+    ok, _ = claim_check(
+        REL, REPO, None, MY_CID8, [_sess()], [_lock()],
+        held_session_ids={MY_SID},
+    )
     assert ok
+
+
+def test_exact_agent_match_without_capability_fails_closed():
+    ok, reason = claim_check(REL, REPO, None, MY_CID8, [_sess()], [_lock()])
+    assert not ok
+    assert "no ATS session found" in reason
+
+
+@pytest.mark.parametrize("agent", [
+    f"claude-code:{MY_CID8}suffix",
+    f"prefix-claude-code:{MY_CID8}",
+    f"codex:{MY_CID8}",
+    MY_CID8,
+    "claude-code",
+])
+def test_agent_match_fallback_is_exact_not_substring(agent):
+    session = _sess(agent=agent)
+    ok, reason = claim_check(
+        REL, REPO, None, MY_CID8, [session], [_lock()],
+        held_session_ids={MY_SID},
+    )
+    assert not ok
+    assert "no ATS session found" in reason
+
+
+@pytest.mark.parametrize("identity", ["", "short", "bad identity", "bad/id/value"])
+def test_missing_or_malformed_fallback_identity_fails_closed(identity):
+    ok, reason = claim_check(REL, REPO, None, identity, [_sess()], [_lock()])
+    assert not ok
+    assert "no ATS session found" in reason
+
+
+def test_similar_id_lock_remains_a_foreign_conflict_without_pointer():
+    similar = f"claude-code:{MY_CID8}f"
+    sessions = [_sess(sid="other", agent=similar)]
+    locks = [dict(_lock(sid="other"), mode="exclusive")]
+    assert find_conflicts(REL, sessions, MY_CID8, REPO, locks=locks) == [
+        (similar, "", REL, "exclusive")]
+
+
+def test_exact_label_lock_remains_foreign_without_capability_validation():
+    label = f"claude-code:{MY_CID8}"
+    sessions = [_sess(sid="other", agent=label)]
+    locks = [dict(_lock(sid="other"), mode="exclusive")]
+    assert find_conflicts(REL, sessions, MY_CID8, REPO, locks=locks) == [
+        (label, "", REL, "exclusive")]
 
 
 def test_unanchored_lock_covers_legacy_rows():
@@ -421,4 +470,4 @@ async def test_scope_only_session_cannot_block_the_exclusive_holder(client):
                           locks=locks) == [
         ("claude-code:bbbbbbbb", "", "src/a.py", "exclusive")]
     assert find_conflicts("src/a.py", sessions, "bbbbbbbb", REPO,
-                          locks=locks) == []
+                          locks=locks, sibling_session_ids={holder_sid}) == []

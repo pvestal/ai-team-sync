@@ -710,10 +710,15 @@ def delete_delegated_capability(state_dir: Path) -> None:
         pass
 
 
-def save_pointer(session_id: str, cid: str | None = None) -> None:
-    """Record the ATS session id for this Claude session. Writes both the
-    per-session pointer (authoritative) and the global file (back-compat).
-    Best-effort: never raises into a hook/turn."""
+def save_pointer(session_id: str, cid: str | None = None, *,
+                 write_global: bool = True) -> None:
+    """Record the ATS session id for this client.
+
+    Hooks and legacy callers write both the authoritative per-client pointer
+    and the back-compat global file.  A request-bound MCP caller passes
+    ``write_global=False`` because another client can observe that shared file.
+    Best-effort: never raises into a hook/turn.
+    """
     cid = cid or claude_session_id()
     sd = _state_dir()
     try:
@@ -721,7 +726,8 @@ def save_pointer(session_id: str, cid: str | None = None) -> None:
     except Exception:
         pass
     try:
-        global_pointer_path().write_text(session_id)
+        if write_global:
+            global_pointer_path().write_text(session_id)
     except Exception:
         pass
     if cid:

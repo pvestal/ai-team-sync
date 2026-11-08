@@ -50,7 +50,9 @@ async def test_extend_scope_merges_scope_and_creates_locks(db_engine, monkeypatc
             "developer": "patrick", "agent": "claude-code",
             "scope": ["src/a/**"], "auto_lock": True})
         sid = r.json()["id"]
-    monkeypatch.setattr(mcp, "load_session_id", lambda: sid)
+        token = r.headers["X-ATS-Approval-Token"]
+    monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", sid)
+    monkeypatch.setattr(mcp, "_IN_PROCESS_TOKENS", {sid: token})
 
     out = await mcp.call_tool("extend_scope", {"patterns": ["src/b/**"], "mode": "advisory"})
     text = out[0].text
@@ -99,7 +101,9 @@ async def test_extend_scope_reports_refused_locks_and_never_claims_them(db_engin
         me = await c.post("/api/sessions", json={
             "developer": "patrick", "agent": "claude-code", "scope": ["src/a/**"], "auto_lock": True})
         sid = me.json()["id"]
-    monkeypatch.setattr(mcp, "load_session_id", lambda: sid)
+        token = me.headers["X-ATS-Approval-Token"]
+    monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", sid)
+    monkeypatch.setattr(mcp, "_IN_PROCESS_TOKENS", {sid: token})
 
     async def scope_and_locks():
         async with AsyncClient(transport=transport, base_url="http://localhost:8400") as c:

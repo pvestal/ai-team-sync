@@ -736,6 +736,8 @@ def _bridge_mcp(client, monkeypatch, tmp_path):
     # Each case is a fresh MCP process: no session left in this module's pointer.
     monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", None)
     monkeypatch.setattr(mcp, "_IN_PROCESS_TOKENS", {})
+    monkeypatch.setattr(mcp, "_IN_PROCESS_STATE", {})
+    monkeypatch.setattr(mcp, "_CAPABILITY_PROBLEMS", {})
     # A ticketed MCP start_session first fetches the exact task authority (fail
     # closed); answer it with the suite's valid envelope for ticket 4101.
     from tests.test_task_brief import TASK_ENVELOPE
@@ -782,7 +784,11 @@ async def _via_mcp(mcp, client, monkeypatch, door, governed, value):
             "developer": "dev", "agent": "default", "scope": [], "repo_root": governed,
             "description": "auto-registered on SessionStart (UNSCOPED)", "ticket_id": 4101})
         sid = s.json()["id"]
-        monkeypatch.setattr(mcp, "load_session_id", lambda: sid)
+        monkeypatch.setattr(mcp, "_IN_PROCESS_SESSION_ID", sid)
+        monkeypatch.setattr(
+            mcp, "_IN_PROCESS_TOKENS",
+            {sid: s.headers["X-ATS-Approval-Token"]},
+        )
     if value is not _ABSENT:
         args["admission"] = value
     text = (await mcp.call_tool(door, args))[0].text
