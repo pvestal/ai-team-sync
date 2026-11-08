@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 import ai_team_sync.mcp.server as mcp
 from ai_team_sync import session_pointer as sp
 from ai_team_sync.database import get_db
+from ai_team_sync.mcp import caller_context as cc
 from ai_team_sync.server import create_app
 
 ROOT = "/srv/delegated-twin"
@@ -193,6 +194,55 @@ async def test_adopted_child_can_use_token_protected_tools(db_engine, monkeypatc
 
     assert "capability missing" not in inbox
     assert "No pending ATS messages" in inbox
+
+
+@pytest.mark.asyncio
+async def test_request_bound_delegated_child_adopts_into_its_own_context(
+        db_engine, monkeypatch, tmp_path):
+    transport = _wire(monkeypatch, db_engine, tmp_path)
+    delegation_id, child, token = await _bound_child(transport)
+    _as_child(monkeypatch, tmp_path, delegation_id, child, token)
+    context = cc.isolated_caller(
+        "codex", "019a5f42-3333-7000-8000-000000000003")
+
+    with cc.bind_caller(context):
+        text = (await mcp.call_tool("start_session", {
+            "scope": [], "description": "request-bound delegated child",
+            "repo_root": ROOT,
+        }))[0].text
+        decision = (await mcp.call_tool("log_decision", {
+            "session_id": child, "title": "delegated proof",
+            "chosen": "capability stayed request-bound", "reasoning": "test",
+        }))[0].text
+
+    assert f"Delegated session already open: {child}" in text
+    assert context.default_session_id == child
+    assert context.tokens == {child: token}
+    assert "Decision logged" in decision
+
+
+@pytest.mark.asyncio
+async def test_public_delegation_binding_cannot_bypass_a_bound_callers_capability(
+        db_engine, monkeypatch, tmp_path):
+    transport = _wire(monkeypatch, db_engine, tmp_path)
+    delegation_id, child, token = await _bound_child(transport)
+    _as_child(monkeypatch, tmp_path, delegation_id, child, token)
+    context = cc.isolated_caller(
+        "codex", "019a5f42-4444-7000-8000-000000000004")
+    # Even if a caller somehow installs the public child id as its default,
+    # the delegation binding alone must not skip the per-caller capability.
+    context.default_session_id = child
+    before = {row["id"]: row["decision_count"] for row in await _rows(transport)}
+
+    with cc.bind_caller(context):
+        decision = (await mcp.call_tool("log_decision", {
+            "session_id": child, "title": "must not land",
+            "chosen": "stolen", "reasoning": "public binding only",
+        }))[0].text
+
+    after = {row["id"]: row["decision_count"] for row in await _rows(transport)}
+    assert "capability missing" in decision.lower()
+    assert before[child] == after[child]
 
 
 @pytest.mark.asyncio

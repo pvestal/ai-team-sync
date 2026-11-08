@@ -613,13 +613,16 @@ def _load_legacy_approval(session_id: str, cid: str) -> str:
     return ""
 
 
-def load_approval_token(session_id: str, cid: str | None = None) -> str:
+def load_approval_token(session_id: str, cid: str | None = None, *,
+                        allow_delegated: bool = True) -> str:
     """The capability for EXACTLY `session_id`, or ''. Never another row's.
 
     Order: this client's keyring (a revoked entry answers ''), then the legacy
-    eight-character file under the rule in _load_legacy_approval, then a
-    delegated child's own capability file. Raises CapabilityStoreError for a
-    malformed keyring rather than reading it as empty."""
+    eight-character file under the rule in _load_legacy_approval, then -- only
+    when ``allow_delegated`` is true -- a delegated child's process-scoped
+    capability file. Request-bound callers disable that last fallback. Raises
+    CapabilityStoreError for a malformed keyring rather than reading it as
+    empty."""
     cid = (cid or claude_session_id() or "").strip()
     if not session_id:
         return ""
@@ -630,8 +633,10 @@ def load_approval_token(session_id: str, cid: str | None = None) -> str:
         token = _load_legacy_approval(session_id, cid)
         if token:
             return token
-    delegated = load_delegated_capability()
-    return delegated[1] if delegated and delegated[0] == session_id else ""
+    if allow_delegated:
+        delegated = load_delegated_capability()
+        return delegated[1] if delegated and delegated[0] == session_id else ""
+    return ""
 
 
 def legacy_capability_sessions(cid: str) -> set[str]:

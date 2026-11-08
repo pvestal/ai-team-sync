@@ -164,6 +164,34 @@ def test_two_metadata_free_transports_fail_closed(monkeypatch):
         cc.context_for_request(second, "codex")
 
 
+def test_delegated_process_refuses_a_second_caller_context(monkeypatch):
+    cc.reset_context_registry_for_tests()
+    monkeypatch.setenv("ATS_DELEGATION", "delegation-0001")
+    transport = SimpleNamespace()
+    server = SimpleNamespace(request_context=SimpleNamespace(
+        session=transport,
+        meta={"threadId": CID_A, "sessionId": "host-session-0001"},
+    ))
+    first = cc.context_for_request(server, "codex")
+    assert first.client_id == lifecycle_session_key("codex", CID_A)
+
+    server.request_context = SimpleNamespace(
+        session=transport,
+        meta={"threadId": CID_B, "sessionId": "host-session-0001"},
+    )
+    with pytest.raises(cc.CallerContextError, match="delegated MCP process"):
+        cc.context_for_request(server, "codex")
+
+
+def test_bound_caller_does_not_inherit_process_env_session(monkeypatch, tmp_path):
+    monkeypatch.setenv("ATS_STATE_DIR", str(tmp_path))
+    monkeypatch.setenv("ATS_SESSION_ID", "delegated-child-session")
+    context = cc.isolated_caller("codex", CID_A)
+
+    with cc.bind_caller(context):
+        assert mcp.resolve_identity() == (None, "none")
+
+
 def test_real_stdio_process_interleaves_two_codex_thread_contexts(
         live_ats, tmp_path):
     """Exercise the actual MCP SDK RequestContext and Codex `_meta` boundary."""

@@ -14,6 +14,7 @@ stored in that bucket (or an explicit delegation binding).
 from __future__ import annotations
 
 import contextvars
+import os
 import re
 import secrets
 import weakref
@@ -65,6 +66,11 @@ _STRONG_TRANSPORT_CONTEXTS: dict[int, tuple[Any, dict[str, CallerContext]]] = {}
 # without making the hook-published live id a shared multi-client identity.
 _LEGACY_TRANSPORT: Any | None = None
 _LEGACY_CODEX_LIFECYCLE = ""
+# A delegated MCP process is itself an authority envelope for ONE child caller.
+# The delegation capability is stored at process scope for the spawned worker,
+# so multiplexing a second lifecycle into that process is ambiguous and must
+# fail closed.  This is a one-time binding, not a mutable "current caller".
+_DELEGATION_CALLER: tuple[str, str] | None = None
 
 _META_KEYS = (
     "codex/thread_id",
@@ -191,6 +197,32 @@ def _bucket_for_transport(transport_session: Any) -> dict[str, CallerContext]:
         return entry[1]
 
 
+def _bind_delegated_process(context: CallerContext) -> None:
+    """Bind an explicit delegated-process envelope to exactly one caller.
+
+    A supervisor passes one capability through ``ATS_DELEGATION`` and the
+    delegated-capability file.  Those process-scoped credentials cannot safely
+    distinguish multiplexed clients, so a second caller is refused rather than
+    allowed to adopt the same child authority.
+    """
+
+    global _DELEGATION_CALLER
+
+    delegation_id = (os.environ.get("ATS_DELEGATION") or "").strip()
+    if not delegation_id:
+        return
+    binding = (delegation_id, context.key)
+    if _DELEGATION_CALLER is None:
+        _DELEGATION_CALLER = binding
+        return
+    if _DELEGATION_CALLER != binding:
+        raise CallerContextError(
+            "delegated MCP process is already bound to a different caller; "
+            "refusing to share its child capability (launch a separate MCP "
+            "process for each delegated client)"
+        )
+
+
 def context_for_request(server: Any, base_agent: str) -> CallerContext:
     """Resolve the caller bucket for the current MCP request.
 
@@ -252,9 +284,11 @@ def context_for_request(server: Any, base_agent: str) -> CallerContext:
                 "MCP caller thread changed host session identity; refusing to "
                 "reuse its authority bucket"
             )
+        _bind_delegated_process(existing)
         return existing
     created = _new_context(base_agent, lifecycle_id, source,
                            host_session_id=host_session_id)
+    _bind_delegated_process(created)
     bucket[bucket_key] = created
     return created
 
@@ -285,8 +319,9 @@ def isolated_caller(base_agent: str, lifecycle_id: str) -> CallerContext:
 def reset_context_registry_for_tests() -> None:
     """Tests only: discard request buckets without touching ATS sessions."""
 
-    global _LEGACY_TRANSPORT, _LEGACY_CODEX_LIFECYCLE
+    global _LEGACY_TRANSPORT, _LEGACY_CODEX_LIFECYCLE, _DELEGATION_CALLER
     _TRANSPORT_CONTEXTS.clear()
     _STRONG_TRANSPORT_CONTEXTS.clear()
     _LEGACY_TRANSPORT = None
     _LEGACY_CODEX_LIFECYCLE = ""
+    _DELEGATION_CALLER = None

@@ -283,7 +283,15 @@ def _capability_for(session_id: str | None) -> str:
         return token
     from ai_team_sync import session_pointer as sp
     try:
-        token = sp.load_approval_token(session_id, cid=_client_id())
+        # A request-bound caller may use only its in-memory context and its
+        # caller-keyed keyring. The delegated-capability file belongs to the
+        # whole MCP process; start_session is the one proof/adoption boundary
+        # that may copy it into the bound caller's context.
+        token = sp.load_approval_token(
+            session_id,
+            cid=_client_id(),
+            allow_delegated=caller_ctx.bound_caller() is None,
+        )
     except sp.CapabilityStoreError as exc:
         problems[session_id] = f"capability keyring refused: {exc}"
         return ""
@@ -330,7 +338,11 @@ def resolve_identity() -> tuple[str | None, str]:
     if bound is not None:
         try:
             from ai_team_sync import session_pointer as sp
-            found = sp.resolve_pointer(cid=bound.client_id, allow_global=False)
+            # Never inherit process $ATS_SESSION_ID here. A delegated caller
+            # proves and adopts that row through start_session, which installs
+            # the capability into THIS caller context. The env id alone is a
+            # public selector shared by every client in this process.
+            found = sp.read_session_pointer(bound.client_id)
         except Exception:
             found = None
         return (found, "per_session") if found else (None, "none")
@@ -1482,15 +1494,16 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
     async def deny_mutation(client) -> str | None:
         """Refusal text for a session-mutating call, or None to proceed."""
-        # A delegated child's authority is its DELEGATION BINDING, not its name.
-        # If the delegation ATS created names this exact session as its child,
-        # that is proof no label comparison can improve on.
+        # A delegated child's authority is its exact DELEGATION BINDING plus
+        # the child capability held by THIS caller context. The public binding
+        # alone is not a credential and must never skip capability validation.
         deleg_id = (os.environ.get("ATS_DELEGATION") or "").strip()
         if deleg_id and active_session_id:
             try:
                 r = await client.get(f"{SERVER_URL}/api/delegations/{deleg_id}")
                 if r.status_code == 200 and \
-                        r.json().get("child_session_id") == active_session_id:
+                        r.json().get("child_session_id") == active_session_id and \
+                        _holds_capability(active_session_id):
                     return None
             except Exception:
                 pass  # fall through to the normal checks
