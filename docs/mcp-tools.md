@@ -77,7 +77,7 @@ session id, and no lock moves between parent and subagent.
 
 | Tool | Effect | Notes |
 |---|---|---|
-| `log_decision` | mutates | Records what was chosen and why, for later readers. Optional `session_id` names one of this caller context's own sessions. |
+| `log_decision` | mutates | Records what was chosen and why, for later readers. Optional `ticket_id` binds the decision to a Tower ticket on the row (#2910): omitted, the session's own ticket is used; a ticket contradicting the session's is refused and nothing is written. Optional `session_id` names one of this caller context's own sessions. |
 | `get_decision_history` | reads | Cross-agent decisions on your current ticket or repo by default; supports `team_wide`, `ticket_id`, `repo_root`, `session_id`, and `since` filters. |
 | `request_override` | mutates | Ask the lock holder for permission to cross their claim. |
 | `respond_to_request` | mutates | Owner-bound: only the session the request is addressed to may answer. |
