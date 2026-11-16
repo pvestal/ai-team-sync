@@ -474,9 +474,11 @@ def test_session_response_carries_creator_uid(world):
 
 
 def test_a_legacy_null_creator_identity_is_unverified_in_a_governed_repo(world):
-    """A row from before #2741 (creator_uid NULL): the server's cross_account
-    refuses every account for it since #2763, and the guards refuse it as an
-    env-only identity in a governed repository."""
+    """A row from before #2741 (creator_uid NULL) is refused by all three guards
+    in a governed repository. Since #2763 the server's cross_account refuses
+    every account for such a row, so the ownership read (/api/locks/check,
+    caller_identity_unresolved) refuses it before the guards' own
+    no-recorded-creator check is reached; either refusal is fail-closed."""
     import sqlite3
 
     legacy = world["session"]("claude-code:dddddddd", world["gov_real"])
@@ -484,9 +486,10 @@ def test_a_legacy_null_creator_identity_is_unverified_in_a_governed_repo(world):
     with sqlite3.connect(world["db"]) as db:
         db.execute("UPDATE sessions SET creator_uid = NULL WHERE id = ?", (legacy,))
     env = world["env"](legacy)
+    refused = ("does not accept session", "no recorded creator")
     edit = _edit_guard(world["gov"] / "g2.txt", env)
-    assert edit.returncode == 2 and "no recorded creator" in edit.stderr
+    assert edit.returncode == 2 and any(r in edit.stderr for r in refused), edit.stderr
     commit = _commit(world["gov"], env, path="g2.txt")
-    assert commit.returncode != 0 and "no recorded creator" in commit.stderr
+    assert commit.returncode != 0 and any(r in commit.stderr for r in refused), commit.stderr
     g = _bash_guard("echo x >> g2.txt", world["gov"], env)
-    assert g.returncode == 2 and "no recorded creator" in g.stderr
+    assert g.returncode == 2 and any(r in g.stderr for r in refused), g.stderr
