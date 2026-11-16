@@ -443,23 +443,44 @@ async def test_restoration_survives_a_no_op_re_anchor(client, db_session, door):
 
 async def test_legacy_row_without_creator_uid_is_refused_restoration(
         client, db_session, door):
+    """Since #2763 the heartbeat itself refuses (403) every account for a row
+    whose creator was never identified, before restoration runs: the session
+    does not revive and no lock is minted. The journal is left as written --
+    no request can ever spend it."""
     sess = await _silent_session(db_session, scope=["src/**"],
                                  locks=[("src/**", "exclusive")], identified=False)
     sid = sess.id
     assert await auto_complete_stale_sessions(db_session) == 1
 
     resp = await door(client, sid)
-    assert resp.status_code == 200, resp.text
-    assert resp.json()["status"] == "active", "the session itself still revives"
-    assert resp.json()["restoration_reason"] == "unidentified_owner"
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["error"] == "session_not_yours"
+    assert (await _row(db_session, sid)).status == "completed", "the session did not revive"
+    assert await _locks_of(db_session, sid) == {}
+
+
+async def test_the_unidentified_owner_refusal_still_holds_below_the_door(db_session):
+    """Defence in depth: restore_reaped_locks refuses a NULL-creator row on its
+    own, for any caller that reaches it without the heartbeat's account check."""
+    from ai_team_sync.routers.sessions import restore_reaped_locks
+
+    sess = await _silent_session(db_session, scope=["src/**"],
+                                 locks=[("src/**", "exclusive")], identified=False)
+    sid = sess.id
+    assert await auto_complete_stale_sessions(db_session) == 1
+    row = await _row(db_session, sid)
+    outcome = await restore_reaped_locks(db_session, row, was_auto_completed=True)
+    assert outcome.reason == "unidentified_owner"
+    assert outcome.not_restored == ["src/**"]
+    await db_session.commit()
     assert await _locks_of(db_session, sid) == {}
     assert await _journal_of(db_session, sid) == "", "a refused journal stayed armed"
 
 
 async def test_a_foreign_account_cannot_mint_locks_on_a_legacy_row(
         client, db_session, monkeypatch):
-    """The attack the refusal closes. The session may still revive — that is the
-    pre-existing #2741 gap, ticketed as #2763 — but no lock is minted for it."""
+    """The attack the refusal closes. Since #2763 the foreign heartbeat does not
+    even revive the session (403); no lock is minted for it."""
     from ai_team_sync import peer_identity
 
     sess = await _silent_session(db_session, scope=["src/**"],
@@ -469,8 +490,9 @@ async def test_a_foreign_account_cannot_mint_locks_on_a_legacy_row(
 
     monkeypatch.setattr(peer_identity, "peer_uid_for_request",
                         lambda request: os.getuid() + 1)
-    assert (await _heartbeat(client, sid)).status_code == 200
+    assert (await _heartbeat(client, sid)).status_code == 403
     assert await _all_locks(db_session) == [], "a foreign heartbeat minted a lock"
+    assert (await _row(db_session, sid)).status == "completed"
 
 
 # ── 6. identity-bound sessions ──────────────────────────────────────────
@@ -632,7 +654,9 @@ async def test_a_partial_restoration_leaves_no_journal_behind(client, db_session
 
 @pytest.mark.parametrize("break_it,code", [
     ("anchor", "anchor_moved"),
-    ("legacy", "unidentified_owner"),
+    # "legacy" (creator_uid NULL) no longer reaches restoration through the
+    # heartbeat: #2763 refuses it with 403 first. Its refusal below the door is
+    # pinned by test_the_unidentified_owner_refusal_still_holds_below_the_door.
     ("poison", "invalid_journal"),
 ])
 async def test_a_refused_restoration_consumes_the_journal_exactly_once(
@@ -1467,7 +1491,6 @@ from ai_team_sync.routers.sessions import (  # noqa: E402
     OUTCOME_RESTORED,
     REFUSAL_ANCHOR_MOVED,
     REFUSAL_INVALID_JOURNAL,
-    REFUSAL_UNIDENTIFIED_OWNER,
 )
 
 
@@ -1550,7 +1573,9 @@ async def test_repeated_cycles_cannot_wear_the_loss_away(client, db_session):
 
 @pytest.mark.parametrize("mutate,reason", [
     (lambda s: setattr(s, "repo_root", "/srv/moved-away"), REFUSAL_ANCHOR_MOVED),
-    (lambda s: setattr(s, "creator_uid", None), REFUSAL_UNIDENTIFIED_OWNER),
+    # creator_uid NULL: the heartbeat answers 403 since #2763; the lanes that
+    # refusal leaves unheld are pinned below the door (not_restored == lanes) by
+    # test_the_unidentified_owner_refusal_still_holds_below_the_door.
 ])
 async def test_a_whole_journal_refusal_records_the_lanes_it_leaves_unheld(
         client, db_session, mutate, reason):

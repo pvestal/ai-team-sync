@@ -107,3 +107,79 @@ async def test_a_session_with_no_rows_moves_freely(client):
     a, _ = await _start(client, REPO_A, "claude-code:aaaa2808")
     moved = await client.patch(f"/api/sessions/{a}", json={"repo_root": REPO_B + "/"})
     assert moved.status_code == 200 and moved.json()["repo_root"] == REPO_B
+
+
+# ── Codex VERIFY c5fb3132 findings: every writer of repo_root, and the race ──
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_adoption_cannot_reanchor_a_placeholder_holding_a_lock(client):
+    """start_session adopting a SessionStart placeholder assigns a new repo_root
+    to the EXISTING row, which keeps its lock rows: same refusal as PATCH."""
+    from ai_team_sync.session_marker import AUTOREG_DESCRIPTION
+
+    key = "lifecycle-2808-adopt"
+    placeholder = await client.post("/api/sessions", json={
+        "developer": "patrick", "agent": "claude-code:cccc2808", "scope": [],
+        "repo_root": REPO_A, "description": AUTOREG_DESCRIPTION, "lifecycle_key": key})
+    assert placeholder.status_code == 201, placeholder.text
+    pid = placeholder.json()["id"]
+    token = {"X-ATS-Approval-Token": placeholder.headers["X-ATS-Approval-Token"]}
+    assert (await _lock(client, pid)).status_code == 201  # a placeholder can hold a lock
+
+    adopt = await client.post("/api/sessions", headers=token, json={
+        "developer": "patrick", "agent": "claude-code:cccc2808", "scope": [],
+        "repo_root": REPO_B, "description": "real work", "lifecycle_key": key,
+        "adopt_session_id": pid})
+    assert adopt.status_code == 409, adopt.text
+    assert adopt.json()["detail"]["error"] == "repo_root_change_with_live_locks"
+    assert adopt.json()["detail"]["locks"] == ["src/**"]
+    row = (await client.get(f"/api/sessions/{pid}")).json()
+    assert row["repo_root"] == REPO_A and row["description"] == AUTOREG_DESCRIPTION
+
+    same_root = await client.post("/api/sessions", headers=token, json={
+        "developer": "patrick", "agent": "claude-code:cccc2808", "scope": [],
+        "repo_root": REPO_A, "description": "real work", "lifecycle_key": key,
+        "adopt_session_id": pid})
+    assert same_root.status_code == 200, "adoption without a move is unaffected"
+
+
+@pytest.mark.asyncio
+async def test_a_lock_committed_after_the_precheck_still_refuses_the_reanchor(
+        client, monkeypatch):
+    """The PATCH pre-check reads the rows as loaded; a lock created before the
+    assignment must still be seen. The re-anchor now runs inside the acquisition
+    guard (which POST /api/locks also takes) and re-reads the rows there."""
+    from ai_team_sync.routers import sessions as sessions_router
+
+    a, _ = await _start(client, REPO_A, "claude-code:aaaa2808")
+    real_precheck = sessions_router._refuse_reanchor_with_live_locks
+    raced = {}
+
+    def precheck_then_race(session, body):
+        real_precheck(session, body)  # passes: no rows yet
+        raced["checked"] = True
+
+    monkeypatch.setattr(sessions_router, "_refuse_reanchor_with_live_locks", precheck_then_race)
+    real_guard = sessions_router.__dict__.get("acquisition_guard")
+    from ai_team_sync.routers import locks as locks_router
+    original_guard = locks_router.acquisition_guard
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def guard_after_a_rival_lock(db):
+        if raced.get("checked") and not raced.get("locked"):
+            raced["locked"] = True
+            created = await _lock(client, a)  # commits through its own guard
+            assert created.status_code == 201, created.text
+        async with original_guard(db):
+            yield
+
+    monkeypatch.setattr(locks_router, "acquisition_guard", guard_after_a_rival_lock)
+    moved = await client.patch(f"/api/sessions/{a}", json={"repo_root": REPO_B})
+    assert raced.get("locked"), "the race was not staged"
+    assert moved.status_code == 409, moved.text
+    assert moved.json()["detail"]["locks"] == ["src/**"]
+    assert (await client.get(f"/api/sessions/{a}")).json()["repo_root"] == REPO_A
+    assert real_guard is None  # sessions imports the guard lazily from locks

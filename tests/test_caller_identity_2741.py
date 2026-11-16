@@ -855,13 +855,18 @@ async def test_r1_f2_an_unidentified_owner_is_not_clearable_by_a_bound_or_uniden
     assert not (await _authorize(client, peer, EXEC_UID, executor, "commit", **_commit(["src/a.py"])))["allowed"]
 
 
-async def test_r1_f2_unidentified_owners_stay_manageable_by_an_ordinary_account(client, bound_registry, peer, db_session):
+async def test_r1_f2_unidentified_owners_are_manageable_by_no_account(client, bound_registry, peer, db_session):
+    """Superseded by #2763: this used to pin "ordinary identified accounts keep
+    the old behaviour" for creator_uid NULL. No account can prove it created such
+    a row, so none may change it -- not even the one that happens to hold its
+    capability (the capability is not an account fact)."""
     owner = await _sid(client, peer, OTHER_UID, "claude-code:legacy")
     await db_session.execute(update(Session).where(Session.id == owner).values(creator_uid=None))
     await db_session.commit()
     peer["uid"] = OTHER_UID
     assert (await client.post(f"/api/sessions/{owner}/complete", json={},
-                              headers=_owner(client, owner))).status_code == 200
+                              headers=_owner(client, owner))).status_code == 403
+    assert (await client.get(f"/api/sessions/{owner}")).json()["status"] == "active"
 
 
 def _repo(tmp_path):

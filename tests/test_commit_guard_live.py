@@ -474,8 +474,8 @@ def test_session_response_carries_creator_uid(world):
 
 
 def test_a_legacy_null_creator_identity_is_unverified_in_a_governed_repo(world):
-    """A row from before #2741 (creator_uid NULL) is accepted by the server's
-    cross_account for an ordinary account; the guards refuse it as an
+    """A row from before #2741 (creator_uid NULL): the server's cross_account
+    refuses every account for it since #2763, and the guards refuse it as an
     env-only identity in a governed repository."""
     import sqlite3
 
