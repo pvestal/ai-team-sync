@@ -50,6 +50,50 @@ async def approved_override_for_lock(db: AsyncSession, requester_session_id: str
                for r in rows if lock_created is not None)
 
 
+def _aware_utc(dt: datetime | None) -> datetime | None:
+    return dt.replace(tzinfo=timezone.utc) if dt is not None and dt.tzinfo is None else dt
+
+
+async def approved_override_lock_ids(db: AsyncSession, requester_session_id: str,
+                                     locks) -> set[str]:
+    """approved_override_for_lock for many locks in ONE read: the ids of the
+    `locks` this requester holds a live, approved, not-older-than-the-lock grant
+    for. Same rule, same filters.
+
+    The conflict check runs under the acquisition guard, i.e. while holding the
+    database writer lock, and used to ask once per live lock -- one event-loop
+    round trip each, 140 of them with tonight's board -- while every writer
+    outside the guard waited (#3750). Columns only, so the request's identity
+    map is not touched."""
+    locks = list(locks)
+    if not requester_session_id or not locks:
+        return set()
+    now = datetime.now(timezone.utc)
+    rows = (await db.execute(
+        select(OverrideRequest.owner_session_id, OverrideRequest.conflicting_pattern,
+               OverrideRequest.created_at).where(
+            OverrideRequest.requester_session_id == requester_session_id,
+            OverrideRequest.owner_session_id.in_({lock.session_id for lock in locks}),
+            OverrideRequest.status == "approved",
+            OverrideRequest.expires_at > now,
+        ))).all()
+    # The newest grant per (owner, lane) decides: "any grant at least as new as
+    # the lock" is "the newest grant is at least as new as the lock".
+    newest: dict[tuple[str, str], datetime] = {}
+    for owner, pattern, created in rows:
+        created = _aware_utc(created)
+        if created is not None and (newest.get((owner, pattern)) is None
+                                    or created > newest[(owner, pattern)]):
+            newest[(owner, pattern)] = created
+    granted = set()
+    for lock in locks:
+        lock_created = _aware_utc(lock.created_at)
+        grant = newest.get((lock.session_id, lock.pattern))
+        if lock_created is not None and grant is not None and grant >= lock_created:
+            granted.add(lock.id)
+    return granted
+
+
 async def _load_request_by_id_or_prefix(
     db: AsyncSession, request_id: str
 ) -> OverrideRequest:

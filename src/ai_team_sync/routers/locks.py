@@ -205,11 +205,15 @@ async def create_lock(body: LockCreate, request: Request, db: AsyncSession = Dep
     # governed-repository pattern validation (#3581).
     from ai_team_sync.routers.sessions import (
         _check_scope_conflicts, blocking_conflict, refuse_unbacked_patterns,
-        scope_conflict_detail)
+        scope_conflict_detail, warm_scope_conflicts)
 
     repo_ctx = RepoContext()
     await asyncio.to_thread(refuse_unbacked_patterns, [body.pattern],
                             session.repo_root or "", repo_ctx)
+    # Decide the overlaps now, outside the writer lock; the guarded check below
+    # re-reads the live locks and looks the answers up (#3750).
+    await warm_scope_conflicts(db, [body.pattern], repo_root=session.repo_root or "",
+                               exclude_session_id=session.id, repo_ctx=repo_ctx)
     # Work admission (#3591) at a session's first claim. Sessions begin
     # auto-registered and unscoped, so extend_scope is the usual first claim;
     # start_session's admission is not the only door.

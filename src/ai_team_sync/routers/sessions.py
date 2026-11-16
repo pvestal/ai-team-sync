@@ -384,19 +384,21 @@ async def _check_scope_conflicts(
     each conflict carries `governed_repo`, which makes any overlap blocking.
     """
     from ai_team_sync.routers.locks import _get_active_locks
-    from ai_team_sync.routers.override_requests import approved_override_for_lock
+    from ai_team_sync.routers.override_requests import approved_override_lock_ids
 
     ctx = repo_ctx or RepoContext()
     # Same notion of a live lock as the board and the grant check (#2741).
     active_locks = await _get_active_locks(db)
-    candidates = []
-    for lock, owner, lock_repo_root in active_locks:
-        if exclude_session_id and lock.session_id == exclude_session_id:
-            continue
-        if await approved_override_for_lock(db, requester_session_id, lock):
-            continue
-        candidates.append((lock, owner, lock_repo_root))
+    others = [(lock, owner, lock_repo_root) for lock, owner, lock_repo_root in active_locks
+              if not (exclude_session_id and lock.session_id == exclude_session_id)]
+    # One override read for every candidate, not one per live lock (#3750):
+    # callers hold the database writer lock here.
+    granted = await approved_override_lock_ids(
+        db, requester_session_id, [lock for lock, _owner, _root in others])
+    candidates = [c for c in others if c[0].id not in granted]
 
+    # With a context warmed by warm_scope_conflicts, every overlap below is a
+    # lookup; only a lock committed after the warm-up is computed here.
     def _decide():
         # Each pattern is placed by its OWN root (a worktree is its main
         # checkout; an absolute pattern is wherever it points) before comparing.
@@ -417,6 +419,54 @@ async def _check_scope_conflicts(
         "session_id": lock.session_id,
         "governed_repo": governed,
     } for new_pattern, lock, owner in hits]
+
+
+async def warm_scope_conflicts(
+    db: AsyncSession,
+    new_patterns: list[str],
+    *,
+    repo_root: str = "",
+    exclude_session_id: str = "",
+    repo_ctx: RepoContext,
+) -> None:
+    """Decide, BEFORE the acquisition guard, the file overlaps that
+    _check_scope_conflicts will ask under it (#3750).
+
+    Overlap is the expensive part of a claim: every new pattern against every
+    live lock, on file indexes built from every worktree of each repository
+    (2026-11-15: 140 live locks, 278 anime-studio worktrees, 1.4-2.7 s). Under
+    acquisition_guard that time is spent holding the SQLite writer lock, and
+    every writer outside the guard -- heartbeats, file activities, delegations
+    -- timed out at the driver's 5 s busy limit with `database is locked`.
+
+    Nothing here decides anything. It reads which lanes are held now, without
+    locks and without touching the request's identity map, and fills
+    `repo_ctx`'s per-request overlap memo. The guarded check still re-reads the
+    live locks and overrides inside the guard and makes the decision there; a
+    lock committed after this read is simply computed there, as before. A
+    failure of the computation only costs the speed-up (the guarded check meets
+    it again for the locks still live); a failure of the read is the request's,
+    as any other read before the guard."""
+    if not new_patterns:
+        return
+    query = (select(ScopeLock.pattern, Session.repo_root).join(Session)
+             .where(Session.status.in_(["active", "paused"])))
+    if exclude_session_id:
+        query = query.where(ScopeLock.session_id != exclude_session_id)
+    with db.no_autoflush:
+        held = set((await db.execute(query)).all())
+
+    def _warm():
+        repo_ctx.governed_root(repo_root)
+        for new_pattern in new_patterns:
+            for pattern, lock_repo_root in held:
+                repo_ctx.overlap(new_pattern, repo_root, pattern, lock_repo_root)
+
+    try:
+        await asyncio.to_thread(_warm)
+    except Exception:  # noqa: BLE001 -- an optimization; the guarded check decides
+        logger.warning("scope-conflict warm-up failed; the check computes under the "
+                       "guard instead", exc_info=True)
 
 
 def refuse_unbacked_patterns(patterns: list[str], repo_root: str, ctx: RepoContext) -> None:
@@ -1289,6 +1339,10 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
     if locking:
         repo_ctx = RepoContext()
         await asyncio.to_thread(refuse_unbacked_patterns, scope, repo_root, repo_ctx)
+        # The overlaps, too, outside the writer lock (#3750). No exclusion: an
+        # adopted row is only known under the guard, and warming its own lanes
+        # as well is harmless.
+        await warm_scope_conflicts(db, scope, repo_root=repo_root, repo_ctx=repo_ctx)
     # Work admission (#3591): what the work is, decided before the claim exists.
     admitted = (await admission.admit(body.admission, ticket_id=ticket_id, repo_root=repo_root,
                                       scope=scope, objective=body.description,
