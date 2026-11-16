@@ -135,6 +135,7 @@ class RepoContext:
         self._dirs: dict[str, frozenset[str]] = {}
         self._checkouts: dict[str, list[str]] = {}
         self._covered: dict[tuple[str, str], frozenset[str]] = {}
+        self._overlap: dict[tuple, bool] = {}
         self.config_error = ""
         try:
             self._governed = set(governed_repositories())
@@ -315,7 +316,19 @@ class RepoContext:
 
     def overlap(self, pattern: str, root: str, other: str, other_root: str) -> bool:
         """Can `pattern` held under `root` and `other` held under `other_root`
-        name a common file? Each is placed by its own root first."""
+        name a common file? Each is placed by its own root first.
+
+        Memoized for this context's life (one request), like the indexes it is
+        computed from. That is what lets an acquisition decide every overlap
+        BEFORE it takes the database writer lock and only look the answers up
+        under it (#3750): computed under the lock it held the whole SQLite file
+        for seconds on a large board."""
+        key = (pattern, root, other, other_root)
+        if key not in self._overlap:
+            self._overlap[key] = self._overlap_uncached(pattern, root, other, other_root)
+        return self._overlap[key]
+
+    def _overlap_uncached(self, pattern: str, root: str, other: str, other_root: str) -> bool:
         a, b = self.place(pattern, root), self.place(other, other_root)
         if a is None or b is None:
             return self._absolute_overlap(a, pattern, b, other)
