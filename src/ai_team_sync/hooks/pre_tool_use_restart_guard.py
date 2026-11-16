@@ -365,10 +365,12 @@ def main() -> None:
     if verdict.blocked:
         print("ATS RESTART GUARD: raw service control of a GOVERNED unit is refused:\n"
               + "\n".join(f"  - {b}" for b in verdict.blocked)
-              + "\nUse `ats safe-restart <unit> --reason \"...\"` -- it refuses while requests, "
-                "jobs or GPU queues are in flight, drains the service, restarts it, verifies "
-                "it, and records the attempt and the outcome (#3580). If the gate refuses, "
-                "the refusal names what is in flight; wait for it or ask the operator.",
+              + "\nUse `ats safe-restart <unit> --reason \"...\"` -- it drains the service "
+                "first (new writes get 503 + Retry-After, no new jobs start), waits a bounded "
+                "time for requests, jobs and GPU queues in flight, never restarts while any "
+                "remain, then restarts, verifies, and records the attempt and the outcome "
+                "(#3580, #3744). If the gate refuses, the refusal names what held it; retry "
+                "later or ask the operator.",
               file=sys.stderr)
         sys.exit(2)
     warnings += [w if w.startswith("ATS RESTART GUARD") else f"ATS RESTART GUARD: {w}"

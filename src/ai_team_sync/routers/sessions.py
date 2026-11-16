@@ -182,7 +182,7 @@ def _parse_unresolved(raw: str) -> list[tuple[str, str]]:
     raw = raw or ""
     try:
         parsed = json.loads(raw) if raw else []
-    except (TypeError, ValueError):
+    except _UNREADABLE_JSON:
         return []
     if not isinstance(parsed, list):
         return []
@@ -230,6 +230,12 @@ def _live_lock_patterns(s: Session) -> set[str]:
     a dead row clear a live loss and hand the scope fallback back to a session
     holding nothing.
     """
+    return _live_patterns_of(s, s.locks or [])
+
+
+def _live_patterns_of(s: Session, rows) -> set[str]:
+    """_live_lock_patterns over explicitly supplied lock rows of session `s`
+    (e.g. re-read inside the acquisition guard)."""
     from ai_team_sync.routers.locks import live_exclusive_owner
 
     def _aware(dt):
@@ -237,7 +243,7 @@ def _live_lock_patterns(s: Session) -> set[str]:
 
     now = datetime.now(timezone.utc)
     held = set()
-    for lk in (s.locks or []):
+    for lk in rows:
         expires = _aware(getattr(lk, "expires_at", None))
         if (expires and expires > now) or (lk.mode == "exclusive" and live_exclusive_owner(s)):
             held.add(canonical_pattern(lk.pattern))
@@ -448,6 +454,12 @@ REFUSAL_UNIDENTIFIED_OWNER = "unidentified_owner"
 REFUSAL_ANCHOR_MOVED = "anchor_moved"
 REFUSAL_INVALID_JOURNAL = "invalid_journal"
 
+# What an unreadable journal can raise from json.loads. RecursionError is NOT a
+# ValueError (it subclasses RuntimeError): syntactically valid JSON nested ~10k
+# levels deep raises it from the C scanner, and before #2814 it escaped the
+# heartbeat as an HTTP 500 instead of this module's structured invalid_journal.
+_UNREADABLE_JSON = (TypeError, ValueError, RecursionError)
+
 # Why a single lane did not come back, when the journal itself was fine.
 NOT_RESTORED_NEWER_HOLDER = "newer_holder"
 NOT_RESTORED_EXPIRED = "expired"
@@ -495,7 +507,7 @@ def journal_names_locks(raw: str | None) -> bool:
         return False
     try:
         envelope = json.loads(raw)
-    except (TypeError, ValueError):
+    except _UNREADABLE_JSON:
         return True
     if not isinstance(envelope, dict):
         return True
@@ -560,7 +572,7 @@ def _journalled_patterns(raw: str) -> list[str]:
     """
     try:
         envelope = json.loads(raw) if raw else {}
-    except (TypeError, ValueError):
+    except _UNREADABLE_JSON:
         return []
     if not isinstance(envelope, dict):
         return []
@@ -677,6 +689,9 @@ async def restore_reaped_locks(
         return _refused(REFUSAL_IDENTITY_BOUND,
                         "an identity-bound session's authority ended with it (#2741)")
     if getattr(session, "creator_uid", None) is None:
+        # Defence in depth since #2763: the heartbeat's cross_account check now
+        # refuses (403) every requester for such a row before restoration runs,
+        # so this refusal is reached only by a caller that skips that check.
         # Name the lanes BEFORE disarming: after _disarm_journal the only record
         # that this session was stripped of them is gone (#2760).
         lanes = _journalled_patterns(session.reaped_locks or "")
@@ -745,7 +760,7 @@ async def _grant_from_journal(
 
     try:
         envelope = json.loads(raw)
-    except (TypeError, ValueError):
+    except _UNREADABLE_JSON:
         return _refused(REFUSAL_INVALID_JOURNAL, "journal is not readable JSON",
                         _journalled_patterns(raw))
     if not isinstance(envelope, dict):
@@ -1017,21 +1032,52 @@ def _refuse_reanchor_with_live_locks(session: Session, body: SessionUpdate) -> N
     """A lock pattern means a file only relative to its session's repo_root, so
     moving the root of a session holding live locks would re-point every lock
     with none of the acquisition checks (#3581). Refused (409); completing in the
-    same request releases the locks, so that is allowed."""
+    same request releases the locks, so that is allowed.
+
+    DORMANT ROWS MOVE TOO (#2808). A ScopeLock carries no anchor of its own; it
+    is read under its session's repo_root. An EXCLUSIVE row whose owner is
+    paused and silent is not live (it blocks nobody, so a newer holder may take
+    the lane), yet it is not gone either: one heartbeat makes it live again,
+    under whatever root the session has then. Re-anchoring past such a row let
+    it wake in another repo -- or, moved back, beside the newer holder -- having
+    passed no conflict check in either place. Every row the session still holds
+    therefore refuses the move, live or not; the sweep deletes a dead row within
+    one interval, after which the move is allowed. (#2808's recorded option (a),
+    re-run the conflict check against the new root, is subsumed: a session that
+    may re-anchor holds no row left to check.)
+
+    This is the pre-check on the rows as loaded, so a refusal applies no field.
+    update_session repeats it on rows re-read INSIDE the acquisition guard (a
+    lock committed meanwhile is seen), and start_session's lifecycle adoption,
+    the other writer of an existing row's repo_root, runs the same rule there."""
     if body.repo_root is None or body.status == "completed":
         return
-    if body.repo_root.rstrip("/") == (session.repo_root or "").rstrip("/"):
-        return
-    held = sorted(_live_lock_patterns(session))
-    if held:
-        raise HTTPException(409, detail={
-            "error": "repo_root_change_with_live_locks",
-            "message": (f"session {session.id} holds {len(held)} live lock(s) anchored to "
-                        f"{session.repo_root or '<unanchored>'}; release them (or complete the "
-                        f"session) before re-anchoring to {body.repo_root.rstrip('/')}. "
-                        f"No field of this request was applied."),
-            "session_id": session.id,
-            "locks": held})
+    detail = _reanchor_refusal(session, session.locks or [], body.repo_root)
+    if detail is not None:
+        raise HTTPException(409, detail=detail)
+
+
+def _reanchor_refusal(session: Session, rows, new_root: str) -> dict | None:
+    """The 409 detail refusing to move `session` (holding lock `rows`) to
+    `new_root`, or None when the move re-points nothing (#3581, #2808)."""
+    new_root = (new_root or "").rstrip("/")
+    if new_root == (session.repo_root or "").rstrip("/"):
+        return None
+    held = sorted(_live_patterns_of(session, rows))
+    dormant = sorted({canonical_pattern(lk.pattern) for lk in rows} - set(held))
+    if not (held or dormant):
+        return None
+    counted = f"{len(held)} live lock(s)" + (
+        f" and {len(dormant)} dormant lock row(s)" if dormant else "")
+    return {
+        "error": "repo_root_change_with_live_locks",
+        "message": (f"session {session.id} holds {counted} anchored to "
+                    f"{session.repo_root or '<unanchored>'}; release them (or complete the "
+                    f"session) before re-anchoring to {new_root or '<unanchored>'}. "
+                    f"No field of this request was applied."),
+        "session_id": session.id,
+        "locks": held,
+        "dormant_locks": dormant}
 
 
 def scope_conflict_detail(what: str, conflict: dict, conflicts: list[dict]) -> dict:
@@ -1305,6 +1351,14 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
                     response.headers["X-ATS-Approval-Token"] = token
                     return _session_to_response(session)
                 adopted = lifecycle_candidate
+                # The adopted row keeps its lock rows, and they are read under
+                # the repo_root assigned below: the re-anchor rule applies here
+                # too, on rows read inside this guard (#2808).
+                held_rows = (await db.execute(select(ScopeLock).where(
+                    ScopeLock.session_id == adopted.id))).scalars().all()
+                moved = _reanchor_refusal(adopted, held_rows, repo_root or "")
+                if moved is not None:
+                    raise HTTPException(409, detail=moved)
             elif lifecycle_candidate is not None:
                 raise HTTPException(409, detail={
                     "error": "lifecycle_exists",
@@ -1475,8 +1529,8 @@ def _refuse_foreign_change(request: Request, session: Session, body: SessionUpda
     bound worker could clear another session's exclusive claim and then be
     granted the files it protected. Another account's silent session is left to
     the in-process reaper. A session whose creator was never identified (legacy
-    rows) follows cross_account's legacy rule: ordinary identified accounts may
-    change it, unidentifiable callers and headless bound accounts may not.
+    rows, or a requester the kernel could not name) can be changed by NO account
+    (#2763, cross_account): nobody can prove they created it.
 
     An identity-bound session is stricter: its authority ends with it (no
     reopening), its anchor is part of what its claims mean (not movable), and
@@ -1624,7 +1678,12 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
     from ai_team_sync.routers.locks import acquisition_guard
     # Every status change is serialized with the reaper's retirement (#2811),
     # not only completion: the checks above ran on the row as loaded.
-    serialize = body.status is not None
+    # A re-anchor is serialized too (#2808): POST /api/locks takes this guard,
+    # so a lock committed between the pre-check above and the assignment below
+    # would otherwise be re-pointed unchecked.
+    reanchoring = (body.repo_root is not None and body.status != "completed"
+                   and body.repo_root.rstrip("/") != (session.repo_root or "").rstrip("/"))
+    serialize = body.status is not None or reanchoring
     loaded_status = session.status
     already_completed = False
     async with (acquisition_guard(db) if serialize else contextlib.nullcontext()):
@@ -1645,7 +1704,14 @@ async def update_session(session_id: str, body: SessionUpdate, request: Request,
             # reaper's True on an owner-completed row, and the stale lock list
             # would name rows the reaper already deleted.
             await db.refresh(session)
-            if body.status != "completed" and session.status != loaded_status:
+            if reanchoring:
+                fresh = (await db.execute(select(ScopeLock).where(
+                    ScopeLock.session_id == session.id))).scalars().all()
+                moved = _reanchor_refusal(session, fresh, body.repo_root)
+                if moved is not None:
+                    raise HTTPException(409, detail=moved)
+            if body.status is not None and body.status != "completed" \
+                    and session.status != loaded_status:
                 # Pause/resume decided on a status that no longer holds (e.g.
                 # the reaper retired it meanwhile). Applying it would revive a
                 # reaped row past the refusals above; a retry meets them with

@@ -1139,6 +1139,15 @@ async def list_tools() -> list[Tool]:
                         "type": "string",
                         "description": "Optional exact peer session to notify and require acknowledgement from.",
                     },
+                    "ticket_id": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": (
+                            "Optional Tower ticket this decision is about, bound on the row "
+                            "so a ticket-scoped query finds it without title search "
+                            "(#2910). Omitted: your session's ticket, if it has one. "
+                            "Naming a ticket other than your session's is refused."),
+                    },
                     "session_id": _OWN_SESSION_SCHEMA,
                 },
                 "required": ["title", "chosen", "reasoning"],
@@ -2952,6 +2961,16 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 rejected = arguments.get("rejected", "")
                 reasoning = arguments["reasoning"]
                 recipient_id = arguments.get("recipient_session_id")
+                # #2910: an explicit ticket binding, validated here so a malformed
+                # value is refused rather than silently dropped. The server derives
+                # the session's ticket when none is given and refuses (409) one
+                # that contradicts it; neither case writes a partial row.
+                decision_ticket = arguments.get("ticket_id")
+                if decision_ticket is not None and (
+                        type(decision_ticket) is not int or decision_ticket < 1):
+                    return [TextContent(type="text", text=(
+                        f"❌ Decision NOT logged: ticket_id must be a positive integer, "
+                        f"got {decision_ticket!r}"))]
                 headers = {}
                 if recipient_id:
                     token = _capability_for(active_session_id)
@@ -2959,27 +2978,39 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         return [TextContent(type="text", text=_missing_capability("addressed decision", active_session_id))]
                     headers["X-ATS-Approval-Token"] = token
 
+                payload = {
+                    "session_id": active_session_id,
+                    "recipient_session_id": recipient_id,
+                    "title": title,
+                    "chosen": chosen,
+                    "rejected": rejected,
+                    "reasoning": reasoning,
+                    "files": [],
+                }
+                if decision_ticket is not None:
+                    payload["ticket_id"] = decision_ticket
                 response = await client.post(
-                    f"{SERVER_URL}/api/decisions",
-                    json={
-                        "session_id": active_session_id,
-                        "recipient_session_id": recipient_id,
-                        "title": title,
-                        "chosen": chosen,
-                        "rejected": rejected,
-                        "reasoning": reasoning,
-                        "files": [],
-                    }, headers=headers,
+                    f"{SERVER_URL}/api/decisions", json=payload, headers=headers,
                 )
+                if response.status_code in (409, 422):
+                    try:
+                        why = response.json().get("detail")
+                    except ValueError:
+                        why = response.text[:300]
+                    return [TextContent(type="text", text=(
+                        f"❌ Decision NOT logged (HTTP {response.status_code}): {why}"))]
                 response.raise_for_status()
+                stored_ticket = response.json().get("ticket_id")
 
                 msg = f"✅ Decision logged!\n\n"
                 msg += f"Title: {title}\n"
                 msg += f"Chosen: {chosen}\n"
                 if rejected:
                     msg += f"Rejected: {rejected}\n"
-                msg += f"Reasoning: {reasoning}\n\n"
-                msg += "Team can view this decision in session history."
+                msg += f"Reasoning: {reasoning}\n"
+                if stored_ticket is not None:
+                    msg += f"Ticket: #{stored_ticket}\n"
+                msg += "\nTeam can view this decision in session history."
 
                 return [TextContent(type="text", text=msg)]
 

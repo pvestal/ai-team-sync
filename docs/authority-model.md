@@ -140,9 +140,12 @@ conservative exclusive-lock comparison regardless of how a lock came to exist.
 session — however long it has been silent — cannot be completed, patched,
 re-anchored, have locks attached, have its locks deleted, or have a delegation
 child opened under it by a different or unidentifiable uid; another account's
-ghost is left to the in-process reaper. For sessions whose creator was never
-identified (older rows), unidentifiable callers and headless bound accounts are
-refused and ordinary identified accounts behave as before. An identity-bound
+ghost is left to the in-process reaper. A session whose creator was never
+identified (rows older than #2741, or one created by a requester the kernel could
+not name) is foreign to EVERY account (#2763): none can heartbeat, resurrect,
+patch, complete or act through it; it stays readable as history. (Measured
+2026-11-15: 1680 such rows, all completed, none holding a lock or a restoration
+journal.) An identity-bound
 session cannot be reopened (PATCH or heartbeat) and its anchor cannot move.
 Liveness follows the same rule on every path that proves it — the heartbeat
 endpoint, `X-ATS-Session-Id` / `X-ATS-Agent` headers and `POST /api/presence`

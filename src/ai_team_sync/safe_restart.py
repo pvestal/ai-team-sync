@@ -2,6 +2,10 @@
 
     acquire lease -> drain -> wait for clear -> systemctl restart -> verify -> complete
 
+On a unit with a drain, the lease is granted while requests and jobs are still in
+flight (#3744): the drain stops new admissions, and the bounded wait for clear is
+what keeps the restart from cutting that work off.
+
 Refuses, and exits non-zero, on any failed or unavailable check.
 
 ONCE AUTHORIZED, AN OUTCOME IS ALWAYS RECORDED. Everything after the drain
@@ -275,6 +279,9 @@ def run_safe_restart(unit: str, reason: str, *, server: str, session_id: str | N
             f"expires in {lease['expires_in_s']}s)")
         if policy.get("waivers"):
             out(f"WAIVED evidence for {unit}: {policy['waivers']}")
+        for probe in lease.get("probes") or []:
+            if probe.get("status") == "drainable":  # #3744: drain first, then wait
+                out(f"  draining first -- {probe.get('name')}: {probe.get('detail')}")
 
         def release(why: str) -> None:
             try:

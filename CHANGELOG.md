@@ -17,6 +17,34 @@
   not an OS boundary: see `docs/restart-gate.md`.
 
 ### Fixed
+- **`ats safe-restart` drains first, then waits (#3744).** The acquire probe
+  needed zero requests and zero jobs in flight before the drain could even
+  start, so a busy service never restarted (2026-11-15: 177 `tower-echo-brain`
+  attempts refused, all at the acquire probe). On a unit with a drain, in-flight
+  requests and jobs now read `drainable` at acquire; `/drain` stops new
+  admissions and waits up to `drain_wait_s`; the restart is still authorized
+  only by a final round with nothing in flight, and a timeout names what held
+  it. Unknown evidence, a busy GPU queue, another lease's drain, and units
+  without a drain still refuse at acquire. After a drain times out the unit
+  cools down for 4 x `drain_wait_s` (no new drain; a lease only on a clear
+  round), so a retry loop cannot hold a busy service drained. Server-side; old
+  and new `ats safe-restart` clients both work.
+- **A deeply nested restoration journal is `invalid_journal`, not HTTP 500
+  (#2814).** `RecursionError` from `json.loads` is caught at every journal
+  parse site.
+- **Re-anchoring is refused while ANY lock row is held (#2808)**, live or
+  dormant (`dormant_locks` in the 409), so a paused owner's exclusive row cannot
+  wake under another repository root.
+- **A session whose creator was never identified is foreign to every
+  requester (#2763)**: no account can heartbeat, resurrect or change it; it
+  stays readable.
+- **`log_decision` takes `ticket_id` (#2910)**: bound on the row, derived
+  from the session's ticket when omitted, refused when it contradicts it.
+- **The test suite's worker registry is CI's (#2762)**: `tests/conftest.py`
+  points `ATS_WORKERS_CONFIG` at an empty file, so the workstation's
+  `~/.config/ai-team-sync/workers.toml` no longer changes what the suite means.
+- **Docs: the glob-intersection limit of lock overlap (#2806)** is stated in
+  `docs/lock-readers.md` with its measurements.
 - **Every session keeps its own capability: a second `start_session` no
   longer destroys the first one's (#3593).** The client capability file held
   one `{session_id, token}` pair, rewritten in place and keyed by `cid[:8]`, and

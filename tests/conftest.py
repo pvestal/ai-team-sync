@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 
 import pytest
 import pytest_asyncio
@@ -11,6 +13,19 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 # Force SQLite test database before any imports
 os.environ["DATABASE_URL"] = "sqlite+aiosqlite://"
+
+# The worker registry is the BUILTINS, as in CI (#2762). Without this the
+# workstation's ~/.config/ai-team-sync/workers.toml (which adds the deliberate
+# echo-executor class, #2741/#2742) extended the registry under test, so the
+# local suite meant something different from GitHub Actions: one permanent red
+# test and a different collection. An EMPTY file is exactly "no user config"
+# (no config_error either), and it is set in os.environ so spawned ats-server
+# and hook subprocesses inherit it. Tests that need a registry file still set
+# ATS_WORKERS_CONFIG themselves (monkeypatch), which overrides this. The
+# operator's real file is never read or touched.
+_CI_WORKERS = Path(tempfile.mkdtemp(prefix="ats-test-workers-")) / "workers.toml"
+_CI_WORKERS.write_text("# builtins only, as in CI (#2762)\n")
+os.environ["ATS_WORKERS_CONFIG"] = str(_CI_WORKERS)
 
 # No test may reach the live Echo Brain (#3537). Every session a test completed
 # -- in this process or in a spawned ats-server, which inherits this environment
