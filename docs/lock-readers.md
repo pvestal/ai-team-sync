@@ -175,6 +175,29 @@ Both are never narrower than the old two-way `fnmatch`, so `frontend/*/X.vue`
 and `frontend/src/**` overlap exactly when a file such as `frontend/src/X.vue`
 exists.
 
+**Two different globs (#2806).** The defect #2806 was filed for (2026-09-16:
+`_check_scope_conflicts` asked whether one pattern STRING `fnmatch`ed the
+other, so `src/*.py` and `src/a*` both took an exclusive lock over `src/a.py`)
+is gone from every acquisition path since the overlap rule above replaced the
+string test. What overlap still cannot see, by construction:
+
+| Where | `src/*.py` vs `src/a*` | Why |
+|-------|------------------------|-----|
+| git checkout, `src/a.py` exists | **overlap** | a real file covered by both |
+| git checkout, no file matched by both (only `src/b.py`, `src/a.md`) | no overlap: both granted | decided on files that exist at acquisition; a file created later (`src/a.py`) is then covered by both locks. A glob-free path not yet created IS caught (literal rule above). |
+| no usable checkout | **overlap** | algebraic: compatible literal prefixes are overlap (may over-report, never under-reports the old rule) |
+
+Recorded decision (2026-10-01, option (c), delegated ratification): this limit
+is documented, not engineered away; reopen on a real observed collision.
+Measurements: 2026-10-01, over all 2,230 sessions, 351 distinct mid-pattern-glob
+patterns and 0 overlapping-lifetime same-repo pairs that shared a `git ls-files`
+match while the string check missed them (declared scope as proxy, since
+completed sessions' lock rows are deleted); 2026-11-15, 209 live locks, 0 with a
+glob anywhere but a trailing `/**`, so 0 pairs exposed to the future-file case.
+Loss suppression (`_unrestored_state`) is a separate, REPORTING comparison: it
+subtracts a live lock from a recorded loss only on canonical equality, so
+`src/*.py` never suppresses a lost `src/a*` (#2807 owns broader-vs-narrower).
+
 **Every anchored session**: an absolute pattern outside its `repo_root` is
 refused 422 `pattern_outside_repo_root` (a lock the edit guard could never
 honour), and when the operator config is unreadable every acquisition by an
