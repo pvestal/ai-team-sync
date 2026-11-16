@@ -52,7 +52,8 @@ def build_child_packet(*, mode: str, delegation: Mapping[str, Any],
                        scope: Sequence[str] = (),
                        task_envelope_text: str = "",
                        brief: str = "",
-                       verify_env_text: str = "") -> str:
+                       verify_env_text: str = "",
+                       review_tests_text: str = "") -> str:
     """The full packet text for a delegated child.
 
     Worker-independent by construction: nothing here branches on who will run
@@ -86,6 +87,14 @@ def build_child_packet(*, mode: str, delegation: Mapping[str, Any],
         # one, and cannot tell a faithful reproduction from a stale checkout.
         # The manifest carries a per-file hash comparison so this is checkable.
         lines += ["", verify_env_text.rstrip()]
+
+    if review_tests_text:
+        # Test evidence ATS produced on the exact commit under review (#3656),
+        # before the objective for the same reason as the manifest above: the
+        # reviewer should know what has been executed, by whom, before it starts
+        # judging. It is a separate block from any implementer-quoted numbers
+        # in the objective, so the two can be compared rather than conflated.
+        lines += ["", review_tests_text.rstrip()]
 
     lines += [
         "",

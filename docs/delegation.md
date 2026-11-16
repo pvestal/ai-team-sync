@@ -162,6 +162,76 @@ The worktree is checked out **detached**, so a commit in it advances no branch.
 Teardown runs `git worktree remove --force` and prunes, leaving the commit
 unreachable from any ref. `git push` needs a network the sandbox denies.
 
+## ATS-run review tests (#3656)
+
+A Codex VERIFY child cannot run database-backed tests: its read-only sandbox
+denies `socket()` for every family and makes `/var/tmp` read-only, so a bwrap
+test sandbox with a private PostgreSQL cannot start inside it. Opening the
+reviewer's sandbox is the rejected alternative (the reviewer itself would then
+reach local services). Instead the delegating parent declares a selection and
+**ATS runs it before the child launches**:
+
+```
+ats delegate --worker codex --mode VERIFY --repo <tree> \
+  --review-tests "tests/test_x.py -k 'a and b'" [--review-sha <sha>] \
+  [--review-base <base sha>] [--review-repo <other tree>] [--review-timeout 30] ...
+ats review-tests --repo <tree> --sha <sha> -- tests/test_x.py -q   # same run, no delegation
+```
+
+| Step | What happens |
+|---|---|
+| checkout | the exact commit, in a throwaway detached worktree under `work_dir`. No program runs on the host during any of the runner's git calls. Nothing can **select** a filter driver: the commit's `.gitattributes` is not read (`GIT_ATTR_SOURCE` = empty tree), nor the global or system attributes files (`core.attributesFile=/dev/null`, `GIT_ATTR_NOSYSTEM=1`), and a run is refused while `$GIT_COMMON_DIR/info/attributes` (which git cannot be told to ignore) mentions a filter. Nothing selected can **run**: every configured driver is blanked, enumerated in the source repo's and the new worktree's config context (a conditional include can define one only for worktrees), and the checkout happens inside the new worktree (`--no-checkout`, then `reset --hard`). So git-lfs never runs and a committed `.lfsconfig` cannot send it anywhere; LFS files arrive as pointers. Hooks and fsmonitor are off and the caller's `GIT_*` environment is dropped |
+| launcher | the sandbox launcher on the host is **never** the reviewed commit's: in `sandbox` mode the runner directory is overwritten from the sandbox repo's trusted ref; in `hosted` mode the commit runs inside a throwaway checkout of the sandbox repo at that ref, with a private test database |
+| probe | first thing inside the sandbox, before any test, run by an absolute host interpreter (`probe_python`, default `/usr/bin/python3`, never a PATH lookup the tested tree's venv could answer): only `lo` in the network namespace, every host Postgres socket (from `/proc/net/unix` plus `db_sockets`) refuses connect, `secret_paths` unreadable, a host canary directory not writable. A failed probe exits before the tests and the run is **refused** |
+| result | raw log (durable, under `log_dir`, with its sha256), exit status, pytest summary, failing ids, and with `--review-base` the same selection on the base and the new/fixed failures |
+| attach | the block goes into the child's packet ahead of the objective, and the evidence into the delegation's returned evidence (`evidence.review_tests`) and the CLI's JSON |
+
+The run happens before any record exists, so a refusal (no profile, unresolvable
+commit, worktree failure, failed or ambiguous probe) leaves no delegation row or
+child session (exit 5), and test minutes are not charged to the child's lease. A
+run that completed with failing tests, timed out, or whose sandbox could not
+build its scratch database (a reviewed migration can cause that) is evidence,
+not an outage: it is attached and the review proceeds.
+
+`unshare -rn` alone is not a database boundary: a filesystem Unix socket is
+reachable from any network namespace that can see its path, a read-only bind
+mount does not stop a connect to it, and credential files stay readable. Only a
+mount that hides the socket's directory (the sandbox's tmpfs over `/run`) does.
+The end-to-end test's mutation cases hold exactly this.
+
+The selection is the parent's choice, made visible to the reviewer, who can
+name a further selection in its verdict for the confirmation round. The probe
+corroborates the boundary; it does not replace it. Code under test shares the
+sandbox and can print anything, so a log carrying the per-run probe marker more
+than once is refused as ambiguous.
+
+Configuration is machine-local, `~/.config/ai-team-sync/review_runner.toml`
+(`$ATS_REVIEW_RUNNER_CONFIG` overrides); a repository with no profile is refused:
+
+```toml
+work_dir = "/var/tmp/ats-review"      # must stay visible inside the sandbox
+log_dir = "~/.local/state/ai-team-sync/review-runs"
+nice = 10
+probe_python = "/usr/bin/python3"
+db_sockets = ["/var/run/postgresql/.s.PGSQL.5432"]
+secret_paths = ["~/.pgpass"]
+
+[sandbox]
+repo = "/srv/app"                       # the repository that owns the sandbox
+trusted_ref = "main"
+runner_dir = "scripts/test_sandbox"
+entrypoint = "scripts/test_sandbox/pytest-sandbox"   # supports `--exec CMD...`
+
+[repos."/srv/app"]
+mode = "sandbox"
+
+[repos."/srv/other"]                    # a repo with no sandbox of its own
+mode = "hosted"
+python = "/srv/other/venv/bin/python"
+test_database = "other_test_review"
+dsn_env = "OTHER_TEST_DSN"
+```
+
 ## The supervisor finalizes the child session
 
 **The delegation launcher owns child-session finalization. The child is never
