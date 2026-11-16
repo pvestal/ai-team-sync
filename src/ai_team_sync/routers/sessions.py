@@ -182,7 +182,7 @@ def _parse_unresolved(raw: str) -> list[tuple[str, str]]:
     raw = raw or ""
     try:
         parsed = json.loads(raw) if raw else []
-    except (TypeError, ValueError):
+    except _UNREADABLE_JSON:
         return []
     if not isinstance(parsed, list):
         return []
@@ -448,6 +448,12 @@ REFUSAL_UNIDENTIFIED_OWNER = "unidentified_owner"
 REFUSAL_ANCHOR_MOVED = "anchor_moved"
 REFUSAL_INVALID_JOURNAL = "invalid_journal"
 
+# What an unreadable journal can raise from json.loads. RecursionError is NOT a
+# ValueError (it subclasses RuntimeError): syntactically valid JSON nested ~10k
+# levels deep raises it from the C scanner, and before #2814 it escaped the
+# heartbeat as an HTTP 500 instead of this module's structured invalid_journal.
+_UNREADABLE_JSON = (TypeError, ValueError, RecursionError)
+
 # Why a single lane did not come back, when the journal itself was fine.
 NOT_RESTORED_NEWER_HOLDER = "newer_holder"
 NOT_RESTORED_EXPIRED = "expired"
@@ -495,7 +501,7 @@ def journal_names_locks(raw: str | None) -> bool:
         return False
     try:
         envelope = json.loads(raw)
-    except (TypeError, ValueError):
+    except _UNREADABLE_JSON:
         return True
     if not isinstance(envelope, dict):
         return True
@@ -560,7 +566,7 @@ def _journalled_patterns(raw: str) -> list[str]:
     """
     try:
         envelope = json.loads(raw) if raw else {}
-    except (TypeError, ValueError):
+    except _UNREADABLE_JSON:
         return []
     if not isinstance(envelope, dict):
         return []
@@ -745,7 +751,7 @@ async def _grant_from_journal(
 
     try:
         envelope = json.loads(raw)
-    except (TypeError, ValueError):
+    except _UNREADABLE_JSON:
         return _refused(REFUSAL_INVALID_JOURNAL, "journal is not readable JSON",
                         _journalled_patterns(raw))
     if not isinstance(envelope, dict):
