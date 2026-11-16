@@ -181,7 +181,14 @@ honour), and when the operator config is unreadable every acquisition by an
 anchored session is refused 503 `operator_config_unreadable` (fail closed;
 unanchored legacy sessions are unaffected). A session holding live locks cannot
 change its `repo_root` (409 `repo_root_change_with_live_locks`, nothing
-applied); completing it in the same request is allowed.
+applied); completing it in the same request is allowed. Since #2808 the same
+409 also covers DORMANT rows (`dormant_locks`): an exclusive lock whose owner is
+paused and silent blocks nobody, but one heartbeat makes it live again under
+whatever `repo_root` the session then has, so moving past it would wake it in
+another repository (or, moved back, beside a newer holder) without any conflict
+check. The sweep deletes such a row within one interval; then the move is
+allowed. A lock row has no anchor column of its own (option (c), rejected as
+unnecessary once no held row can move).
 
 **Serialized.** The conflict check, the insert and the commit are one step
 (`routers/locks.py` `acquisition_guard`): one in-process `asyncio.Lock`, and the

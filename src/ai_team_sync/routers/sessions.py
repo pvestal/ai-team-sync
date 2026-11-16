@@ -1023,21 +1023,38 @@ def _refuse_reanchor_with_live_locks(session: Session, body: SessionUpdate) -> N
     """A lock pattern means a file only relative to its session's repo_root, so
     moving the root of a session holding live locks would re-point every lock
     with none of the acquisition checks (#3581). Refused (409); completing in the
-    same request releases the locks, so that is allowed."""
+    same request releases the locks, so that is allowed.
+
+    DORMANT ROWS MOVE TOO (#2808). A ScopeLock carries no anchor of its own; it
+    is read under its session's repo_root. An EXCLUSIVE row whose owner is
+    paused and silent is not live (it blocks nobody, so a newer holder may take
+    the lane), yet it is not gone either: one heartbeat makes it live again,
+    under whatever root the session has then. Re-anchoring past such a row let
+    it wake in another repo -- or, moved back, beside the newer holder -- having
+    passed no conflict check in either place. Every row the session still holds
+    therefore refuses the move, live or not; the sweep deletes a dead row within
+    one interval, after which the move is allowed. (#2808's recorded option (a),
+    re-run the conflict check against the new root, is subsumed: a session that
+    may re-anchor holds no row left to check.)"""
     if body.repo_root is None or body.status == "completed":
         return
     if body.repo_root.rstrip("/") == (session.repo_root or "").rstrip("/"):
         return
     held = sorted(_live_lock_patterns(session))
-    if held:
+    dormant = sorted({canonical_pattern(lk.pattern) for lk in (session.locks or [])}
+                     - set(held))
+    if held or dormant:
+        rows = f"{len(held)} live lock(s)" + (
+            f" and {len(dormant)} dormant lock row(s)" if dormant else "")
         raise HTTPException(409, detail={
             "error": "repo_root_change_with_live_locks",
-            "message": (f"session {session.id} holds {len(held)} live lock(s) anchored to "
+            "message": (f"session {session.id} holds {rows} anchored to "
                         f"{session.repo_root or '<unanchored>'}; release them (or complete the "
                         f"session) before re-anchoring to {body.repo_root.rstrip('/')}. "
                         f"No field of this request was applied."),
             "session_id": session.id,
-            "locks": held})
+            "locks": held,
+            "dormant_locks": dormant})
 
 
 def scope_conflict_detail(what: str, conflict: dict, conflicts: list[dict]) -> dict:
