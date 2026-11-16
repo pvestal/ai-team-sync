@@ -335,7 +335,13 @@ async def test_probes_in_a_round_run_concurrently(gate_env, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_busy_service_refuses_the_lease_and_records_the_attempt(client, gate_env):
-    svc, _ = gate_env
+    # #3744: only a unit with NO live drain still refuses busy work at acquire
+    # (a drain unit is granted and drained first: test_restart_drain_first_3744).
+    svc, cfg = gate_env
+    _write_config(cfg, UNIT_TOML.replace(
+        'drain_url = "http://svc.test/api/system/drain"\n'
+        'release_url = "http://svc.test/api/system/drain/release"\n',
+        'waive = { drain = "test unit: no drain endpoint on purpose" }\n'))
     svc.in_flight = [{"method": "POST", "path": "/api/scenes/beats/899/story-render",
                       "age_s": 3.0}]
     resp = await client.post("/api/restarts/leases", json={"unit": "svc", "reason": "deploy"})

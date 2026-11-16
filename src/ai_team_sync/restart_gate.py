@@ -372,7 +372,7 @@ class ProbeResult:
     name: str
     kind: str
     url: str
-    status: str  # clear | busy | unavailable
+    status: str  # clear | busy | unavailable | drainable (acquire-time only, #3744)
     detail: str
 
     def as_dict(self) -> dict:
@@ -391,7 +391,19 @@ def _is_count(value) -> bool:
 
 
 def _interpret_inflight(data, lease_id: str, expect_drain: bool,
-                        require_jobs: bool = True) -> tuple[str, str]:
+                        require_jobs: bool = True,
+                        drain_first: bool = False) -> tuple[str, str]:
+    """Read one inflight snapshot.
+
+    drain_first (#3744) is the acquire-time reading for a unit whose drain this
+    lease is about to start: requests in flight and active jobs are what that
+    drain stops admitting and then waits for, so they read DRAINABLE -- the lease
+    may be granted and drained -- instead of BUSY. Everything else is unchanged:
+    a malformed, multi-worker or jobs-undeterminable answer is still UNAVAILABLE,
+    and a drain already held by another lease is still BUSY. The restart itself
+    is still authorized only by the drain's FINAL round (expect_drain=True,
+    drain_first=False), which needs in_flight == 0 and every job count 0.
+    """
     if not isinstance(data, dict):
         return "unavailable", "response is not a JSON object"
     in_flight = data.get("in_flight")
@@ -424,17 +436,23 @@ def _interpret_inflight(data, lease_id: str, expect_drain: bool,
     busy = []
     if draining and holder != lease_id:
         busy.append(f"already draining for another lease {holder or '?'}")
+    work = []  # what a drain stops admitting and then waits for
     if in_flight:
         routes = data.get("routes") if isinstance(data.get("routes"), list) else []
         named = ", ".join(
             f"{r.get('method', '?')} {r.get('path', '?')} ({r.get('age_s', '?')}s)"
             for r in routes[:5] if isinstance(r, dict))
-        busy.append(f"{in_flight} request(s) in flight: {named or 'unnamed'}")
+        work.append(f"{in_flight} request(s) in flight: {named or 'unnamed'}")
     active = {k: v for k, v in jobs.items() if v}
     if active:
-        busy.append("active jobs: " + ", ".join(f"{k}={v}" for k, v in sorted(active.items())))
+        work.append("active jobs: " + ", ".join(f"{k}={v}" for k, v in sorted(active.items())))
     if busy:
-        return "busy", "; ".join(busy)
+        return "busy", "; ".join(busy + work)
+    if work:
+        if drain_first:
+            return "drainable", ("; ".join(work) + " -- the drain stops new admissions "
+                                 "and waits (bounded) for these")
+        return "busy", "; ".join(work)
     return "clear", (f"in_flight=0, active_jobs={jobs}, pid={process.get('pid')}, "
                      f"draining={draining}")
 
@@ -456,7 +474,8 @@ def _interpret_comfyui(data) -> tuple[str, str]:
 
 
 async def run_probe(client: httpx.AsyncClient, probe: Probe, *, lease_id: str = "",
-                    expect_drain: bool = False, require_jobs: bool = True) -> ProbeResult:
+                    expect_drain: bool = False, require_jobs: bool = True,
+                    drain_first: bool = False) -> ProbeResult:
     def result(status: str, detail: str) -> ProbeResult:
         return ProbeResult(probe.name, probe.kind, probe.url, status, detail)
 
@@ -477,16 +496,21 @@ async def run_probe(client: httpx.AsyncClient, probe: Probe, *, lease_id: str = 
     except (ValueError, json.JSONDecodeError):
         return result("unavailable", f"malformed JSON: {resp.text[:120]!r}")
     if probe.kind == "inflight":
-        return result(*_interpret_inflight(data, lease_id, expect_drain, require_jobs))
+        return result(*_interpret_inflight(data, lease_id, expect_drain, require_jobs,
+                                           drain_first))
     return result(*_interpret_comfyui(data))
 
 
 def overall(results: list[ProbeResult]) -> str:
+    """unavailable > busy > drainable > clear. 'drainable' only ever comes from a
+    drain_first round (#3744); it means "grant, then drain", never "restart"."""
     statuses = {r.status for r in results}
     if not results or "unavailable" in statuses:
         return "unavailable"
     if "busy" in statuses:
         return "busy"
+    if "drainable" in statuses:
+        return "drainable"
     return "clear"
 
 
@@ -495,15 +519,27 @@ def summarize(results: list[ProbeResult]) -> str:
                      for r in results if r.status != "clear") or "all probes clear"
 
 
+def drains_first(gate: UnitGate, bootstrap: bool) -> bool:
+    """True when a lease on this unit is granted while requests or jobs are still
+    in flight, because its drain will stop admitting new ones and wait for these
+    (#3744). Only a NORMAL lease on a unit whose drain is configured and not
+    waived: without a drain nothing would stop new work, so such a unit keeps
+    the old wait-for-idle grant (a busy probe refuses the lease)."""
+    return (not bootstrap) and bool(gate.drain_url) and "drain" not in gate.waived
+
+
 async def run_probes(gate: UnitGate, *, lease_id: str = "",
-                     expect_drain: bool = False) -> list[ProbeResult]:
+                     expect_drain: bool = False,
+                     drain_first: bool = False) -> list[ProbeResult]:
     """One probe ROUND. Probes run concurrently; the caller checks the round
-    finished inside the lease TTL before acting on it."""
+    finished inside the lease TTL before acting on it. drain_first applies to
+    the inflight probes only: a non-empty GPU queue is not something the unit's
+    drain can stop, so it stays BUSY (and refuses the lease) as before."""
     require_jobs = "jobs" not in gate.waived
     async with http_client() as client:
         return list(await asyncio.gather(*[
             run_probe(client, p, lease_id=lease_id, expect_drain=expect_drain,
-                      require_jobs=require_jobs)
+                      require_jobs=require_jobs, drain_first=drain_first)
             for p in gate.probes]))
 
 

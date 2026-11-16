@@ -5,11 +5,24 @@ is the authorization a governed restart is made under:
 
     POST /api/restarts/leases                   acquire: one active lease per unit
                                                 (DB-enforced), then probe; refused
-                                                if anything is in flight or unknown
+                                                if anything is unknown, a GPU queue
+                                                is busy, or (units without a drain)
+                                                anything is in flight
     POST /api/restarts/leases/{id}/drain        ask the service to stop admitting
                                                 writes, poll until in-flight work,
                                                 active jobs and GPU queues are all
                                                 empty -> 'cleared' (bounded wait)
+
+DRAIN FIRST (#3744). On a unit whose drain is configured and not waived, the
+acquire round no longer needs a moment with zero requests and jobs in flight:
+under continuous load (Echo, 2026-11-15: 177 refusals in an hour, every one at
+the acquire probe) that moment never comes. Requests and jobs in flight read
+DRAINABLE at acquire; the lease is granted and /drain stops new admissions
+(503 + Retry-After; no new jobs) and waits, bounded by drain_wait_s, for them
+to finish. The restart is still authorized only by /drain's final round, which
+needs in_flight == 0 and every job count 0 -- the #3640 evidence is read, never
+waived. If the bound expires, the refusal names the requests and jobs that held
+it and the drain is released. A unit without a drain keeps wait-for-idle.
     POST /api/restarts/leases/{id}/renew        heartbeat: extend the lease AND
                                                 re-assert the service drain
     POST /api/restarts/leases/{id}/complete     the caller restarted; record outcome
@@ -286,10 +299,12 @@ async def _load(db: AsyncSession, lease_id: str) -> RestartLease:
     return lease
 
 
-async def _round(gate: rg.UnitGate, lease: RestartLease, expect_drain: bool):
+async def _round(gate: rg.UnitGate, lease: RestartLease, expect_drain: bool,
+                 drain_first: bool = False):
     if lease.mode == "bootstrap":
         return await rg.run_bootstrap_checks(gate)
-    return await rg.run_probes(gate, lease_id=lease.id, expect_drain=expect_drain)
+    return await rg.run_probes(gate, lease_id=lease.id, expect_drain=expect_drain,
+                               drain_first=drain_first)
 
 
 @router.post("", status_code=201)
@@ -341,9 +356,13 @@ async def acquire_lease(body: LeaseAcquire, db: AsyncSession = Depends(get_db)):
                                  f"{body.unit} is already leased by {who}", "lease",
                                  {"holder": holder.id if holder else None}, gate=gate)
 
-    results = await _round(gate, lease, expect_drain=False)
+    # #3744: on a drain unit, work in flight now reads DRAINABLE -- the drain
+    # this lease starts will stop new admissions and wait for it. Unknown
+    # evidence, a busy GPU queue or another lease's drain still refuse here.
+    drain_first = rg.drains_first(gate, body.bootstrap)
+    results = await _round(gate, lease, expect_drain=False, drain_first=drain_first)
     verdict = rg.overall(results)
-    if verdict != "clear":
+    if verdict not in ("clear", "drainable"):
         return await _refuse_lease(db, lease, 503 if verdict == "unavailable" else 409,
                                    rg.summarize(results), results, "probe")
     await db.refresh(lease)
@@ -391,8 +410,12 @@ async def drain_lease(lease_id: str, body: LeaseDrain | None = None,
 
     wait = min(body.wait_s if body.wait_s is not None else gate.drain_wait_s,
                max(0.0, remaining - 1))
+    # What the acquire round saw, kept for the attempt row: the requests and
+    # jobs this drain waited for (#3744). lease.probes is overwritten below.
+    at_grant = _loads(lease.probes, [])
     loop = asyncio.get_running_loop()
-    deadline = loop.time() + wait
+    started = loop.time()
+    deadline = started + wait
     while True:
         # A FINAL round: every probe (run concurrently) must say clear, and the
         # in-flight probe must show the drain held by THIS lease.
@@ -403,6 +426,7 @@ async def drain_lease(lease_id: str, body: LeaseDrain | None = None,
         if verdict == "unavailable":
             return await _refuse_lease(db, lease, 503, rg.summarize(results), results, "drain")
         if loop.time() >= deadline:
+            # Names what held the drain: the routes and job kinds still counted.
             return await _refuse_lease(
                 db, lease, 409, f"drain did not clear within {wait:.0f}s: {rg.summarize(results)}",
                 results, "drain")
@@ -412,7 +436,8 @@ async def drain_lease(lease_id: str, body: LeaseDrain | None = None,
     # the condition is evaluated inside the same transaction as the attempt row.
     probes = [r.as_dict() for r in results]
     row = _new_service_restart(lease, "authorized", {
-        "stage": "cleared", "drained": drains, "probes": probes})
+        "stage": "cleared", "drained": drains, "probes": probes,
+        "at_grant": at_grant, "drain_wait_s": round(loop.time() - started, 3)})
     db.add(row)
     await db.flush()
     cleared = await db.execute(

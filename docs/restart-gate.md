@@ -16,6 +16,13 @@ Three things were missing:
 This gate applies only to restarts made through it. The section below says exactly
 which restarts those are.
 
+**#3744 (2026-11-15).** The first version needed a moment with zero requests and
+zero jobs in flight before it would even START the drain. Under continuous load
+that moment never came: 177 `tower-echo-brain` attempts between 19:30 and 20:25
+PT were refused, every one at the acquire probe, and the drain that would have
+stopped new admissions was never begun. The gate now drains first and then
+waits, bounded; the restart itself still waits for zero.
+
 ## The service-control boundary
 
 ### What is enforced
@@ -25,6 +32,7 @@ which restarts those are.
 | Required evidence per unit | `restart_gate.py` `_parse_unit` / `load_gate_config` | A weak or partial gate. Every governed unit must declare `inflight`, `jobs`, `gpu_queue` and `drain` evidence. A missing class makes the whole config invalid, so every unit is refused. The only way out of a class is an explicit `waive` entry with a written reason, which is shown in every lease response and recorded on the attempt row. |
 | One active lease per unit, enforced by the database | `restart_lease_model.py` (UNIQUE `active_unit`) | Two callers both being cleared to restart the same unit. |
 | Probes that fail closed | `restart_gate.py` `run_probe` / `run_probes` | A gated restart while requests are in flight, jobs are active, or a GPU queue is non-empty. Each of these also refuses: a probe that is down, times out, returns non-200 or malformed JSON; `active_jobs_ok=false`; empty job evidence (unless waived); and a service that cannot prove it is a single worker. |
+| Drain first, then wait (#3744) | `restart_gate.py` `drains_first` / `_interpret_inflight(drain_first=True)`, `routers/restart_leases.py` `acquire_lease` | Starvation under continuous load. On a unit whose drain is configured and not waived, requests and jobs in flight at ACQUIRE read `drainable`, not `busy`: the lease is granted, `/drain` stops new admissions (503 + `Retry-After`, no new jobs) and waits up to `drain_wait_s` for that work. The restart is still authorized only by the final round (`in_flight == 0`, every job 0); if the bound expires the refusal names the routes and job kinds that held it and the drain is released. Unknown evidence, a non-empty GPU queue and another lease's drain still refuse at acquire, and a unit whose drain is waived keeps wait-for-idle. The authorized attempt row records `at_grant` (what the drain waited for) and `drain_wait_s`. |
 | Drain inside the service | anime-studio `packages/core/inflight.py` | New mutating requests between the check and the restart: they get 503 with `Retry-After` and are not counted. The drain check and the in-flight increment happen in one event-loop step. The drain is mandatory unless waived. |
 | Final round plus a check at commit time | `routers/restart_leases.py` `drain_lease` | Clearing a lease on stale evidence. A lease becomes `cleared` only after a complete, concurrent probe round shows all of: `draining` is true for this lease, `in_flight` is 0, jobs are 0, and GPU queues are empty. The clearing UPDATE also requires `state='draining' AND expires_at > now`, inside the same transaction as the attempt row. |
 | Lease and drain renewal | `safe_restart.py` `Heartbeat`, `POST /leases/{id}/renew` | The lease or drain expiring under a slow `systemctl restart` or slow verification. Config load rejects any `lease_ttl_s` that is not greater than `drain_wait + restart + verify + 10s`. |
@@ -93,11 +101,15 @@ operator's decision.
 
 ```
 ats safe-restart <unit> --reason "..."
-  POST /api/restarts/leases              UNIQUE insert -> probes (concurrent round)
+  POST /api/restarts/leases              UNIQUE insert -> probes (concurrent round;
+      on a drain unit, requests/jobs in flight read 'drainable' (#3744))
       -> 201 {lease (mode, waivers), policy (waivers)} | 409/503 + 'refused' row
-  POST /api/restarts/leases/{id}/drain   service drain (ttl = lease remaining) ->
-      rounds until a FINAL round is clear AND shows draining for THIS lease ->
+  POST /api/restarts/leases/{id}/drain   service drain (ttl = lease remaining):
+      new writes 503 + Retry-After, no new jobs -> rounds until a FINAL round is
+      clear AND shows draining for THIS lease (bounded by drain_wait_s; on expiry
+      409 naming what held it, drain released) ->
       conditional UPDATE (state='draining' AND expires_at > now) + 'authorized' row
+      (before_state: probes, at_grant, drain_wait_s)
   -- authorized: heartbeat renews lease + drain every ttl/3; signals report --
   pre-issue re-check: GET lease (cleared, active, >= 5 s left) and, for drain units,
       the service's inflight (draining == this lease, in_flight == 0); else 'aborted'

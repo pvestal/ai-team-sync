@@ -284,30 +284,104 @@ def _post_async(url: str, results: list):
 # ── T2a ─────────────────────────────────────────────────────────────────────
 
 
-def test_t2a_inflight_post_refuses_then_restart_proceeds(rig):
+def test_t2a_inflight_post_is_drained_first_then_restart_proceeds(rig):
+    """#3744: a request in flight no longer refuses the lease; the drain starts
+    first, the request finishes, and only then is the unit restarted."""
     unit, ats, _ = rig
     results: list = []
-    t = _post_async(f"{unit.base}/work?seconds=10", results)
+    t = _post_async(f"{unit.base}/work?seconds=3", results)
     _until(lambda: unit.inflight()["in_flight"] == 1)
     old_pid = unit.main_pid()
 
-    refused = ats.safe_restart(unit, "T2a busy")
-    assert refused.returncode == 2, refused.stdout + refused.stderr
-    assert "POST /work" in refused.stdout
-    assert unit.main_pid() == old_pid, "a refused restart touches nothing"
-    print("T2a refused:", refused.stdout.strip().splitlines()[0])
-
+    ok = ats.safe_restart(unit, "T2a busy")
     t.join()
-    assert results[0].status_code == 200, "the in-flight request completed untouched"
-    ok = ats.safe_restart(unit, "T2a idle")
     assert ok.returncode == 0, ok.stdout + ok.stderr
+    assert "draining first" in ok.stdout and "POST /work" in ok.stdout, ok.stdout
+    assert results[0].status_code == 200, "the in-flight request completed before the restart"
+    assert results[0].json()["pid"] == old_pid
     new_pid = unit.main_pid()
     assert new_pid and new_pid != old_pid
     rows = ats.restarts(unit)
-    assert [r["outcome"] for r in rows] == ["refused", "authorized", "completed"], rows
-    assert "/work" in rows[0]["before"]["refusal"]
-    assert (rows[2]["old_pid"], rows[2]["new_pid"]) == (old_pid, new_pid)
-    print("T2a rows:", [(r["outcome"], r["old_pid"], r["new_pid"]) for r in rows])
+    assert [r["outcome"] for r in rows] == ["authorized", "completed"], rows
+    assert "/work" in json.dumps(rows[0]["before"]["at_grant"])
+    assert (rows[1]["old_pid"], rows[1]["new_pid"]) == (old_pid, new_pid)
+    print("T2a drained-first:", rows[0]["before"]["drain_wait_s"], "s;",
+          [(r["outcome"], r["old_pid"], r["new_pid"]) for r in rows])
+
+
+def test_t2a_work_that_outlasts_the_drain_bound_refuses_and_touches_nothing(make_rig):
+    """The bound holds: work still in flight when drain_wait_s runs out refuses
+    the restart, names the request, releases the drain, and the request finishes."""
+    unit, ats = make_rig(drain_wait_s=2)
+    results: list = []
+    t = _post_async(f"{unit.base}/work?seconds=8", results)
+    _until(lambda: unit.inflight()["in_flight"] == 1)
+    old_pid = unit.main_pid()
+
+    refused = ats.safe_restart(unit, "T2a bound")
+    assert refused.returncode == 2, refused.stdout + refused.stderr
+    assert "drain did not clear within 2s" in refused.stdout and "POST /work" in refused.stdout
+    assert unit.main_pid() == old_pid, "a refused restart touches nothing"
+    assert not unit.inflight()["draining"], "the refused lease released its drain"
+    assert httpx.post(f"{unit.base}/write", timeout=10, trust_env=False).status_code == 200
+    t.join()
+    assert results[0].status_code == 200, "the in-flight request completed untouched"
+    rows = ats.restarts(unit)
+    assert [r["outcome"] for r in rows] == ["refused"], rows
+    assert rows[0]["before"]["stage"] == "drain" and "/work" in rows[0]["before"]["refusal"]
+    print("T2a bound:", rows[0]["before"]["refusal"])
+
+
+def test_3744_restart_succeeds_under_continuous_load_with_no_silent_drops(rig):
+    """The #3744 acceptance shape: overlapping writers keep a request in flight
+    at every instant, so wait-for-idle never grants. Drain-first does: every
+    request either completes (200), is refused explicitly (503 + Retry-After)
+    while the drain holds, or fails at the client while the unit is down --
+    none hangs or vanishes."""
+    unit, ats, _ = rig
+    stop = threading.Event()
+    outcomes: list = []
+    lock = threading.Lock()
+
+    def writer():
+        with httpx.Client(trust_env=False, timeout=30) as c:
+            while not stop.is_set():
+                try:
+                    r = c.post(f"{unit.base}/work?seconds=0.4")
+                    item = (r.status_code, r.headers.get("retry-after"))
+                    if r.status_code == 503:
+                        time.sleep(0.05)  # a client honouring Retry-After backs off
+                except httpx.HTTPError as exc:
+                    item = ("error", type(exc).__name__)
+                    time.sleep(0.1)
+                with lock:
+                    outcomes.append(item)
+
+    threads = [threading.Thread(target=writer, daemon=True) for _ in range(4)]
+    for t in threads:
+        t.start()
+        time.sleep(0.1)
+    _until(lambda: unit.inflight()["in_flight"] >= 1)
+    old_pid = unit.main_pid()
+    try:
+        r = ats.safe_restart(unit, "#3744 under load")
+    finally:
+        time.sleep(1.0)
+        stop.set()
+        for t in threads:
+            t.join(timeout=35)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "draining first" in r.stdout, r.stdout
+    assert unit.main_pid() != old_pid
+    assert all(not t.is_alive() for t in threads), "a request hung"
+    codes = [o[0] for o in outcomes]
+    assert codes.count(200) > 0 and codes.count(503) > 0, outcomes
+    assert all(o[1] for o in outcomes if o[0] == 503), "every 503 carries Retry-After"
+    assert set(codes) <= {200, 503, "error"}, outcomes
+    rows = ats.restarts(unit)
+    assert [x["outcome"] for x in rows] == ["authorized", "completed"], rows
+    print("#3744 load:", {c: codes.count(c) for c in set(codes)},
+          "drain_wait_s", rows[0]["before"]["drain_wait_s"])
 
 
 # ── T2b ─────────────────────────────────────────────────────────────────────
@@ -419,8 +493,9 @@ def test_t2d_active_jobs_undeterminable_or_busy_refuses(rig):
     r = ats.safe_restart(unit, "T2d no jobs")
     assert r.returncode == 3 and "no active-job evidence" in r.stdout, r.stdout
     unit.jobs_file.write_text('{"generating_shots": 2}')
-    r = ats.safe_restart(unit, "T2d jobs busy")
+    r = ats.safe_restart(unit, "T2d jobs busy")  # #3744: drained first, then refused
     assert r.returncode == 2 and "generating_shots=2" in r.stdout, r.stdout
+    assert not unit.inflight()["draining"], "the refused lease released its drain"
 
 
 def test_t2d_partial_config_refuses(rig):
