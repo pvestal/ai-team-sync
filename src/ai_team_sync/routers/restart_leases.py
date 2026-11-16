@@ -22,7 +22,10 @@ DRAINABLE at acquire; the lease is granted and /drain stops new admissions
 to finish. The restart is still authorized only by /drain's final round, which
 needs in_flight == 0 and every job count 0 -- the #3640 evidence is read, never
 waived. If the bound expires, the refusal names the requests and jobs that held
-it and the drain is released. A unit without a drain keeps wait-for-idle.
+it and the drain is released, and the unit cools down (DRAIN_COOLDOWN_FACTOR x
+drain_wait_s): no new drain, a lease only on a fully clear round, so a retry
+loop cannot keep a busy service drained. A unit without a drain keeps
+wait-for-idle.
     POST /api/restarts/leases/{id}/renew        heartbeat: extend the lease AND
                                                 re-assert the service drain
     POST /api/restarts/leases/{id}/complete     the caller restarted; record outcome
@@ -79,6 +82,16 @@ router = APIRouter(prefix="/restarts/leases", tags=["restarts"])
 POLL_INTERVAL_S = 0.5
 #: Seconds between expiry sweeps (env ATS_RESTART_SWEEP_S overrides).
 DEFAULT_SWEEP_S = 15.0
+#: Drain-first cooldown (#3744), in multiples of the unit's drain_wait_s. A drain
+#: blocks the service's writes and new jobs for up to drain_wait_s; a retry loop
+#: against work that outlasts that bound (2026-11-15: a 69-minute Echo worker
+#: cycle, 177 attempts in under an hour) would otherwise hold the service drained
+#: back to back. After a drain times out, the unit is NOT drained again for this
+#: long: a lease is granted only on a fully clear round (the old wait-for-idle),
+#: so drains take at most 1/(1+factor) of the time.
+DRAIN_COOLDOWN_FACTOR = 4
+#: The refusal prefix of a drain that ran out of time; the cooldown reads it.
+DRAIN_TIMEOUT_PREFIX = "drain did not clear within"
 
 
 class LeaseAcquire(BaseModel):
@@ -299,6 +312,26 @@ async def _load(db: AsyncSession, lease_id: str) -> RestartLease:
     return lease
 
 
+async def _drain_cooldown(db: AsyncSession, unit: str, gate: rg.UnitGate) -> str | None:
+    """The refusal prefix when `unit` is cooling down after a timed-out drain
+    (see DRAIN_COOLDOWN_FACTOR), else None."""
+    window = timedelta(seconds=DRAIN_COOLDOWN_FACTOR * gate.drain_wait_s)
+    last = (await db.execute(
+        select(RestartLease)
+        .where(RestartLease.unit == unit, RestartLease.state == "refused",
+               RestartLease.refusal.startswith(DRAIN_TIMEOUT_PREFIX),
+               RestartLease.finished_at >= _now() - window)
+        .order_by(RestartLease.finished_at.desc()).limit(1))).scalar_one_or_none()
+    if last is None:
+        return None
+    until = _aware(last.finished_at) + window
+    return (f"cooldown: the last drain of {unit} (lease {last.id}) timed out at "
+            f"{_aware(last.finished_at).isoformat(timespec='seconds')} ({last.refusal}); "
+            f"it will not be drained again before {until.isoformat(timespec='seconds')} "
+            f"({max(1, math.ceil((until - _now()).total_seconds()))}s) -- until then a lease "
+            f"is granted only when nothing is in flight. Now: ")
+
+
 async def _round(gate: rg.UnitGate, lease: RestartLease, expect_drain: bool,
                  drain_first: bool = False):
     if lease.mode == "bootstrap":
@@ -365,6 +398,11 @@ async def acquire_lease(body: LeaseAcquire, db: AsyncSession = Depends(get_db)):
     if verdict not in ("clear", "drainable"):
         return await _refuse_lease(db, lease, 503 if verdict == "unavailable" else 409,
                                    rg.summarize(results), results, "probe")
+    if verdict == "drainable":
+        cooling = await _drain_cooldown(db, body.unit, gate)
+        if cooling is not None:
+            return await _refuse_lease(db, lease, 409, cooling + rg.summarize(results),
+                                       results, "cooldown")
     await db.refresh(lease)
     if lease.state != "probing":
         raise HTTPException(409, f"lease left 'probing' concurrently (now {lease.state})")
@@ -428,7 +466,7 @@ async def drain_lease(lease_id: str, body: LeaseDrain | None = None,
         if loop.time() >= deadline:
             # Names what held the drain: the routes and job kinds still counted.
             return await _refuse_lease(
-                db, lease, 409, f"drain did not clear within {wait:.0f}s: {rg.summarize(results)}",
+                db, lease, 409, f"{DRAIN_TIMEOUT_PREFIX} {wait:.0f}s: {rg.summarize(results)}",
                 results, "drain")
         await asyncio.sleep(POLL_INTERVAL_S)
 

@@ -25,8 +25,10 @@
   admissions and waits up to `drain_wait_s`; the restart is still authorized
   only by a final round with nothing in flight, and a timeout names what held
   it. Unknown evidence, a busy GPU queue, another lease's drain, and units
-  without a drain still refuse at acquire. Server-side; old and new
-  `ats safe-restart` clients both work.
+  without a drain still refuse at acquire. After a drain times out the unit
+  cools down for 4 x `drain_wait_s` (no new drain; a lease only on a clear
+  round), so a retry loop cannot hold a busy service drained. Server-side; old
+  and new `ats safe-restart` clients both work.
 - **A deeply nested restoration journal is `invalid_journal`, not HTTP 500
   (#2814).** `RecursionError` from `json.loads` is caught at every journal
   parse site.

@@ -23,6 +23,7 @@ Reuses the in-process FakeService fixture of the #3580 tests.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone
 
 import httpx
 import pytest
@@ -260,3 +261,59 @@ def test_the_wrapper_reports_what_it_is_draining_first():
     assert rc == sr.EXIT_BUSY
     assert any("draining first -- api: 1 request(s) in flight: POST /mcp" in line
                for line in lines), lines
+
+
+# ── cooldown: a retry loop cannot keep a busy service drained ──────────────
+
+
+@pytest.mark.asyncio
+async def test_after_a_drain_times_out_the_unit_is_not_drained_again_during_cooldown(
+        client, gate_env):
+    svc, _ = gate_env
+    svc.jobs = {"worker:domain_ingestor": 1}  # outlasts every drain
+    first = (await _acquire(client)).json()["lease"]
+    timed_out = await client.post(f"/api/restarts/leases/{first['id']}/drain",
+                                  json={"wait_s": 0})
+    assert timed_out.status_code == 409 and "drain did not clear" in timed_out.json()["detail"]
+    drains_so_far = len(svc.drain_calls)
+
+    retry = await _acquire(client, reason="retry loop")
+    assert retry.status_code == 409, retry.text
+    detail = retry.json()["detail"]
+    assert detail.startswith("cooldown:") and first["id"] in detail
+    assert "worker:domain_ingestor=1" in detail, "names what is still holding it"
+    assert len(svc.drain_calls) == drains_so_far, "a cooling unit is never drained"
+    rows = await _restarts(client)
+    assert rows[-1]["before"]["stage"] == "cooldown"
+
+    svc.jobs = {"worker:domain_ingestor": 0}  # idle: the old wait-for-idle grant
+    idle = await _acquire(client, reason="idle moment")
+    assert idle.status_code == 201, idle.text
+
+
+@pytest.mark.asyncio
+async def test_drain_first_resumes_once_the_cooldown_has_passed(client, gate_env, db_engine):
+    from sqlalchemy import update
+    from ai_team_sync.restart_lease_model import RestartLease
+
+    svc, _ = gate_env
+    svc.jobs = {"worker:domain_ingestor": 1}
+    first = (await _acquire(client)).json()["lease"]
+    await client.post(f"/api/restarts/leases/{first['id']}/drain", json={"wait_s": 0})
+    async with db_engine.begin() as conn:  # the timeout was long ago
+        await conn.execute(update(RestartLease).where(RestartLease.id == first["id"])
+                           .values(finished_at=datetime.now(timezone.utc) - timedelta(hours=1)))
+    again = await _acquire(client, reason="after cooldown")
+    assert again.status_code == 201, again.text
+    api = next(p for p in again.json()["lease"]["probes"] if p["name"] == "api")
+    assert api["status"] == "drainable"
+
+
+@pytest.mark.asyncio
+async def test_other_refusals_start_no_cooldown(client, gate_env):
+    svc, _ = gate_env
+    svc.queue = {"queue_running": [[0, "p-1"]], "queue_pending": []}
+    assert (await _acquire(client)).status_code == 409  # GPU busy: refused at probe
+    svc.queue = {"queue_running": [], "queue_pending": []}
+    svc.in_flight = [ROUTE]
+    assert (await _acquire(client)).status_code == 201, "no drain timed out, so no cooldown"
