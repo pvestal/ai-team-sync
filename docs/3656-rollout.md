@@ -1,8 +1,10 @@
 # #3656 rollout (prepared, not performed)
 
 ATS-run review tests: `ats delegate --review-tests` and `ats review-tests`. Nothing
-in this branch deploys itself; the coordinator runs it in the same quiet window as
-the W11/W12 train (`ATS_ROLLOUT_W11_W12.md`), after those two merges.
+in this branch deploys itself. The W11/W12 train it was prepared beside already
+landed and deployed (main 05cd2e2, 2026-11-15 21:54 PT); this branch merges
+cleanly onto it and is deployed on its own, in a quiet window, by the release
+worker.
 
 ## What changes where
 
@@ -15,7 +17,9 @@ the W11/W12 train (`ATS_ROLLOUT_W11_W12.md`), after those two merges.
 
 No REST route, schema, migration, MCP tool or hook change. `ats-server` and
 `ats-mcp` import none of the changed modules, so neither needs a restart for this
-branch (the train's `deploy.sh` restarts `ats-server` anyway for W12). The MCP
+branch; `deploy.sh` (the only sanctioned install path, because it stamps the
+commit) restarts `ats-server` anyway (~2-3 s: MCP calls fail and the Bash/commit
+guards fail closed in governed repos, hence the quiet window). The MCP
 `delegate` tool does not pass the new flags yet: its handler is in
 `mcp/server.py`, which W11 and W12 both change; a follow-up adds the passthrough
 and raises that handler's subprocess timeout by `--review-timeout`.
@@ -24,7 +28,9 @@ and raises that handler's subprocess timeout by `--review-timeout`.
 
 ```bash
 cd /home/patrick/code/ai-team-sync
-# after W11's ff-merge and W12's merge (their steps 2-3):
+git status --short --untracked-files=no        # must be empty
+PREV=$(git rev-parse --short HEAD)             # expect 05cd2e2 or later
+curl -s 'http://127.0.0.1:8400/api/restarts/leases?active=true'   # must be []
 git merge --no-ff fix/3656-review-runner -m "Merge fix/3656-review-runner (#3656)"
 # focused check on the merged tree (CI recipe):
 env -u ATS_AGENT -u CLAUDECODE -u CLAUDE_CODE -u CLAUDE_CODE_SESSION_ID -u ATS_WORKERS_CONFIG \
@@ -32,7 +38,8 @@ env -u ATS_AGENT -u CLAUDECODE -u CLAUDE_CODE -u CLAUDE_CODE_SESSION_ID -u ATS_W
     nice -n 10 .venv/bin/python -m pytest -q -p no:cacheprovider tests/test_review_runner_3656.py \
     tests/test_child_session_lifecycle.py tests/test_task_envelope_reaches_the_child.py \
     tests/test_verify_worktree_containment.py tests/test_collab_s1_verdicts.py
-scripts/deploy.sh                      # the train's single deploy
+scripts/deploy.sh                      # stamp, pipx reinstall, hooks, ats-server restart
+curl -s http://127.0.0.1:8400/api/version   # commit = the merge, dirty false
 install -m 600 /opt/tower-evidence/echo_autonomous_production_2026_11_15/w3656_review_runner/review_runner.toml \
     ~/.config/ai-team-sync/review_runner.toml
 ```
@@ -70,6 +77,6 @@ packet has one; it was run by ATS on the stated commit, not by the implementer."
 
 ## Rollback
 
-Revert the merge and run `scripts/deploy.sh`; remove
+`git checkout "$PREV"` (or revert the merge) and run `scripts/deploy.sh`; remove
 `~/.config/ai-team-sync/review_runner.toml` (optional: old code never reads it).
 Logs under `~/.local/state/ai-team-sync/review-runs/` are inert.

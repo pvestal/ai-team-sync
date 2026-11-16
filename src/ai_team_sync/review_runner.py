@@ -438,12 +438,18 @@ class ReviewRun:
 # user-wide with required=true, and a committed .lfsconfig can point git-lfs at
 # any URL, so a reviewed commit could make host-side git-lfs fetch from a server
 # of its choosing (Codex VERIFY 26b13c62). Two locks, either one sufficient:
-#   1. GIT_ATTR_SOURCE = the empty tree, and core.attributesFile=/dev/null: the
-#      commit's own .gitattributes (and a global attributes file) are not read,
-#      so nothing selects a driver. (git >= 2.42; older git ignores it.)
-#   2. Every configured filter driver is blanked for these invocations, so a
-#      driver selected from any remaining source ($GIT_DIR/info/attributes) has
-#      no program to run. required=false keeps that from being an error.
+#   1. Nothing may SELECT a driver. Git reads attributes from four places, and
+#      each is closed: the tree (GIT_ATTR_SOURCE = the empty tree, git >= 2.42),
+#      the global file (core.attributesFile=/dev/null), the system file
+#      (GIT_ATTR_NOSYSTEM=1), and $GIT_COMMON_DIR/info/attributes, which no
+#      option can switch off, so a run is REFUSED while it mentions a filter.
+#   2. Nothing selected can RUN: every configured filter driver is blanked
+#      (smudge/clean/process empty, required=false). Drivers are enumerated in
+#      the context the command runs in AND, for a new worktree, in the source
+#      repository's: a conditional include (includeIf gitdir:.../worktrees/**)
+#      can define a driver visible only inside the linked worktree, and the
+#      checkout therefore happens there (`worktree add --no-checkout`, then
+#      `reset --hard` inside it) with the union of both (Codex VERIFY 862b35f2).
 # Hooks are off for the same reason, and the caller's GIT_* environment
 # (GIT_DIR, GIT_WORK_TREE, GIT_CONFIG_*...) is dropped so it cannot redirect
 # these commands to another repository or inject configuration.
@@ -455,6 +461,7 @@ _EMPTY_TREE: dict[str, str] = {}
 
 def _git_env(repo: str | Path | None = None) -> dict:
     env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["GIT_ATTR_NOSYSTEM"] = "1"
     if repo is not None:
         key = os.path.realpath(str(repo))
         if key not in _EMPTY_TREE:
@@ -466,14 +473,19 @@ def _git_env(repo: str | Path | None = None) -> dict:
     return env
 
 
-def _safe_flags(repo: str | Path) -> list[str]:
+def _driver_names(where: str | Path) -> set[str]:
+    """Filter drivers configured as seen from `where` (includes resolved)."""
+    proc = subprocess.run(["git", "-C", str(where), "config", "--name-only", "--get-regexp",
+                           r"^filter\."], capture_output=True, text=True, env=_git_env())
+    return {m.group(1) for m in (re.match(r"^filter\.(.+)\.[^.]+$", line)
+                                 for line in proc.stdout.splitlines()) if m}
+
+
+def _safe_flags(repo: str | Path, extra_drivers: set[str] = frozenset()) -> list[str]:
     key = os.path.realpath(str(repo))
     if key in _SAFE_FLAGS:
         return _SAFE_FLAGS[key]
-    proc = subprocess.run(["git", "-C", key, "config", "--name-only", "--get-regexp",
-                           r"^filter\."], capture_output=True, text=True, env=_git_env())
-    names = sorted({m.group(1) for m in (re.match(r"^filter\.(.+)\.[^.]+$", line)
-                                         for line in proc.stdout.splitlines()) if m})
+    names = sorted(_driver_names(key) | set(extra_drivers))
     flags = ["-c", "core.hooksPath=/dev/null", "-c", "core.attributesFile=/dev/null",
              "-c", "core.fsmonitor=false"]
     for name in names:
@@ -485,6 +497,24 @@ def _safe_flags(repo: str | Path) -> list[str]:
         flags += ["-c", f"filter.{name}.required=false"]
     _SAFE_FLAGS[key] = flags
     return flags
+
+
+def _refuse_selecting_attributes(repo: str | Path) -> None:
+    """$GIT_COMMON_DIR/info/attributes is the one attribute source git cannot be
+    told to ignore. A run is refused while it can select a filter driver."""
+    path = Path(_git(repo, "rev-parse", "--path-format=absolute", "--git-path",
+                     "info/attributes").strip())
+    try:
+        text = path.read_text(errors="replace")
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ReviewRunError(f"cannot read {path}: {exc}; refusing") from exc
+    if "filter" in text:
+        raise ReviewRunError(
+            f"{path} can select a git filter driver, which would run a host program "
+            f"on the reviewed commit's content during checkout; refusing. Remove the "
+            f"filter line there to use the review runner on this repository.")
 
 
 def _git(repo: str | Path, *args: str, check: bool = True, text: bool = True):
@@ -512,8 +542,13 @@ def common_root(repo: str | Path) -> str:
 
 def _add_worktree(repo: str, path: Path, sha: str) -> None:
     # _git's flags: no hook (with a relative core.hooksPath a post-checkout hook
-    # would come from the commit being checked out) and no filter program.
-    _git(repo, "worktree", "add", "--detach", "--quiet", str(path), sha)
+    # would come from the commit being checked out) and no filter program. The
+    # checkout itself runs INSIDE the new worktree, after its config context
+    # exists, with the drivers of both contexts blanked (see the section above).
+    _git(repo, "worktree", "add", "--detach", "--no-checkout", "--quiet", str(path), sha)
+    _SAFE_FLAGS.pop(os.path.realpath(str(path)), None)
+    _safe_flags(path, extra_drivers=_driver_names(repo))
+    _git(path, "reset", "--hard", "--quiet", sha)
     head = _git(path, "rev-parse", "HEAD").strip()
     if head != sha:
         raise ReviewRunError(f"worktree {path} is at {head}, not {sha}")
@@ -614,6 +649,10 @@ def run_review_tests(lead_tree: str, rev: str, selection: Sequence[str], *,
     cfg = config or load_config()
     repo = common_root(lead_tree)
     profile = cfg.profile_for(repo)
+    # Before ANY git command that reads attributes (status, checkout).
+    _refuse_selecting_attributes(repo)
+    if profile.mode == "hosted":
+        _refuse_selecting_attributes(cfg.sandbox_repo)
     sha = _commit(repo, rev)
     if not sha:
         raise ReviewRunError(f"{rev!r} does not name a commit in {repo}")

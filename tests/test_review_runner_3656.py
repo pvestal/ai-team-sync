@@ -237,14 +237,64 @@ def test_reviewed_gitattributes_cannot_run_a_filter_on_the_host(world):
     assert not sentinel.exists(), "no filter program ran during checkout or status"
 
 
-def test_a_driver_selected_outside_the_tree_is_neutralized_too(world):
-    """Lock 2 alone: $GIT_DIR/info/attributes is not covered by GIT_ATTR_SOURCE."""
+def test_info_attributes_that_can_select_a_filter_refuses_the_run(world):
+    """$GIT_COMMON_DIR/info/attributes is the one source git cannot ignore."""
     sentinel = world["tmp"] / "filter-ran"
     _install_launcher(world, UNCONFINED)
     _sentinel_driver(world, sentinel)
     _write(world["repo"] / ".git" / "info" / "attributes", "* filter=sentinel\n")
-    with pytest.raises(rr.ReviewRunError, match="ISOLATION PROBE FAILED"):
+    with pytest.raises(rr.ReviewRunError, match="info/attributes can select a git filter"):
         rr.run_review_tests(str(world["repo"]), "main", ["tests"], config=world["config"]())
+    assert not sentinel.exists()
+    assert len(_worktrees(world["repo"])) == 1, "refused before any checkout"
+
+
+def _worktree_only_driver(world, name: str, sentinel: Path):
+    """A driver defined ONLY for linked worktrees, through a conditional include
+    (Codex VERIFY 862b35f2): invisible from the source repository's context."""
+    script = world["tmp"] / f"{name}.sh"
+    _write(script, f"#!/bin/sh\ntouch {sentinel}\ncat\n", 0o755)
+    inc = world["tmp"] / f"{name}.inc"
+    inc.write_text(f'[filter "{name}"]\n\tsmudge = {script}\n\tclean = {script}\n'
+                   f'\tprocess = {script}\n\trequired = true\n')
+    gitdir = os.path.realpath(world["repo"] / ".git")
+    _git(world["repo"], "config", f"includeIf.gitdir:{gitdir}/worktrees/**.path", str(inc))
+    seen_from_source = _git(world["repo"], "config", "--get-regexp", "^filter\\.")
+    assert name not in seen_from_source
+
+
+def test_worktree_only_driver_selected_by_info_attributes_is_refused(world):
+    sentinel = world["tmp"] / "filter-ran"
+    _install_launcher(world, UNCONFINED)
+    _worktree_only_driver(world, "wtonly", sentinel)
+    _write(world["repo"] / ".git" / "info" / "attributes", "* filter=wtonly\n")
+    with pytest.raises(rr.ReviewRunError, match="info/attributes"):
+        rr.run_review_tests(str(world["repo"]), "main", ["tests"], config=world["config"]())
+    assert not sentinel.exists()
+
+
+def test_lock2_alone_blanks_a_worktree_only_driver_at_checkout(world, monkeypatch):
+    """With lock 1 disabled, the reviewed tree's .gitattributes selects a driver
+    defined only in the linked worktree's config context; the checkout runs in
+    that context with that driver blanked, so nothing runs."""
+    sentinel = world["tmp"] / "filter-ran"
+    _install_launcher(world, UNCONFINED)
+    _git(world["repo"], "checkout", "-q", "-b", "wt-driver")
+    _write(world["repo"] / ".gitattributes", "*.bin filter=wtonly\n")
+    _write(world["repo"] / "payload.bin", "content\n")
+    reviewed = _commit(world["repo"], "selects a worktree-only driver")
+    _git(world["repo"], "checkout", "-q", "main")
+    _worktree_only_driver(world, "wtonly", sentinel)
+    real_env = rr._git_env
+
+    def without_lock1(repo=None):
+        env = real_env(repo)
+        env.pop("GIT_ATTR_SOURCE", None)
+        return env
+    monkeypatch.setattr(rr, "_git_env", without_lock1)
+    with pytest.raises(rr.ReviewRunError, match="ISOLATION PROBE FAILED") as exc:
+        rr.run_review_tests(str(world["repo"]), reviewed, ["tests"], config=world["config"]())
+    assert exc.value.run.sha == reviewed
     assert not sentinel.exists()
 
 
