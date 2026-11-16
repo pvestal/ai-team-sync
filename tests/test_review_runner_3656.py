@@ -209,6 +209,69 @@ def test_no_checkout_hook_runs_on_the_host(world):
     assert not sentinel.exists()
 
 
+def _sentinel_driver(world, sentinel: Path):
+    """A configured filter driver whose every program leaves a sentinel, as the
+    system/user git-lfs driver would run git-lfs (Codex VERIFY 26b13c62)."""
+    script = world["tmp"] / "filter.sh"
+    _write(script, f"#!/bin/sh\ntouch {sentinel}\ncat\n", 0o755)
+    for key in ("smudge", "clean"):
+        _git(world["repo"], "config", f"filter.sentinel.{key}", str(script))
+    _git(world["repo"], "config", "filter.sentinel.process", str(script))
+    _git(world["repo"], "config", "filter.sentinel.required", "true")
+
+
+def test_reviewed_gitattributes_cannot_run_a_filter_on_the_host(world):
+    sentinel = world["tmp"] / "filter-ran"
+    _install_launcher(world, UNCONFINED)
+    _git(world["repo"], "checkout", "-q", "-b", "lfs-like")
+    _write(world["repo"] / ".gitattributes", "* filter=sentinel\n")
+    _write(world["repo"] / "payload.bin", "pointer-like content\n")
+    _git(world["repo"], "-c", "filter.sentinel.clean=cat", "add", "-A")
+    _git(world["repo"], "commit", "-q", "-m", "reviewed commit selects a filter")
+    reviewed = _git(world["repo"], "rev-parse", "HEAD")
+    _sentinel_driver(world, sentinel)
+    os.utime(world["repo"] / "payload.bin")      # dirty stat: `git status` would clean
+    with pytest.raises(rr.ReviewRunError, match="ISOLATION PROBE FAILED") as exc:
+        rr.run_review_tests(str(world["repo"]), reviewed, ["tests"], config=world["config"]())
+    assert exc.value.run.sha == reviewed
+    assert not sentinel.exists(), "no filter program ran during checkout or status"
+
+
+def test_a_driver_selected_outside_the_tree_is_neutralized_too(world):
+    """Lock 2 alone: $GIT_DIR/info/attributes is not covered by GIT_ATTR_SOURCE."""
+    sentinel = world["tmp"] / "filter-ran"
+    _install_launcher(world, UNCONFINED)
+    _sentinel_driver(world, sentinel)
+    _write(world["repo"] / ".git" / "info" / "attributes", "* filter=sentinel\n")
+    with pytest.raises(rr.ReviewRunError, match="ISOLATION PROBE FAILED"):
+        rr.run_review_tests(str(world["repo"]), "main", ["tests"], config=world["config"]())
+    assert not sentinel.exists()
+
+
+def test_the_callers_git_environment_cannot_redirect_the_run(world, monkeypatch, tmp_path):
+    head = _install_launcher(world, UNCONFINED)
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    _git(decoy, "init", "-q")
+    monkeypatch.setenv("GIT_DIR", str(decoy / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(decoy))
+    with pytest.raises(rr.ReviewRunError, match="ISOLATION PROBE FAILED") as exc:
+        rr.run_review_tests(str(world["repo"]), "main", ["tests"], config=world["config"]())
+    assert exc.value.run.sha == head and exc.value.run.repo == os.path.realpath(world["repo"])
+
+
+def test_probe_interpreter_is_an_absolute_host_path(world, tmp_path):
+    """Not a PATH lookup inside the sandbox, where the tested tree's venv/bin
+    comes first and a committed venv/bin/python3 could print a fake PASS."""
+    _install_launcher(world, UNCONFINED)
+    with pytest.raises(rr.ReviewRunError) as exc:
+        rr.run_review_tests(str(world["repo"]), "main", ["tests"], config=world["config"]())
+    argv = exc.value.run.argv
+    assert argv[argv.index("--exec") + 1] == "/usr/bin/python3"
+    with pytest.raises(rr.ReviewRunError, match="probe_python"):
+        world["config"](probe_python=str(tmp_path / "no-such-python"))
+
+
 def test_reviewed_commit_cannot_supply_the_launcher(world):
     """The launcher is the one host-side program; the reviewed commit's copy never runs."""
     _install_launcher(world, UNCONFINED, "trusted launcher on main")

@@ -120,6 +120,7 @@ class RunnerConfig:
     work_dir: str
     log_dir: str
     nice: int = 10
+    probe_python: str = "/usr/bin/python3"
     db_sockets: tuple = ()
     secret_paths: tuple = ()
     source: str = ""
@@ -218,6 +219,14 @@ def load_config(path: Path | None = None) -> RunnerConfig:
             raise ReviewRunError(f"{source}: repos.{raw_root!r}.mode must be "
                                  f"'sandbox' or 'hosted', got {mode!r}")
 
+    # The probe's interpreter is an absolute HOST path, never a PATH lookup inside
+    # the sandbox: the launcher puts the tested tree's venv/bin first on PATH,
+    # and a reviewed commit can commit a venv/bin/python3 that prints a fake PASS.
+    probe_python = _abs(doc.get("probe_python", "/usr/bin/python3"), "probe_python",
+                        source, resolve=False)
+    if not os.access(probe_python, os.X_OK):
+        raise ReviewRunError(f"{source}: probe_python {probe_python} is not executable")
+
     nice = doc.get("nice", 10)
     if not isinstance(nice, int) or not 0 <= nice <= 19:
         raise ReviewRunError(f"{source}: nice must be an integer 0-19")
@@ -242,7 +251,7 @@ def load_config(path: Path | None = None) -> RunnerConfig:
         work_dir=work_dir,
         log_dir=_abs(doc.get("log_dir", "~/.local/state/ai-team-sync/review-runs"),
                      "log_dir", source),
-        nice=nice, db_sockets=_paths("db_sockets"),
+        nice=nice, probe_python=probe_python, db_sockets=_paths("db_sockets"),
         secret_paths=_paths("secret_paths"), source=source)
 
 
@@ -250,10 +259,11 @@ def load_config(path: Path | None = None) -> RunnerConfig:
 # The isolation probe: runs first, inside the same sandbox as the tests
 # ---------------------------------------------------------------------------
 
-# Run as `python3 -I -c PROBE_PROGRAM <nonce> <params-json> -- <command...>`.
-# -I keeps the reviewed tree (the sandbox's cwd) off sys.path, so a planted
-# socket.py or json.py cannot answer for the probe. It execs the command only
-# when every check passed.
+# Run as `<probe_python> -I -c PROBE_PROGRAM <nonce> <params-json> -- <command...>`,
+# probe_python an absolute host interpreter (config, default /usr/bin/python3).
+# -I keeps the reviewed tree (the sandbox's cwd) and PYTHON* variables off
+# sys.path, so a planted socket.py or json.py cannot answer for the probe. It
+# execs the command only when every check passed.
 PROBE_PROGRAM = r'''
 import errno, json, os, socket, sys
 nonce, params = sys.argv[1], json.loads(sys.argv[2])
@@ -418,12 +428,71 @@ class ReviewRun:
         }
 
 
-def _git(repo: str | Path, *args: str, check: bool = True) -> str:
-    proc = subprocess.run(["git", "-C", str(repo), *args],
-                          capture_output=True, text=True)
+# ---------------------------------------------------------------------------
+# Git on the host: nothing the reviewed commit carries may make it run anything
+# ---------------------------------------------------------------------------
+# Checkout is the one step that touches reviewed content on the host, before any
+# sandbox exists. Git runs programs at checkout (and at `status`) only through
+# filter drivers: the commit's .gitattributes selects a driver, configuration
+# names its program. On Tower the git-lfs driver is configured system- and
+# user-wide with required=true, and a committed .lfsconfig can point git-lfs at
+# any URL, so a reviewed commit could make host-side git-lfs fetch from a server
+# of its choosing (Codex VERIFY 26b13c62). Two locks, either one sufficient:
+#   1. GIT_ATTR_SOURCE = the empty tree, and core.attributesFile=/dev/null: the
+#      commit's own .gitattributes (and a global attributes file) are not read,
+#      so nothing selects a driver. (git >= 2.42; older git ignores it.)
+#   2. Every configured filter driver is blanked for these invocations, so a
+#      driver selected from any remaining source ($GIT_DIR/info/attributes) has
+#      no program to run. required=false keeps that from being an error.
+# Hooks are off for the same reason, and the caller's GIT_* environment
+# (GIT_DIR, GIT_WORK_TREE, GIT_CONFIG_*...) is dropped so it cannot redirect
+# these commands to another repository or inject configuration.
+# Consequence: an LFS-tracked file is checked out as its pointer text.
+
+_SAFE_FLAGS: dict[str, list[str]] = {}
+_EMPTY_TREE: dict[str, str] = {}
+
+
+def _git_env(repo: str | Path | None = None) -> dict:
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    if repo is not None:
+        key = os.path.realpath(str(repo))
+        if key not in _EMPTY_TREE:
+            _EMPTY_TREE[key] = subprocess.run(
+                ["git", "-C", key, "hash-object", "-t", "tree", "/dev/null"],
+                capture_output=True, text=True, env=env).stdout.strip()
+        if _EMPTY_TREE[key]:
+            env["GIT_ATTR_SOURCE"] = _EMPTY_TREE[key]
+    return env
+
+
+def _safe_flags(repo: str | Path) -> list[str]:
+    key = os.path.realpath(str(repo))
+    if key in _SAFE_FLAGS:
+        return _SAFE_FLAGS[key]
+    proc = subprocess.run(["git", "-C", key, "config", "--name-only", "--get-regexp",
+                           r"^filter\."], capture_output=True, text=True, env=_git_env())
+    names = sorted({m.group(1) for m in (re.match(r"^filter\.(.+)\.[^.]+$", line)
+                                         for line in proc.stdout.splitlines()) if m})
+    flags = ["-c", "core.hooksPath=/dev/null", "-c", "core.attributesFile=/dev/null",
+             "-c", "core.fsmonitor=false"]
+    for name in names:
+        if not re.match(r"^[A-Za-z0-9_.-]+$", name):
+            raise ReviewRunError(f"filter driver name {name!r} configured for {key} cannot "
+                                 f"be neutralized safely; refusing")
+        for field_ in ("smudge", "clean", "process"):
+            flags += ["-c", f"filter.{name}.{field_}="]
+        flags += ["-c", f"filter.{name}.required=false"]
+    _SAFE_FLAGS[key] = flags
+    return flags
+
+
+def _git(repo: str | Path, *args: str, check: bool = True, text: bool = True):
+    proc = subprocess.run(["git", "-C", str(repo), *_safe_flags(repo), *args],
+                          capture_output=True, text=text, env=_git_env(repo))
     if check and proc.returncode != 0:
-        raise ReviewRunError(f"git {' '.join(args)} failed in {repo}: "
-                             f"{proc.stderr.strip()}")
+        err = proc.stderr if text else proc.stderr.decode("utf-8", "replace")
+        raise ReviewRunError(f"git {' '.join(args)} failed in {repo}: {err.strip()}")
     return proc.stdout
 
 
@@ -442,11 +511,9 @@ def common_root(repo: str | Path) -> str:
 
 
 def _add_worktree(repo: str, path: Path, sha: str) -> None:
-    # hooksPath=/dev/null: a checkout must not run any hook. With a relative
-    # core.hooksPath a post-checkout hook would come from the tree being
-    # checked out, i.e. from the commit under review, on the host.
-    _git(repo, "-c", "core.hooksPath=/dev/null", "worktree", "add", "--detach",
-         "--quiet", str(path), sha)
+    # _git's flags: no hook (with a relative core.hooksPath a post-checkout hook
+    # would come from the commit being checked out) and no filter program.
+    _git(repo, "worktree", "add", "--detach", "--quiet", str(path), sha)
     head = _git(path, "rev-parse", "HEAD").strip()
     if head != sha:
         raise ReviewRunError(f"worktree {path} is at {head}, not {sha}")
@@ -487,8 +554,7 @@ def _install_trusted_runner(cfg: RunnerConfig, trusted_sha: str, tree: Path) -> 
         dst.parent.mkdir(parents=True, exist_ok=True)
         if not dst.parent.resolve().is_relative_to(root):
             raise ReviewRunError(f"{rel} resolves outside the throwaway tree; refusing")
-        data = subprocess.run(["git", "-C", cfg.sandbox_repo, "cat-file", "blob", blob],
-                              capture_output=True, check=True).stdout
+        data = _git(cfg.sandbox_repo, "cat-file", "blob", blob, text=False)
         dst.write_bytes(data)
         dst.chmod(0o755 if mode == "100755" else 0o644)
 
@@ -611,7 +677,7 @@ def run_review_tests(lead_tree: str, rev: str, selection: Sequence[str], *,
             command = ["bash", "-c", HOSTED_SCRIPT, "bash", str(tree), profile.python,
                        profile.test_database, profile.dsn_env, *selection]
         run.argv = ["nice", "-n", str(cfg.nice), str(launcher_root / cfg.entrypoint),
-                    "--exec", "python3", "-I", "-c", PROBE_PROGRAM, nonce,
+                    "--exec", cfg.probe_python, "-I", "-c", PROBE_PROGRAM, nonce,
                     json.dumps(params), "--", *command]
 
         out(f"review tests: {profile.mode} run of {sha[:12]} ({' '.join(selection)}) "

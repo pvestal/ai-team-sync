@@ -180,9 +180,9 @@ ats review-tests --repo <tree> --sha <sha> -- tests/test_x.py -q   # same run, n
 
 | Step | What happens |
 |---|---|
-| checkout | the exact commit, in a throwaway detached worktree under `work_dir`, with checkout hooks disabled (`core.hooksPath=/dev/null`) |
+| checkout | the exact commit, in a throwaway detached worktree under `work_dir`. No program runs on the host during any of the runner's git calls: hooks off, the commit's `.gitattributes` not read (`GIT_ATTR_SOURCE` = empty tree, `core.attributesFile=/dev/null`), every configured filter driver blanked (git-lfs included, so a committed `.lfsconfig` cannot send host-side git-lfs anywhere; LFS files arrive as pointers), caller's `GIT_*` environment dropped |
 | launcher | the sandbox launcher on the host is **never** the reviewed commit's: in `sandbox` mode the runner directory is overwritten from the sandbox repo's trusted ref; in `hosted` mode the commit runs inside a throwaway checkout of the sandbox repo at that ref, with a private test database |
-| probe | first thing inside the sandbox, before any test: only `lo` in the network namespace, every host Postgres socket (from `/proc/net/unix` plus `db_sockets`) refuses connect, `secret_paths` unreadable, a host canary directory not writable. A failed probe exits before the tests and the run is **refused** |
+| probe | first thing inside the sandbox, before any test, run by an absolute host interpreter (`probe_python`, default `/usr/bin/python3`, never a PATH lookup the tested tree's venv could answer): only `lo` in the network namespace, every host Postgres socket (from `/proc/net/unix` plus `db_sockets`) refuses connect, `secret_paths` unreadable, a host canary directory not writable. A failed probe exits before the tests and the run is **refused** |
 | result | raw log (durable, under `log_dir`, with its sha256), exit status, pytest summary, failing ids, and with `--review-base` the same selection on the base and the new/fixed failures |
 | attach | the block goes into the child's packet ahead of the objective, and the evidence into the delegation's returned evidence (`evidence.review_tests`) and the CLI's JSON |
 
@@ -212,6 +212,7 @@ Configuration is machine-local, `~/.config/ai-team-sync/review_runner.toml`
 work_dir = "/var/tmp/ats-review"      # must stay visible inside the sandbox
 log_dir = "~/.local/state/ai-team-sync/review-runs"
 nice = 10
+probe_python = "/usr/bin/python3"
 db_sockets = ["/var/run/postgresql/.s.PGSQL.5432"]
 secret_paths = ["~/.pgpass"]
 
