@@ -365,19 +365,22 @@ def cross_account(peer_uid: int | None, owner: Session, *, any_status: bool = Fa
     the file. Another account's ghost is the in-process reaper's to collect;
     a same-account ghost stays reapable exactly as before.
 
-    Owner never identified (rows older than #2741): an unidentifiable requester
-    or a headless bound account is refused, because a bound worker can make
-    itself unidentifiable on purpose (a forwarding header, a socket closed
-    before the lookup). Ordinary identified accounts keep the old behaviour.
+    OWNER NEVER IDENTIFIED (creator_uid NULL: rows older than #2741, or a session
+    created by a requester the kernel could not name) -- EVERY requester is
+    foreign (#2763). No account can prove it created such a row, so none may
+    heartbeat, resurrect, change or act through it. This used to fall through to
+    "any identified, non-bound account may", which let another OS account
+    heartbeat a reaped legacy row back to active. Measured 2026-11-15 on the live
+    database: 1680 NULL-creator rows, ALL completed (199 reaped), none holding a
+    lock or a restoration journal, newest started 2026-09-13 -- so the rows this
+    makes inert are history, and they stay readable.
     """
     if not any_status and owner.status not in ("active", "paused"):
         return False
     creator = getattr(owner, "creator_uid", None)
-    if creator is not None:
-        return peer_uid != creator
-    from ai_team_sync.workers import registry
-
-    return peer_uid is None or peer_uid in registry().bound_account_uids()
+    if creator is None:
+        return True
+    return peer_uid != creator
 
 
 @router.get("/ownership")
