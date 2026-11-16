@@ -694,8 +694,23 @@ class _SpawnRefused(RuntimeError):
 @click.option("--acceptance", "-a", required=True, help="What a satisfactory answer must contain")
 @click.option("--lease-minutes", default=30, show_default=True)
 @click.option("--dry-run", is_flag=True, help="Create the record and print the child packet; launch nothing")
+@click.option("--review-tests", default="", help=(
+    "VERIFY only: pytest selection (one shell-quoted string) that ATS runs on the "
+    "reviewed commit inside the kernel sandbox BEFORE the child launches; the log, "
+    "exit status and manifest go into the child's packet and the delegation's "
+    "evidence (#3656)"))
+@click.option("--review-repo", default="",
+              help="Tree whose repository --review-tests runs in (default: --repo), for a "
+                   "change whose acceptance needs another repository's tests")
+@click.option("--review-sha", default="HEAD", show_default=True,
+              help="Commit (in --review-repo) that --review-tests runs on")
+@click.option("--review-base", default="",
+              help="Also run --review-tests on this base commit and diff the failures")
+@click.option("--review-timeout", default=30, show_default=True,
+              help="Minutes allowed per --review-tests run")
 def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
-             acceptance, lease_minutes, dry_run):
+             acceptance, lease_minutes, dry_run, review_tests, review_repo,
+             review_sha, review_base, review_timeout):
     """Delegate a bounded subproblem to another worker.
 
     The delegating worker keeps ownership throughout: this creates a CHILD
@@ -746,6 +761,41 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
                 f"reconstruct the acceptance criteria. Drop --task to delegate "
                 f"without task authority, or fix the id / Echo Brain.", err=True)
             sys.exit(4)
+
+    # Review tests run BEFORE any record exists (#3656): a run that cannot be
+    # made trustworthy costs no delegation row or child session, and the
+    # minutes the tests take are not charged to the child's lease. The reviewer
+    # cannot run them itself -- Codex's read-only sandbox denies every socket
+    # family, so the sandbox's private PostgreSQL cannot start inside it -- so
+    # ATS runs them, on the exact commit, inside the kernel sandbox, and the
+    # child receives the raw result instead of the implementer's numbers.
+    review = None
+    if review_tests:
+        import shlex
+        from ai_team_sync import review_runner as _rr
+        if mode != "VERIFY":
+            click.echo("delegation refused: --review-tests feeds a VERIFY review; "
+                       f"this delegation is {mode}", err=True)
+            sys.exit(2)
+        review_repo = review_repo or repo
+        if not review_repo:
+            click.echo("delegation refused: --review-tests needs --repo or "
+                       "--review-repo (the tree whose commit is tested)", err=True)
+            sys.exit(2)
+        try:
+            selection = shlex.split(review_tests)
+        except ValueError as exc:
+            click.echo(f"delegation refused: --review-tests is not a valid shell-"
+                       f"quoted selection: {exc}", err=True)
+            sys.exit(2)
+        try:
+            review = _rr.run_for_review(
+                review_repo, review_sha, selection, base_rev=review_base or None,
+                timeout_s=review_timeout * 60, out=lambda m: click.echo(m, err=True))
+        except (_rr.ReviewRunError, OSError, subprocess.SubprocessError) as exc:
+            click.echo(f"delegation refused (review tests not run): {exc}", err=True)
+            sys.exit(5)
+        click.echo(review.packet_text(), err=True)
 
     with httpx.Client(timeout=30) as c:
         resp = c.post(f"{server}/api/delegations", json={
@@ -815,7 +865,8 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
     packet = build_child_packet(
         mode=mode, delegation=d, objective=objective, acceptance=acceptance,
         scope=list(scope), task_envelope_text=task_envelope_text, brief=brief,
-        verify_env_text=(verify_env.manifest_text if verify_env else ""))
+        verify_env_text=(verify_env.manifest_text if verify_env else ""),
+        review_tests_text=(review.packet_text() if review else ""))
 
     if dry_run:
         click.echo(json.dumps({"delegation": d, "child_session": child_id,
@@ -907,6 +958,10 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
                              "launch_error": launch_error or None},
                 "actor_session_id": child_id,
             }
+            if review is not None:
+                # What ATS ran for this review, attached to the record so the
+                # parent and later readers see the same evidence the child got.
+                payload["evidence"]["review_tests"] = review.evidence()
             if structured_verdict is not None:
                 payload["structured_verdict"] = structured_verdict
             # The child's own capability: only the reviewer records a verdict.
@@ -962,12 +1017,44 @@ def delegate(parent_task, parent_session, worker, mode, scope, repo, objective,
         "verify_worktree": (str(verify_env.path) if verify_env else None),
         "verify_base_commit": (verify_env.base_commit if verify_env else None),
         "verify_worktree_removed": verify_removed,
+        # What ATS ran before this review (#3656), or null when none was asked.
+        "review_tests": (review.evidence() if review else None),
         # The recorded verdict (#3585): what counts is effective_verdict.
         "effective_verdict": effective_verdict,
         "structured_verdict": structured_verdict,
         "result": output,
         "verify_before_accepting": d["acceptance"],
     }, indent=2))
+
+
+@cli.command("review-tests", context_settings={"ignore_unknown_options": True})
+@click.option("--repo", required=True, help="A tree of the repository under review")
+@click.option("--sha", default="HEAD", show_default=True, help="Commit to test")
+@click.option("--base", default="", help="Also run on this base commit and diff the failures")
+@click.option("--timeout", "timeout_min", default=30, show_default=True,
+              help="Minutes allowed per run")
+@click.option("--json", "as_json", is_flag=True, help="Print the evidence JSON instead")
+@click.argument("selection", nargs=-1, type=click.UNPROCESSED, required=True)
+def review_tests_cmd(repo, sha, base, timeout_min, as_json, selection):
+    """Run a pytest SELECTION on one commit inside the kernel sandbox (#3656).
+
+    Exactly what `ats delegate --review-tests` runs before a VERIFY child, printed
+    as the block that child receives. Exit: the tested commit's pytest status,
+    124 when it timed out, 5 when the run was refused (no profile, bad commit,
+    or the isolation probe failed).
+    """
+    import sys
+    from ai_team_sync import review_runner as _rr
+    try:
+        review = _rr.run_for_review(repo, sha, list(selection), base_rev=base or None,
+                                    timeout_s=timeout_min * 60,
+                                    out=lambda m: click.echo(m, err=True))
+    except (_rr.ReviewRunError, OSError, subprocess.SubprocessError) as exc:
+        click.echo(f"review tests refused: {exc}", err=True)
+        sys.exit(5)
+    click.echo(json.dumps(review.evidence(), indent=2) if as_json else review.packet_text())
+    head = review.head
+    sys.exit(124 if head.timed_out else (1 if head.exit_code is None else head.exit_code))
 
 
 @cli.command("safe-restart")
