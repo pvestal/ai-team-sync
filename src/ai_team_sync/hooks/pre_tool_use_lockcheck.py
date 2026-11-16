@@ -366,7 +366,11 @@ def main() -> None:
     # would otherwise turn the holder's lock into "mine".
     from ai_team_sync.hooks import commit_guard as cg
 
-    ident = cg.resolve_identity(payload.get("session_id") or None)
+    # Inside a Claude Code subagent the payload names it (`agent_id`), and the
+    # session that subagent started is ITS identity, not the parent's (#3677).
+    agent_id = payload.get("agent_id")
+    ident = cg.resolve_identity(payload.get("session_id") or None,
+                                agent_id if isinstance(agent_id, str) else None)
     if ident.conflict:
         print(f"ATS LOCK GUARD: {ident.conflict}", file=sys.stderr)
         sys.exit(2)

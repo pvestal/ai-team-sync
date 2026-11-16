@@ -43,6 +43,9 @@ class CallerContext:
     tokens: dict[str, str] = field(default_factory=dict)
     states: dict[str, str] = field(default_factory=dict)
     parents: dict[str, str] = field(default_factory=dict)
+    # Sessions a subagent of this client opened -> that subagent's agent id
+    # (#3677). Never the default target and never chosen as the next default.
+    agent_sessions: dict[str, str] = field(default_factory=dict)
     capability_problems: dict[str, str] = field(default_factory=dict)
 
 
@@ -295,6 +298,64 @@ def context_for_request(server: Any, base_agent: str) -> CallerContext:
 
 def bound_caller() -> CallerContext | None:
     return _BOUND_CALLER.get()
+
+
+# ── which AGENT of the client issued this call (#3677) ───────────────────────
+#
+# A Claude session and every subagent it runs share one client id, one MCP
+# transport and one caller bucket above. Claude Code sends each tools/call's
+# tool_use_id as _meta["claudecode/toolUseId"]; the ATS PreToolUse hook for that
+# same call recorded which agent issued it (session_pointer.record_tool_caller).
+# The answer is a SELECTOR for this client's own sessions (which one is this
+# agent's default), never an authority grant: every mutation still needs the
+# exact session capability.
+TOOL_USE_META_KEY = "claudecode/toolUseId"
+
+_TOOL_CALLER: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "ats_mcp_tool_caller", default=None
+)
+
+
+def tool_use_id_from_meta(meta: Any) -> str:
+    value = _meta_mapping(meta).get(TOOL_USE_META_KEY)
+    if not isinstance(value, str):
+        return ""
+    value = value.strip()
+    return value if _CLIENT_ID.fullmatch(value) else ""
+
+
+def tool_caller_for_request(server: Any, context: CallerContext | None) -> str | None:
+    """The issuing agent of the current request: a subagent id, '' for the
+    main thread, or None when not known (no request, no tool_use_id, no record,
+    or a caller whose identity is per-thread request metadata rather than the
+    shared Claude session id)."""
+    try:
+        request = server.request_context
+    except LookupError:
+        return None
+    tool_use_id = tool_use_id_from_meta(getattr(request, "meta", None))
+    if not tool_use_id:
+        return None
+    if context is not None and context.source not in ("legacy_hook",):
+        return None
+    cid = context.client_id if context is not None else (sp.claude_session_id() or "")
+    return sp.tool_caller(tool_use_id, cid)
+
+
+def tool_caller() -> str | None:
+    """The agent bound for this request: subagent id, '' (main thread) or None."""
+    return _TOOL_CALLER.get()
+
+
+@contextmanager
+def bind_tool_caller(agent_id: str | None) -> Iterator[str | None]:
+    """Bind the issuing agent for exactly the current async/request context."""
+
+    token = _TOOL_CALLER.set(agent_id)
+    try:
+        yield agent_id
+    finally:
+        _TOOL_CALLER.reset(token)
 
 
 @contextmanager

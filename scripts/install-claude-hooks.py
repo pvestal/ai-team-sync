@@ -15,6 +15,9 @@ from typing import Any
 AUTOSTART_MODULE = "ai_team_sync.hooks.session_autostart"
 CONTEXT_MODULE = "ai_team_sync.hooks.ats_context"
 INBOX_MODULE = "ai_team_sync.hooks.override_inbox"
+CALLER_MODULE = "ai_team_sync.hooks.pre_tool_use_ats_caller"
+# The ATS MCP server's tools as Claude Code names them (server "ai-team-sync").
+ATS_MCP_TOOL_MATCHER = "mcp__ai-team-sync__.*"
 
 
 def _operator_config_declares_repositories() -> bool:
@@ -63,6 +66,27 @@ def _prepend(
     else:
         groups.remove(target)
         groups.insert(0, target)
+    target["hooks"] = hooks + list(target.get("hooks") or [])
+    events[event] = groups
+
+
+def _install_matched(
+    settings: dict[str, Any], event: str, matcher: str, hooks: list[dict[str, Any]],
+    modules: set[str]
+) -> None:
+    """Put `hooks` in the `event` group whose matcher is exactly `matcher`,
+    after removing every earlier copy of `modules` from that event. Idempotent."""
+    events = settings.setdefault("hooks", {})
+    before = list(events.get(event) or [])
+    groups = _without_modules(before, modules)
+    # A group that held nothing but an earlier copy of these modules goes too.
+    groups = [group for group in groups
+              if group.get("hooks") or set(group) - {"hooks", "matcher"}
+              or group in before]
+    target = next((group for group in groups if group.get("matcher") == matcher), None)
+    if target is None:
+        target = {"matcher": matcher, "hooks": []}
+        groups.append(target)
     target["hooks"] = hooks + list(target.get("hooks") or [])
     events[event] = groups
 
@@ -173,6 +197,23 @@ def install(settings_path: Path, python: str) -> None:
             },
         ],
         {CONTEXT_MODULE, INBOX_MODULE},
+    )
+
+    # #3677: record which agent (main thread or a Claude Code subagent) issues
+    # each ATS MCP call, so a subagent's start_session never takes its parent's
+    # pointer. It never blocks; a missing record is the pre-#3677 behaviour.
+    _install_matched(
+        settings,
+        "PreToolUse",
+        ATS_MCP_TOOL_MATCHER,
+        [
+            {
+                "type": "command",
+                "command": f"{python} -m {CALLER_MODULE}",
+                "timeout": 5,
+            }
+        ],
+        {CALLER_MODULE},
     )
 
     rendered = json.dumps(settings, indent=2) + "\n"

@@ -60,6 +60,28 @@ stays the default and keeps the pointer, and the subagent passes its own
 `session_id` on every later call. Nothing is inferred from the shared Claude
 session id, and no lock moves between parent and subagent.
 
+**Claude Code subagents are recognised without that argument (#3677).** Claude
+Code puts `agent_id` in every hook payload fired inside a subagent and sends
+each MCP call's `tool_use_id` as `_meta["claudecode/toolUseId"]`. The
+`pre_tool_use_ats_caller` PreToolUse hook (matcher `mcp__ai-team-sync__.*`,
+installed by `scripts/install-claude-hooks.py`) records tool_use_id -> agent_id
+in `<state>/.ats_tool_callers/`, and the MCP server reads it for that call. A
+`start_session` issued by a subagent then:
+
+- never moves the Claude session's pointer or this process's default, and never
+  claims the parent's SessionStart placeholder;
+- is linked to the process default as its parent (when that is an open session
+  this client holds), unless `parent_session_id` names one;
+- is recorded as THAT subagent's own session in its agent pointer
+  (`<state>/.ats_agent_pointers/<client id>/<agent id>`). The subagent's later
+  calls without `session_id` act as it, including after it completes (they are
+  then refused there rather than falling back to the parent's session), and
+  the edit and Bash guards resolve it from the hook payload's `agent_id`.
+
+The main thread's calls, and calls with no hook record (hook not installed, an
+older client, Codex), are UNKNOWN and keep the behaviour above: a second plain
+`start_session` becomes the default. Unknown is never read as "main thread".
+
 ## Locks and presence
 
 | Tool | Effect | Notes |

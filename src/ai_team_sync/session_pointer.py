@@ -742,6 +742,231 @@ def save_pointer(session_id: str, cid: str | None = None, *,
             pass
 
 
+# ── per-subagent pointers and the tool-caller record (#3677) ──────────────────
+#
+# Every subagent of one Claude session shares that session's id, its stdio MCP
+# process and therefore the pointer above. A subagent's start_session used to
+# move that pointer to its own row, so the PARENT's edits and commits were
+# judged as the subagent's and refused against the parent's own locks.
+#
+# Claude Code names the acting subagent in two places that ATS can read:
+#   * every hook payload fired inside a subagent carries `agent_id` (absent on
+#     the main thread), and
+#   * every MCP tools/call carries `_meta["claudecode/toolUseId"]`, which is the
+#     same `tool_use_id` the PreToolUse hook for that call received.
+# The PreToolUse hook for ATS tools (hooks/pre_tool_use_ats_caller) records
+# tool_use_id -> agent_id, so the MCP server can tell which agent is calling.
+# A subagent's own session is then kept in ITS OWN pointer, keyed by
+# (client id, agent id), and the shared per-client pointer stays the parent's.
+#
+# Neither file carries a capability, and both are written only by this user's
+# own processes: like every pointer they are selectors, not proofs.
+AGENT_POINTER_DIR_NAME = ".ats_agent_pointers"
+TOOL_CALLER_DIR_NAME = ".ats_tool_callers"
+# A tool-caller record is consumed within one tool call; anything older is
+# swept. Generous, so a slow MCP start or a queued call still finds it.
+TOOL_CALLER_TTL_S = 15 * 60
+_AGENT_POINTER_MAX_AGE_S = _LIVE_CID_MAX_AGE_S
+
+
+def _private_dir(name: str, *, create: bool) -> Path | None:
+    """<state>/<name>, 0700 and owned by this user, or None when it does not
+    exist (create=False) or cannot be made safe. Never raises."""
+    d = _state_dir() / name
+    try:
+        if create:
+            _state_dir().mkdir(parents=True, exist_ok=True)
+            try:
+                os.mkdir(d, 0o700)
+            except FileExistsError:
+                pass
+        st = os.lstat(d)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        return None
+    if hasattr(os, "getuid") and st.st_uid != os.getuid():
+        return None
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            return None
+    return d
+
+
+def _write_private_text(path: Path, text: str) -> bool:
+    """Atomically replace `path` with `text` (0600). Never raises."""
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    except OSError:
+        return False
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(text)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _read_private_text(path: Path) -> str | None:
+    """Contents of a regular file this user owns, or None. Never follows a
+    symlink at the final component; never raises."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or (
+                hasattr(os, "getuid") and st.st_uid != os.getuid()):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            fd = -1
+            return stream.read()
+    except Exception:
+        return None
+    finally:
+        if fd != -1:
+            os.close(fd)
+
+
+def agent_key(agent_id: str) -> str:
+    """Filename-safe key for a Claude Code subagent id (same rule as client_key)."""
+    return client_key(agent_id)
+
+
+def agent_pointer_path(cid: str, agent_id: str) -> Path:
+    return (_state_dir() / AGENT_POINTER_DIR_NAME / client_key(cid)
+            / agent_key(agent_id))
+
+
+def save_agent_pointer(session_id: str, cid: str, agent_id: str) -> bool:
+    """Record `session_id` as THIS subagent's own session. Never touches the
+    per-client pointer. Returns whether it was written; never raises."""
+    cid, agent_id = (cid or "").strip(), (agent_id or "").strip()
+    if not (session_id and cid and agent_id):
+        return False
+    root = _private_dir(AGENT_POINTER_DIR_NAME, create=True)
+    if root is None:
+        return False
+    d = root / client_key(cid)
+    try:
+        os.mkdir(d, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return False
+    try:
+        st = os.lstat(d)
+        if not stat.S_ISDIR(st.st_mode) or (
+                hasattr(os, "getuid") and st.st_uid != os.getuid()):
+            return False
+    except OSError:
+        return False
+    # Old entries of this client (subagents long finished) are dropped; the
+    # pointer of a finished subagent is never read again (its id is not reused).
+    try:
+        cutoff = time.time() - _AGENT_POINTER_MAX_AGE_S
+        for entry in os.scandir(d):
+            if entry.is_file(follow_symlinks=False) and entry.stat().st_mtime < cutoff:
+                os.unlink(entry.path)
+    except OSError:
+        pass
+    return _write_private_text(d / agent_key(agent_id), session_id)
+
+
+def read_agent_pointer(cid: str | None, agent_id: str | None) -> str | None:
+    """The session THIS subagent started, or None. The main thread (no agent
+    id) has no agent pointer: it uses the per-client pointer."""
+    cid, agent_id = (cid or "").strip(), (agent_id or "").strip()
+    if not (cid and agent_id):
+        return None
+    if _private_dir(AGENT_POINTER_DIR_NAME, create=False) is None:
+        return None
+    text = _read_private_text(agent_pointer_path(cid, agent_id))
+    return (text or "").strip() or None
+
+
+def _tool_use_key(tool_use_id: str) -> str | None:
+    tool_use_id = (tool_use_id or "").strip()
+    return tool_use_id if _SAFE_CLIENT_KEY.fullmatch(tool_use_id) else None
+
+
+def record_tool_caller(tool_use_id: str, cid: str, agent_id: str | None) -> bool:
+    """Record which agent issued one tool call: `agent_id` for a subagent, ''
+    for the main thread. Written by the PreToolUse hook before the call runs.
+    Sweeps expired records. Returns whether it was written; never raises."""
+    key = _tool_use_key(tool_use_id)
+    cid = (cid or "").strip()
+    if not key or not cid:
+        return False
+    d = _private_dir(TOOL_CALLER_DIR_NAME, create=True)
+    if d is None:
+        return False
+    try:
+        cutoff = time.time() - TOOL_CALLER_TTL_S
+        for entry in os.scandir(d):
+            if entry.is_file(follow_symlinks=False) and entry.stat().st_mtime < cutoff:
+                os.unlink(entry.path)
+    except OSError:
+        pass
+    return _write_private_text(d / key, json.dumps(
+        {"cid": cid, "agent_id": (agent_id or "").strip(), "ts": time.time()}))
+
+
+def tool_caller(tool_use_id: str, cid: str | None) -> str | None:
+    """The agent that issued `tool_use_id`: its agent id for a subagent, '' for
+    the main thread, or None when it is NOT KNOWN (no record, an expired or
+    malformed one, or one written for another client id). Unknown is never
+    read as 'main thread'."""
+    key = _tool_use_key(tool_use_id)
+    cid = (cid or "").strip()
+    if not key or not cid:
+        return None
+    d = _private_dir(TOOL_CALLER_DIR_NAME, create=False)
+    if d is None:
+        return None
+    path = d / key
+    raw = _read_private_text(path)
+    if raw is None:
+        return None
+    try:
+        if time.time() - path.stat().st_mtime > TOOL_CALLER_TTL_S:
+            return None
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or data.get("cid") != cid:
+        return None
+    agent = data.get("agent_id")
+    if not isinstance(agent, str):
+        return None
+    agent = agent.strip()
+    if agent and not _SAFE_CLIENT_KEY.fullmatch(agent):
+        return None
+    return agent
+
+
+def open_capability_sessions(cid: str | None = None) -> set[str]:
+    """Sessions this client's keyring holds as OPEN (its own, not completed or
+    revoked). set() when the keyring is missing or unreadable."""
+    cid = (cid or claude_session_id() or "").strip()
+    if not cid:
+        return set()
+    try:
+        entries = _read_store(capability_store_path(cid), cid)
+    except CapabilityStoreError:
+        return set()
+    return {sid for sid, e in entries.items() if e["state"] == CAP_OPEN}
+
+
 def resolve_pointer(cid: str | None = None, allow_global: bool = True) -> str | None:
     """Resolve THIS session's ATS session id. See module docstring for order.
 

@@ -47,13 +47,22 @@ verdict**. A process that borrows the lock holder's id would pass the guard.
 The Bash guard and both git hooks share one resolver,
 `commit_guard.resolve_identity`:
 
+0. Inside a Claude Code **subagent** the hook payload carries `agent_id`
+   (#3677). When that subagent's `start_session` recorded its own session
+   (`<state>/.ats_agent_pointers/<client id>/<agent id>`), **that agent pointer
+   wins** for the edit guard and the Bash guard: the per-client pointer is the
+   parent's. Git hooks get no `agent_id` (the Bash tool's environment does not
+   name the subagent), so they resolve through rule 1.
 1. If a Claude session id is known, and that session's per-session pointer
-   `~/.ats_session_<cid8>` exists, **the pointer wins**. The id comes from the
-   hook payload, or else from `$CLAUDE_CODE_SESSION_ID` or the live-cid record.
-   The Claude Bash tool's environment carries that variable, so a `git commit`
-   run by an agent resolves to the agent's own pointer. A different
-   `$ATS_SESSION_ID` is a **conflict**. The guard refuses and names both ids:
-   the git hooks exit 1 and the Bash guard exits 2.
+   `~/.ats_session_<client id>` exists, **the pointer wins**. The id comes from
+   the hook payload, or else from `$CLAUDE_CODE_SESSION_ID` or the live-cid
+   record. The Claude Bash tool's environment carries that variable, so a
+   `git commit` run by an agent resolves to its Claude session's pointer. A
+   different `$ATS_SESSION_ID` is a **conflict** -- the guard refuses and names
+   both ids (git hooks exit 1, the Bash guard exits 2) -- unless it names a
+   session this same Claude session's keyring holds **open** (`env_held`,
+   #3677). That lets a subagent say which of its Claude session's own sessions
+   is committing; it is self-asserted and validated like rule 2.
 2. Otherwise `$ATS_SESSION_ID` is used, then a delegated child's capability
    file. Both are *self-asserted*. They are trusted only after ATS confirms two
    things:
@@ -71,8 +80,16 @@ The Bash guard and both git hooks share one resolver,
 3. The shared `~/.ats_session` file is never used, because it names whichever
    session on the machine wrote it last.
 
-A session's own locks never refuse its own commit. An approved override clears
-only the lock it was granted for.
+A session's own locks never refuse its own commit. Nor do the locks of its
+**siblings** (#3593's edit-guard rule, applied to the git hooks and the Bash
+guard by #3677): ACTIVE sessions whose label is exactly `claude-code:<cid8>` of
+this Claude session AND whose own capability this Claude session's private
+keyring holds -- the Claude session itself, its subagents and its other
+sessions. They share one Claude session id and one Bash environment, so a git
+hook cannot tell which of them is committing; a same-label row whose
+capability is not held (forged, or another client's) is still another
+session's. The old cid8-substring match on agent text (#2893) is gone. An
+approved override clears only the lock it was granted for.
 
 **What this does not establish.** Every source above is a value that a process
 of the same OS account can set. Identity is cooperative:
@@ -95,8 +112,9 @@ of the same OS account can set. Identity is cooperative:
   Bash guards. It is judged as unidentified. Only self-asserted identities are
   refused on failure.
 - The edit guard (`pre_tool_use_lockcheck.py`) resolves identity the same way
-  (`commit_guard.resolve_identity`): the pointer wins, a contradicting
-  `$ATS_SESSION_ID` is refused (exit 2), and a self-asserted identity is
+  (`commit_guard.resolve_identity`, with the payload's `agent_id`): the agent or
+  client pointer wins, a contradicting `$ATS_SESSION_ID` that is not an open
+  session of this Claude session is refused (exit 2), and a self-asserted identity is
   validated with `identity_problem`. Failing validation refuses the edit in a
   governed repository and is judged unidentified elsewhere. It does not
   validate pointer-backed identities (unchanged).

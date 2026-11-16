@@ -152,6 +152,11 @@ _IN_PROCESS_STATE: dict[str, str] = {}
 # The relationship is explicit registration context, never inferred from the
 # Claude session id every subagent of one Claude session shares.
 _IN_PROCESS_PARENT: dict[str, str] = {}
+# Sessions a Claude Code SUBAGENT opened (#3677): session -> the subagent's
+# agent id, as the ATS PreToolUse hook recorded it for that start_session call.
+# Such a session is the subagent's own default (its agent pointer), never this
+# process's default and never chosen as the next one.
+_IN_PROCESS_AGENT: dict[str, str] = {}
 # Why the last capability lookup for a session came back empty, for refusals
 # that say WHY instead of a bare "missing".
 _CAPABILITY_PROBLEMS: dict[str, str] = {}
@@ -186,6 +191,11 @@ def _parents() -> dict[str, str]:
     return bound.parents if bound is not None else _IN_PROCESS_PARENT
 
 
+def _agent_sessions() -> dict[str, str]:
+    bound = caller_ctx.bound_caller()
+    return bound.agent_sessions if bound is not None else _IN_PROCESS_AGENT
+
+
 def _capability_problems() -> dict[str, str]:
     bound = caller_ctx.bound_caller()
     return (bound.capability_problems if bound is not None
@@ -196,6 +206,39 @@ def _client_id() -> str | None:
     bound = caller_ctx.bound_caller()
     return bound.client_id if bound is not None else None
 
+
+def _caller_agent() -> str | None:
+    """Which agent of this client issued the current call (#3677): a Claude
+    Code subagent id, '' for the main thread, None when not known. Known only
+    when the ATS PreToolUse hook recorded this call's tool_use_id."""
+    return caller_ctx.tool_caller()
+
+
+def _caller_agent_session() -> str | None:
+    """The session the CALLING SUBAGENT started (its agent pointer), or None.
+
+    Only a session whose capability entry this caller context or this client's
+    keyring holds -- in any state, so a subagent whose own session completed
+    keeps acting as that completed session (and is refused there) instead of
+    silently falling back to its parent's session. None for the main thread and
+    for an unknown caller: they keep the process default."""
+    agent = _caller_agent()
+    if not agent:
+        return None
+    from ai_team_sync import session_pointer as sp
+    cid = _client_id() or sp.claude_session_id()
+    sid = sp.read_agent_pointer(cid, agent)
+    if not sid:
+        return None
+    if sid in _tokens() or sid in _states():
+        return sid
+    try:
+        if sid in sp.capability_entries(cid):
+            return sid
+    except sp.CapabilityStoreError:
+        pass
+    return None
+
 # Tools whose `session_id` argument selects which of this process's own
 # sessions acts. complete_session has its own targeting (session_target).
 _IN_PROCESS_TARGETING_TOOLS = frozenset({
@@ -205,24 +248,30 @@ _IN_PROCESS_TARGETING_TOOLS = frozenset({
 
 
 def _remember_in_process(session_id: str, token: str, *, make_default: bool = True,
-                         parent: str | None = None) -> None:
+                         parent: str | None = None, agent: str | None = None) -> None:
     """Record a session this process opened; by default make it the default
     target. A registered subagent (make_default=False) is added BESIDE the
-    default and never replaces it. Bounded like the keyring: past the cap the
-    oldest NON-open session is dropped; an open one never is (the map grows)."""
+    default and never replaces it. A session a Claude Code subagent opened
+    (`agent`, #3677) never becomes the default, not even when there is none.
+    Bounded like the keyring: past the cap the oldest NON-open session is
+    dropped; an open one never is (the map grows)."""
     from ai_team_sync.session_pointer import APPROVAL_TOKEN_MAX
 
     tokens, states, parents = _tokens(), _states(), _parents()
+    agents = _agent_sessions()
     problems = _capability_problems()
     tokens.pop(session_id, None)
     states.pop(session_id, None)
     parents.pop(session_id, None)
+    agents.pop(session_id, None)
     problems.pop(session_id, None)
     if token:
         tokens[session_id] = token
     if parent:
         parents[session_id] = parent
-    if make_default or not _default_session_id():
+    if agent:
+        agents[session_id] = agent
+    if make_default or (not agent and not _default_session_id()):
         _set_default_session_id(session_id)
     while len(tokens) > APPROVAL_TOKEN_MAX:
         victim = next((sid for sid in tokens
@@ -232,6 +281,7 @@ def _remember_in_process(session_id: str, token: str, *, make_default: bool = Tr
         tokens.pop(victim, None)
         states.pop(victim, None)
         parents.pop(victim, None)
+        agents.pop(victim, None)
 
 
 def _record_capability_state(session_id: str, state: str) -> str | None:
@@ -257,11 +307,13 @@ def _retire_in_process(session_id: str) -> str | None:
     ever acts when named; with none the default is left as it was, exactly as
     before #3593. Returns the default afterwards."""
     states, tokens, parents = _states(), _tokens(), _parents()
+    agents = _agent_sessions()
     if states.get(session_id) != "revoked":
         states[session_id] = "completed"
     if _default_session_id() == session_id:
         still_open = [sid for sid in tokens
-                      if sid not in states and sid not in parents]
+                      if sid not in states and sid not in parents
+                      and sid not in agents]
         if still_open:
             _set_default_session_id(still_open[-1])
     return _default_session_id()
@@ -330,6 +382,13 @@ def resolve_identity() -> tuple[str | None, str]:
     no pointer file we can see did not come from shared state, so it is
     'explicit' — a caller handed it to us directly.
     """
+    # A Claude Code subagent acts as the session IT started (#3677), never as
+    # its parent's default by omission. Main thread and unknown callers keep
+    # the process default below, exactly as before.
+    own = _caller_agent_session()
+    if own:
+        return own, ("in_process" if own in _tokens() else "keyring")
+
     current = _default_session_id()
     if current:
         return current, "in_process"
@@ -1416,10 +1475,24 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     except caller_ctx.CallerContextError as exc:
         return [TextContent(type="text", text=f"❌ {exc}")]
 
+    # Which agent of this client issued the call (#3677). Bound only when the
+    # request yields an answer, so an outer binding (tests, internal callers)
+    # is never replaced by "unknown".
+    try:
+        agent = caller_ctx.tool_caller_for_request(mcp_server, context)
+    except Exception:  # noqa: BLE001 — unknown caller is the pre-#3677 behaviour
+        agent = None
+
     if context is None:
-        return await _call_tool_with_nudges(name, arguments)
+        if agent is None:
+            return await _call_tool_with_nudges(name, arguments)
+        with caller_ctx.bind_tool_caller(agent):
+            return await _call_tool_with_nudges(name, arguments)
     with caller_ctx.bind_caller(context):
-        return await _call_tool_with_nudges(name, arguments)
+        if agent is None:
+            return await _call_tool_with_nudges(name, arguments)
+        with caller_ctx.bind_tool_caller(agent):
+            return await _call_tool_with_nudges(name, arguments)
 
 
 async def _call_tool_with_nudges(
@@ -1727,14 +1800,45 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                             f"❌ Subagent session not started: parent {parent_sid} is "
                             f"{pstatus or 'not readable on the server'}, not open."))]
 
+                from ai_team_sync import session_pointer as sp
+                live_cid = _client_id() or sp.claude_session_id()
+
+                # A CLAUDE CODE SUBAGENT (#3677). Every subagent shares this
+                # client's id, pointer and MCP process, so without this a
+                # subagent's start_session took the pointer and the default
+                # from its parent (and could claim the parent's SessionStart
+                # placeholder). Which agent is calling comes from Claude Code
+                # itself: the PreToolUse hook recorded this call's tool_use_id
+                # with the payload's agent_id. A subagent's session is its OWN
+                # default (its agent pointer); the client pointer, the process
+                # default and any placeholder stay the parent's. Without
+                # parent_session_id it is linked to the process default when
+                # that is an open session this client holds.
+                caller_agent = _caller_agent() or ""
+                implicit_parent = ""
+                if caller_agent and not parent_sid:
+                    candidate = (_default_session_id()
+                                 or (sp.resolve_pointer(cid=live_cid, allow_global=False)
+                                     if live_cid else None))
+                    if candidate and not _states().get(candidate) \
+                            and _holds_capability(candidate):
+                        try:
+                            crow = await client.get(f"{SERVER_URL}/api/sessions/{candidate}")
+                            cstatus = (crow.json().get("status")
+                                       if crow.status_code == 200 else None)
+                        except Exception:  # noqa: BLE001 — unknown: no link, no refusal
+                            cstatus = None
+                        if cstatus in ("active", "paused"):
+                            implicit_parent = candidate
+                as_subagent = bool(parent_sid or caller_agent)
+                link_parent = parent_sid or implicit_parent
+
                 # SessionStart may already have registered a placeholder for
                 # this exact client id. Capture its capability for adoption
                 # below. A session capability authorizes only its own row.
-                from ai_team_sync import session_pointer as sp
-                live_cid = _client_id() or sp.claude_session_id()
                 placeholder_session_id = (
                     sp.resolve_pointer(cid=live_cid, allow_global=False)
-                    if live_cid and not parent_sid else None)
+                    if live_cid and not as_subagent else None)
                 try:
                     placeholder_approval_token = (
                         sp.load_approval_token(placeholder_session_id, cid=live_cid)
@@ -1755,8 +1859,10 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         # Unknown is handled as an attempted lifecycle claim,
                         # never as permission to mint a silent sibling.
                         placeholder_is_autoreg = True
-                if parent_sid:
-                    description = f"{description} [subagent of session {parent_sid}]"
+                if link_parent:
+                    description = f"{description} [subagent of session {link_parent}]"
+                elif caller_agent:
+                    description = f"{description} [Claude Code subagent]"
 
                 response = await client.post(
                     f"{SERVER_URL}/api/sessions",
@@ -1771,10 +1877,10 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                         "ticket_role": arguments.get("ticket_role") or None,
                         "auto_lock": True,
                         "lock_mode": "exclusive" if exclusive else "advisory",
-                        "lifecycle_key": (live_cid if not parent_sid
+                        "lifecycle_key": (live_cid if not as_subagent
                                           and (not placeholder_session_id
                                                or placeholder_is_autoreg) else None),
-                        "adopt_session_id": (placeholder_session_id if not parent_sid
+                        "adopt_session_id": (placeholder_session_id if not as_subagent
                                              and placeholder_is_autoreg else None),
                         # Forwarded exactly as given ({} stays {}), and only when
                         # given: MCP and the API judge one admission contract.
@@ -1782,7 +1888,7 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                            if "admission" in arguments else {}),
                     },
                     headers={"X-ATS-Approval-Token": placeholder_approval_token}
-                    if placeholder_approval_token and not parent_sid
+                    if placeholder_approval_token and not as_subagent
                     and placeholder_is_autoreg else {},
                 )
 
@@ -1830,15 +1936,18 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # ADDED beside any session this process already holds, never in
                 # place of it (#3593). A subagent never takes the default or
                 # the pointer: those stay its parent's.
-                if not parent_sid:
+                if not as_subagent:
                     save_session_id(data["id"])
-                _remember_in_process(data["id"], new_token, make_default=not parent_sid,
-                                     parent=parent_sid or None)
+                _remember_in_process(data["id"], new_token, make_default=not as_subagent,
+                                     parent=link_parent or None,
+                                     agent=caller_agent or None)
+                agent_pointer_saved = bool(caller_agent) and sp.save_agent_pointer(
+                    data["id"], live_cid or "", caller_agent)
                 keyring_warning = ""
                 try:
                     sp.save_approval_token(data["id"], new_token,
                                            cid=live_cid,
-                                           parent_session_id=parent_sid or None)
+                                           parent_session_id=link_parent or None)
                 except sp.CapabilityStoreError as exc:
                     keyring_warning = (
                         f"capability NOT saved to this client's keyring ({exc}); this MCP "
@@ -1852,7 +1961,19 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 if keyring_warning:
                     msg += f"⚠️ {keyring_warning}; session start continued.\n"
                 msg += f"Session ID: {data['id']}\n"
-                if parent_sid:
+                if caller_agent:
+                    msg += (f"Registered as THIS SUBAGENT's own session (Claude Code agent "
+                            f"{caller_agent}"
+                            + (f", subagent of session {link_parent}" if link_parent else "")
+                            + "): this Claude session's pointer and default session are "
+                            "unchanged. ")
+                    if agent_pointer_saved:
+                        msg += ("This subagent's ATS calls without session_id, and its "
+                                "Edit/Write/Bash guards, now act as this session.\n")
+                    else:
+                        msg += ("Its agent pointer could NOT be saved, so name "
+                                f"session_id={data['id']} on every call made as it.\n")
+                elif parent_sid:
                     msg += (f"Registered as a SUBAGENT of session {parent_sid}: the parent "
                             f"stays this process's default session and keeps the pointer. "
                             f"Name session_id={data['id']} on every call made as this "
@@ -2663,6 +2784,9 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 # 2026-09-11 wrong-session completion.
                 pointer_id, pointer_source = resolve_identity()
                 default_pointer_id = pointer_id
+                # A subagent's own session (#3677): completing it never clears
+                # or moves the Claude session's pointer, which is its parent's.
+                agent_own_session = _caller_agent_session()
                 # This process's in-process identity is the SET of sessions it
                 # opened (#3593). Naming one of them is not a disagreement with
                 # another of them -- no guessing is involved -- so it is that
@@ -2799,7 +2923,14 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
 
                 # Only drop the pointer when it was OUR session; clearing it after
                 # completing some other row would strand this process's own id.
-                if not explicit_id or explicit_id == default_pointer_id:
+                # A subagent completing the session it started leaves both the
+                # client pointer (its parent's) and its own agent pointer alone:
+                # the agent pointer keeps naming the completed row, so a later
+                # call from that subagent is refused there instead of silently
+                # acting as the parent's session (#3677).
+                if agent_own_session and target.session_id == agent_own_session:
+                    pass
+                elif not explicit_id or explicit_id == default_pointer_id:
                     clear_session_id()
                     # Another session this process opened is still live: it is
                     # now the default, so point this client's pointer at it

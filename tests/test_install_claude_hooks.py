@@ -144,3 +144,38 @@ def test_installer_moves_startup_only_echo_behind_ats(tmp_path):
     assert all("echo-ambient.py" not in command for command in start_commands)
     assert "--supplement-command" in prompt_commands[0]
     assert "echo-ambient.py --mode hook" in prompt_commands[0]
+
+
+def test_installer_adds_the_ats_caller_hook_for_ats_mcp_tools_idempotently(tmp_path):
+    """#3677: the MCP server learns which agent (main thread or a Claude Code
+    subagent) issues each ATS call from this PreToolUse hook. Existing
+    PreToolUse groups (the edit and Bash guards, other matchers) are kept."""
+    module = _module()
+    settings = tmp_path / "settings.json"
+    existing = [
+        {"matcher": "Bash|mcp__.*", "hooks": [{"type": "command", "command": "gate.sh"}]},
+        {"matcher": "Edit|Write", "hooks": [{
+            "type": "command",
+            "command": "/opt/ats/bin/python -m ai_team_sync.hooks.pre_tool_use_lockcheck"}]},
+        # A stale copy under another matcher is moved, not duplicated.
+        {"matcher": "mcp__.*", "hooks": [{
+            "type": "command",
+            "command": "/old/bin/python -m ai_team_sync.hooks.pre_tool_use_ats_caller"}]},
+    ]
+    settings.write_text(json.dumps({"hooks": {"PreToolUse": existing}}))
+
+    module.install(settings, "/opt/ats/bin/python")
+    first = settings.read_text()
+    module.install(settings, "/opt/ats/bin/python")
+    assert settings.read_text() == first
+
+    groups = json.loads(first)["hooks"]["PreToolUse"]
+    callers = [(g.get("matcher"), h) for g in groups for h in g.get("hooks", [])
+               if "pre_tool_use_ats_caller" in h.get("command", "")]
+    assert callers == [("mcp__ai-team-sync__.*", {
+        "type": "command",
+        "command": "/opt/ats/bin/python -m ai_team_sync.hooks.pre_tool_use_ats_caller",
+        "timeout": 5})]
+    assert "onFailure" not in callers[0][1]          # it must never block a call
+    assert groups[0] == existing[0] and groups[1] == existing[1]
+    assert all(g.get("matcher") != "mcp__.*" for g in groups)

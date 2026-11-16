@@ -1223,8 +1223,10 @@ class Decision:
     residual: list[str] = field(default_factory=list)   # unresolved constructs -> stderr
 
 
-def decide(command: str, cwd: str | None, claude_sid: str) -> Decision:
-    """The verdict for one Bash command."""
+def decide(command: str, cwd: str | None, claude_sid: str,
+           agent_id: str = "") -> Decision:
+    """The verdict for one Bash command. `agent_id` is the hook payload's
+    Claude Code subagent id ('' on the main thread, #3677)."""
     from ai_team_sync.hooks import commit_guard as cg
     from ai_team_sync.hooks.pre_tool_use_lockcheck import claim_check
     from ai_team_sync.operator_config import OperatorConfigError
@@ -1240,7 +1242,7 @@ def decide(command: str, cwd: str | None, claude_sid: str) -> Decision:
     # Same resolution as the git hooks (#3581 review finding 1): this Claude
     # session's pointer wins; a contradicting $ATS_SESSION_ID is refused; an
     # env-only identity is trusted only once ATS confirms it (identity_problem).
-    ident = cg.resolve_identity(claude_sid or None)
+    ident = cg.resolve_identity(claude_sid or None, agent_id or None)
     if ident.conflict:
         result.code = 2
         result.blocks.append(f"ATS BASH GUARD: {ident.conflict}")
@@ -1251,6 +1253,20 @@ def decide(command: str, cwd: str | None, claude_sid: str) -> Decision:
     cid8 = (claude_sid or "")[:8]
     blocks: list[str] = []
     claim_ctx: tuple[list, list] | None = None
+    # This Claude session's own sessions -- its subagents and its other
+    # sessions (#3593 rule, #3677): their locks are not another session's,
+    # exactly as in the edit guard. Exact label + capability held, never a
+    # label substring (#2893). A failed read only withholds the exemption.
+    from ai_team_sync.hooks.pre_tool_use_lockcheck import canonical_sibling_label
+
+    sibling_label, held, siblings = "", set(), set()
+    if canonical_sibling_label(claude_sid):
+        try:
+            claim_ctx = _fetch_sessions_and_locks()
+            sibling_label, held, siblings = cg.held_siblings(claude_sid, None, claim_ctx[0])
+        except Exception:  # noqa: BLE001 — no proven sibling, no exemption
+            claim_ctx = None
+            sibling_label, held, siblings = "", set(), set()
     block_locks = os.environ.get("ATS_LOCKCHECK_BLOCK", "2") != "0"
     block_claims = os.environ.get("ATS_CLAIMCHECK", "1") != "0"
 
@@ -1285,7 +1301,7 @@ def decide(command: str, cwd: str | None, claude_sid: str) -> Decision:
                     f"not be asked ({exc}). Failing closed.")
             continue
         eff_sid = None if problem else my_sid
-        holders = cg.foreign_holders(results, eff_sid, cid8)
+        holders = cg.foreign_holders(results, eff_sid, siblings)
         by_path = {}
         for h in holders:
             by_path.setdefault(h.path, []).append(h)
@@ -1315,7 +1331,9 @@ def decide(command: str, cwd: str | None, claude_sid: str) -> Decision:
                         continue
                 sessions, locks = claim_ctx
                 for rel in direct:
-                    ok, reason = claim_check(rel, root, eff_sid, cid8, sessions, locks)
+                    ok, reason = claim_check(rel, root, eff_sid, cid8, sessions, locks,
+                                             sibling_label=sibling_label,
+                                             held_session_ids=held)
                     if not ok:
                         (blocks if block_claims else warnings).append(
                             f"ATS CLAIM GUARD (bash `{origin.get(rel)}`): {reason}")
@@ -1336,7 +1354,9 @@ def main() -> None:
         sys.exit(0)
     cwd = payload.get("cwd") or os.getcwd()
     try:
-        d = decide(command, cwd, str(payload.get("session_id") or ""))
+        agent_id = payload.get("agent_id")
+        d = decide(command, cwd, str(payload.get("session_id") or ""),
+                   agent_id if isinstance(agent_id, str) else "")
     except Exception as exc:  # a parser bug must not wedge every shell command
         print(f"ATS BASH GUARD: internal error, command NOT checked: "
               f"{type(exc).__name__}: {exc}", file=sys.stderr)

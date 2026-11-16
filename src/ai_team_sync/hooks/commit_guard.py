@@ -103,17 +103,19 @@ class Identity:
     OS account) can set. See docs/commit-guard.md, "Identity"."""
 
     session_id: str | None
-    source: str              # per_session | env | delegated | none
+    # agent | per_session | env_held | env | delegated | none
+    source: str
     conflict: str = ""       # non-empty: $ATS_SESSION_ID contradicts the pointer
 
     @property
     def self_asserted(self) -> bool:
         """An identity that came only from the environment / a capability file,
-        with no per-Claude-session pointer behind it."""
-        return self.source in ("env", "delegated")
+        with no pointer behind it, so the caller validates it with
+        identity_problem() before trusting it."""
+        return self.source in ("env", "delegated", "env_held")
 
 
-def resolve_identity(cid: str | None = None) -> Identity:
+def resolve_identity(cid: str | None = None, agent_id: str | None = None) -> Identity:
     """The acting ATS session, local sources only (#3581 review finding 1).
 
     An identity REMOVES that session's locks from the verdict, so a process
@@ -121,10 +123,17 @@ def resolve_identity(cid: str | None = None) -> Identity:
     pass. Order therefore differs from session_pointer.resolve_pointer, where
     $ATS_SESSION_ID always wins:
 
+    0. Inside a Claude Code SUBAGENT (`agent_id`, from the hook payload) whose
+       start_session recorded its own session, that agent pointer wins
+       (#3677): the per-client pointer is the parent's.
     1. When a Claude session id is known (the hook payload's, else
        $CLAUDE_CODE_SESSION_ID / the live-cid record) and its per-session
        pointer ~/.ats_session_<client id> exists, the POINTER wins. A different
-       $ATS_SESSION_ID is a conflict: the caller refuses and names both.
+       $ATS_SESSION_ID is a conflict -- the caller refuses and names both --
+       UNLESS it names a session this same Claude session's own keyring holds
+       OPEN (`env_held`, #3677): a git hook cannot tell which subagent of the
+       Claude session is committing, so a subagent may say which of the Claude
+       session's own sessions it is. Self-asserted, so still validated.
     2. Otherwise $ATS_SESSION_ID, then a delegated child's capability file --
        both self-asserted, so the caller must validate them with
        identity_problem() before trusting them.
@@ -135,17 +144,36 @@ def resolve_identity(cid: str | None = None) -> Identity:
 
     env = (os.environ.get("ATS_SESSION_ID") or "").strip()
     cid = (cid or sp.claude_session_id() or "").strip()
+    agent = (agent_id or "").strip()
     if cid:
-        # Full-id pointer, or a pre-#3593-r2 eight-character one (read only).
-        pointer = sp.read_session_pointer(cid) or ""
+        pointer, source, whose = "", "", ""
+        if agent:
+            pointer = sp.read_agent_pointer(cid, agent) or ""
+            # Stricter than the per-client pointer: an agent pointer counts
+            # only when it names a session whose own capability this Claude
+            # session's keyring holds, so a stray or planted file can never
+            # make another client's session "mine".
+            try:
+                if pointer and pointer not in sp.held_capability_sessions(cid):
+                    pointer = ""
+            except Exception:  # noqa: BLE001 — unreadable keyring: not proven
+                pointer = ""
+            source, whose = "agent", f"this subagent's own ATS pointer ({cid[:8]}/{agent}"
+        if not pointer:
+            # Full-id pointer, or a pre-#3593-r2 eight-character one (read only).
+            pointer = sp.read_session_pointer(cid) or ""
+            source, whose = "per_session", f"this Claude session's own ATS pointer ({cid[:8]}"
         if pointer:
             conflict = ""
             if env and env != pointer:
-                conflict = (f"$ATS_SESSION_ID={env} contradicts this Claude session's own "
-                            f"ATS pointer ({cid[:8]} -> {pointer}). An inherited or "
-                            f"borrowed session id would remove that session's locks from "
-                            f"the verdict; unset ATS_SESSION_ID or fix the pointer.")
-            return Identity(pointer, "per_session", conflict)
+                if env in sp.open_capability_sessions(cid):
+                    return Identity(env, "env_held")
+                conflict = (f"$ATS_SESSION_ID={env} contradicts {whose} -> {pointer}), and "
+                            f"it is not a session this Claude session's keyring holds open. "
+                            f"An inherited or borrowed session id would remove that "
+                            f"session's locks from the verdict; unset ATS_SESSION_ID or "
+                            f"fix the pointer.")
+            return Identity(pointer, source, conflict)
     if env:
         return Identity(env, "env")
     delegated = sp.load_delegated_capability()
@@ -261,14 +289,17 @@ class Verdict:
 
 
 def foreign_holders(results: list[dict], my_session_id: str | None,
-                    my_agent_hint: str = "") -> list[Holder]:
+                    sibling_ids: set[str] | None = None) -> list[Holder]:
     """Every OTHER session's lock in a /api/locks/check answer.
 
     Own locks are recognised by the server (is_own, which it grants only to a
-    session the requesting OS account owns) or by exact session id. When no
-    session id is known, `my_agent_hint` (a Claude session's cid8) is the same
-    legacy label fallback the edit guard's find_conflicts uses. Locks with an
-    approved override for this caller are not foreign obstacles."""
+    session the requesting OS account owns) or by exact session id. A lock held
+    by a SIBLING (sibling_ids: this Claude session's own sessions, see
+    held_siblings) is not another session's either -- the edit guard's #3593
+    rule. Agent label text is never matched by containment (#2893): the old
+    cid8-substring fallback is gone. Locks with an approved override for this
+    caller are not foreign obstacles."""
+    siblings = sibling_ids or set()
     out: list[Holder] = []
     for result in results:
         path = str(result.get("path", ""))
@@ -276,7 +307,7 @@ def foreign_holders(results: list[dict], my_session_id: str | None,
             sid = str(match.get("session_id", ""))
             if match.get("is_own") or (my_session_id and sid == my_session_id):
                 continue
-            if not my_session_id and my_agent_hint and my_agent_hint in str(match.get("agent", "")):
+            if sid and sid in siblings:
                 continue
             if match.get("override_granted"):
                 continue
@@ -287,12 +318,56 @@ def foreign_holders(results: list[dict], my_session_id: str | None,
     return out
 
 
+def held_siblings(cid: str | None, my_session_id: str | None,
+                  sessions: list) -> tuple[str, set[str], set[str]]:
+    """(sibling label, held, sibling ids) for this Claude session (#3593/#3677).
+
+    A sibling is an ACTIVE session whose label is exactly 'claude-code:<cid8>'
+    AND whose own capability this Claude session's private keyring holds: the
+    Claude session itself, its registered subagents, and its other sessions.
+    Every subagent shares the Claude session's id and the git hook's
+    environment, so a commit guard cannot tell which of them is committing; a
+    lock one of them holds is therefore never "another session's" to it -- the
+    same rule the edit guard applies. ('', set(), set()) when no usable Claude
+    session id is known (a human's shell), inside a delegated child, or when
+    the keyring is unreadable (no proven sibling, no exemption)."""
+    from ai_team_sync import session_pointer as sp
+    from ai_team_sync.hooks.pre_tool_use_lockcheck import (canonical_sibling_label,
+                                                           sibling_session_ids)
+
+    cid = (cid or "").strip()
+    label = canonical_sibling_label(cid)
+    if not label:
+        return "", set(), set()
+    try:
+        held = sp.held_capability_sessions(cid)
+    except Exception:  # noqa: BLE001 — unreadable keyring: no sibling is trusted
+        return label, set(), set()
+    return label, held, sibling_session_ids(sessions, label, my_session_id) & held
+
+
+def fetch_sessions(timeout: float = 5.0) -> list:
+    """GET /api/sessions. Raises GuardUnavailable on any read failure."""
+    try:
+        import httpx
+
+        with httpx.Client(timeout=timeout) as client:
+            s = client.get(f"{server_url()}/api/sessions")
+            s.raise_for_status()
+            sessions = s.json()
+    except Exception as exc:  # transport, HTTP status, JSON
+        raise GuardUnavailable(f"{type(exc).__name__}: {exc}") from exc
+    return sessions if isinstance(sessions, list) else sessions.get("sessions", [])
+
+
 def own_claim_gaps(paths: list[str], repo_root: str, session_id: str,
-                   timeout: float = 5.0) -> list[tuple[str, str]]:
+                   timeout: float = 5.0, *, sibling_label: str = "",
+                   held_session_ids: set[str] | None = None) -> list[tuple[str, str]]:
     """(path, reason) for each path `session_id` holds no live lock on.
 
     The same decision the edit guard makes (claim_check over GET /api/sessions
-    and GET /api/locks). Raises GuardUnavailable on any read failure."""
+    and GET /api/locks), including its sibling rule when `sibling_label` and
+    `held_session_ids` are given. Raises GuardUnavailable on any read failure."""
     from ai_team_sync.hooks.pre_tool_use_lockcheck import claim_check
 
     try:
@@ -310,7 +385,9 @@ def own_claim_gaps(paths: list[str], repo_root: str, session_id: str,
     locks = locks if isinstance(locks, list) else locks.get("locks", [])
     gaps = []
     for path in paths:
-        ok, reason = claim_check(path, repo_root, session_id, "", sessions, locks)
+        ok, reason = claim_check(path, repo_root, session_id, "", sessions, locks,
+                                 sibling_label=sibling_label,
+                                 held_session_ids=held_session_ids)
         if not ok:
             gaps.append((path, reason))
     return gaps
@@ -433,8 +510,36 @@ def run_git_guard(hook: str, paths: list[str], cwd: str | None = None) -> int:
              f"`git commit --no-verify` (unaudited).")
         return 1
 
-    holders = foreign_holders(results, sid)
+    # This Claude session's own sessions (#3593 rule, extended here by #3677):
+    # its subagents share its id and this hook's environment, so the commit
+    # guard cannot tell which of them commits. A lock one of them holds is
+    # not another session's, exactly as in the edit guard. A failed read only
+    # withholds the exemption (stricter), it never grants anything.
+    from ai_team_sync import session_pointer as sp
+
+    sibling_label, held, siblings = "", set(), set()
+    cid = (sp.claude_session_id() or "").strip()
+    if cid:
+        try:
+            sibling_label, held, siblings = held_siblings(cid, None, fetch_sessions())
+        except GuardUnavailable:
+            sibling_label, held, siblings = "", set(), set()
+
+    holders = foreign_holders(results, sid, siblings)
     v = verdict(holders, governed_repo=is_governed, identified=bool(sid))
+    # Visible, never blocking: which of these paths another session of this
+    # same Claude session holds (a parallel subagent, the parent).
+    sibling_lines = sorted({
+        f"  {r.get('path')} -- {m.get('mode')} lock '{m.get('pattern')}' held by "
+        f"{m.get('agent')} (session {m.get('session_id')})"
+        for r in results for m in (r.get("matches") or [])
+        if str(m.get("session_id", "")) in siblings
+        and str(m.get("session_id", "")) != (sid or "") and not m.get("is_own")})
+    if sibling_lines:
+        _err(f"{TAG} note ({hook}): these paths are held by another session of this "
+             f"same Claude session; not another session's lock, not blocking:")
+        for line in sibling_lines:
+            _err(line)
     if override:
         return _override(hook, override, root, paths, sid, v.blocking)
 
@@ -445,7 +550,8 @@ def run_git_guard(hook: str, paths: list[str], cwd: str | None = None) -> int:
             _err(h.line())
     if v.ok and is_governed and sid:
         try:
-            gaps = own_claim_gaps(paths, root, sid)
+            gaps = own_claim_gaps(paths, root, sid, sibling_label=sibling_label,
+                                  held_session_ids=held)
         except GuardUnavailable as exc:
             _err(f"\n{TAG} REFUSED ({hook}): could not read ATS sessions/locks to check "
                  f"session {sid}'s own claim in {root} ({exc}). This guard fails closed.")
