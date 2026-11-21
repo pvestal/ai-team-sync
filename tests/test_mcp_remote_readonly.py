@@ -522,12 +522,20 @@ async def test_refusal_is_logged_without_the_credential(upstream, caplog, auth, 
     assert f"auth_headers={0 if auth is None else 1}" in line
     assert f"scheme={scheme} " in line
     assert f"credential_len={cred_len} expected_len={len(HEX)}" in line
-    assert "xff=160.79.104.7" in line and "funnel=yes" in line
+    assert "xff=anthropic " in line and "funnel=yes" in line
     assert line.startswith("401 POST /mcp ")
 
 
+def _secret_groups_valid_ipv6(secret):
+    """A VALID IPv6 address built from the secret's hex (review r2 probe)."""
+    return ":".join(secret[i:i + 4] for i in range(0, 32, 4))
+
+
 @pytest.mark.parametrize("xff", [HEX, f"1.2.3.4, {HEX}", f"::1%{HEX}", f"{HEX[:4]}::{HEX[4:8]}x",
-                                 "1.2.3.4\nWARNING:ats_remote_mcp.auth:forged", "9" * 500])
+                                 "1.2.3.4\nWARNING:ats_remote_mcp.auth:forged", "9" * 500,
+                                 _secret_groups_valid_ipv6(HEX),
+                                 f"::ffff:{HEX[:4]}:{HEX[4:8]}",
+                                 f"1.2.3.4, {_secret_groups_valid_ipv6(HEX)}"])
 async def test_forwarded_header_never_echoes_client_text(caplog, xff):
     caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
     status = await _raw(rr.build_app(HEX), "POST", "/mcp", [("X-Forwarded-For", xff)])
@@ -536,7 +544,19 @@ async def test_forwarded_header_never_echoes_client_text(caplog, xff):
     _assert_no_secret(line)
     assert "\n" not in line and "forged" not in line and len(line) < 300
     xff_field = line.split("xff=")[1].split(" ")[0]
-    assert set(xff_field.split(",")) <= {"<invalid>", "1.2.3.4", "-"}, xff_field
+    # Classes only: no digit or hex group from the client survives.
+    assert set(xff_field.split(",")) <= {"<invalid>", "v4", "v6", "anthropic", "-"}, xff_field
+    assert not any(ch.isdigit() for ch in xff_field.replace("v4", "").replace("v6", ""))
+
+
+@pytest.mark.parametrize("xff,expected", [
+    ("160.79.104.7", "anthropic"), ("160.79.111.255", "anthropic"),
+    ("::ffff:160.79.104.7", "anthropic"), ("160.79.112.1", "v4"),
+    ("2001:db8::1", "v6"), ("garbage", "<invalid>"),
+    ("160.79.104.7, 10.0.0.1", "anthropic,v4"),
+])
+def test_forwarded_address_classification(xff, expected):
+    assert rr._client_addresses(xff) == expected
 
 
 @pytest.mark.parametrize("method,path", [

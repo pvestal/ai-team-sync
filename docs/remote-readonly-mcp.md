@@ -48,18 +48,21 @@ allowlist and each tool's exact upstream requests as literals.
 Every 401 is logged to the `ats-mcp-remote` journal as one line, for example:
 
 ```
-WARNING:ats_remote_mcp.auth:401 POST /mcp auth_headers=1 scheme=bearer credential_len=64 expected_len=64 len_match=True xff=160.79.104.7 funnel=yes
+WARNING:ats_remote_mcp.auth:401 POST /mcp auth_headers=1 scheme=bearer credential_len=64 expected_len=64 len_match=True xff=anthropic funnel=yes
 ```
 
 `auth_headers` is how many Authorization headers arrived (0 = the client sent
 none). `scheme` is the lowercased scheme name if it is one of bearer / basic /
 digest / token / negotiate, `<none>` for a value without a scheme, otherwise
-`<other>`. Lengths are of the credential only. `xff` lists the forwarded
-client address(es) as parsed IP addresses (anything else is `<invalid>`), and
-`funnel` says whether Tailscale marked the request as Funnel traffic. Method
+`<other>`. Lengths are of the credential only. `xff` classifies each
+forwarded client address (up to three): `anthropic` if it is inside
+Anthropic's claude.ai egress range 160.79.104.0/21, otherwise `v4` / `v6`, or
+`<invalid>`. The address itself is never logged: it is client-chosen bits, and
+a valid IPv6 address can carry 32 hex characters of anything. `funnel` says
+whether Tailscale marked the request as Funnel traffic. Method
 and path are logged only when they are a standard method and `/mcp`; anything
-else is `<other>`. Every field is a number, a member of a fixed set, or a
-parsed IP address, so no client-sent text (and no credential) reaches the log.
+else is `<other>`. Every field is a number or a member of a fixed set, so no
+client-sent text (and no credential) reaches the log.
 
 ```bash
 journalctl --user -u ats-mcp-remote --since -15min | grep ats_remote_mcp.auth

@@ -436,22 +436,36 @@ def _parse_bearer(value: bytes) -> tuple[str, bytes]:
     return logged, (rest.lstrip(b" ") if scheme == "bearer" else b"")
 
 
-def _client_addresses(raw: str) -> str:
-    """The forwarded client address(es), only as parsed IP addresses.
+# Anthropic's published egress range for claude.ai connectors -- the question a
+# refusal log has to answer is "was this claude.ai?".
+ANTHROPIC_EGRESS = ipaddress.ip_network("160.79.104.0/21")
 
-    Each comma-separated entry is kept only if it parses as an IP address, so
-    arbitrary attacker text -- including a hex-shaped secret -- never reaches
-    the log. At most three entries.
+
+def _client_addresses(raw: str) -> str:
+    """Classify each forwarded client address; never echo it.
+
+    An address is client-chosen bits: a valid IPv6 address can carry 32 hex
+    characters of anything, including the secret (review r2 of this change).
+    So each comma-separated entry (at most three) is logged only as
+    ``anthropic`` (inside ANTHROPIC_EGRESS), ``v4`` / ``v6`` (some other
+    address), or ``<invalid>``.
     """
     out = []
     for part in raw.split(",")[:3]:
         part = part.strip()
         try:
-            if "%" in part:  # an IPv6 zone id is free text; refuse it
+            if "%" in part:  # an IPv6 zone id is free text
                 raise ValueError(part)
-            out.append(str(ipaddress.ip_address(part)))
+            addr = ipaddress.ip_address(part)
         except ValueError:
             out.append("<invalid>")
+            continue
+        if addr.version == 6 and addr.ipv4_mapped is not None:
+            addr = addr.ipv4_mapped
+        if addr in ANTHROPIC_EGRESS:
+            out.append("anthropic")
+        else:
+            out.append(f"v{addr.version}")
     return ",".join(out) or "-"
 
 
