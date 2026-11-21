@@ -1669,10 +1669,18 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     data = response.json()
                 except ValueError:
                     data = response.text
+                info_only = bool(arguments.get("info_only"))
                 if (response.status_code == 200 and isinstance(data, dict) and data.get("ok")
-                        and not arguments.get("info_only")):
-                    oq.remember(active_session_id, data["question_id"])
-                return [TextContent(type="text", text=oq.format_ask_result(response.status_code, data))]
+                        and not info_only):
+                    try:
+                        oq.remember(active_session_id, data["question_id"], data.get("delivery_token") or "")
+                    except ValueError as exc:
+                        return [TextContent(type="text", text=(
+                            f"⚠ Question {data.get('question_id')} was filed with Echo, but its answer "
+                            f"cannot come back to this session ({exc}); read the ruling with task_brief "
+                            "after the operator answers."))]
+                return [TextContent(type="text", text=oq.format_ask_result(
+                    response.status_code, data, info_only=info_only))]
             if (name == "send_message" or name == "message_inbox" or
                     name == "acknowledge_message" or name == "message_status" or
                     name == "readdress_message"):

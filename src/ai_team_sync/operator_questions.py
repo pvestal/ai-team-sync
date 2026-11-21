@@ -1,11 +1,11 @@
 """#3774: ask the operator one question through Echo's Telegram, get the answer back here.
 
 ask_operator (MCP) files the question with Echo for the CALLER'S OWN ATS session (the
-process's own session, never a caller-supplied id), and records the question id in a
-private per-session list under the ATS state directory. The UserPromptSubmit inbox hook
-reads that list: only while it is non-empty does it ask Echo for answered questions, so a
-session that never asked pays nothing. Each answer is printed into the session's next turn,
-then marked delivered with Echo and dropped from the list.
+process's own session, never a caller-supplied id). Echo answers with a per-question
+delivery secret, kept with the question id in a private 0600 file under the ATS state dir.
+The UserPromptSubmit inbox hook, only when it holds this session's capability and the file
+lists open questions, reads each answer with that question's own secret, prints it into the
+session's next turn, and only then marks it delivered with Echo and drops it from the file.
 
 The answer is also a current operator ruling on the ticket, so task_brief shows it to
 every session working that ticket; this hook only makes sure the asker hears it at once.
@@ -21,6 +21,8 @@ from typing import Any
 ECHO_URL = os.environ.get("ECHO_URL", "http://127.0.0.1:8309")
 _SID = re.compile(r"^[0-9a-zA-Z-]{8,64}$")
 _QID = re.compile(r"^[0-9a-f-]{36}$")
+_TOKEN = re.compile(r"^[0-9a-f]{32,128}$")
+TOKEN_HEADER = "X-Operator-Question-Token"
 
 
 def _dir() -> Path:
@@ -33,33 +35,46 @@ def _path(session_id: str) -> Path:
     return _dir() / f"{session_id}.json"
 
 
-def pending_ids(session_id: str) -> list[str]:
+def _load(session_id: str) -> dict[str, str]:
+    """{question_id: delivery_token}. The token is Echo's per-question secret, returned only
+    to the asker at ask time; Echo requires it to read or mark that answer."""
     try:
         data = json.loads(_path(session_id).read_text())
     except (OSError, ValueError):
-        return []
-    return [q for q in data if isinstance(q, str) and _QID.match(q)] if isinstance(data, list) else []
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {q: t for q, t in data.items()
+            if isinstance(q, str) and _QID.match(q) and isinstance(t, str) and _TOKEN.match(t)}
 
 
-def _write(session_id: str, ids: list[str]) -> None:
+def pending_ids(session_id: str) -> list[str]:
+    return sorted(_load(session_id))
+
+
+def _write(session_id: str, entries: dict[str, str]) -> None:
     d = _dir()
     d.mkdir(mode=0o700, exist_ok=True)
     p = _path(session_id)
-    if not ids:
+    if not entries:
         p.unlink(missing_ok=True)
         return
     tmp = p.with_suffix(".tmp")
-    tmp.write_text(json.dumps(sorted(set(ids))))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(entries, f)
     os.chmod(tmp, 0o600)
     tmp.replace(p)
 
 
-def remember(session_id: str, question_id: str) -> None:
-    _write(session_id, pending_ids(session_id) + [question_id])
+def remember(session_id: str, question_id: str, token: str) -> None:
+    if not _QID.match(question_id or "") or not _TOKEN.match(token or ""):
+        raise ValueError("bad question id or delivery token")
+    _write(session_id, {**_load(session_id), question_id: token})
 
 
 def forget(session_id: str, question_id: str) -> None:
-    _write(session_id, [q for q in pending_ids(session_id) if q != question_id])
+    _write(session_id, {q: t for q, t in _load(session_id).items() if q != question_id})
 
 
 ASK_FIELDS = ("tower_task_id", "question_key", "question", "options", "context", "evidence",
@@ -72,7 +87,7 @@ def ask_payload(session_id: str, arguments: dict[str, Any]) -> dict[str, Any]:
     return body
 
 
-def format_ask_result(status_code: int, data: Any) -> str:
+def format_ask_result(status_code: int, data: Any, *, info_only: bool = False) -> str:
     if status_code == 200 and isinstance(data, dict) and data.get("ok"):
         sent = data.get("sent") or {}
         if data["delivery"] == "now":
@@ -80,6 +95,9 @@ def format_ask_result(status_code: int, data: Any) -> str:
                      else f"NOT sent yet ({sent.get('error')}: {sent.get('why')}); it stays queued")
         else:
             where = "queued for the operator's morning digest (blocks fewer than 10 moments)"
+        if info_only:
+            return (f"✅ Notice {data['question_id']} filed: {where}. It is information only: no "
+                    "buttons, nothing is recorded, and no answer comes back.")
         return (f"✅ Question {data['question_id']} filed: {where}. The operator's tap is recorded "
                 "as a ruling on the ticket and appears in this session's next turn.")
     detail = data.get("detail", data) if isinstance(data, dict) else data
@@ -104,21 +122,32 @@ def format_answers(answers: list[dict]) -> str | None:
     return "\n".join(lines)
 
 
-def surface_answers(session_id: str, client) -> str | None:
-    """For the inbox hook (sync httpx client). Prints nothing and calls nothing when this
-    session has no open question. An answer is marked delivered only after it was
-    formatted for printing; a failure leaves it for the next prompt."""
-    ids = pending_ids(session_id)
-    if not ids:
-        return None
-    r = client.get(f"{ECHO_URL}/api/operator-questions/answers", params={"ats_session_id": session_id})
-    if r.status_code != 200:
-        return None
-    answers = [a for a in (r.json() or {}).get("answers") or [] if a.get("question_id") in ids]
-    note = format_answers(answers)
+def collect_answers(session_id: str, client) -> list[dict]:
+    """For the inbox hook (sync httpx client). Calls nothing when this session has no open
+    question. Each question is read with its own delivery token, so a session can read only
+    the questions it filed. Nothing is acknowledged here: the hook prints first, then calls
+    acknowledge()."""
+    out = []
+    for qid, token in _load(session_id).items():
+        r = client.get(f"{ECHO_URL}/api/operator-questions/{qid}/answer", headers={TOKEN_HEADER: token})
+        if r.status_code != 200:
+            continue
+        a = r.json() or {}
+        if a.get("answered") and a.get("question_id") == qid:
+            out.append(a)
+    return out
+
+
+def acknowledge(session_id: str, answers: list[dict], client) -> list[str]:
+    """After the note was printed and flushed: mark each answer delivered with Echo and drop it
+    from the list. A failed mark keeps it, so the next prompt shows it again (at-least-once)."""
+    tokens, done = _load(session_id), []
     for a in answers:
-        d = client.post(f"{ECHO_URL}/api/operator-questions/{a['question_id']}/delivered",
-                        json={"ats_session_id": session_id})
-        if d.status_code == 200:
-            forget(session_id, a["question_id"])
-    return note
+        qid = a["question_id"]
+        if qid not in tokens:
+            continue
+        r = client.post(f"{ECHO_URL}/api/operator-questions/{qid}/delivered", headers={TOKEN_HEADER: tokens[qid]})
+        if r.status_code == 200:
+            forget(session_id, qid)
+            done.append(qid)
+    return done
