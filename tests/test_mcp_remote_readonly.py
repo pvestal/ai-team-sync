@@ -137,7 +137,7 @@ async def test_mutating_tool_call_is_refused_without_upstream(upstream, name):
 # ---- bearer gate -----------------------------------------------------------------
 
 @pytest.mark.parametrize("auth", [None, "", "Bearer", f"Bearer {TOKEN}x",
-                                  f"Basic {TOKEN}", f"Bearer{TOKEN}",
+                                  f"Basic {TOKEN}",
                                   f"Bearer {TOKEN[:-1]}", f"Token {TOKEN}"])
 async def test_requests_without_the_exact_bearer_are_rejected_before_mcp(upstream, auth):
     async with serve() as http:
@@ -615,3 +615,22 @@ async def test_bare_wrong_secret_logs_value_len_not_value(upstream, caplog):
     line = _refusal_lines(caplog)[0]
     assert f"value_len={len(HEX)} scheme=<none> credential_len=0" in line
     assert "ffffffff" not in line
+
+
+# ---- "Bearer" immediately followed by the secret (claude.ai sent value_len=70) ----
+
+@pytest.mark.parametrize("auth", [f"Bearer{HEX}", f"bearer{HEX}", f"BEARER{HEX}", f" Bearer{HEX} "])
+async def test_joined_bearer_secret_accepted(upstream, auth):
+    async with serve_hex() as http:
+        r = await _call(http, "tools/list", headers=_h(auth))
+    assert r.status_code == 200, (auth, r.text)
+
+
+@pytest.mark.parametrize("auth", [f"Bearer{HEX}0", f"Bearer{HEX[:-1]}", f"Bearer{HEX[1:]}",
+                                  f"Bearerx{HEX}", f"Beare{HEX}", f"Basic{HEX}",
+                                  f"BearerBearer{HEX}", "Bearer"])
+async def test_joined_near_misses_rejected(upstream, auth):
+    async with serve_hex() as http:
+        r = await _call(http, "tools/list", headers=_h(auth))
+    assert r.status_code == 401, auth
+    assert upstream.requests == []

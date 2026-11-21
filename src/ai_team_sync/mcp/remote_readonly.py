@@ -514,9 +514,15 @@ class BearerGate:
         # the whole value (claude.ai's connector sends the header value without
         # a scheme -- operator ruling 2026-11-21, #3760).
         bare = _bare_value(auth[0]) if len(auth) == 1 else b""
+        # Third form: "Bearer" immediately followed by the secret, no space --
+        # what claude.ai's connector actually sent (value_len = 6 + 64, operator
+        # ruling 2026-11-21). The prefix is matched case-insensitively; the
+        # secret still has to match exactly.
+        joined = bare[6:] if bare[:6].lower() == b"bearer" else b""
         bearer_ok = hmac.compare_digest(credential, self._token) and scheme == "bearer"
         bare_ok = hmac.compare_digest(bare, self._token)
-        ok = len(auth) == 1 and (bearer_ok or bare_ok)
+        joined_ok = hmac.compare_digest(joined, self._token)
+        ok = len(auth) == 1 and (bearer_ok or bare_ok or joined_ok)
         if not ok:
             self._log_refusal(scope, headers, auth, scheme, credential)
             return await _send_status(send, 401, b"unauthorized\n",
