@@ -158,6 +158,17 @@ def main() -> None:
             pass  # a later prompt retries; surfacing never fabricates receipt
     if missing_capability:
         print(format_missing_capability(session_id))
+    # #3774: the operator's Telegram answers to this session's own ask_operator questions.
+    # Reads Echo only while this session has an open question.
+    try:
+        import httpx
+        from ai_team_sync import operator_questions as oq
+        with httpx.Client(timeout=2) as client:
+            ruling_note = oq.surface_answers(session_id, client)
+    except Exception:
+        ruling_note = None  # best-effort: the answer stays undelivered for the next prompt
+    if ruling_note:
+        print(ruling_note)
     sys.exit(0)
 
 

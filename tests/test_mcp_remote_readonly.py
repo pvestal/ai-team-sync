@@ -24,7 +24,7 @@ MUTATING_TOOLS = frozenset({
     "start_session", "complete_session", "pause_session", "resume_session",
     "extend_scope", "delete_lock", "check_locks",  # check_locks may create a lock row
     "delegate", "reconcile_delegation",
-    "log_decision", "record_restart",
+    "log_decision", "record_restart", "ask_operator",
     "request_override", "respond_to_request",
     "send_message", "acknowledge_message", "readdress_message",
     # session-identity reads: they answer as "my" session, which a remote

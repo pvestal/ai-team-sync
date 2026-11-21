@@ -244,7 +244,7 @@ def _caller_agent_session() -> str | None:
 _IN_PROCESS_TARGETING_TOOLS = frozenset({
     "log_decision", "pause_session", "resume_session", "extend_scope",
     "readdress_message", "message_status", "send_message", "message_inbox",
-    "acknowledge_message", "delete_lock", "reconcile_delegation"})
+    "acknowledge_message", "delete_lock", "reconcile_delegation", "ask_operator"})
 
 
 def _remember_in_process(session_id: str, token: str, *, make_default: bool = True,
@@ -608,6 +608,39 @@ async def list_tools() -> list[Tool]:
                 "body": {"type": "string", "minLength": 1, "maxLength": 4000},
                 "session_id": _OWN_SESSION_SCHEMA,
             }, "required": ["body"]},
+        ),
+        Tool(
+            name="ask_operator",
+            description=(
+                "Ask the operator ONE decision you genuinely need, as one Telegram message with "
+                "one button per option (#3774). His tap is recorded on the ticket as a current "
+                "operator ruling (task_brief shows it) and comes back into THIS session's next "
+                "turn. Refused if he already ruled on this question_key for this ticket, or it is "
+                "already waiting. Blocks >= 10 moments: sent now; otherwise sent with his morning "
+                "digest. Write it the way he reads: project and scene title, who and what act, the "
+                "question in plain words, what each answer does; no shot numbers or ids in the "
+                "text. info_only=true sends a no-button notice and records nothing."),
+            inputSchema={"type": "object", "properties": {
+                "tower_task_id": {"type": "integer", "minimum": 1},
+                "question_key": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{1,79}$",
+                                 "description": "Stable slug for this question on this ticket; a ruling on it blocks re-asking."},
+                "question": {"type": "string", "minLength": 1, "maxLength": 700},
+                "options": {"type": "array", "maxItems": 4, "items": {"type": "object", "properties": {
+                    "label": {"type": "string", "maxLength": 40},
+                    "ruling": {"type": "string", "maxLength": 400,
+                               "description": "What choosing this means, recorded with the ruling."}},
+                    "required": ["label"]}},
+                "context": {"type": "object", "description": "project, scene, who, act (text or list), detail (text or list)"},
+                "evidence": {"type": "array", "maxItems": 4, "items": {"type": "object", "properties": {
+                    "path": {"type": "string", "description": "absolute path readable by Echo"},
+                    "caption": {"type": "string"},
+                    "media_type": {"type": "string", "enum": ["photo", "document"]}},
+                    "required": ["path"]}},
+                "moments_blocked": {"type": "integer", "minimum": 0},
+                "info_only": {"type": "boolean"},
+                "test": {"type": "boolean", "description": "Label it test and send it now."},
+                "session_id": _OWN_SESSION_SCHEMA,
+            }, "required": ["tower_task_id", "question_key", "question"]},
         ),
         Tool(
             name="message_inbox",
@@ -1623,6 +1656,23 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                 pass
 
         try:
+            if name == "ask_operator":
+                from ai_team_sync import operator_questions as oq
+                refusal = await deny_mutation(client)
+                if refusal:
+                    return [TextContent(type="text", text=f"❌ {refusal}")]
+                if not active_session_id or not _holds_capability(active_session_id):
+                    return [TextContent(type="text", text=_missing_capability(name, active_session_id))]
+                response = await client.post(f"{oq.ECHO_URL}/api/operator-questions",
+                                             json=oq.ask_payload(active_session_id, arguments), timeout=90.0)
+                try:
+                    data = response.json()
+                except ValueError:
+                    data = response.text
+                if (response.status_code == 200 and isinstance(data, dict) and data.get("ok")
+                        and not arguments.get("info_only")):
+                    oq.remember(active_session_id, data["question_id"])
+                return [TextContent(type="text", text=oq.format_ask_result(response.status_code, data))]
             if (name == "send_message" or name == "message_inbox" or
                     name == "acknowledge_message" or name == "message_status" or
                     name == "readdress_message"):
