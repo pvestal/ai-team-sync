@@ -434,71 +434,48 @@ async def test_oversized_answer_is_an_error_for_every_tool(monkeypatch, name):
 
 
 # ---- RFC 7235 parsing + refusal diagnostics (#3760 claude.ai connector 401s) ------
-
-@pytest.mark.parametrize("auth", [f"Bearer {TOKEN}", f"bearer {TOKEN}", f"BEARER {TOKEN}",
-                                  f"  Bearer   {TOKEN}  ", f"Bearer\t{TOKEN}"])
-async def test_rfc7235_scheme_case_and_whitespace_accepted(upstream, auth):
-    h = {k: v for k, v in HDRS.items() if k != "Authorization"}
-    h["Authorization"] = auth
-    async with serve() as http:
-        r = await _call(http, "tools/list", headers=h)
-    assert r.status_code == 200, (auth, r.text)
+# A hex-shaped secret on purpose: it survives naive "address characters only"
+# filters, which is exactly the leak review r1 of this change demonstrated.
+HEX = "0123456789abcdef" * 4
 
 
-def _refusal_lines(caplog):
-    return [r.getMessage() for r in caplog.records if r.name == "ats_remote_mcp.auth"]
+@contextlib.asynccontextmanager
+async def serve_hex():
+    app = rr.build_app(HEX)
+    async with app.manager.run():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),
+                                     base_url="http://127.0.0.1:8402") as c:
+            yield c
 
 
-@pytest.mark.parametrize("auth,scheme,cred_len", [
-    (None, "-", 0),
-    ("", "<empty>", 0),
-    (TOKEN, "<none>", 0),                       # token with no scheme: never logged
-    (f"Basic {TOKEN}", "basic", 0),
-    (f"Weird{TOKEN[:3]} {TOKEN}", "<other>", 0),
-    (f"Bearer {TOKEN}x", "bearer", len(TOKEN) + 1),
-    (f"bearer  {TOKEN[:-2]} ", "bearer", len(TOKEN) - 2),
-])
-async def test_refusal_is_logged_without_the_credential(upstream, caplog, auth, scheme, cred_len):
-    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
+def _h(auth=None, **extra):
     h = {k: v for k, v in HDRS.items() if k != "Authorization"}
     if auth is not None:
         h["Authorization"] = auth
-    h["X-Forwarded-For"] = "160.79.104.7"
-    h["Tailscale-Funnel-Request"] = "?1"
-    async with serve() as http:
-        r = await _call(http, "tools/list", headers=h)
-    assert r.status_code == 401
-    lines = _refusal_lines(caplog)
-    assert len(lines) == 1, lines
-    line = lines[0]
-    assert TOKEN[:12] not in line and TOKEN[-12:] not in line
-    assert f"auth_headers={0 if auth is None else 1}" in line
-    assert f"scheme={scheme} " in line
-    assert f"credential_len={cred_len} expected_len={len(TOKEN)}" in line
-    assert "xff=160.79.104.7" in line and "funnel=yes" in line
-    assert line.startswith("401 POST /mcp ")
+    h.update(extra)
+    return h
 
 
-async def test_refusal_log_sanitizes_forwarded_header(upstream, caplog):
-    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
-    h = {k: v for k, v in HDRS.items() if k != "Authorization"}
-    h["X-Forwarded-For"] = "1.2.3.4\nINFO fake line " + "9" * 500
-    async with serve() as http:
-        await _call(http, "tools/list", headers=h)
-    line = _refusal_lines(caplog)[0]
-    assert "\n" not in line and "fake" not in line and len(line) < 400
+@pytest.mark.parametrize("auth", [f"Bearer {HEX}", f"bearer {HEX}", f"BEARER {HEX}",
+                                  f"  Bearer   {HEX}  ", f"\tBearer {HEX}\t"])
+async def test_rfc7235_scheme_case_and_whitespace_accepted(upstream, auth):
+    async with serve_hex() as http:
+        r = await _call(http, "tools/list", headers=_h(auth))
+    assert r.status_code == 200, (auth, r.text)
 
 
-async def test_success_is_not_logged_as_refusal(upstream, caplog):
-    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
-    async with serve() as http:
-        r = await _call(http, "tools/list")
-    assert r.status_code == 200 and _refusal_lines(caplog) == []
+@pytest.mark.parametrize("auth", [f"Bearer\t{HEX}", f"Bearer \t{HEX}", f"Bearer\x0b{HEX}",
+                                  f"Bearer\x0c{HEX}", f"Bearer {HEX[:32]} {HEX[32:]}",
+                                  f"Bearer {HEX},Bearer {HEX}", f"Bearer {HEX[1:]}",
+                                  f"Bearer {HEX}0", f"Basic {HEX}", HEX, "Bearer ", "Bearer"])
+async def test_non_rfc_separators_and_near_misses_rejected(upstream, auth):
+    async with serve_hex() as http:
+        r = await _call(http, "tools/list", headers=_h(auth))
+    assert r.status_code == 401, auth
+    assert upstream.requests == []
 
 
-async def test_duplicate_headers_logged_as_refused(caplog):
-    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
-    app = rr.build_app(TOKEN)
+async def _raw(app, method, path, headers):
     sent = []
 
     async def receive():
@@ -507,9 +484,88 @@ async def test_duplicate_headers_logged_as_refused(caplog):
     async def send(m):
         sent.append(m)
 
-    await app({"type": "http", "method": "POST", "path": "/mcp",
-               "headers": [(b"authorization", f"Bearer {TOKEN}".encode()),
-                           (b"authorization", f"Bearer {TOKEN}".encode())]}, receive, send)
-    assert sent[0]["status"] == 401
+    await app({"type": "http", "method": method, "path": path,
+               "headers": [(k.lower().encode(), v.encode("latin-1")) for k, v in headers]},
+              receive, send)
+    return sent[0]["status"]
+
+
+def _refusal_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.name == "ats_remote_mcp.auth"]
+
+
+def _assert_no_secret(line):
+    for i in range(0, len(HEX) - 7):
+        assert HEX[i:i + 8] not in line, (HEX[i:i + 8], line)
+
+
+@pytest.mark.parametrize("auth,scheme,cred_len", [
+    (None, "-", 0),
+    ("", "<empty>", 0),
+    (HEX, "<none>", 0),
+    (f"Basic {HEX}", "basic", 0),
+    (f"Weird{HEX[:3]} {HEX}", "<other>", 0),
+    (f"Bearer {HEX}0", "bearer", len(HEX) + 1),
+    (f"bearer  {HEX[:-2]} ", "bearer", len(HEX) - 2),
+    (f"Bearer\t{HEX}", "<other>", 0),
+])
+async def test_refusal_is_logged_without_the_credential(upstream, caplog, auth, scheme, cred_len):
+    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
+    async with serve_hex() as http:
+        r = await _call(http, "tools/list", headers=_h(
+            auth, **{"X-Forwarded-For": "160.79.104.7", "Tailscale-Funnel-Request": "?1"}))
+    assert r.status_code == 401
+    lines = _refusal_lines(caplog)
+    assert len(lines) == 1, lines
+    line = lines[0]
+    _assert_no_secret(line)
+    assert f"auth_headers={0 if auth is None else 1}" in line
+    assert f"scheme={scheme} " in line
+    assert f"credential_len={cred_len} expected_len={len(HEX)}" in line
+    assert "xff=160.79.104.7" in line and "funnel=yes" in line
+    assert line.startswith("401 POST /mcp ")
+
+
+@pytest.mark.parametrize("xff", [HEX, f"1.2.3.4, {HEX}", f"::1%{HEX}", f"{HEX[:4]}::{HEX[4:8]}x",
+                                 "1.2.3.4\nWARNING:ats_remote_mcp.auth:forged", "9" * 500])
+async def test_forwarded_header_never_echoes_client_text(caplog, xff):
+    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
+    status = await _raw(rr.build_app(HEX), "POST", "/mcp", [("X-Forwarded-For", xff)])
+    assert status == 401
     line = _refusal_lines(caplog)[0]
-    assert "auth_headers=2" in line and TOKEN[:12] not in line
+    _assert_no_secret(line)
+    assert "\n" not in line and "forged" not in line and len(line) < 300
+    xff_field = line.split("xff=")[1].split(" ")[0]
+    assert set(xff_field.split(",")) <= {"<invalid>", "1.2.3.4", "-"}, xff_field
+
+
+@pytest.mark.parametrize("method,path", [
+    ("POST", f"/{HEX}"), ("POST", "/mcp\nWARNING:ats_remote_mcp.auth:forged"),
+    ("POST", f"/mcp/{HEX}"), (HEX[:16], "/mcp"), ("GET", "/mcp\r\nx"),
+])
+async def test_path_and_method_never_echoed(caplog, method, path):
+    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
+    status = await _raw(rr.build_app(HEX), method, path, [])
+    assert status == 401
+    line = _refusal_lines(caplog)[0]
+    _assert_no_secret(line)
+    assert "\n" not in line and "\r" not in line and "forged" not in line
+    assert line.split(" ")[1] in ("POST", "GET", "<other>")
+    assert line.split(" ")[2] in ("/mcp", "<other>")
+
+
+async def test_success_is_not_logged_as_refusal(upstream, caplog):
+    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
+    async with serve_hex() as http:
+        r = await _call(http, "tools/list", headers=_h(f"Bearer {HEX}"))
+    assert r.status_code == 200 and _refusal_lines(caplog) == []
+
+
+async def test_duplicate_headers_logged_as_refused(caplog):
+    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
+    status = await _raw(rr.build_app(HEX), "POST", "/mcp",
+                        [("Authorization", f"Bearer {HEX}"), ("Authorization", f"Bearer {HEX}")])
+    assert status == 401
+    line = _refusal_lines(caplog)[0]
+    assert "auth_headers=2" in line
+    _assert_no_secret(line)

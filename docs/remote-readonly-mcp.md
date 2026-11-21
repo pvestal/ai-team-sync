@@ -52,11 +52,14 @@ WARNING:ats_remote_mcp.auth:401 POST /mcp auth_headers=1 scheme=bearer credentia
 ```
 
 `auth_headers` is how many Authorization headers arrived (0 = the client sent
-none). `scheme` is the lowercased scheme name, `<none>` for a value without a
-scheme, or `<other>` for an unknown one. Lengths are of the credential only.
-`xff` is the forwarded client address (address characters only) and `funnel`
-says whether Tailscale marked the request as Funnel traffic. The credential is
-never logged.
+none). `scheme` is the lowercased scheme name if it is one of bearer / basic /
+digest / token / negotiate, `<none>` for a value without a scheme, otherwise
+`<other>`. Lengths are of the credential only. `xff` lists the forwarded
+client address(es) as parsed IP addresses (anything else is `<invalid>`), and
+`funnel` says whether Tailscale marked the request as Funnel traffic. Method
+and path are logged only when they are a standard method and `/mcp`; anything
+else is `<other>`. Every field is a number, a member of a fixed set, or a
+parsed IP address, so no client-sent text (and no credential) reaches the log.
 
 ```bash
 journalctl --user -u ats-mcp-remote --since -15min | grep ats_remote_mcp.auth
@@ -65,9 +68,11 @@ journalctl --user -u ats-mcp-remote --since -15min | grep ats_remote_mcp.auth
 ## Secret
 
 - Header: `Authorization: Bearer <secret>` (a standard header name that
-  claude.ai custom connectors may send). Per RFC 7235 the scheme is matched
-  case-insensitively and surrounding whitespace is ignored; the secret itself
-  must match exactly.
+  claude.ai custom connectors may send). Per RFC 7235 (`auth-scheme 1*SP
+  token68`) the scheme is matched case-insensitively, one or more spaces may
+  separate it from the secret, and spaces/tabs around the whole value are
+  ignored. A tab, CR, LF, VT or FF inside the value is refused, and the secret
+  itself must match exactly.
 - File: `~/.config/ai-team-sync/remote-mcp.token`, mode 0600, outside the repo.
   The server refuses to start if the file is missing, not 0600, or shorter
   than 32 characters.

@@ -407,22 +407,52 @@ auth_log = logging.getLogger("ats_remote_mcp.auth")
 # "<other>": a value with no scheme at all would otherwise put the token itself
 # in the "scheme" slot.
 _KNOWN_SCHEMES = frozenset({"bearer", "basic", "digest", "token", "negotiate"})
-_XFF_SAFE = re.compile(r"[^0-9A-Fa-f:., ]")
+_KNOWN_METHODS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"})
+# RFC 7230 OWS around a field value: SP and HTAB only.
+_OWS = b" \t"
+# Never valid inside the scheme or the credential.
+_CTL_WS = frozenset(b"\t\r\n\x0b\x0c")
 
 
 def _parse_bearer(value: bytes) -> tuple[str, bytes]:
     """(scheme as logged, credential) from one Authorization value.
 
-    RFC 7235: the scheme is case-insensitive and is separated from the
-    credential by whitespace; surrounding whitespace is not part of either.
+    RFC 7235 ``credentials = auth-scheme [ 1*SP token68 ]``: the scheme is
+    case-insensitive and separated from the credential by spaces (SP only).
+    Optional whitespace around the whole field value is ignored. A tab, CR, LF,
+    VT or FF anywhere inside makes the value invalid.
     """
-    v = value.strip()
-    parts = v.split(None, 1)
-    if len(parts) != 2:
-        return ("<none>" if len(parts) < 2 and v else "<empty>"), b""
-    scheme = parts[0].decode("latin-1").lower()
+    v = value.strip(_OWS)
+    if not v:
+        return "<empty>", b""
+    scheme_b, sep, rest = v.partition(b" ")
+    if any(c in _CTL_WS for c in v):
+        scheme = scheme_b.decode("latin-1").lower()
+        return (scheme if scheme in _KNOWN_SCHEMES else "<other>"), b""
+    if not sep:
+        return "<none>", b""
+    scheme = scheme_b.decode("latin-1").lower()
     logged = scheme if scheme in _KNOWN_SCHEMES else "<other>"
-    return logged, (parts[1].strip() if scheme == "bearer" else b"")
+    return logged, (rest.lstrip(b" ") if scheme == "bearer" else b"")
+
+
+def _client_addresses(raw: str) -> str:
+    """The forwarded client address(es), only as parsed IP addresses.
+
+    Each comma-separated entry is kept only if it parses as an IP address, so
+    arbitrary attacker text -- including a hex-shaped secret -- never reaches
+    the log. At most three entries.
+    """
+    out = []
+    for part in raw.split(",")[:3]:
+        part = part.strip()
+        try:
+            if "%" in part:  # an IPv6 zone id is free text; refuse it
+                raise ValueError(part)
+            out.append(str(ipaddress.ip_address(part)))
+        except ValueError:
+            out.append("<invalid>")
+    return ",".join(out) or "-"
 
 
 class BearerGate:
@@ -466,20 +496,25 @@ class BearerGate:
         return await self.app(scope, _capped_receive(receive), send)
 
     def _log_refusal(self, scope, headers, auth, scheme, credential) -> None:
-        def first(name: bytes) -> str:
-            for k, v in headers:
-                if k == name:
-                    return v.decode("latin-1")
-            return ""
-        # Forwarded headers are attacker-supplied text: keep address characters
-        # only, bounded, so a log line cannot be forged or flooded.
-        xff = _XFF_SAFE.sub("", first(b"x-forwarded-for"))[:100] or "-"
+        xff = ""
+        funnel = False
+        for k, v in headers:
+            if k == b"x-forwarded-for" and not xff:
+                xff = v.decode("latin-1")
+            elif k == b"tailscale-funnel-request":
+                funnel = True
+        # Every logged field is either a number, a member of a fixed set, or a
+        # parsed IP address: nothing a client sends is echoed as text.
+        method = str(scope.get("method", ""))
+        path = scope.get("path", "")
         auth_log.warning(
             "401 %s %s auth_headers=%d scheme=%s credential_len=%d expected_len=%d "
             "len_match=%s xff=%s funnel=%s",
-            scope.get("method", "?"), str(scope.get("path", "?"))[:64], len(auth), scheme,
-            len(credential), len(self._token), len(credential) == len(self._token),
-            xff, "yes" if first(b"tailscale-funnel-request") else "no")
+            method if method in _KNOWN_METHODS else "<other>",
+            path if path in ("/mcp", "/mcp/") else "<other>",
+            len(auth), scheme, len(credential), len(self._token),
+            len(credential) == len(self._token),
+            _client_addresses(xff) if xff else "-", "yes" if funnel else "no")
 
 
 def _capped_receive(receive):
