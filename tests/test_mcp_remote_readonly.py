@@ -63,6 +63,10 @@ class Recorder(httpx.AsyncBaseTransport):
 
 @pytest.fixture
 def upstream(monkeypatch):
+    # Pin the upstream bases: the module reads ATS_SERVER_URL / ECHO_BRAIN_URL at
+    # import, and a test must not inherit them from the shell.
+    monkeypatch.setattr(rr, "ATS_URL", "http://127.0.0.1:8400")
+    monkeypatch.setattr(rr, "ECHO_URL", "http://127.0.0.1:8309")
     rec = Recorder()
     monkeypatch.setattr(rr, "_inner_transport", rec)
     return rec
@@ -239,8 +243,16 @@ async def test_session_id_cannot_traverse_paths(upstream):
     ("GET", "http://evil.example/api/sessions"),
     ("POST", "http://127.0.0.1:8309/api/brief"),
     ("GET", "http://127.0.0.1:8400/api/messages"),
+    ("POST", "http://127.0.0.1:8400/api/restarts"),
+    ("POST", "http://127.0.0.1:8400/api/version"),
+    ("PUT", "http://127.0.0.1:8400/api/brief"),
+    ("POST", "http://127.0.0.1:8400/api/sessions/s1"),
+    ("GET", "http://127.0.0.1:8401/api/sessions"),
+    ("GET", "https://127.0.0.1:8400/api/sessions"),
 ])
-async def test_guard_refuses_non_read_upstream(method, url):
+async def test_guard_refuses_non_read_upstream(monkeypatch, method, url):
+    monkeypatch.setattr(rr, "ATS_URL", "http://127.0.0.1:8400")
+    monkeypatch.setattr(rr, "ECHO_URL", "http://127.0.0.1:8309")
     rec = Recorder()
     async with httpx.AsyncClient(transport=rr._GuardedTransport(rec)) as c:
         with pytest.raises(rr.UpstreamRefused):
@@ -275,3 +287,98 @@ def test_token_file_rules(tmp_path):
         rr.load_token(f)
     with pytest.raises(FileNotFoundError):
         rr.load_token(tmp_path / "missing")
+
+
+# ---- pinned allowlists (#3760 review r1) -------------------------------------------
+# These are literals ON PURPOSE. Checking requests with rr.upstream_allowed would
+# let a widened allowlist pass its own test; these fail on any widening.
+
+PINNED_UPSTREAM = {
+    ("POST", "ats", "/api/brief"),
+    ("GET", "ats", "/api/sessions"),
+    ("GET", "ats", r"/api/sessions/[A-Za-z0-9-]{1,64}"),
+    ("GET", "ats", "/api/decisions"),
+    ("GET", "ats", "/api/locks"),
+    ("GET", "ats", "/api/restarts"),
+    ("GET", "ats", "/api/version"),
+    ("POST", "echo", "/api/preflight"),
+}
+
+
+def test_upstream_allowlist_is_exactly_the_reviewed_set():
+    got = {(m, base, p.pattern) for m, base, p in rr.UPSTREAM_ALLOWLIST}
+    assert got == PINNED_UPSTREAM
+
+
+def test_tool_catalog_is_exactly_the_reviewed_set():
+    assert rr.READONLY_TOOL_NAMES == READ_TOOLS_REVIEWED
+    assert {t.name for t in rr.READONLY_TOOLS} == READ_TOOLS_REVIEWED
+
+
+EXPECTED_REQUESTS = {
+    "task_brief": [("POST", "127.0.0.1:8400", "/api/brief")],
+    "preflight": [("POST", "127.0.0.1:8309", "/api/preflight")],
+    "get_decision_history": [("GET", "127.0.0.1:8400", "/api/decisions")],
+    "team_status": [("GET", "127.0.0.1:8400", "/api/sessions")],
+    "get_session_details": [("GET", "127.0.0.1:8400", "/api/sessions/s1")],
+    "list_all_locks": [("GET", "127.0.0.1:8400", "/api/locks")],
+    "ats_version": [("GET", "127.0.0.1:8400", "/api/version")],
+}
+
+
+@pytest.mark.parametrize("name", sorted(EXPECTED_REQUESTS))
+async def test_each_tool_sends_exactly_its_pinned_requests(upstream, name):
+    async with serve() as http:
+        r = await _call(http, "tools/call", {"name": name, "arguments": READ_CALLS[name]})
+        assert r.json()["result"]["isError"] is False, r.text
+    got = [(q.method, f"{q.url.host}:{q.url.port}", q.url.path) for q in upstream.requests]
+    assert got == EXPECTED_REQUESTS[name]
+
+
+async def test_preflight_is_sent_read_only(upstream):
+    """Echo persists preflight rows unless read_only is true (review r1 finding 1)."""
+    async with serve() as http:
+        await _call(http, "tools/call", {"name": "preflight", "arguments": {"objective": "x"}})
+    body = json.loads(upstream.requests[0].content)
+    assert body["read_only"] is True
+    assert body["requesting_session"] is None
+
+
+# ---- availability bounds -------------------------------------------------------------
+
+class Huge(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request):
+        async def gen():
+            for _ in range(rr.MAX_UPSTREAM_BYTES // 65536 + 2):
+                yield b"x" * 65536
+        return httpx.Response(200, content=gen())
+
+
+async def test_oversized_upstream_answer_is_refused(monkeypatch):
+    monkeypatch.setattr(rr, "_inner_transport", Huge())
+    async with serve() as http:
+        r = await _call(http, "tools/call", {"name": "list_all_locks", "arguments": {}})
+    result = r.json()["result"]
+    assert result["isError"] is True
+    assert "UpstreamTooLarge" in result["content"][0]["text"]
+
+
+def test_tool_output_is_truncated():
+    out = rr._text("y" * (rr.MAX_OUTPUT_CHARS + 500))[0].text
+    assert len(out) < rr.MAX_OUTPUT_CHARS + 100 and out.endswith("characters]")
+
+
+def test_run_passes_concurrency_and_size_limits(monkeypatch, tmp_path):
+    f = tmp_path / "tok"
+    f.write_text(TOKEN)
+    os.chmod(f, 0o600)
+    monkeypatch.setenv("ATS_REMOTE_MCP_TOKEN_FILE", str(f))
+    monkeypatch.delenv("ATS_REMOTE_MCP_HOST", raising=False)
+    seen = {}
+    import uvicorn
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kw: seen.update(kw))
+    rr.run()
+    assert seen["host"] == "127.0.0.1"
+    assert seen["limit_concurrency"] == rr.MAX_CONCURRENCY
+    assert seen["h11_max_incomplete_event_size"] == rr.MAX_BODY_BYTES
+    assert seen["proxy_headers"] is False

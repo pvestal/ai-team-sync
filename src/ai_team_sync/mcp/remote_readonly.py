@@ -52,6 +52,13 @@ MIN_TOKEN_LEN = 32
 # A JSON-RPC tool call is a few hundred bytes. Anything near this is not a
 # legitimate request; refusing it before reading bounds memory per request.
 MAX_BODY_BYTES = 64 * 1024
+# Bounds for an internet-facing endpoint (#3760 review r1). An upstream answer
+# larger than MAX_UPSTREAM_BYTES is refused while streaming, never buffered;
+# tool text is truncated to MAX_OUTPUT_CHARS; uvicorn answers 503 past
+# MAX_CONCURRENCY open connections/requests.
+MAX_UPSTREAM_BYTES = 2 * 1024 * 1024
+MAX_OUTPUT_CHARS = 60_000
+MAX_CONCURRENCY = 16
 REMOTE_WORKER_LABEL = "remote-readonly"
 
 # The names a remote caller may invoke. Kept as a literal, not derived from the
@@ -87,6 +94,13 @@ class UpstreamRefused(RuntimeError):
     """An outbound request outside UPSTREAM_ALLOWLIST was attempted."""
 
 
+class UpstreamTooLarge(httpx.HTTPError):
+    """An allowed upstream answered more than MAX_UPSTREAM_BYTES."""
+
+    def __init__(self, message: str):
+        super().__init__(message)
+
+
 def _origin(url: str) -> tuple[str, str, int | None]:
     u = httpx.URL(url)
     return (u.scheme, u.host, u.port)
@@ -108,7 +122,24 @@ class _GuardedTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if not upstream_allowed(request.method, request.url):
             raise UpstreamRefused(f"{request.method} {request.url} is not a read-only upstream")
-        return await self._inner.handle_async_request(request)
+        response = await self._inner.handle_async_request(request)
+        # Read the body here, bounded, so an oversized upstream answer is
+        # refused while streaming instead of being buffered whole.
+        chunks: list[bytes] = []
+        size = 0
+        try:
+            async for chunk in response.stream:  # raw transport stream
+                size += len(chunk)
+                if size > MAX_UPSTREAM_BYTES:
+                    raise UpstreamTooLarge(
+                        f"{request.method} {request.url.path} answered more than "
+                        f"{MAX_UPSTREAM_BYTES} bytes")
+                chunks.append(chunk)
+        finally:
+            await response.stream.aclose()
+        return httpx.Response(response.status_code, headers=response.headers,
+                              content=b"".join(chunks), request=request,
+                              extensions=response.extensions)
 
     async def aclose(self) -> None:
         await self._inner.aclose()
@@ -126,6 +157,8 @@ def _client(timeout: float = 30.0) -> httpx.AsyncClient:
 
 
 def _text(s: str) -> list[TextContent]:
+    if len(s) > MAX_OUTPUT_CHARS:
+        s = s[:MAX_OUTPUT_CHARS] + f"\n[truncated at {MAX_OUTPUT_CHARS} characters]"
     return [TextContent(type="text", text=s)]
 
 
@@ -239,7 +272,10 @@ async def _preflight(c: httpx.AsyncClient, a: dict[str, Any]) -> list[TextConten
                "tower_task_id": a.get("task_id"),
                "operation_type": a.get("operation_type", "other"),
                "declared_scope": list(a.get("scope") or []),
-               "entities": dict(a.get("entities") or {})}
+               "entities": dict(a.get("entities") or {}),
+               # Echo persists preflight_requests/preflight_evidence unless told
+               # read_only (preflight_api.py); a remote reader writes nothing.
+               "read_only": True}
     try:
         r = await c.post(f"{ECHO_URL}/api/preflight", json=payload, timeout=90)
         r.raise_for_status()
@@ -249,7 +285,7 @@ async def _preflight(c: httpx.AsyncClient, a: dict[str, Any]) -> list[TextConten
     except Exception as exc:  # noqa: BLE001
         return _text(f"PREFLIGHT UNAVAILABLE ({type(exc).__name__}). This is NOT a "
                      "CLEAR result: no history was checked.")
-    lines = [f"{d.get('disposition')} (preflight {d.get('preflight_request_id')})",
+    lines = [f"{d.get('disposition')} (read-only preflight; not recorded)",
              "", str(d.get("recommended_next") or "")]
     ts = d.get("task_state") or {}
     if ts:
@@ -518,7 +554,9 @@ def run() -> None:
     token = load_token(token_file)
     # proxy_headers off: X-Forwarded-* from the Funnel is not trusted for anything.
     uvicorn.run(build_app(token), host=host, port=port, proxy_headers=False,
-                server_header=False, log_level="info", access_log=True)
+                server_header=False, log_level="info", access_log=True,
+                limit_concurrency=MAX_CONCURRENCY, timeout_keep_alive=5,
+                h11_max_incomplete_event_size=MAX_BODY_BYTES)
 
 
 if __name__ == "__main__":

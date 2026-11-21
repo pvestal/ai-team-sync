@@ -27,9 +27,14 @@ fails if any mutating tool is listed on this transport, and
 `test_every_stdio_tool_is_classified` fails when a new stdio tool is added
 without a read/mutating classification.
 
-`preflight` is advisory but Echo records each request as a `preflight_request`
-row (its id is in the answer). That is an audit log entry, not state any
-agent acts on.
+`preflight` is sent to Echo with `read_only: true`, so Echo persists no
+`preflight_requests` / `preflight_evidence` rows for a remote call.
+
+Bounds: request bodies over 64 KiB are refused (413, or the body is cut off
+when chunked); an upstream answer over 2 MiB is refused while streaming; tool
+text is cut at 60,000 characters; uvicorn answers 503 beyond 16 concurrent
+connections. `tests/test_mcp_remote_readonly.py` pins the exact upstream
+allowlist and each tool's exact upstream requests as literals.
 
 ## Secret
 
