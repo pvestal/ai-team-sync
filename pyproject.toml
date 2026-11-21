@@ -65,6 +65,7 @@ dev = [
 ats = "ai_team_sync.cli:cli"
 ats-server = "ai_team_sync.server:main"
 ats-mcp = "ai_team_sync.mcp.server:run"
+ats-mcp-remote = "ai_team_sync.mcp.remote_readonly:run"
 ats-presence-hook = "ai_team_sync.hooks.post_tool_use_presence:main"
 tower-console = "ai_team_sync.console.cli:main"
 

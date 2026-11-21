@@ -1,0 +1,32 @@
+# Read-only ATS MCP over Streamable HTTP, for remote clients such as claude.ai (#3760).
+#
+# USER unit, next to ats-server. Loopback only; the public route is a Tailscale
+# Funnel in front of it (docs/remote-readonly-mcp.md). The process refuses to
+# start on a non-loopback host, or with a missing / weak / group-readable token.
+#
+#   cp deploy/ats-mcp-remote.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now ats-mcp-remote
+[Unit]
+Description=ATS read-only remote MCP (Streamable HTTP, bearer-gated, loopback)
+After=network.target ats-server.service
+Wants=ats-server.service
+
+[Service]
+Type=simple
+Environment=ATS_REMOTE_MCP_HOST=127.0.0.1
+Environment=ATS_REMOTE_MCP_PORT=8402
+Environment=ATS_REMOTE_MCP_TOKEN_FILE=%h/.config/ai-team-sync/remote-mcp.token
+Environment=ATS_SERVER_URL=http://127.0.0.1:8400
+Environment=ECHO_BRAIN_URL=http://127.0.0.1:8309
+# An empty, private state dir: this process must never find a session pointer
+# or keyring to act as (it never looks, but nothing is there if it did).
+Environment=ATS_STATE_DIR=%h/.local/state/ats-mcp-remote
+ExecStartPre=/usr/bin/mkdir -p -m 0700 %h/.local/state/ats-mcp-remote
+ExecStart=%h/.local/bin/ats-mcp-remote
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=default.target
