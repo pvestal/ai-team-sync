@@ -554,6 +554,10 @@ async def test_forwarded_header_never_echoes_client_text(caplog, xff):
     ("::ffff:160.79.104.7", "anthropic"), ("160.79.112.1", "v4"),
     ("2001:db8::1", "v6"), ("garbage", "<invalid>"),
     ("160.79.104.7, 10.0.0.1", "anthropic,v4"),
+    ("160.79.103.255", "v4"), ("160.79.104.0", "anthropic"),
+    ("153.61.208.0", "anthropic"), ("153.61.223.255", "anthropic"),
+    ("153.61.207.255", "v4"), ("153.61.224.0", "v4"),
+    ("::ffff:153.61.210.9", "anthropic"),
 ])
 def test_forwarded_address_classification(xff, expected):
     assert rr._client_addresses(xff) == expected

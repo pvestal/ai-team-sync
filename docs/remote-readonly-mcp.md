@@ -56,7 +56,8 @@ none). `scheme` is the lowercased scheme name if it is one of bearer / basic /
 digest / token / negotiate, `<none>` for a value without a scheme, otherwise
 `<other>`. Lengths are of the credential only. `xff` classifies each
 forwarded client address (up to three): `anthropic` if it is inside
-Anthropic's claude.ai egress range 160.79.104.0/21, otherwise `v4` / `v6`, or
+one of Anthropic's published outbound ranges (160.79.104.0/21,
+153.61.208.0/20), otherwise `v4` / `v6`, or
 `<invalid>`. The address itself is never logged: it is client-chosen bits, and
 a valid IPv6 address can carry 32 hex characters of anything. `funnel` says
 whether Tailscale marked the request as Funnel traffic. Method

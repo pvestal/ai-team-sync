@@ -436,9 +436,12 @@ def _parse_bearer(value: bytes) -> tuple[str, bytes]:
     return logged, (rest.lstrip(b" ") if scheme == "bearer" else b"")
 
 
-# Anthropic's published egress range for claude.ai connectors -- the question a
-# refusal log has to answer is "was this claude.ai?".
-ANTHROPIC_EGRESS = ipaddress.ip_network("160.79.104.0/21")
+# Anthropic's published OUTBOUND ranges ("stable IP addresses that Anthropic
+# uses for outbound requests, for example MCP tool calls", platform.claude.com
+# /docs/en/api/ip-addresses, read 2026-11-21) -- the question a refusal log has
+# to answer is "was this claude.ai?".
+ANTHROPIC_EGRESS = (ipaddress.ip_network("160.79.104.0/21"),
+                    ipaddress.ip_network("153.61.208.0/20"))
 
 
 def _client_addresses(raw: str) -> str:
@@ -447,7 +450,7 @@ def _client_addresses(raw: str) -> str:
     An address is client-chosen bits: a valid IPv6 address can carry 32 hex
     characters of anything, including the secret (review r2 of this change).
     So each comma-separated entry (at most three) is logged only as
-    ``anthropic`` (inside ANTHROPIC_EGRESS), ``v4`` / ``v6`` (some other
+    ``anthropic`` (inside one of the ANTHROPIC_EGRESS ranges), ``v4`` / ``v6`` (some other
     address), or ``<invalid>``.
     """
     out = []
@@ -462,7 +465,7 @@ def _client_addresses(raw: str) -> str:
             continue
         if addr.version == 6 and addr.ipv4_mapped is not None:
             addr = addr.ipv4_mapped
-        if addr in ANTHROPIC_EGRESS:
+        if any(addr in net for net in ANTHROPIC_EGRESS):
             out.append("anthropic")
         else:
             out.append(f"v{addr.version}")
