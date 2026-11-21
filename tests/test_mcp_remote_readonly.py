@@ -34,9 +34,13 @@ MUTATING_TOOLS = frozenset({
     "recent_file_activities", "recent_restarts", "delegation_status",
 })
 READ_TOOLS_REVIEWED = frozenset({
-    "task_brief", "preflight", "get_decision_history", "team_status",
+    "task_brief", "get_decision_history", "team_status",
     "get_session_details", "list_all_locks", "ats_version",
 })
+# Reads with side effects downstream: Echo memory search refreshes its Redis
+# cache and Qdrant access metadata. Off the remote surface by operator ruling
+# (2026-11-21) until Echo search takes a read-only flag.
+SIDE_EFFECT_READS = frozenset({"preflight"})
 
 
 class Recorder(httpx.AsyncBaseTransport):
@@ -63,10 +67,9 @@ class Recorder(httpx.AsyncBaseTransport):
 
 @pytest.fixture
 def upstream(monkeypatch):
-    # Pin the upstream bases: the module reads ATS_SERVER_URL / ECHO_BRAIN_URL at
+    # Pin the upstream bases: the module reads ATS_SERVER_URL at
     # import, and a test must not inherit them from the shell.
     monkeypatch.setattr(rr, "ATS_URL", "http://127.0.0.1:8400")
-    monkeypatch.setattr(rr, "ECHO_URL", "http://127.0.0.1:8309")
     rec = Recorder()
     monkeypatch.setattr(rr, "_inner_transport", rec)
     return rec
@@ -105,6 +108,7 @@ async def test_no_mutating_tool_on_the_remote_transport(upstream):
         assert r.status_code == 200, r.text
         names = {t["name"] for t in r.json()["result"]["tools"]}
         assert not names & MUTATING_TOOLS, f"mutating tools exposed remotely: {names & MUTATING_TOOLS}"
+        assert not names & SIDE_EFFECT_READS
         assert names == READ_TOOLS_REVIEWED
 
 
@@ -112,12 +116,13 @@ async def test_every_stdio_tool_is_classified():
     """A tool added to ats-mcp must be classified here before this suite passes."""
     from ai_team_sync.mcp.server import list_tools
     stdio = {t.name for t in await list_tools()}
-    unclassified = stdio - MUTATING_TOOLS - READ_TOOLS_REVIEWED
+    unclassified = stdio - MUTATING_TOOLS - READ_TOOLS_REVIEWED - SIDE_EFFECT_READS
     assert not unclassified, f"classify these for the remote surface: {unclassified}"
     assert not (MUTATING_TOOLS & READ_TOOLS_REVIEWED)
+    assert not (SIDE_EFFECT_READS & READ_TOOLS_REVIEWED)
 
 
-@pytest.mark.parametrize("name", sorted(MUTATING_TOOLS))
+@pytest.mark.parametrize("name", sorted(MUTATING_TOOLS | SIDE_EFFECT_READS))
 async def test_mutating_tool_call_is_refused_without_upstream(upstream, name):
     async with serve() as http:
         r = await _call(http, "tools/call", {"name": name, "arguments": {"session_id": "s1"}})
@@ -191,7 +196,6 @@ async def test_oversized_body_rejected(upstream):
 
 READ_CALLS = {
     "task_brief": {"objective": "x", "task_id": 3760},
-    "preflight": {"objective": "x"},
     "get_decision_history": {"ticket_id": 3760},
     "team_status": {},
     "get_session_details": {"session_id": "s1"},
@@ -213,7 +217,7 @@ async def test_read_tools_use_only_read_routes(upstream, name):
             assert "x-ats-approval-token" not in req.headers
             if req.method == "POST":
                 body = json.loads(req.content)
-                assert body.get("session_id", "") == "" and body.get("requesting_session") is None
+                assert body.get("session_id", "") == ""
 
 
 async def test_brief_never_names_a_session(upstream):
@@ -242,6 +246,8 @@ async def test_session_id_cannot_traverse_paths(upstream):
     ("GET", "http://127.0.0.1:8400/api/sessions/s1/complete"),
     ("GET", "http://evil.example/api/sessions"),
     ("POST", "http://127.0.0.1:8309/api/brief"),
+    ("POST", "http://127.0.0.1:8309/api/preflight"),
+    ("POST", "http://127.0.0.1:8309/api/echo/memory/search"),
     ("GET", "http://127.0.0.1:8400/api/messages"),
     ("POST", "http://127.0.0.1:8400/api/restarts"),
     ("POST", "http://127.0.0.1:8400/api/version"),
@@ -252,7 +258,6 @@ async def test_session_id_cannot_traverse_paths(upstream):
 ])
 async def test_guard_refuses_non_read_upstream(monkeypatch, method, url):
     monkeypatch.setattr(rr, "ATS_URL", "http://127.0.0.1:8400")
-    monkeypatch.setattr(rr, "ECHO_URL", "http://127.0.0.1:8309")
     rec = Recorder()
     async with httpx.AsyncClient(transport=rr._GuardedTransport(rec)) as c:
         with pytest.raises(rr.UpstreamRefused):
@@ -301,7 +306,6 @@ PINNED_UPSTREAM = {
     ("GET", "ats", "/api/locks"),
     ("GET", "ats", "/api/restarts"),
     ("GET", "ats", "/api/version"),
-    ("POST", "echo", "/api/preflight"),
 }
 
 
@@ -317,7 +321,6 @@ def test_tool_catalog_is_exactly_the_reviewed_set():
 
 EXPECTED_REQUESTS = {
     "task_brief": [("POST", "127.0.0.1:8400", "/api/brief")],
-    "preflight": [("POST", "127.0.0.1:8309", "/api/preflight")],
     "get_decision_history": [("GET", "127.0.0.1:8400", "/api/decisions")],
     "team_status": [("GET", "127.0.0.1:8400", "/api/sessions")],
     "get_session_details": [("GET", "127.0.0.1:8400", "/api/sessions/s1")],
@@ -335,13 +338,16 @@ async def test_each_tool_sends_exactly_its_pinned_requests(upstream, name):
     assert got == EXPECTED_REQUESTS[name]
 
 
-async def test_preflight_is_sent_read_only(upstream):
-    """Echo persists preflight rows unless read_only is true (review r1 finding 1)."""
+async def test_brief_recall_is_forced_off(upstream):
+    """Recall is Echo memory search, which writes cache/access metadata (review r2)."""
     async with serve() as http:
-        await _call(http, "tools/call", {"name": "preflight", "arguments": {"objective": "x"}})
-    body = json.loads(upstream.requests[0].content)
-    assert body["read_only"] is True
-    assert body["requesting_session"] is None
+        await _call(http, "tools/call", {"name": "task_brief",
+                                         "arguments": {"objective": "x", "recall": True}})
+    assert json.loads(upstream.requests[0].content)["recall"] is False
+
+
+def test_nothing_reaches_echo_directly():
+    assert {base for _, base, _ in rr.UPSTREAM_ALLOWLIST} == {"ats"}
 
 
 # ---- availability bounds -------------------------------------------------------------
@@ -382,3 +388,39 @@ def test_run_passes_concurrency_and_size_limits(monkeypatch, tmp_path):
     assert seen["limit_concurrency"] == rr.MAX_CONCURRENCY
     assert seen["h11_max_incomplete_event_size"] == rr.MAX_BODY_BYTES
     assert seen["proxy_headers"] is False
+
+
+# ---- review r2: encoded bodies and error mapping ----------------------------------
+
+class Gzipped(httpx.AsyncBaseTransport):
+    """A 5 KB gzip body that decodes past the cap (the r2 bypass)."""
+
+    def __init__(self):
+        self.seen_accept_encoding = []
+
+    async def handle_async_request(self, request):
+        import gzip
+        self.seen_accept_encoding.append(request.headers.get("accept-encoding"))
+        body = gzip.compress(b"[" + b'"' + b"z" * (rr.MAX_UPSTREAM_BYTES * 2) + b'"]')
+        return httpx.Response(200, headers={"content-encoding": "gzip",
+                                            "content-type": "application/json"},
+                              content=body)
+
+
+@pytest.mark.parametrize("name", ["list_all_locks", "task_brief", "ats_version", "team_status"])
+async def test_encoded_upstream_answer_is_refused_as_error(monkeypatch, name):
+    gz = Gzipped()
+    monkeypatch.setattr(rr, "_inner_transport", gz)
+    async with serve() as http:
+        r = await _call(http, "tools/call", {"name": name, "arguments": READ_CALLS[name]})
+    result = r.json()["result"]
+    assert result["isError"] is True, r.text
+    assert gz.seen_accept_encoding and set(gz.seen_accept_encoding) == {"identity"}
+
+
+@pytest.mark.parametrize("name", ["task_brief", "ats_version", "list_all_locks"])
+async def test_oversized_answer_is_an_error_for_every_tool(monkeypatch, name):
+    monkeypatch.setattr(rr, "_inner_transport", Huge())
+    async with serve() as http:
+        r = await _call(http, "tools/call", {"name": name, "arguments": READ_CALLS[name]})
+    assert r.json()["result"]["isError"] is True, r.text

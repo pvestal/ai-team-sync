@@ -1,7 +1,7 @@
 """Read-only ATS MCP over Streamable HTTP, for remote clients (#3760).
 
 A remote client (claude.ai chat, including voice mode) may READ ATS context --
-task briefs, preflight, decisions, active work -- and nothing else. This is a
+task briefs, decisions, active work -- and nothing else. This is a
 separate server from the stdio ``ats-mcp``, deliberately sharing none of its
 dispatch, because that dispatch carries session identity: it resolves the
 caller from pointer files and keyrings, heartbeats sessions it holds, and
@@ -43,7 +43,6 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import TextContent, Tool
 
 ATS_URL = os.environ.get("ATS_SERVER_URL", "http://127.0.0.1:8400").rstrip("/")
-ECHO_URL = os.environ.get("ECHO_BRAIN_URL", "http://127.0.0.1:8309").rstrip("/")
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8402
@@ -59,13 +58,16 @@ MAX_BODY_BYTES = 64 * 1024
 MAX_UPSTREAM_BYTES = 2 * 1024 * 1024
 MAX_OUTPUT_CHARS = 60_000
 MAX_CONCURRENCY = 16
-REMOTE_WORKER_LABEL = "remote-readonly"
 
 # The names a remote caller may invoke. Kept as a literal, not derived from the
 # stdio catalog, so adding a tool to ats-mcp can never widen this surface.
+# preflight is deliberately ABSENT (operator ruling 2026-11-21, #3760 review r2):
+# Echo's memory search, which every preflight runs, refreshes the Redis result
+# cache and bumps Qdrant access metadata. It returns when Echo's search takes a
+# read-only flag (follow-up ticket). task_brief runs with recall forced off for
+# the same reason.
 READONLY_TOOL_NAMES = frozenset({
     "task_brief",
-    "preflight",
     "get_decision_history",
     "team_status",
     "get_session_details",
@@ -74,9 +76,9 @@ READONLY_TOOL_NAMES = frozenset({
 })
 
 # Every (method, base, path regex) this server may send upstream. GETs are reads
-# by HTTP contract on ATS; the two POSTs are the read-only brief builder (a
-# brief never binds a ticket or claims anything, routers/briefs.py) and Echo's
-# advisory preflight.
+# by HTTP contract on ATS; the one POST is the read-only brief builder (a brief
+# never binds a ticket or claims anything, routers/briefs.py). Nothing here
+# reaches Echo directly.
 _SID = r"[A-Za-z0-9-]{1,64}"
 UPSTREAM_ALLOWLIST: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("POST", "ats", re.compile(r"/api/brief")),
@@ -86,7 +88,6 @@ UPSTREAM_ALLOWLIST: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("GET", "ats", re.compile(r"/api/locks")),
     ("GET", "ats", re.compile(r"/api/restarts")),
     ("GET", "ats", re.compile(r"/api/version")),
-    ("POST", "echo", re.compile(r"/api/preflight")),
 )
 
 
@@ -108,7 +109,7 @@ def _origin(url: str) -> tuple[str, str, int | None]:
 
 def upstream_allowed(method: str, url: httpx.URL) -> bool:
     origin = (url.scheme, url.host, url.port)
-    bases = {"ats": _origin(ATS_URL), "echo": _origin(ECHO_URL)}
+    bases = {"ats": _origin(ATS_URL)}
     for m, base, pattern in UPSTREAM_ALLOWLIST:
         if m == method.upper() and origin == bases[base] and pattern.fullmatch(url.path):
             return True
@@ -122,7 +123,17 @@ class _GuardedTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         if not upstream_allowed(request.method, request.url):
             raise UpstreamRefused(f"{request.method} {request.url} is not a read-only upstream")
+        # The size cap counts wire bytes, so the wire must BE the body: ask for
+        # no compression and refuse any encoded answer (#3760 review r2 -- a
+        # 5 KB gzip body decoded to 5 MB past a raw-byte cap).
+        request.headers["Accept-Encoding"] = "identity"
         response = await self._inner.handle_async_request(request)
+        encoding = response.headers.get("content-encoding", "").strip().lower()
+        if encoding not in ("", "identity"):
+            await response.stream.aclose()
+            raise UpstreamTooLarge(
+                f"{request.method} {request.url.path} answered with content-encoding "
+                f"{encoding!r}; only identity is accepted")
         # Read the body here, bounded, so an oversized upstream answer is
         # refused while streaming instead of being buffered whole.
         chunks: list[bytes] = []
@@ -168,7 +179,8 @@ READONLY_TOOLS: list[Tool] = [
         description=(
             "Read-only. The ATS context packet for a piece of work: live blockers, "
             "prior decisions, prior work, the ticket's current operator rulings, "
-            "each line with provenance and a citation. Reading it claims nothing."),
+            "each line with provenance and a citation. Reading it claims nothing. "
+            "Semantic memory recall is off on this remote surface."),
         inputSchema={
             "type": "object",
             "properties": {
@@ -177,30 +189,7 @@ READONLY_TOOLS: list[Tool] = [
                             "description": "Tower task id for exact rulings."},
                 "repo_root": {"type": "string"},
                 "scope": {"type": "array", "items": {"type": "string"}},
-                "recall": {"type": "boolean"},
                 "resolve_task": {"type": "boolean"},
-            },
-            "required": ["objective"],
-        },
-    ),
-    Tool(
-        name="preflight",
-        description=(
-            "Read-only advisory. Has this action been tried before, and what "
-            "happened? Returns CLEAR / CAUTION / STRONG_WARNING / "
-            "INSUFFICIENT_EVIDENCE with citations. Changes nothing."),
-        inputSchema={
-            "type": "object",
-            "properties": {
-                "objective": {"type": "string"},
-                "task_id": {"type": "integer", "minimum": 1},
-                "operation_type": {"type": "string",
-                                   "enum": ["investigate", "edit", "test", "render",
-                                            "gpu_canary", "service_restart",
-                                            "migration", "other"]},
-                "repo_root": {"type": "string"},
-                "scope": {"type": "array", "items": {"type": "string"}},
-                "entities": {"type": "object"},
             },
             "required": ["objective"],
         },
@@ -252,7 +241,9 @@ async def _task_brief(c: httpx.AsyncClient, a: dict[str, Any]) -> list[TextConte
     body: dict[str, Any] = {"objective": str(a["objective"]),
                             "repo_root": str(a.get("repo_root") or ""),
                             "scope": list(a.get("scope") or []),
-                            "recall": bool(a.get("recall", True)),
+                            # Recall goes to Echo memory search, which writes
+                            # cache/access metadata; never on this surface.
+                            "recall": False,
                             "resolve_task": bool(a.get("resolve_task", True)),
                             # No caller session: a remote reader is nobody's session.
                             "session_id": ""}
@@ -262,52 +253,6 @@ async def _task_brief(c: httpx.AsyncClient, a: dict[str, Any]) -> list[TextConte
     if r.status_code >= 400:
         return _text(f"Task brief refused (HTTP {r.status_code}): {r.text[:500]}")
     return _text(r.json().get("rendered") or json.dumps(r.json(), indent=1)[:20000])
-
-
-async def _preflight(c: httpx.AsyncClient, a: dict[str, Any]) -> list[TextContent]:
-    payload = {"objective": str(a["objective"]),
-               "requesting_worker": REMOTE_WORKER_LABEL,
-               "requesting_session": None,
-               "repo_root": str(a.get("repo_root") or ""),
-               "tower_task_id": a.get("task_id"),
-               "operation_type": a.get("operation_type", "other"),
-               "declared_scope": list(a.get("scope") or []),
-               "entities": dict(a.get("entities") or {}),
-               # Echo persists preflight_requests/preflight_evidence unless told
-               # read_only (preflight_api.py); a remote reader writes nothing.
-               "read_only": True}
-    try:
-        r = await c.post(f"{ECHO_URL}/api/preflight", json=payload, timeout=90)
-        r.raise_for_status()
-        d = r.json()
-    except UpstreamRefused:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        return _text(f"PREFLIGHT UNAVAILABLE ({type(exc).__name__}). This is NOT a "
-                     "CLEAR result: no history was checked.")
-    lines = [f"{d.get('disposition')} (read-only preflight; not recorded)",
-             "", str(d.get("recommended_next") or "")]
-    ts = d.get("task_state") or {}
-    if ts:
-        lines += ["", f"TOWER TASK #{ts.get('task_id')} {ts.get('task_key') or ''}".rstrip(),
-                  f"  status: {ts.get('status')}  gate: {ts.get('gate')}  "
-                  f"priority: {ts.get('priority')}"]
-        if ts.get("recommendation"):
-            lines.append(f"  ruling: {str(ts['recommendation'])[:300]}")
-    for label, key in (("OPERATOR RULINGS", "operator_decisions"),
-                       ("FAILED APPROACHES", "failed_approaches"),
-                       ("CHANGED SINCE", "change_since_evidence")):
-        items = d.get(key) or []
-        if items:
-            lines += ["", label]
-            for e in items[:4]:
-                lines.append(f"  [{e.get('authority_class')}] {e.get('citation')}")
-                if e.get("evidence_text"):
-                    lines.append(f"    {str(e['evidence_text'])[:200]}")
-    if d.get("degraded_reason"):
-        lines += ["", f"degraded: {d['degraded_reason']}"]
-    lines += ["", "Advisory. Nothing was changed."]
-    return _text("\n".join(lines))
 
 
 async def _decisions(c: httpx.AsyncClient, a: dict[str, Any]) -> list[TextContent]:
@@ -390,7 +335,7 @@ async def _version(c: httpx.AsyncClient, a: dict[str, Any]) -> list[TextContent]
         r = await c.get(f"{ATS_URL}/api/version", timeout=5)
         lines.append(summary_line(r.json()) if r.status_code == 200 else
                      f"ats-rest: HTTP {r.status_code}")
-    except UpstreamRefused:
+    except (UpstreamRefused, UpstreamTooLarge):
         raise
     except Exception as exc:  # noqa: BLE001
         lines.append(f"ats-rest: unreachable ({type(exc).__name__})")
@@ -399,7 +344,6 @@ async def _version(c: httpx.AsyncClient, a: dict[str, Any]) -> list[TextContent]
 
 _HANDLERS = {
     "task_brief": _task_brief,
-    "preflight": _preflight,
     "get_decision_history": _decisions,
     "team_status": _team_status,
     "get_session_details": _session_details,

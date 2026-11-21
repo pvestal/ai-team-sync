@@ -17,7 +17,6 @@ Environment=ATS_REMOTE_MCP_HOST=127.0.0.1
 Environment=ATS_REMOTE_MCP_PORT=8402
 Environment=ATS_REMOTE_MCP_TOKEN_FILE=%h/.config/ai-team-sync/remote-mcp.token
 Environment=ATS_SERVER_URL=http://127.0.0.1:8400
-Environment=ECHO_BRAIN_URL=http://127.0.0.1:8309
 # An empty, private state dir: this process must never find a session pointer
 # or keyring to act as (it never looks, but nothing is there if it did).
 Environment=ATS_STATE_DIR=%h/.local/state/ats-mcp-remote

@@ -1,9 +1,16 @@
 # Remote read-only ATS MCP (#3760)
 
 Lets a remote MCP client (claude.ai chat, including voice mode) READ ATS
-context: `task_brief`, `preflight`, `get_decision_history`, `team_status`,
+context: `task_brief`, `get_decision_history`, `team_status`,
 `get_session_details`, `list_all_locks`, `ats_version`. It has no write tools
 and cannot act as any session.
+
+Not on this surface (operator ruling 2026-11-21): `preflight`, and semantic
+memory recall inside `task_brief`. Both run Echo memory search, which refreshes
+Echo's Redis result cache and bumps Qdrant access metadata on every call. They
+return once Echo search takes a read-only flag (follow-up ticket). Until then
+the remote brief carries ATS context, the ticket envelope and its rulings, but
+no recalled memories.
 
 ## Shape
 
@@ -14,11 +21,12 @@ claude.ai ──HTTPS──▶ Tailscale Funnel (tower.<tailnet>.ts.net:443, pat
              127.0.0.1:8402  ats-mcp-remote (user unit)
                1. BearerGate  — 401 unless `Authorization: Bearer <secret>`
                2. /mcp only   — every other path 404
-               3. tool allowlist (7 read tools)
-               4. upstream allowlist — only GET reads + POST /api/brief (ATS)
-                  and POST /api/preflight (Echo) can leave the process
+               3. tool allowlist (6 read tools)
+               4. upstream allowlist — only GET reads + POST /api/brief on
+                  ats-server can leave the process; nothing goes to Echo
+                  directly (the brief's own Echo lookups are reads)
                          ▼
-             ats-server 127.0.0.1:8400 / Echo Brain 127.0.0.1:8309
+             ats-server 127.0.0.1:8400
 ```
 
 Code: `src/ai_team_sync/mcp/remote_readonly.py`. Guard tests:
@@ -27,11 +35,10 @@ fails if any mutating tool is listed on this transport, and
 `test_every_stdio_tool_is_classified` fails when a new stdio tool is added
 without a read/mutating classification.
 
-`preflight` is sent to Echo with `read_only: true`, so Echo persists no
-`preflight_requests` / `preflight_evidence` rows for a remote call.
-
 Bounds: request bodies over 64 KiB are refused (413, or the body is cut off
-when chunked); an upstream answer over 2 MiB is refused while streaming; tool
+when chunked); upstream answers must be uncompressed (`Accept-Encoding:
+identity`; any other content-encoding is refused) and over 2 MiB are refused
+while streaming; tool
 text is cut at 60,000 characters; uvicorn answers 503 beyond 16 concurrent
 connections. `tests/test_mcp_remote_readonly.py` pins the exact upstream
 allowlist and each tool's exact upstream requests as literals.
