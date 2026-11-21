@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import stat
 
@@ -136,7 +137,8 @@ async def test_mutating_tool_call_is_refused_without_upstream(upstream, name):
 # ---- bearer gate -----------------------------------------------------------------
 
 @pytest.mark.parametrize("auth", [None, "", "Bearer", f"Bearer {TOKEN}x",
-                                  f"bearer {TOKEN}", TOKEN, f"Basic {TOKEN}"])
+                                  TOKEN, f"Basic {TOKEN}", f"Bearer{TOKEN}",
+                                  f"Bearer {TOKEN[:-1]}", f"Token {TOKEN}"])
 async def test_requests_without_the_exact_bearer_are_rejected_before_mcp(upstream, auth):
     async with serve() as http:
         h = {k: v for k, v in HDRS.items() if k != "Authorization"}
@@ -383,7 +385,12 @@ def test_run_passes_concurrency_and_size_limits(monkeypatch, tmp_path):
     seen = {}
     import uvicorn
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: seen.update(kw))
+    # run() configures the refusal logger; keep that from leaking into other tests.
+    monkeypatch.setattr(rr.auth_log, "handlers", [])
+    monkeypatch.setattr(rr.auth_log, "propagate", True)
+    monkeypatch.setattr(rr.auth_log, "level", rr.auth_log.level)
     rr.run()
+    assert rr.auth_log.handlers and rr.auth_log.propagate is False
     assert seen["host"] == "127.0.0.1"
     assert seen["limit_concurrency"] == rr.MAX_CONCURRENCY
     assert seen["h11_max_incomplete_event_size"] == rr.MAX_BODY_BYTES
@@ -424,3 +431,85 @@ async def test_oversized_answer_is_an_error_for_every_tool(monkeypatch, name):
     async with serve() as http:
         r = await _call(http, "tools/call", {"name": name, "arguments": READ_CALLS[name]})
     assert r.json()["result"]["isError"] is True, r.text
+
+
+# ---- RFC 7235 parsing + refusal diagnostics (#3760 claude.ai connector 401s) ------
+
+@pytest.mark.parametrize("auth", [f"Bearer {TOKEN}", f"bearer {TOKEN}", f"BEARER {TOKEN}",
+                                  f"  Bearer   {TOKEN}  ", f"Bearer\t{TOKEN}"])
+async def test_rfc7235_scheme_case_and_whitespace_accepted(upstream, auth):
+    h = {k: v for k, v in HDRS.items() if k != "Authorization"}
+    h["Authorization"] = auth
+    async with serve() as http:
+        r = await _call(http, "tools/list", headers=h)
+    assert r.status_code == 200, (auth, r.text)
+
+
+def _refusal_lines(caplog):
+    return [r.getMessage() for r in caplog.records if r.name == "ats_remote_mcp.auth"]
+
+
+@pytest.mark.parametrize("auth,scheme,cred_len", [
+    (None, "-", 0),
+    ("", "<empty>", 0),
+    (TOKEN, "<none>", 0),                       # token with no scheme: never logged
+    (f"Basic {TOKEN}", "basic", 0),
+    (f"Weird{TOKEN[:3]} {TOKEN}", "<other>", 0),
+    (f"Bearer {TOKEN}x", "bearer", len(TOKEN) + 1),
+    (f"bearer  {TOKEN[:-2]} ", "bearer", len(TOKEN) - 2),
+])
+async def test_refusal_is_logged_without_the_credential(upstream, caplog, auth, scheme, cred_len):
+    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
+    h = {k: v for k, v in HDRS.items() if k != "Authorization"}
+    if auth is not None:
+        h["Authorization"] = auth
+    h["X-Forwarded-For"] = "160.79.104.7"
+    h["Tailscale-Funnel-Request"] = "?1"
+    async with serve() as http:
+        r = await _call(http, "tools/list", headers=h)
+    assert r.status_code == 401
+    lines = _refusal_lines(caplog)
+    assert len(lines) == 1, lines
+    line = lines[0]
+    assert TOKEN[:12] not in line and TOKEN[-12:] not in line
+    assert f"auth_headers={0 if auth is None else 1}" in line
+    assert f"scheme={scheme} " in line
+    assert f"credential_len={cred_len} expected_len={len(TOKEN)}" in line
+    assert "xff=160.79.104.7" in line and "funnel=yes" in line
+    assert line.startswith("401 POST /mcp ")
+
+
+async def test_refusal_log_sanitizes_forwarded_header(upstream, caplog):
+    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
+    h = {k: v for k, v in HDRS.items() if k != "Authorization"}
+    h["X-Forwarded-For"] = "1.2.3.4\nINFO fake line " + "9" * 500
+    async with serve() as http:
+        await _call(http, "tools/list", headers=h)
+    line = _refusal_lines(caplog)[0]
+    assert "\n" not in line and "fake" not in line and len(line) < 400
+
+
+async def test_success_is_not_logged_as_refusal(upstream, caplog):
+    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
+    async with serve() as http:
+        r = await _call(http, "tools/list")
+    assert r.status_code == 200 and _refusal_lines(caplog) == []
+
+
+async def test_duplicate_headers_logged_as_refused(caplog):
+    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
+    app = rr.build_app(TOKEN)
+    sent = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(m):
+        sent.append(m)
+
+    await app({"type": "http", "method": "POST", "path": "/mcp",
+               "headers": [(b"authorization", f"Bearer {TOKEN}".encode()),
+                           (b"authorization", f"Bearer {TOKEN}".encode())]}, receive, send)
+    assert sent[0]["status"] == 401
+    line = _refusal_lines(caplog)[0]
+    assert "auth_headers=2" in line and TOKEN[:12] not in line

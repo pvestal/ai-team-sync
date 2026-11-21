@@ -43,10 +43,31 @@ text is cut at 60,000 characters; uvicorn answers 503 beyond 16 concurrent
 connections. `tests/test_mcp_remote_readonly.py` pins the exact upstream
 allowlist and each tool's exact upstream requests as literals.
 
+## Refusal log
+
+Every 401 is logged to the `ats-mcp-remote` journal as one line, for example:
+
+```
+WARNING:ats_remote_mcp.auth:401 POST /mcp auth_headers=1 scheme=bearer credential_len=64 expected_len=64 len_match=True xff=160.79.104.7 funnel=yes
+```
+
+`auth_headers` is how many Authorization headers arrived (0 = the client sent
+none). `scheme` is the lowercased scheme name, `<none>` for a value without a
+scheme, or `<other>` for an unknown one. Lengths are of the credential only.
+`xff` is the forwarded client address (address characters only) and `funnel`
+says whether Tailscale marked the request as Funnel traffic. The credential is
+never logged.
+
+```bash
+journalctl --user -u ats-mcp-remote --since -15min | grep ats_remote_mcp.auth
+```
+
 ## Secret
 
 - Header: `Authorization: Bearer <secret>` (a standard header name that
-  claude.ai custom connectors may send).
+  claude.ai custom connectors may send). Per RFC 7235 the scheme is matched
+  case-insensitively and surrounding whitespace is ignored; the secret itself
+  must match exactly.
 - File: `~/.config/ai-team-sync/remote-mcp.token`, mode 0600, outside the repo.
   The server refuses to start if the file is missing, not 0600, or shorter
   than 32 characters.

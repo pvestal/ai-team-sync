@@ -30,6 +30,7 @@ import contextlib
 import hmac
 import ipaddress
 import json
+import logging
 import os
 import re
 import stat
@@ -400,14 +401,43 @@ async def _send_status(send, status: int, body: bytes, extra: list | None = None
     await send({"type": "http.response.body", "body": body})
 
 
+auth_log = logging.getLogger("ats_remote_mcp.auth")
+
+# Scheme names safe to echo into a log line. Anything else is logged as
+# "<other>": a value with no scheme at all would otherwise put the token itself
+# in the "scheme" slot.
+_KNOWN_SCHEMES = frozenset({"bearer", "basic", "digest", "token", "negotiate"})
+_XFF_SAFE = re.compile(r"[^0-9A-Fa-f:., ]")
+
+
+def _parse_bearer(value: bytes) -> tuple[str, bytes]:
+    """(scheme as logged, credential) from one Authorization value.
+
+    RFC 7235: the scheme is case-insensitive and is separated from the
+    credential by whitespace; surrounding whitespace is not part of either.
+    """
+    v = value.strip()
+    parts = v.split(None, 1)
+    if len(parts) != 2:
+        return ("<none>" if len(parts) < 2 and v else "<empty>"), b""
+    scheme = parts[0].decode("latin-1").lower()
+    logged = scheme if scheme in _KNOWN_SCHEMES else "<other>"
+    return logged, (parts[1].strip() if scheme == "bearer" else b"")
+
+
 class BearerGate:
-    """Outermost ASGI layer: no valid bearer, no further processing."""
+    """Outermost ASGI layer: no valid bearer, no further processing.
+
+    Every refusal is logged with what arrived -- how many Authorization
+    headers, the scheme, the credential length against the expected length, and
+    the forwarded client address -- and never the credential itself.
+    """
 
     def __init__(self, app, token: str):
         if len(token) < MIN_TOKEN_LEN:
             raise ValueError("bearer token too short")
         self.app = app
-        self._expected = f"Bearer {token}".encode()
+        self._token = token.encode()
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
@@ -417,8 +447,13 @@ class BearerGate:
             if scope["type"] == "websocket":
                 await send({"type": "websocket.close", "code": 1008})
             return
-        auth = [v for k, v in scope.get("headers", []) if k == b"authorization"]
-        if len(auth) != 1 or not hmac.compare_digest(auth[0], self._expected):
+        headers = scope.get("headers", [])
+        auth = [v for k, v in headers if k == b"authorization"]
+        scheme, credential = _parse_bearer(auth[0]) if len(auth) == 1 else ("-", b"")
+        ok = (len(auth) == 1 and scheme == "bearer"
+              and hmac.compare_digest(credential, self._token))
+        if not ok:
+            self._log_refusal(scope, headers, auth, scheme, credential)
             return await _send_status(send, 401, b"unauthorized\n",
                                       [(b"www-authenticate", b'Bearer realm="ats"')])
         lengths = [v for k, v in scope.get("headers", []) if k == b"content-length"]
@@ -429,6 +464,22 @@ class BearerGate:
             except ValueError:
                 return await _send_status(send, 400, b"bad content-length\n")
         return await self.app(scope, _capped_receive(receive), send)
+
+    def _log_refusal(self, scope, headers, auth, scheme, credential) -> None:
+        def first(name: bytes) -> str:
+            for k, v in headers:
+                if k == name:
+                    return v.decode("latin-1")
+            return ""
+        # Forwarded headers are attacker-supplied text: keep address characters
+        # only, bounded, so a log line cannot be forged or flooded.
+        xff = _XFF_SAFE.sub("", first(b"x-forwarded-for"))[:100] or "-"
+        auth_log.warning(
+            "401 %s %s auth_headers=%d scheme=%s credential_len=%d expected_len=%d "
+            "len_match=%s xff=%s funnel=%s",
+            scope.get("method", "?"), str(scope.get("path", "?"))[:64], len(auth), scheme,
+            len(credential), len(self._token), len(credential) == len(self._token),
+            xff, "yes" if first(b"tailscale-funnel-request") else "no")
 
 
 def _capped_receive(receive):
@@ -496,6 +547,14 @@ def run() -> None:
     token_file = Path(os.environ.get("ATS_REMOTE_MCP_TOKEN_FILE", str(DEFAULT_TOKEN_FILE)))
     _require_loopback(host)
     token = load_token(token_file)
+    # The refusal log must reach the journal whatever else configured logging:
+    # its own stderr handler, not dependent on a root handler.
+    if not auth_log.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+        auth_log.addHandler(handler)
+        auth_log.setLevel(logging.INFO)
+        auth_log.propagate = False
     # proxy_headers off: X-Forwarded-* from the Funnel is not trusted for anything.
     uvicorn.run(build_app(token), host=host, port=port, proxy_headers=False,
                 server_header=False, log_level="info", access_log=True,
