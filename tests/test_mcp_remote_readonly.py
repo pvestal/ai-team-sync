@@ -137,7 +137,7 @@ async def test_mutating_tool_call_is_refused_without_upstream(upstream, name):
 # ---- bearer gate -----------------------------------------------------------------
 
 @pytest.mark.parametrize("auth", [None, "", "Bearer", f"Bearer {TOKEN}x",
-                                  TOKEN, f"Basic {TOKEN}", f"Bearer{TOKEN}",
+                                  f"Basic {TOKEN}", f"Bearer{TOKEN}",
                                   f"Bearer {TOKEN[:-1]}", f"Token {TOKEN}"])
 async def test_requests_without_the_exact_bearer_are_rejected_before_mcp(upstream, auth):
     async with serve() as http:
@@ -467,7 +467,9 @@ async def test_rfc7235_scheme_case_and_whitespace_accepted(upstream, auth):
 @pytest.mark.parametrize("auth", [f"Bearer\t{HEX}", f"Bearer \t{HEX}", f"Bearer\x0b{HEX}",
                                   f"Bearer\x0c{HEX}", f"Bearer {HEX[:32]} {HEX[32:]}",
                                   f"Bearer {HEX},Bearer {HEX}", f"Bearer {HEX[1:]}",
-                                  f"Bearer {HEX}0", f"Basic {HEX}", HEX, "Bearer ", "Bearer"])
+                                  f"Bearer {HEX}0", f"Basic {HEX}", "Bearer ", "Bearer",
+                                  f"{HEX}0", HEX[1:], f"{HEX[:32]} {HEX[32:]}",
+                                  f"{HEX}\t{HEX}", f" {HEX} x"])
 async def test_non_rfc_separators_and_near_misses_rejected(upstream, auth):
     async with serve_hex() as http:
         r = await _call(http, "tools/list", headers=_h(auth))
@@ -502,7 +504,7 @@ def _assert_no_secret(line):
 @pytest.mark.parametrize("auth,scheme,cred_len", [
     (None, "-", 0),
     ("", "<empty>", 0),
-    (HEX, "<none>", 0),
+    (HEX[:-1], "<none>", 0),
     (f"Basic {HEX}", "basic", 0),
     (f"Weird{HEX[:3]} {HEX}", "<other>", 0),
     (f"Bearer {HEX}0", "bearer", len(HEX) + 1),
@@ -519,7 +521,7 @@ async def test_refusal_is_logged_without_the_credential(upstream, caplog, auth, 
     assert len(lines) == 1, lines
     line = lines[0]
     _assert_no_secret(line)
-    assert f"auth_headers={0 if auth is None else 1}" in line
+    assert f"auth_headers={0 if auth is None else 1} value_len={0 if auth is None else len(auth)} " in line
     assert f"scheme={scheme} " in line
     assert f"credential_len={cred_len} expected_len={len(HEX)}" in line
     assert "xff=anthropic " in line and "funnel=yes" in line
@@ -593,3 +595,23 @@ async def test_duplicate_headers_logged_as_refused(caplog):
     line = _refusal_lines(caplog)[0]
     assert "auth_headers=2" in line
     _assert_no_secret(line)
+
+
+# ---- bare secret as the whole Authorization value (claude.ai connector) ----------
+
+@pytest.mark.parametrize("auth", [HEX, f"  {HEX}  ", f"\t{HEX}"])
+async def test_bare_secret_accepted(upstream, auth):
+    async with serve_hex() as http:
+        r = await _call(http, "tools/list", headers=_h(auth))
+    assert r.status_code == 200, (auth, r.text)
+
+
+async def test_bare_wrong_secret_logs_value_len_not_value(upstream, caplog):
+    caplog.set_level(logging.INFO, logger="ats_remote_mcp.auth")
+    wrong = "f" * len(HEX)
+    async with serve_hex() as http:
+        r = await _call(http, "tools/list", headers=_h(wrong))
+    assert r.status_code == 401
+    line = _refusal_lines(caplog)[0]
+    assert f"value_len={len(HEX)} scheme=<none> credential_len=0" in line
+    assert "ffffffff" not in line

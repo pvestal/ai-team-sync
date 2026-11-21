@@ -444,6 +444,18 @@ ANTHROPIC_EGRESS = (ipaddress.ip_network("160.79.104.0/21"),
                     ipaddress.ip_network("153.61.208.0/20"))
 
 
+def _bare_value(value: bytes) -> bytes:
+    """The whole Authorization value as a bare credential, or b"" if it cannot be one.
+
+    Surrounding OWS is ignored; any SP or control whitespace inside means it is
+    not a single bare token.
+    """
+    v = value.strip(_OWS)
+    if not v or b" " in v or any(c in _CTL_WS for c in v):
+        return b""
+    return v
+
+
 def _client_addresses(raw: str) -> str:
     """Classify each forwarded client address; never echo it.
 
@@ -497,8 +509,14 @@ class BearerGate:
         headers = scope.get("headers", [])
         auth = [v for k, v in headers if k == b"authorization"]
         scheme, credential = _parse_bearer(auth[0]) if len(auth) == 1 else ("-", b"")
-        ok = (len(auth) == 1 and scheme == "bearer"
-              and hmac.compare_digest(credential, self._token))
+        # Two accepted forms, both compared in constant time and both computed
+        # every request: "Bearer <secret>" (RFC 7235), and the bare secret as
+        # the whole value (claude.ai's connector sends the header value without
+        # a scheme -- operator ruling 2026-11-21, #3760).
+        bare = _bare_value(auth[0]) if len(auth) == 1 else b""
+        bearer_ok = hmac.compare_digest(credential, self._token) and scheme == "bearer"
+        bare_ok = hmac.compare_digest(bare, self._token)
+        ok = len(auth) == 1 and (bearer_ok or bare_ok)
         if not ok:
             self._log_refusal(scope, headers, auth, scheme, credential)
             return await _send_status(send, 401, b"unauthorized\n",
@@ -525,11 +543,13 @@ class BearerGate:
         method = str(scope.get("method", ""))
         path = scope.get("path", "")
         auth_log.warning(
-            "401 %s %s auth_headers=%d scheme=%s credential_len=%d expected_len=%d "
-            "len_match=%s xff=%s funnel=%s",
+            "401 %s %s auth_headers=%d value_len=%d scheme=%s credential_len=%d "
+            "expected_len=%d len_match=%s xff=%s funnel=%s",
             method if method in _KNOWN_METHODS else "<other>",
             path if path in ("/mcp", "/mcp/") else "<other>",
-            len(auth), scheme, len(credential), len(self._token),
+            # value_len: the raw header value's total length (one header only).
+            len(auth), len(auth[0]) if len(auth) == 1 else 0,
+            scheme, len(credential), len(self._token),
             len(credential) == len(self._token),
             _client_addresses(xff) if xff else "-", "yes" if funnel else "no")
 

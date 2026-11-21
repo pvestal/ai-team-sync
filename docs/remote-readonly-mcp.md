@@ -48,11 +48,11 @@ allowlist and each tool's exact upstream requests as literals.
 Every 401 is logged to the `ats-mcp-remote` journal as one line, for example:
 
 ```
-WARNING:ats_remote_mcp.auth:401 POST /mcp auth_headers=1 scheme=bearer credential_len=64 expected_len=64 len_match=True xff=anthropic funnel=yes
+WARNING:ats_remote_mcp.auth:401 POST /mcp auth_headers=1 value_len=71 scheme=bearer credential_len=64 expected_len=64 len_match=True xff=anthropic funnel=yes
 ```
 
 `auth_headers` is how many Authorization headers arrived (0 = the client sent
-none). `scheme` is the lowercased scheme name if it is one of bearer / basic /
+none); `value_len` is the raw header value's total length. `scheme` is the lowercased scheme name if it is one of bearer / basic /
 digest / token / negotiate, `<none>` for a value without a scheme, otherwise
 `<other>`. Lengths are of the credential only. `xff` classifies each
 forwarded client address (up to three): `anthropic` if it is inside
@@ -76,7 +76,8 @@ journalctl --user -u ats-mcp-remote --since -15min | grep ats_remote_mcp.auth
   token68`) the scheme is matched case-insensitively, one or more spaces may
   separate it from the secret, and spaces/tabs around the whole value are
   ignored. A tab, CR, LF, VT or FF inside the value is refused, and the secret
-  itself must match exactly.
+  itself must match exactly. The bare secret as the whole value (no scheme) is also
+  accepted, because claude.ai's connector sends it that way.
 - File: `~/.config/ai-team-sync/remote-mcp.token`, mode 0600, outside the repo.
   The server refuses to start if the file is missing, not 0600, or shorter
   than 32 characters.
