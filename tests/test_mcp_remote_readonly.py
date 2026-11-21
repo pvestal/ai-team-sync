@@ -269,7 +269,7 @@ async def test_guard_refuses_non_read_upstream(monkeypatch, method, url):
 
 # ---- startup refusals --------------------------------------------------------------
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.50.135", "::", "tower", "100.115.223.59"])
+@pytest.mark.parametrize("host", ["0.0.0.0", "198.51.100.7", "::", "tower", "100.64.0.1"])
 def test_non_loopback_bind_refused(host):
     with pytest.raises(SystemExit):
         rr._require_loopback(host)
