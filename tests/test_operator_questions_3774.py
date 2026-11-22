@@ -63,7 +63,8 @@ def test_ask_result_wording_including_info_only():
     assert "morning digest" in oq.format_ask_result(200, {"ok": True, "question_id": Q1, "delivery": "digest"})
     ruled = oq.format_ask_result(409, {"detail": {"ok": False, "error": "ALREADY_RULED", "ruling": "Answer: Lift.",
                                                   "decided_at": "2026-11-21T23:59:00+00:00"}})
-    assert ruled.startswith("⛔ Not asked") and "Answer: Lift." in ruled
+    assert ruled.startswith("⛔ Not asked") and "Answer: Lift." not in ruled   # never the ruling text
+    assert "task_brief" in ruled
     pointer = oq.format_ask_result(409, {"detail": {"ok": False, "error": "ALREADY_RULED",
                                                     "why": "read it with task_brief(task_id=3774) instead of re-asking",
                                                     "decided_at": "2026-11-21T23:59:00+00:00"}})
