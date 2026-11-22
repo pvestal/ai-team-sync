@@ -157,8 +157,9 @@ def format_ask_result(status_code: int, data: Any, *, info_only: bool = False) -
     if isinstance(detail, dict) and detail.get("error") == "ALREADY_RULED":
         # Never the ruling's text, even if a response carried it: the ruling is read through
         # task_brief for the ticket, where its provenance is shown. Echo's `why` says so.
-        return ("⛔ Not asked: the operator already ruled on this question "
-                f"({detail.get('decided_at')}). {detail.get('why') or 'Read it with task_brief for this ticket.'}")
+        when = f" ({detail['decided_at']})" if detail.get("decided_at") else ""
+        return ("⛔ Not asked: the operator already ruled on this question"
+                f"{when}. {detail.get('why') or 'Read it with task_brief for this ticket.'}")
     if isinstance(detail, dict) and detail.get("error"):
         return f"❌ Not asked ({detail['error']}): {detail.get('why')}"
     return f"❌ Not asked (HTTP {status_code}): {str(detail)[:300]}"
