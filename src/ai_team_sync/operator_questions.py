@@ -155,8 +155,10 @@ def format_ask_result(status_code: int, data: Any, *, info_only: bool = False) -
                 "as a ruling on the ticket and appears in this session's next turn.")
     detail = data.get("detail", data) if isinstance(data, dict) else data
     if isinstance(detail, dict) and detail.get("error") == "ALREADY_RULED":
+        # Echo does not return the ruling's text on this unauthenticated route; it says where to
+        # read it (task_brief for the ticket).
         return ("⛔ Not asked: the operator already ruled on this question "
-                f"({detail.get('decided_at')}): {detail.get('ruling')}")
+                f"({detail.get('decided_at')}). {detail.get('ruling') or detail.get('why') or ''}").rstrip()
     if isinstance(detail, dict) and detail.get("error"):
         return f"❌ Not asked ({detail['error']}): {detail.get('why')}"
     return f"❌ Not asked (HTTP {status_code}): {str(detail)[:300]}"

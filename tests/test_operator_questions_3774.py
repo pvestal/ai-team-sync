@@ -64,6 +64,10 @@ def test_ask_result_wording_including_info_only():
     ruled = oq.format_ask_result(409, {"detail": {"ok": False, "error": "ALREADY_RULED", "ruling": "Answer: Lift.",
                                                   "decided_at": "2026-11-21T23:59:00+00:00"}})
     assert ruled.startswith("⛔ Not asked") and "Answer: Lift." in ruled
+    pointer = oq.format_ask_result(409, {"detail": {"ok": False, "error": "ALREADY_RULED",
+                                                    "why": "read it with task_brief(task_id=3774) instead of re-asking",
+                                                    "decided_at": "2026-11-21T23:59:00+00:00"}})
+    assert "task_brief(task_id=3774)" in pointer and "None" not in pointer
 
 
 # ---------------------------------------------------------------- the MCP path
