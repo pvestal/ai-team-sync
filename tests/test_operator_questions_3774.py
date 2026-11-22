@@ -98,7 +98,8 @@ def echo(wired, monkeypatch):  # noqa: F811  (pytest fixture parameter)
                 calls.append(k.get("json"))
                 info = (k.get("json") or {}).get("info_only")
                 return Resp(200, {"ok": True, "question_id": Q1, "delivery": "now", "sent": {"ok": True},
-                                  "delivery_token": T1, "info_only": info})
+                                  "delivery_token": (k.get("json") or {}).get("delivery_token"),
+                                  "info_only": info})
             return await self._c.post(url, *a, **k)
 
         def __getattr__(self, name):
@@ -120,6 +121,9 @@ async def test_ask_operator_files_as_the_callers_own_session_only(echo, tmp_path
     assert "filed" in text, text
     assert echo[-1]["ats_session_id"] == sid                    # never the caller-supplied id
     assert oq.pending_ids(sid) == [Q1]
+    # a retry of the same question sends the same token (a lost response is recoverable)
+    await mcp.call_tool("ask_operator", dict(ASK))
+    assert echo[-1]["delivery_token"] == echo[-2]["delivery_token"]
     # a session this process never opened cannot be named
     n = len(echo)
     refused = (await mcp.call_tool("ask_operator", {**ASK, "session_id": "11111111-2222-4333-8444-555555555555"}))[0].text
@@ -225,3 +229,89 @@ def test_a_failed_acknowledgement_shows_the_answer_again_next_prompt(state, monk
     oq.remember(SID, Q1, T1)
     _run_hook(monkeypatch, token="capability", events=[], delivered_code=500)
     assert oq.pending_ids(SID) == [Q1]
+
+
+
+# ---------------------------------------------------------------- Codex r2 findings
+
+def test_delivery_token_is_deterministic_and_bound_to_session_and_question():
+    a = oq.delivery_token("cap", SID, 3774, "forest-hold")
+    assert a == oq.delivery_token("cap", SID, 3774, "forest-hold") and len(a) == 64
+    assert a != oq.delivery_token("cap", SID, 3774, "other")
+    assert a != oq.delivery_token("cap", Q1, 3774, "forest-hold")
+    assert a != oq.delivery_token("other-cap", SID, 3774, "forest-hold")
+    with pytest.raises(ValueError):
+        oq.delivery_token("", SID, 3774, "forest-hold")
+
+
+def test_concurrent_remember_and_forget_never_lose_a_token(state):
+    import multiprocessing as mp
+    import uuid
+    ids = [str(uuid.uuid4()) for _ in range(24)]
+    ctx = mp.get_context("spawn")
+    procs = [ctx.Process(target=oq.remember, args=(SID, q, "e" * 48)) for q in ids]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+    assert sorted(oq.pending_ids(SID)) == sorted(ids)
+    half = ids[:12]
+    procs = [ctx.Process(target=oq.forget, args=(SID, q)) for q in half]
+    procs += [ctx.Process(target=oq.remember, args=(SID, Q1, T1))]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join()
+    assert sorted(oq.pending_ids(SID)) == sorted(ids[12:] + [Q1])
+    leftovers = [f.name for f in (state / ".ats_operator_questions").iterdir() if f.suffix == ".tmp"]
+    assert leftovers == []
+
+
+def test_a_corrupt_question_file_is_never_overwritten(state):
+    oq.remember(SID, Q1, T1)
+    p = state / ".ats_operator_questions" / f"{SID}.json"
+    p.write_text("{not json")
+    with pytest.raises(oq.QuestionFileCorrupt):
+        oq.remember(SID, Q2, T2)
+    with pytest.raises(oq.QuestionFileCorrupt):
+        oq.forget(SID, Q1)
+    assert p.read_text() == "{not json"
+
+
+def test_codex_prompt_hook_surfaces_the_answer_too(state, monkeypatch):
+    from ai_team_sync.hooks import ats_context as hook
+    seen = []
+
+    async def inbox(server, client, payload):
+        return {"session_id": SID, "token": "capability", "rows": []}
+    monkeypatch.setattr(hook, "_codex_inbox", inbox)
+    monkeypatch.setattr(hook, "resolve_request_target", lambda prompt, cwd=None: None)
+    monkeypatch.setattr(hook, "_run_supplement", lambda *a, **k: None)
+    monkeypatch.setattr(oq, "surface_for_prompt", lambda sid, cap, **k: seen.append((sid, cap)) or True)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"session_id": "codex-cid", "prompt": "hi"})))
+    with pytest.raises(SystemExit):
+        hook.main(["--agent", "codex"])
+    assert seen == [(SID, "capability")]
+
+
+def test_surface_for_prompt_prints_then_acknowledges(state):
+    oq.remember(SID, Q1, T1)
+    events = []
+
+    class C:
+        def get(self, url, params=None, headers=None):
+            events.append("get")
+            return SyncResp(200, ANSWER)
+
+        def post(self, url, json=None, headers=None):
+            events.append("ack")
+            return SyncResp(200, {"ok": True})
+
+    class Out(io.StringIO):
+        def write(self, s):
+            if s.strip():
+                events.append("print")
+            return super().write(s)
+    assert oq.surface_for_prompt(SID, "", out=Out(), client=C()) is False and events == []
+    assert oq.surface_for_prompt(SID, "capability", out=Out(), client=C()) is True
+    assert events == ["get", "print", "ack"] and oq.pending_ids(SID) == []

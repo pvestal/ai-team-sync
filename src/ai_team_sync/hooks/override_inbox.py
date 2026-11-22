@@ -164,15 +164,8 @@ def main() -> None:
     # an answer is acknowledged to Echo only after it was printed and flushed.
     if token:
         try:
-            import httpx
             from ai_team_sync import operator_questions as oq
-            with httpx.Client(timeout=2) as client:
-                answers = oq.collect_answers(session_id, client)
-                ruling_note = oq.format_answers(answers)
-                if ruling_note:
-                    print(ruling_note)
-                    sys.stdout.flush()
-                    oq.acknowledge(session_id, answers, client)
+            oq.surface_for_prompt(session_id, token)
         except Exception:
             pass  # best-effort: an unacknowledged answer is shown again on the next prompt
     sys.exit(0)

@@ -1663,17 +1663,23 @@ async def _call_tool_impl(name: str, arguments: dict[str, Any]) -> list[TextCont
                     return [TextContent(type="text", text=f"❌ {refusal}")]
                 if not active_session_id or not _holds_capability(active_session_id):
                     return [TextContent(type="text", text=_missing_capability(name, active_session_id))]
+                info_only = bool(arguments.get("info_only"))
+                token = None if info_only else oq.delivery_token(
+                    _capability_for(active_session_id), active_session_id,
+                    arguments.get("tower_task_id"), arguments.get("question_key"))
                 response = await client.post(f"{oq.ECHO_URL}/api/operator-questions",
-                                             json=oq.ask_payload(active_session_id, arguments), timeout=90.0)
+                                             json=oq.ask_payload(active_session_id, arguments, token),
+                                             timeout=90.0)
                 try:
                     data = response.json()
                 except ValueError:
                     data = response.text
-                info_only = bool(arguments.get("info_only"))
                 if (response.status_code == 200 and isinstance(data, dict) and data.get("ok")
                         and not info_only):
                     try:
-                        oq.remember(active_session_id, data["question_id"], data.get("delivery_token") or "")
+                        if data.get("delivery_token") != token:
+                            raise ValueError("Echo did not bind the question to this session's token")
+                        oq.remember(active_session_id, data["question_id"], token)
                     except ValueError as exc:
                         return [TextContent(type="text", text=(
                             f"⚠ Question {data.get('question_id')} was filed with Echo, but its answer "

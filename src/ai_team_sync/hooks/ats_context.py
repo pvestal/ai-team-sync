@@ -447,7 +447,8 @@ async def _codex_inbox(server_url: str, client: Any, payload: dict[str, Any]) ->
     rows = rows if isinstance(rows, list) else []
     note = format_message_inbox(rows)
     if not note:
-        return {}
+        # No messages, but the identity is kept so the operator-question step (#3774) can run.
+        return {"session_id": session_id, "token": token, "rows": []}
     prompt_id = str(payload.get("turn_id") or payload.get("prompt_id")
                     or payload.get("hook_event_id") or uuid.uuid4())
     return {"note": note, "rows": rows, "session_id": session_id,
@@ -455,7 +456,7 @@ async def _codex_inbox(server_url: str, client: Any, payload: dict[str, Any]) ->
 
 
 async def _mark_codex_inbox(server_url: str, delivery: dict[str, Any]) -> None:
-    if not delivery:
+    if not delivery or not delivery.get("rows"):
         return
     import httpx
     async with httpx.AsyncClient(timeout=3) as client:
@@ -832,12 +833,20 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit(2)
     if note:
         print(note)
-    if delivery:
+    if delivery.get("note"):
         print(delivery["note"])
         sys.stdout.flush()
         # Mark only after stdout was handed to the client. A crash before this
         # point leaves the message pending and un-surfaced for the next prompt.
         asyncio.run(_mark_codex_inbox(server, delivery))
+    if args.agent == "codex" and delivery.get("token"):
+        # #3774: the operator's Telegram answers to this Codex session's own ask_operator
+        # questions; printed and flushed before Echo is told they were delivered.
+        try:
+            from ai_team_sync import operator_questions as oq
+            oq.surface_for_prompt(delivery["session_id"], delivery["token"])
+        except Exception:
+            pass  # retryable: an unacknowledged answer is shown again next prompt
     # The supplement starts only after ATS succeeded. Keeping it in this same
     # process avoids Claude's parallel hook execution reordering the sources.
     _run_supplement(args.supplement_command, args.supplement_timeout, raw_payload)
