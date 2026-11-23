@@ -53,19 +53,50 @@ _SECRET_PATTERNS = (
     re.compile(r"\bhvs\.[A-Za-z0-9_-]{20,}"),                  # Vault tokens
     re.compile(r"(?i)\b(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S+"),
 )
-_ABS_PATH = re.compile(r"(?<![\w.:/])/(?:opt|home|mnt|etc|var|tmp|srv|root|usr|run|media)/[^\s'\",;)\]}]+")
+# A credential written as JSON text inside a string column ("token": "...").
+_SECRET_JSON = re.compile(
+    r'(?i)("(?:[a-z0-9_]*?)(?:token|secret|password|passwd|api[_-]?key|credential|cookie|'
+    r'authorization|chat_id|user_id|telegram_[a-z_]*id)"\s*:\s*)("[^"]*"|-?[0-9]+)')
+# A dict KEY naming a credential or a personal identifier: its value is
+# withheld whatever its type (#3787 review r1: nested {"token": ...} and
+# integer telegram_chat_id survived a text-only scrub).
+_SENSITIVE_KEY = re.compile(
+    r"(?i)(token|secret|password|passwd|api[_-]?key|credential|cookie|authorization|"
+    r"bearer|nonce|chat_id|user_id|from_user|telegram_[a-z_]*id|session_fingerprint|"
+    r"private_key|signature)")
+_ABS_PATH = re.compile(r"(?<![\w.:/])/(?:opt|home|mnt|etc|var|tmp|srv|root|usr|run|media|"
+                       r"proc|sys|dev|boot|lib|snap)/[^\s'\",;)\]}]*")
+# Repo citations in Echo task text stay readable as repo-relative labels;
+# every other absolute path is withheld.
+_REPO_ROOTS = (("/opt/tower-echo-brain/", "echo:"), ("/opt/anime-studio/", "anime-studio:"),
+               ("/home/patrick/code/ai-team-sync/", "ai-team-sync:"))
+
+
+def _label_path(m: re.Match, repos: bool) -> str:
+    path = m.group(0)
+    if repos:
+        for root, label in _REPO_ROOTS:
+            rest = path[len(root):]
+            if path.startswith(root) and ".." not in rest and not rest.startswith("."):
+                return label + rest
+    return "<path>"
 
 
 def scrub(value: Any, *, paths: bool = True) -> Any:
-    """Remove credential-shaped text (always) and absolute filesystem paths
-    (``paths=True``: production rows, where a path names a media file),
-    recursively. Echo task text keeps its repo paths: they are citations."""
+    """Withhold credentials and personal ids (by key, by JSON text, by shape)
+    and absolute filesystem paths, recursively. ``paths=True`` (production
+    rows, where a path names a media file) withholds every absolute path;
+    ``paths=False`` (Echo task text) keeps repo paths as repo-relative labels
+    and withholds all others."""
     if isinstance(value, str):
+        value = _SECRET_JSON.sub(lambda m: m.group(1) + '"<redacted>"', value)
         for pat in _SECRET_PATTERNS:
             value = pat.sub("<redacted>", value)
-        return _ABS_PATH.sub("<path>", value) if paths else value
+        return _ABS_PATH.sub(lambda m: _label_path(m, repos=not paths), value)
     if isinstance(value, dict):
-        return {k: scrub(v, paths=paths) for k, v in value.items()}
+        return {k: ("<redacted>" if isinstance(k, str) and _SENSITIVE_KEY.search(k)
+                    and v not in (None, "", [], {}) else scrub(v, paths=paths))
+                for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [scrub(v, paths=paths) for v in value]
     return value
@@ -244,8 +275,36 @@ SELECT current_user AS who,
                  'INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')) AS writable,
        (SELECT count(*) FROM pg_namespace n
          WHERE has_schema_privilege(current_user, n.oid, 'CREATE')) AS create_schemas,
+       (SELECT rolreplication FROM pg_roles WHERE rolname = current_user) AS replication,
+       (SELECT count(*) FROM pg_class c
+         WHERE c.relkind = 'S'
+           AND has_sequence_privilege(current_user, c.oid, 'USAGE, SELECT, UPDATE')) AS sequences,
+       -- Functions that could persist state when called: large-object writers
+       -- (PUBLIC by default) and any SECURITY DEFINER function outside pg_catalog.
+       (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+         WHERE ((n.nspname = 'pg_catalog' AND p.proname IN
+                   ('lo_creat', 'lo_create', 'lo_from_bytea', 'lo_put', 'lowrite',
+                    'lo_truncate', 'lo_truncate64', 'lo_unlink', 'lo_open', 'lo_import',
+                    'lo_export', 'be_lo_put', 'be_lo_from_bytea'))
+                OR (p.prosecdef AND n.nspname <> 'pg_catalog'))
+           AND has_function_privilege(current_user, p.oid, 'EXECUTE')) AS writer_functions,
+       (SELECT coalesce(array_agg(c.relname::text ORDER BY c.relname), '{}')
+          FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = 'remote_read'
+           AND has_table_privilege(current_user, c.oid, 'SELECT')) AS readable_views,
        current_setting('transaction_read_only') AS ro
 """
+
+# The exact views the role may read in each database (deploy/sql/remote_read/).
+EXPECTED_VIEWS = {
+    "echo": frozenset({"tower_tasks", "tower_task_runs", "operator_questions",
+                       "notification_outbox"}),
+    "anime": frozenset({"production_assignments", "production_assignment_items",
+                        "production_assignment_submissions",
+                        "production_assignment_stop_choices", "dispatch_holds", "judge_queue",
+                        "accepted_media", "gpu_claims", "render_admission_executions",
+                        "render_admission_refusals", "video_submissions"}),
+}
 
 
 class NotConfigured(RuntimeError):
@@ -317,6 +376,14 @@ async def _verify_role(conn, db_key: str) -> None:
         problems.append("remote_read is writable")
     if r["create_schemas"]:
         problems.append("role can CREATE in a schema")
+    if r["replication"]:
+        problems.append("role has REPLICATION")
+    if r["sequences"]:
+        problems.append(f"{r['sequences']} sequence(s) usable")
+    if r["writer_functions"]:
+        problems.append(f"{r['writer_functions']} state-writing function(s) executable")
+    if set(r["readable_views"]) != EXPECTED_VIEWS[db_key]:
+        problems.append("readable remote_read set differs from the reviewed views")
     if r["ro"] != "on":
         problems.append("session is not read-only")
     if problems:
@@ -444,6 +511,7 @@ def read_as_flags(path: Path | None = None) -> dict[str, str]:
 _OPEN = ("pending", "in_progress", "blocked")
 GATES = frozenset({"none", "decision", "gpu", "aesthetic", "verdict", "upstream", "verify"})
 LANES = frozenset({"video", "keyframe"})
+OUTBOX_STATUSES = frozenset({"delivered", "failed", "pending"})
 _SINCE = {"type": "string", "format": "date-time"}
 
 
@@ -479,7 +547,8 @@ TOWER_TOOLS: list[Tool] = [
     _tool("notification_outbox",
           "Echo's notification outbox (pushes sent to the operator): title, body "
           "excerpt, channels, delivery status and time. No Telegram inbox, no personal chat.",
-          {"status": {"type": "string"}, "since": _SINCE, "limit": _lim(50)}),
+          {"status": {"type": "string", "enum": sorted(OUTBOX_STATUSES)}, "since": _SINCE,
+           "limit": _lim(50)}),
     _tool("production_assignments",
           "Anime Studio production assignments (records only; not Anime Studio's "
           "derived eligibility). Pass assignment_id for one assignment with its items, "
@@ -518,9 +587,14 @@ TOWER_TOOLS: list[Tool] = [
 ]
 
 TOWER_TOOL_NAMES = frozenset(t.name for t in TOWER_TOOLS)
-# String arguments whose values are validated against a fixed shape and may be
-# logged verbatim by the audit log.
-SAFE_STRING_ARGS = frozenset({"status", "gate", "lane", "state", "outcome", "scope_kind"})
+# Per tool, the string arguments whose value is checked against a FIXED enum
+# (the tool's own inputSchema enum): only those values may be logged verbatim
+# (#3787 review r1: a free lowercase word in state/outcome/scope_kind is
+# client text and is logged as length + hash).
+AUDIT_ENUMS: dict[str, dict[str, frozenset[str]]] = {
+    t.name: {k: frozenset(v["enum"]) for k, v in t.inputSchema.get("properties", {}).items()
+             if isinstance(v, dict) and "enum" in v}
+    for t in TOWER_TOOLS}
 
 
 # ---- handlers ----------------------------------------------------------------------
@@ -564,7 +638,7 @@ async def h_operator_questions(c, a, echo_url: str):
 
 async def h_notification_outbox(c, a, echo_url: str):
     return _out("outbox", await run_query(
-        "notification_outbox", _word(a, "status"), _since(a), _limit(a, 50)))
+        "notification_outbox", _word(a, "status", OUTBOX_STATUSES), _since(a), _limit(a, 50)))
 
 
 async def h_production_assignments(c, a, echo_url: str):

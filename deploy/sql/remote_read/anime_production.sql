@@ -20,6 +20,26 @@
 
 BEGIN;
 
+-- Fail closed (#3787 review r1): a remote_read schema that already holds any
+-- object other than the reviewed views refuses this migration, so nothing
+-- unexpected can inherit the connector's grants.
+DO $$
+DECLARE stray text;
+BEGIN
+  SELECT string_agg(c.relname, ', ') INTO stray
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'remote_read'
+     AND c.relname NOT IN ('production_assignments', 'production_assignment_items', 'production_assignment_submissions', 'production_assignment_stop_choices', 'dispatch_holds', 'judge_queue', 'accepted_media', 'gpu_claims', 'render_admission_executions', 'render_admission_refusals', 'video_submissions');
+  IF stray IS NULL THEN
+    SELECT string_agg(p.proname, ', ') INTO stray
+      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'remote_read';
+  END IF;
+  IF stray IS NOT NULL THEN
+    RAISE EXCEPTION 'remote_read holds unreviewed objects: %', stray;
+  END IF;
+END $$;
+
 CREATE SCHEMA IF NOT EXISTS remote_read AUTHORIZATION tower_remote_read_owner;
 REVOKE ALL ON SCHEMA remote_read FROM PUBLIC;
 GRANT USAGE ON SCHEMA remote_read TO tower_remote_ro;
@@ -169,6 +189,34 @@ FROM public.video_submissions v;
 
 RESET ROLE;
 
-GRANT SELECT ON ALL TABLES IN SCHEMA remote_read TO tower_remote_ro;
+-- Named grants only (#3787 review r1): never ALL TABLES IN SCHEMA.
+GRANT SELECT ON remote_read.production_assignments TO tower_remote_ro;
+GRANT SELECT ON remote_read.production_assignment_items TO tower_remote_ro;
+GRANT SELECT ON remote_read.production_assignment_submissions TO tower_remote_ro;
+GRANT SELECT ON remote_read.production_assignment_stop_choices TO tower_remote_ro;
+GRANT SELECT ON remote_read.dispatch_holds TO tower_remote_ro;
+GRANT SELECT ON remote_read.judge_queue TO tower_remote_ro;
+GRANT SELECT ON remote_read.accepted_media TO tower_remote_ro;
+GRANT SELECT ON remote_read.gpu_claims TO tower_remote_ro;
+GRANT SELECT ON remote_read.render_admission_executions TO tower_remote_ro;
+GRANT SELECT ON remote_read.render_admission_refusals TO tower_remote_ro;
+GRANT SELECT ON remote_read.video_submissions TO tower_remote_ro;
+
+-- Large-object creation is the one persistent write PostgreSQL grants to
+-- PUBLIC by default (#3787 review r1: a session that turns its own read-only
+-- default off could lo_create/lo_from_bytea). Measured 2026-11-23: 0 large
+-- objects in this database and no Echo/Anime Studio code uses them;
+-- superusers are unaffected. Rollback re-grants them to PUBLIC.
+REVOKE EXECUTE ON FUNCTION
+  pg_catalog.lo_creat(integer),
+  pg_catalog.lo_create(oid),
+  pg_catalog.lo_from_bytea(oid, bytea),
+  pg_catalog.lo_put(oid, bigint, bytea),
+  pg_catalog.lowrite(integer, bytea),
+  pg_catalog.lo_truncate(integer, integer),
+  pg_catalog.lo_truncate64(integer, bigint),
+  pg_catalog.lo_unlink(oid),
+  pg_catalog.lo_open(oid, integer)
+  FROM PUBLIC;
 
 COMMIT;

@@ -50,12 +50,17 @@ class Upstream(httpx.AsyncBaseTransport):
         return httpx.Response(200, json=[])
 
 
+def good_role_row(db_key="anime"):
+    return {"who": tower.DB_ROLE, "elevated": False, "memberships": 0, "outside": 0,
+            "writable": 0, "create_schemas": 0, "replication": False, "sequences": 0,
+            "writer_functions": 0, "readable_views": sorted(tower.EXPECTED_VIEWS[db_key]),
+            "ro": "on"}
+
+
 class FakeConn:
-    def __init__(self, log, role_row=None, rows=None):
+    def __init__(self, log, role_row=None, rows=None, db_key="anime"):
         self.log, self.rows = log, rows or []
-        self.role_row = role_row or {"who": tower.DB_ROLE, "elevated": False,
-                                     "memberships": 0, "outside": 0, "writable": 0,
-                                     "create_schemas": 0, "ro": "on"}
+        self.role_row = role_row or good_role_row(db_key)
 
     @contextlib.asynccontextmanager
     async def transaction(self, **kw):
@@ -85,7 +90,7 @@ def env(monkeypatch, tmp_path):
 
     async def connect(db_key):
         state["conns"].append(db_key)
-        return FakeConn(log, state["role_row"], state["rows"])
+        return FakeConn(log, state["role_row"], state["rows"], db_key)
 
     monkeypatch.setattr(tower, "connect", connect)
     monkeypatch.setattr(tower, "_verified", set())
@@ -247,9 +252,14 @@ async def test_limits_over_the_schema_are_refused_and_handlers_cap_too(env):
 
 @pytest.mark.parametrize("bad", [
     {"who": "patrick"}, {"elevated": True}, {"memberships": 1}, {"outside": 3},
-    {"writable": 1}, {"create_schemas": 1}, {"ro": "off"}])
+    {"writable": 1}, {"create_schemas": 1}, {"ro": "off"},
+    # review r1: replication, sequences, state-writing functions (large objects,
+    # SECURITY DEFINER), and any readable remote_read object beyond the reviewed set
+    {"replication": True}, {"sequences": 1}, {"writer_functions": 1},
+    {"readable_views": sorted(tower.EXPECTED_VIEWS["anime"] | {"secret_dump"})},
+    {"readable_views": sorted(tower.EXPECTED_VIEWS["anime"] - {"gpu_claims"})}])
 async def test_a_role_that_can_do_more_than_read_remote_read_is_refused(env, bad):
-    env["role_row"] = {**FakeConn([]).role_row, **bad}
+    env["role_row"] = {**good_role_row("anime"), **bad}
     async with serve() as http:
         res = await call(http, "gpu_claims")
     assert res["isError"] is True and "self-check" in text(res)
@@ -296,7 +306,8 @@ async def test_tower_task_sends_exactly_one_get_to_echo_and_scrubs_secrets(env):
     assert got == [("GET", "127.0.0.1:8309", "/api/tower-tasks/3760")]
     out = text(res)
     assert "abcdefghijklmnop12345" not in out and "<redacted>" in out
-    assert "src/x.py" in out and "/opt/anime-studio/a.py" in out  # task citations kept
+    # repo citations kept as repo-relative labels; the absolute path is not echoed
+    assert "src/x.py" in out and "anime-studio:a.py" in out and "/opt/anime-studio" not in out
 
 
 @pytest.mark.parametrize("method,url", [
@@ -342,6 +353,35 @@ async def test_production_rows_are_scrubbed_of_credentials_and_paths(env, secret
     assert secret not in out and "<redacted>" in out
     assert "/opt/anime-studio" not in out and "<path>" in out
     assert "a" * 64 in out  # hashes are evidence, never redacted
+
+
+@pytest.mark.parametrize("value,leak", [
+    ({"stop_conditions": {"token": "supersecretvalue123456"}}, "supersecretvalue123456"),
+    ({"context": {"telegram_chat_id": 123456789}}, "123456789"),
+    ({"scope": {"nested": [{"api_key": "k-0123456789"}]}}, "k-0123456789"),
+    ({"reason": 'body {"token": "jsonsecret0001", "x": 1}'}, "jsonsecret0001"),
+    ({"reason": '{"chat_id": 987654321}'}, "987654321"),
+    ({"reason": "see /home/patrick/private/job.log"}, "/home/patrick/private"),
+    ({"reason": "see /proc/self/environ"}, "/proc/self"),
+])
+def test_scrub_is_key_aware_and_covers_json_text_and_paths(value, leak):
+    for paths in (True, False):
+        out = json.dumps(tower.scrub(value, paths=paths))
+        assert leak not in out, (paths, out)
+
+
+def test_echo_text_keeps_repo_citations_but_not_other_paths():
+    s = tower.scrub("fix /opt/tower-echo-brain/src/core/x.py; log /home/patrick/private/a.log; "
+                    "escape /opt/anime-studio/../../etc/passwd", paths=False)
+    assert "echo:src/core/x.py" in s
+    assert "/home/patrick/private" not in s and "etc/passwd" not in s
+
+
+async def test_task_run_error_paths_are_withheld(env):
+    env["rows"] = [{"error": "crashed reading /home/patrick/private/job.log", "id": 1}]
+    async with serve() as http:
+        res = await call(http, "tower_task_runs", {"task_id": 1})
+    assert "/home/patrick/private" not in text(res) and "<path>" in text(res)
 
 
 # ---- service_state ----------------------------------------------------------------------------
@@ -518,6 +558,33 @@ async def test_audit_never_records_free_text_or_unlisted_names(env, journal):
     assert lines[1]["outcome"] == "refused"
     assert lines[2]["args"]["status"] == "pending" and lines[2]["outcome"] == "ok"
     assert all({"client", "ms", "outcome", "ts"} <= set(l) for l in lines)
+
+
+@pytest.mark.parametrize("tool,key", [("operator_questions", "state"),
+                                      ("governed_executions", "outcome"),
+                                      ("video_submissions", "outcome"),
+                                      ("dispatch_holds", "scope_kind"),
+                                      ("production_assignments", "status")])
+async def test_free_filter_words_are_hashed_in_the_audit(env, tool, key):
+    """review r1: a lowercase word accepted as a filter is still client text."""
+    async with serve() as http:
+        await call(http, tool, {key: "clientsecret"})
+    raw = env["audit_path"].read_text()
+    assert "clientsecret" not in raw
+    assert json.loads(raw.splitlines()[-1])["args"][key]["len"] > 0
+
+
+def test_audit_enums_are_the_schema_enums():
+    assert tower.AUDIT_ENUMS["open_tasks"] == {"status": frozenset(tower._OPEN),
+                                               "gate": tower.GATES}
+    assert tower.AUDIT_ENUMS["judge_queue"] == {"lane": tower.LANES}
+    assert tower.AUDIT_ENUMS["notification_outbox"] == {"status": tower.OUTBOX_STATUSES}
+    assert tower.AUDIT_ENUMS["operator_questions"] == {}
+
+
+async def test_audit_file_is_private(env):
+    async with serve() as http:
+        await call(http, "gpu_claims")
     assert oct(env["audit_path"].stat().st_mode & 0o777) == "0o600"
 
 

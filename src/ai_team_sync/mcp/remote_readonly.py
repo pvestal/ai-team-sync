@@ -383,7 +383,7 @@ async def _dispatch(c: httpx.AsyncClient, name: str, a: dict[str, Any]) -> list[
 # Process-wide controls; run() points the audit log at the state directory.
 RATE_LIMITER = RateLimiter()
 AUDIT = AuditLog(None)
-SAFE_AUDIT_STRINGS = tower.SAFE_STRING_ARGS
+
 
 
 def _caller(server: Server) -> str:
@@ -416,7 +416,7 @@ def build_server() -> Server:
                 entry.update(tool="<unlisted>", name_len=len(str(name)), outcome="refused")
                 raise PermissionError(f"Refused: {name!r} is not available on the "
                                       "read-only remote surface.")
-            entry.update(tool=name, args=describe_args(a, SAFE_AUDIT_STRINGS))
+            entry.update(tool=name, args=describe_args(a, tower.AUDIT_ENUMS.get(name)))
             if not RATE_LIMITER.allow(client, "call") or (
                     name in tower.DB_TOOLS and not RATE_LIMITER.allow(client, "db")):
                 entry["outcome"] = "rate_limited"

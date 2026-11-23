@@ -104,19 +104,21 @@ audit_log = logging.getLogger("ats_remote_mcp.audit")
 MAX_AUDIT_BYTES = 10 * 1024 * 1024
 
 
-def describe_args(args: dict[str, Any], safe_strings: frozenset[str]) -> dict[str, Any]:
+def describe_args(args: dict[str, Any],
+                  enums: dict[str, frozenset[str]] | None = None) -> dict[str, Any]:
     """Arguments as they may be logged: never client free text.
 
-    ints/bools verbatim; strings verbatim only for keys whose values the tool
-    validated against a fixed set (``safe_strings``); every other string, and
+    ints/bools verbatim; a string verbatim only when it is a member of that
+    tool's FIXED enum for that key (``enums``); every other string, and
     anything nested, as its length and a short sha256 prefix.
     """
+    enums = enums or {}
     out: dict[str, Any] = {}
     for k, v in list((args or {}).items())[:16]:
         key = k if isinstance(k, str) and re.fullmatch(r"[a-z_]{1,32}", k) else "<key>"
         if isinstance(v, bool) or (isinstance(v, int) and abs(v) < 2**53):
             out[key] = v
-        elif isinstance(v, str) and key in safe_strings and re.fullmatch(r"[a-z_]{1,32}", v):
+        elif isinstance(v, str) and v in enums.get(key, ()):
             out[key] = v
         else:
             raw = json.dumps(v, sort_keys=True, default=str).encode()

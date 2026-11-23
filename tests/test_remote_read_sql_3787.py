@@ -162,6 +162,53 @@ async def test_session_flipped_to_read_write_still_cannot_touch_any_table():
         await c.close()
 
 
+LO_WRITERS = ["SELECT lo_create(0)", "SELECT lo_creat(-1)",
+              "SELECT lo_from_bytea(0, 'x'::bytea)", "SELECT lo_put(1, 0, 'x'::bytea)",
+              "SELECT lo_unlink(1)", "SELECT lo_open(1, 131072)"]
+
+
+@pytest.mark.parametrize("db", ["echo_brain", "anime_production"])
+async def test_large_objects_cannot_be_created_even_after_flipping_read_write(db):
+    """review r1 finding 1: large-object creation was PUBLIC by default."""
+    su = await _super(db)
+    before = await su.fetchval("SELECT count(*) FROM pg_largeobject_metadata")
+    c = await _conn(db)
+    try:
+        await c.execute("SET default_transaction_read_only = off")
+        for sql in LO_WRITERS:
+            with pytest.raises(asyncpg.PostgresError):
+                await c.execute(sql)
+    finally:
+        await c.close()
+    assert await su.fetchval("SELECT count(*) FROM pg_largeobject_metadata") == before
+    await su.close()
+
+
+async def test_migration_refuses_a_remote_read_schema_with_unreviewed_objects():
+    """review r1 finding 2: nothing pre-existing in remote_read inherits grants."""
+    from pathlib import Path
+    sql_dir = Path(__file__).resolve().parents[1] / "deploy" / "sql" / "remote_read"
+    su = await _super("postgres")
+    try:
+        await su.execute("DROP DATABASE IF EXISTS rr_stray_check")
+        await su.execute("CREATE DATABASE rr_stray_check")
+    finally:
+        await su.close()
+    for name in ("echo_brain.sql", "anime_production.sql"):
+        c = await _super("rr_stray_check")
+        try:
+            await c.execute("DROP SCHEMA IF EXISTS remote_read CASCADE; CREATE SCHEMA remote_read; "
+                            "CREATE TABLE remote_read.secret_dump (v text)")
+            with pytest.raises(asyncpg.RaiseError, match="unreviewed objects"):
+                await c.execute((sql_dir / name).read_text())
+            await c.execute("ROLLBACK")  # the script's own BEGIN is left aborted
+            assert await c.fetchval(
+                "SELECT has_table_privilege('tower_remote_ro', 'remote_read.secret_dump', "
+                "'SELECT')") is False
+        finally:
+            await c.close()
+
+
 async def test_cannot_signal_another_backend():
     su = await _super("echo_brain")
     c = await _conn("echo_brain")

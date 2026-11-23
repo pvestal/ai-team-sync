@@ -44,12 +44,23 @@ Boundaries:
   bodies; `echo_telegram_messages` and `telegram_inbox` are not exposed). The
   connector sends only the literal SELECTs in `NAMED_QUERIES`, each in a READ
   ONLY transaction, and before first use per database refuses a role that is
-  elevated, inherits a role, can touch any relation outside `remote_read`, can
-  write `remote_read`, can CREATE in a schema, or is not read-only by default.
-- **Redaction:** credential-shaped text (bearer/JWT/`sk-`/`ghp_`/Vault tokens,
-  `password=`-style pairs) is replaced everywhere; absolute filesystem paths are
-  replaced in Anime Studio rows (Echo task text keeps its repo-path citations).
-  Hashes are never redacted.
+  elevated or has REPLICATION, inherits a role, can touch any relation or
+  sequence outside `remote_read`, can write `remote_read`, can read anything in
+  `remote_read` other than the exact reviewed views, can CREATE in a schema,
+  can execute a state-writing function (large-object writers, any SECURITY
+  DEFINER function outside pg_catalog), or is not read-only by default.
+  The migrations grant each view by name (never `ALL TABLES IN SCHEMA`),
+  refuse to run if `remote_read` already holds any unreviewed object, and
+  revoke PUBLIC EXECUTE on the large-object writer functions (0 large objects
+  and no code using them in either database, measured 2026-11-23; the
+  rollback re-grants them).
+- **Redaction:** a value under any key naming a credential or personal id
+  (token, secret, password, api_key, chat_id, user_id, telegram_*id, nonce,
+  ...) is withheld whatever its type; the same keys written as JSON text inside
+  a string are withheld; credential-shaped text (bearer/JWT/`sk-`/`ghp_`/Vault
+  tokens, `password=` pairs) is replaced everywhere. Absolute paths are
+  withheld; Echo task text keeps repo citations as repo-relative labels
+  (`echo:src/...`, `anime-studio:packages/...`). Hashes are never redacted.
 - **Per-client secrets:** the #3760 secret is client `claude-ai`; each further
   client has its own `<client>.token` (0600) in
   `~/.config/ai-team-sync/remote-mcp.clients.d/` (0700). Secrets must differ.
@@ -58,7 +69,8 @@ Boundaries:
 - **Audit:** one JSON line per call to `$ATS_STATE_DIR/audit.jsonl` (0600,
   rotated once at 10 MiB) and the journal: time, client, tool, outcome, ms,
   output size, and arguments (integers/booleans and fixed-shape enum words
-  verbatim; any other string as length + sha256 prefix). An unlisted tool
+  verbatim only when the value is in that tool's fixed schema enum; any other
+  string as length + sha256 prefix). An unlisted tool
   name is logged as `<unlisted>` with its length. Library log messages
   (mcp, uvicorn) are written as `<message withheld>`, and uvicorn's access log
   is off, because both echoed client text.

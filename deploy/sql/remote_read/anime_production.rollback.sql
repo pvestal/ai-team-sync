@@ -9,4 +9,15 @@ REVOKE SELECT ON public.production_assignments, public.production_assignment_ite
                   public.render_admission_execution_refusals, public.video_submissions
   FROM tower_remote_read_owner;
 REVOKE USAGE ON SCHEMA public FROM tower_remote_read_owner;
+GRANT EXECUTE ON FUNCTION
+  pg_catalog.lo_creat(integer),
+  pg_catalog.lo_create(oid),
+  pg_catalog.lo_from_bytea(oid, bytea),
+  pg_catalog.lo_put(oid, bigint, bytea),
+  pg_catalog.lowrite(integer, bytea),
+  pg_catalog.lo_truncate(integer, integer),
+  pg_catalog.lo_truncate64(integer, bigint),
+  pg_catalog.lo_unlink(oid),
+  pg_catalog.lo_open(oid, integer)
+  TO PUBLIC;
 COMMIT;
