@@ -339,3 +339,14 @@ def test_clients_file_rules(tmp_path):
     p.write_text(json.dumps({"clients": {"Bad Id": {"secret_sha256": "a" * 64}}}))
     with pytest.raises(RuntimeError):
         oa.load_clients(p)
+
+
+async def test_r1_a_rotated_secret_sharing_the_old_hash_prefix_still_ends_every_token(env):
+    """review r1: tokens were bound to a 16-hex prefix of the secret hash."""
+    async with serve(env) as c:
+        t = await _tokens(c)
+        old = env["server"].clients[CID]["secret_sha256"]
+        env["server"].clients[CID]["secret_sha256"] = old[:16] + ("0" if old[16] != "0" else "1") + old[17:]
+        assert (await mcp(c, t["access_token"])).status_code == 401
+        assert env["store"].rotate_refresh(t["refresh_token"], CID,
+                                           env["server"].clients[CID]["secret_sha256"]) is None

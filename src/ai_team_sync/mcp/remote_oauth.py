@@ -157,7 +157,7 @@ class TokenStore:
     def issue(self, client_id: str, secret_sha: str, scope: str, aud: str) -> dict:
         access, refresh = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         now = self.clock()
-        base = {"client": client_id, "csec": secret_sha[:16], "scope": scope, "aud": aud}
+        base = {"client": client_id, "csec": secret_sha, "scope": scope, "aud": aud}
         with self._lock:
             self._tokens[_sha(access)] = {**base, "kind": "access", "exp": now + ACCESS_TTL_S}
             self._tokens[_sha(refresh)] = {**base, "kind": "refresh", "exp": now + REFRESH_TTL_S,
@@ -182,7 +182,7 @@ class TokenStore:
                     self._tokens.pop(rec["access"], None)
                 self._save()
 
-    def rotate_refresh(self, token: str, client_id: str, csec16: str) -> dict | None:
+    def rotate_refresh(self, token: str, client_id: str, csec: str) -> dict | None:
         """Consume a refresh token -- only when it is this client's, live, and
         issued under the client's current secret (so presenting someone else's
         token can never revoke it)."""
@@ -190,7 +190,8 @@ class TokenStore:
         with self._lock:
             rec = self._tokens.get(h)
             if (not rec or rec["kind"] != "refresh" or rec["exp"] <= self.clock()
-                    or rec["client"] != client_id or rec["csec"] != csec16):
+                    or rec["client"] != client_id
+                    or not hmac.compare_digest(str(rec.get("csec", "")), csec)):
                 return None
             self._tokens.pop(h, None)
             if rec.get("access"):
@@ -222,7 +223,7 @@ class OAuthServer:
             return None
         client = self.clients.get(rec["client"])
         # a removed client, or a changed secret, ends every token it was issued
-        if not client or client["secret_sha256"][:16] != rec["csec"]:
+        if not client or not hmac.compare_digest(client["secret_sha256"], str(rec.get("csec", ""))):
             return None
         return "oauth:" + rec["client"]
 
@@ -336,7 +337,7 @@ class OAuthServer:
             self._record("token", "issued", cid)
             return await _json(send, 200, self.store.issue(cid, csec, SCOPE, rec["resource"]))
         if grant == "refresh_token":
-            rec = self.store.rotate_refresh(form.get("refresh_token", ""), cid, csec[:16])
+            rec = self.store.rotate_refresh(form.get("refresh_token", ""), cid, csec)
             if not rec:
                 self._record("token", "invalid_grant", cid)
                 return await _json(send, 400, {"error": "invalid_grant"})
