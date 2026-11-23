@@ -51,18 +51,75 @@ _SECRET_PATTERNS = (
     re.compile(r"\b(?:sk|pk|rk)-[A-Za-z0-9_-]{16,}"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
     re.compile(r"\bhvs\.[A-Za-z0-9_-]{20,}"),                  # Vault tokens
-    re.compile(r"(?i)\b(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S+"),
 )
-# One key/value rule for every quoting form (review r4): bare (`authorization:
-# Basic x`), Python repr (`{'token': 'x'}`), JSON and escaped JSON
-# (`{\"token\":\"x\"}`). The key may be wrapped in quotes and backslashes;
-# the value, optionally led by an auth scheme word, is withheld up to the next
-# quote, backslash, comma, semicolon, brace, bracket or whitespace.
-_SECRET_KV = re.compile(
-    r"(?i)([\"'\\]*\b[a-z0-9_-]*?(?:token|secret|password|passwd|api[_-]?key|credential|"
-    r"cookie|authorization|bearer|nonce|chat_id|user_id|private_key|signature)[a-z0-9_-]*"
-    r"[\"'\\]*\s*[:=]\s*[\"'\\]*)"
-    r"((?:(?:bearer|basic|token|digest)\s+)?[^\s\"'\\,;{}\[\]]+)")
+# key/value forms are handled by _scrub_kv below (one rule, every quoting form).
+# The KEY half of a key/value credential; the value's extent is decided by
+# _scrub_kv (review r5: a regex value stopped at whitespace, so a quoted
+# passphrase or an escaped private key leaked after its first word).
+_KV_KEY = re.compile(
+    r"(?i)[\"'\\]*\b[a-z0-9_-]*?(?P<key>token|secret|password|passwd|passphrase|api[_-]?key|"
+    r"credential|cookie|authorization|bearer|nonce|chat_id|user_id|private_key|signature)"
+    r"[a-z0-9_-]*[\"'\\]*\s*[:=]\s*")
+# Keys whose unquoted value is ALWAYS a secret. The other keys also head prose
+# in task notes ("requires operator authorization: Codex review ..."), so their
+# unquoted value is withheld only when its first word is credential-shaped.
+_STRONG_KEYS = {"secret", "password", "passwd", "passphrase", "credential", "cookie",
+                "private_key", "api_key", "api-key", "apikey"}
+_SCHEME_WORDS = {"bearer", "basic", "digest", "token", "negotiate"}
+
+
+def _credential_shaped(word: str) -> bool:
+    w = word.strip("\"'`.,;:()[]{}")
+    if not w:
+        return False
+    return (w.lower() in _SCHEME_WORDS or any(ch.isdigit() for ch in w) or len(w) >= 16
+            or (len(w) >= 8 and any(ch in "+/=_-~." for ch in w)))
+# A PEM private key anywhere, raw or with escaped newlines; unterminated = to the end.
+_PEM_PRIVATE = re.compile(r"-----BEGIN[^-\n]*PRIVATE KEY-----.*?(?:-----END[^-\n]*PRIVATE KEY-----|\Z)",
+                          re.S)
+
+
+def _scrub_kv(text: str) -> str:
+    """Withhold the whole value after every credential key.
+
+    A value opened by a quote (", ' or an escaped form like \\") runs to the
+    matching unescaped close; an unquoted value runs to the end of the line
+    (a real newline or a literal backslash-n). Over-withholding the rest of a
+    line is the accepted cost: a value is never cut at a space."""
+    out, i = [], 0
+    for m in _KV_KEY.finditer(text):
+        if m.start() < i:
+            continue
+        j = m.end()
+        q = re.match(r"(\\*)([\"'])", text[j:])
+        if q:
+            close, k = q.group(0), j + len(q.group(0))
+            while True:
+                k = text.find(close, k)
+                if k < 0:
+                    k = len(text)
+                    break
+                # a plain quote preceded by a backslash is escaped content, not the close
+                if not q.group(1) and k > 0 and text[k - 1] == "\\":
+                    k += 1
+                    continue
+                break
+            out.append(text[i:j] + close + "<redacted>")
+            i = k
+        else:
+            ends = [e for e in (text.find("\n", j), text.find("\\n", j)) if e >= 0]
+            line_end = min(ends) if ends else len(text)
+            first = (text[j:line_end].split() or [""])[0]
+            assignment = "=" in m.group(0)
+            if (m.group("key").lower() not in _STRONG_KEYS and not assignment
+                    and not _credential_shaped(first)):
+                continue  # prose after a weak key, e.g. "operator authorization: Codex ..."
+            out.append(text[i:j] + "<redacted>")
+            i = line_end
+    out.append(text[i:])
+    return "".join(out)
+
+
 # A credential written as JSON text inside a string column ("token": "...").
 _SECRET_JSON = re.compile(
     r'(?i)("(?:[a-z0-9_]*?)(?:token|secret|password|passwd|api[_-]?key|credential|cookie|'
@@ -158,7 +215,8 @@ def scrub(value: Any, *, paths: bool = True) -> Any:
         value = _scrub_embedded_json(value, paths)
         value = _SECRET_JSON.sub(lambda m: m.group(1) + '"<redacted>"', value)
         value = _SECRET_JSON_CONTAINER.sub('"<redacted>": "<redacted>"', value)
-        value = _SECRET_KV.sub(lambda m: m.group(1) + "<redacted>", value)
+        value = _PEM_PRIVATE.sub("<redacted private key>", value)
+        value = _scrub_kv(value)
         for pat in _SECRET_PATTERNS:
             value = pat.sub("<redacted>", value)
         return _scrub_paths(value, repos=not paths)

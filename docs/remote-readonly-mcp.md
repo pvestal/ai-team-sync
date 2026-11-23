@@ -62,7 +62,14 @@ Boundaries:
   (token, secret, password, api_key, chat_id, user_id, telegram_*id, nonce,
   ...) is withheld whatever its type; the same keys written inside a string are
   withheld in every quoting form (bare `key: value`, `key=value`, Python repr,
-  JSON, escaped JSON); credential-shaped text (bearer/JWT/`sk-`/`ghp_`/Vault
+  JSON, escaped JSON): a quoted value up to its real closing quote, an unquoted
+  value to the end of its line (never cut at a space). Strong keys (password,
+  passphrase, secret, credential, cookie, private_key, api_key) always
+  withhold; the other keys (token, authorization, nonce, chat_id, user_id,
+  signature) withhold after `=`, or after `:` when the first word is
+  credential-shaped (an auth scheme, a digit, >=16 chars, or >=8 chars with
+  `+/=_-~.`), so ruling prose like "operator authorization: Codex review" is
+  kept. PEM private-key blocks are withheld whole; credential-shaped text (bearer/JWT/`sk-`/`ghp_`/Vault
   tokens, `password=` pairs) is replaced everywhere. Absolute paths are
   withheld from the leading `/` to the next delimiter, spaces and Unicode
   included (a path that may contain spaces cannot be cut at a space); Echo
@@ -71,7 +78,10 @@ Boundaries:
   Hashes are never redacted.
 - **Per-client secrets:** the #3760 secret is client `claude-ai`; each further
   client has its own `<client>.token` (0600) in
-  `~/.config/ai-team-sync/remote-mcp.clients.d/` (0700). Secrets must differ.
+  `~/.config/ai-team-sync/remote-mcp.clients.d/` (0700). Secrets must differ,
+  may not start with `bearer` or contain whitespace (either would make two
+  clients' accepted forms collide), and a credential that matches more than
+  one client is refused (401), never attributed by order.
 - **Rate limits:** per client, 60 tool calls/min and 30 database tool
   calls/min; over the limit is a tool error.
 - **Audit:** one JSON line per call (exception: a client over its rate limit

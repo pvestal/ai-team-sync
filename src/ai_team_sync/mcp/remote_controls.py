@@ -35,7 +35,18 @@ def _read_private_token(path: Path) -> str:
     token = path.read_text().strip()
     if len(token) < MIN_TOKEN_LEN:
         raise RuntimeError(f"{path} holds a token shorter than {MIN_TOKEN_LEN} chars")
+    check_secret_shape(token, path.name)
     return token
+
+
+def check_secret_shape(token: str, where: str = "secret") -> None:
+    """Refuse a secret the bearer gate could confuse with another client's
+    (review r5): one starting with "bearer" is indistinguishable, in the
+    accepted bare form, from "Bearer"+X joined form of a secret X; one with
+    whitespace can split into scheme + credential."""
+    if token[:6].lower() == "bearer" or any(c.isspace() for c in token):
+        raise RuntimeError(f"{where}: a remote client secret may not start with 'bearer' "
+                           "or contain whitespace")
 
 
 def load_clients(primary_file: Path, primary_client: str,

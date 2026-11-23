@@ -351,7 +351,9 @@ async def test_production_rows_are_scrubbed_of_credentials_and_paths(env, secret
         res = await call(http, "dispatch_holds")
     out = text(res)
     assert secret not in out and "<redacted>" in out
-    assert "/opt/anime-studio" not in out and "<path>" in out
+    # the path is withheld either as <path> or inside a credential value that
+    # runs to the end of the line (r5: unquoted values are never cut at a space)
+    assert "/opt/anime-studio" not in out and "output/x.mp4" not in out
     assert "a" * 64 in out  # hashes are evidence, never redacted
 
 
@@ -750,3 +752,82 @@ def test_r4_pinned_origins_pass():
     rr.require_pinned_origins()  # module defaults
     assert rr.PINNED_ORIGINS == {"ats": ("http", "127.0.0.1", 8400),
                                  "echo": ("http", "127.0.0.1", 8309)}
+
+
+# ---- review round 5 regressions ------------------------------------------------------
+
+PEM = "-----BEGIN OPENSSH PRIVATE KEY-----\nAAAABBBBCCCC\nDDDD\n-----END OPENSSH PRIVATE KEY-----"
+
+
+@pytest.mark.parametrize("value,leaks", [
+    ("password: 'horse battery staple'", ["battery", "staple"]),
+    ('passphrase = "horse battery staple" ok', ["battery", "staple"]),
+    ('{\\"password\\":\\"horse battery staple\\"}', ["battery", "staple"]),
+    ("{'secret': 'a \\' b staple'}", ["staple"]),
+    ("password: horse battery staple", ["battery", "staple"]),
+    ("token=abc def\\nnext line", ["abc", "def"]),
+    (PEM, ["AAAABBBBCCCC", "DDDD"]),
+    (PEM.replace("\n", "\\n"), ["AAAABBBBCCCC"]),
+    ("key starts -----BEGIN RSA PRIVATE KEY-----\nAAAABBBBCCCC (truncated", ["AAAABBBBCCCC"]),
+    ("{'private_key': '" + PEM.replace("\n", "\\n") + "'}", ["AAAABBBBCCCC"]),
+])
+def test_r5_values_with_spaces_and_private_keys_are_withheld(value, leaks):
+    for paths in (True, False):
+        out = json.dumps(tower.scrub(value, paths=paths))
+        for leak in leaks:
+            assert leak not in out, (paths, value, out)
+
+
+async def test_r5_through_tool(env):
+    env["rows"] = [{"reason": "password: 'horse battery staple' " + PEM}]
+    async with serve() as http:
+        out = text(await call(http, "dispatch_holds"))
+    assert "battery" not in out and "AAAABBBBCCCC" not in out
+
+
+@pytest.mark.parametrize("bad", ["Bearer" + "x" * 40, "bearer" + "y" * 40, "x" * 20 + " " + "y" * 20])
+def test_r5_ambiguous_client_secret_shapes_are_refused(tmp_path, bad):
+    with pytest.raises(ValueError):
+        rr.BearerGate(lambda *a: None, {"a": "z" * 48, "b": bad})
+    primary = _token_file(tmp_path / "remote-mcp.token", bad)
+    with pytest.raises(RuntimeError):
+        rc.load_clients(primary, "claude-ai", None)
+
+
+async def test_r5_a_credential_matching_two_clients_is_refused_not_first_wins(env, monkeypatch):
+    # Bypass the shape check to construct the exact r5 collision and prove the
+    # gate itself refuses an ambiguous match instead of attributing by order.
+    monkeypatch.setattr(rc, "check_secret_shape", lambda *a, **k: None)
+    x = "q" * 48
+    for order in ({"pre": "Bearer" + x, "suf": x}, {"suf": x, "pre": "Bearer" + x}):
+        async with serve(order) as http:
+            r = await http.post("/mcp", headers={**_hdr("Bearer" + x)}, content="{}")
+            # "Bearer"+x sent bare matches "pre" (bare) and "suf" (joined form): ambiguous
+            r2 = await http.post("/mcp", headers={"Authorization": "Bearer" + x,
+                                                  "Accept": "application/json, text/event-stream",
+                                                  "Content-Type": "application/json"},
+                                 content=json.dumps({"jsonrpc": "2.0", "id": 1,
+                                                     "method": "tools/list"}))
+        assert r2.status_code == 401
+
+
+@pytest.mark.parametrize("prose", [
+    "Next requires operator authorization: Codex review of the branch first",
+    "the token: was refreshed by the service",
+    "Header: Authorization: header name only",
+])
+def test_r5_prose_after_a_weak_key_is_kept(prose):
+    assert tower.scrub(prose, paths=False) == prose
+
+
+@pytest.mark.parametrize("value,leak", [
+    ("authorization: supersecret123456", "supersecret123456"),
+    ("Authorization: Basic dXNlcjpwYXNz", "dXNlcjpwYXNz"),
+    ("token: 0123456789abcdef", "0123456789abcdef"),
+    ("chat_id: 987654321", "987654321"),
+    ("nonce=Zx_9-abcdEFGH", "Zx_9-abcdEFGH"),
+    ("secret: horse battery staple", "battery"),
+])
+def test_r5_credential_shaped_values_after_any_key_are_withheld(value, leak):
+    for paths in (True, False):
+        assert leak not in tower.scrub(value, paths=paths), value

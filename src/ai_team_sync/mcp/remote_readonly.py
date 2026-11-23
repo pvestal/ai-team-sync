@@ -623,6 +623,12 @@ class BearerGate:
             raise ValueError("bearer token too short")
         if len(set(clients.values())) != len(clients):
             raise ValueError("two clients share one secret")
+        from ai_team_sync.mcp.remote_controls import check_secret_shape
+        for cid, t in clients.items():
+            try:
+                check_secret_shape(t, cid)
+            except RuntimeError as exc:
+                raise ValueError(str(exc)) from None
         self.app = app
         self._clients = [(cid, t.encode()) for cid, t in clients.items()]
         # The refusal log reports the expected length of the first (primary) secret.
@@ -651,13 +657,15 @@ class BearerGate:
         joined = bare[6:] if bare[:6].lower() == b"bearer" else b""
         # Every client's secret is compared in all three forms on every request,
         # so timing does not depend on which client (if any) matched.
-        matched = None
+        matches = []
         for cid, secret in self._clients:
             bearer_ok = hmac.compare_digest(credential, secret) and scheme == "bearer"
             bare_ok = hmac.compare_digest(bare, secret)
             joined_ok = hmac.compare_digest(joined, secret)
-            if (bearer_ok or bare_ok or joined_ok) and matched is None:
-                matched = cid
+            if bearer_ok or bare_ok or joined_ok:
+                matches.append(cid)
+        # Exactly one client, or nobody (review r5): attribution never depends on order.
+        matched = matches[0] if len(matches) == 1 else None
         ok = len(auth) == 1 and matched is not None
         if not ok:
             self._log_refusal(scope, headers, auth, scheme, credential)
