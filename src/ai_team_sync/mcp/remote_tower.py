@@ -56,9 +56,13 @@ _SECRET_PATTERNS = (
 # The KEY half of a key/value credential; the value's extent is decided by
 # _scrub_kv (review r5: a regex value stopped at whitespace, so a quoted
 # passphrase or an escaped private key leaked after its first word).
+# ONE list of sensitive key words for every rule below (review r7: the text
+# rules had drifted from the structural one, e.g. from_user).
+_KEY_WORDS = (r"token|secret|password|passwd|passphrase|api[_-]?key|credential|cookie|"
+              r"authorization|bearer|nonce|chat_id|user_id|from_user|telegram_[a-z_]*id|"
+              r"session_fingerprint|private_key|signature")
 _KV_KEY = re.compile(
-    r"(?i)[\"'\\]*\b[a-z0-9_-]*?(?P<key>token|secret|password|passwd|passphrase|api[_-]?key|"
-    r"credential|cookie|authorization|bearer|nonce|chat_id|user_id|private_key|signature)"
+    r"(?i)[\"'\\]*\b[a-z0-9_-]*?(?P<key>" + _KEY_WORDS + r")"
     r"[a-z0-9_-]*[\"'\\]*\s*[:=]\s*")
 # A PEM private key anywhere, raw or with escaped newlines; unterminated = to the end.
 _PEM_PRIVATE = re.compile(r"-----BEGIN[^-\n]*PRIVATE KEY-----.*?(?:-----END[^-\n]*PRIVATE KEY-----|\Z)",
@@ -113,15 +117,11 @@ def _scrub_kv(text: str) -> str:
 
 # A credential written as JSON text inside a string column ("token": "...").
 _SECRET_JSON = re.compile(
-    r'(?i)("(?:[a-z0-9_]*?)(?:token|secret|password|passwd|api[_-]?key|credential|cookie|'
-    r'authorization|chat_id|user_id|telegram_[a-z_]*id)"\s*:\s*)("[^"]*"|-?[0-9]+)')
+    r'(?i)("(?:[a-z0-9_]*?)(?:' + _KEY_WORDS + r')[a-z0-9_]*"\s*:\s*)("[^"]*"|-?[0-9]+)')
 # A dict KEY naming a credential or a personal identifier: its value is
 # withheld whatever its type (#3787 review r1: nested {"token": ...} and
 # integer telegram_chat_id survived a text-only scrub).
-_SENSITIVE_KEY = re.compile(
-    r"(?i)(token|secret|password|passwd|api[_-]?key|credential|cookie|authorization|"
-    r"bearer|nonce|chat_id|user_id|from_user|telegram_[a-z_]*id|session_fingerprint|"
-    r"private_key|signature)")
+_SENSITIVE_KEY = re.compile(r"(?i)(" + _KEY_WORDS + r")")
 # An absolute path starts at a '/' not preceded by a word character, '.', ':',
 # '/' or '~' (so URLs and dates are not paths) and RUNS TO THE NEXT DELIMITER,
 # spaces and any Unicode included (review r3: "/data private/x", "/dataé/x"; a
@@ -135,8 +135,7 @@ _JSON_START = re.compile(r"[\[{]")
 # A sensitive key in text whose value is a container that did not parse as
 # JSON: everything from the key to the end of the string is withheld.
 _SECRET_JSON_CONTAINER = re.compile(
-    r'(?is)"[a-z0-9_]*?(?:token|secret|password|passwd|api[_-]?key|credential|cookie|'
-    r'authorization|chat_id|user_id|telegram_[a-z_]*id|nonce|private_key|signature)"\s*:\s*[\[{].*')
+    r'(?is)"[a-z0-9_]*?(?:' + _KEY_WORDS + r')[a-z0-9_]*"\s*:\s*[\[{].*')
 # Repo citations in Echo task text stay readable as repo-relative labels;
 # every other absolute path is withheld.
 _REPO_ROOTS = (("/opt/tower-echo-brain/", "echo:"), ("/opt/anime-studio/", "anime-studio:"),
@@ -196,6 +195,35 @@ def _scrub_embedded_json(text: str, paths: bool) -> str:
         i = end
 
 
+_ESCAPE = re.compile(r"\\+u([0-9a-fA-F]{4})|\\+U([0-9a-fA-F]{8})|\\+x([0-9a-fA-F]{2})"
+                     r"|%([0-9a-fA-F]{2})|&#[xX]([0-9a-fA-F]{1,6});|&#([0-9]{1,7});")
+
+
+def _decode_escapes(text: str) -> str:
+    """Decode \\uXXXX / \\UXXXXXXXX / \\xXX (any backslash depth), %XX and
+    numeric HTML entities before any rule runs, repeated up to three times for
+    layered encodings (review r7: "\\u0074oken" is "token" to every JSON
+    reader). Rules then see the characters a reader would see; the output
+    carries the decoded form."""
+    if not any(c in text for c in "\\%&"):
+        return text
+
+    def one(m: re.Match) -> str:
+        hexval = next((g for g in m.groups()[:5] if g), None)
+        try:
+            cp = int(hexval, 16) if hexval else int(m.group(6))
+            return chr(cp) if 0 < cp <= 0x10FFFF else m.group(0)
+        except (TypeError, ValueError):
+            return m.group(0)
+
+    for _ in range(3):
+        decoded = _ESCAPE.sub(one, text)
+        if decoded == text:
+            break
+        text = decoded
+    return text
+
+
 def scrub(value: Any, *, paths: bool = True) -> Any:
     """Withhold credentials and personal ids (by key, by JSON text, by shape)
     and absolute filesystem paths, recursively. ``paths=True`` (production
@@ -203,6 +231,7 @@ def scrub(value: Any, *, paths: bool = True) -> Any:
     ``paths=False`` (Echo task text) keeps repo paths as repo-relative labels
     and withholds all others."""
     if isinstance(value, str):
+        value = _decode_escapes(value)
         value = _scrub_embedded_json(value, paths)
         value = _SECRET_JSON.sub(lambda m: m.group(1) + '"<redacted>"', value)
         value = _SECRET_JSON_CONTAINER.sub('"<redacted>": "<redacted>"', value)
@@ -212,7 +241,7 @@ def scrub(value: Any, *, paths: bool = True) -> Any:
             value = pat.sub("<redacted>", value)
         return _scrub_paths(value, repos=not paths)
     if isinstance(value, dict):
-        return {k: ("<redacted>" if isinstance(k, str) and _SENSITIVE_KEY.search(k)
+        return {k: ("<redacted>" if isinstance(k, str) and _SENSITIVE_KEY.search(_decode_escapes(k))
                     and v not in (None, "", [], {}) else scrub(v, paths=paths))
                 for k, v in value.items()}
     if isinstance(value, (list, tuple)):

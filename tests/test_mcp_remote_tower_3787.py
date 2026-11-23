@@ -848,3 +848,37 @@ def test_r6_escaped_closes_and_every_credential_key_withheld(value, leak):
 def test_r6_text_after_a_properly_closed_value_survives():
     out = tower.scrub('{"password": "s3cr et", "shot": "abc"}', paths=True)
     assert "s3cr" not in out and '"shot": "abc"' in out
+
+
+# ---- review round 7 regressions ------------------------------------------------------
+
+@pytest.mark.parametrize("value,leak", [
+    ('payload={\\"\\\\u0074oken\\":\\"unicode-key-secret\\"}', "unicode-key-secret"),   # r7 probe
+    ('{"\\u0074oken": "unicode-key-secret"}', "unicode-key-secret"),
+    ("{'from_user': 123456789012}", "123456789012"),
+    ("%74oken=urlencoded-secret", "urlencoded-secret"),
+    ("&#116;oken: entity-secret-1", "entity-secret-1"),
+    ("\\x74oken=hexescaped-secret", "hexescaped-secret"),
+    ("%2574oken=double-encoded-secret", "double-encoded-secret"),
+    ('{"telegram_chat_id": "424242"}', "424242"),
+])
+def test_r7_encoded_keys_and_unified_key_list(value, leak):
+    for paths in (True, False):
+        assert leak not in json.dumps(tower.scrub(value, paths=paths)), (paths, value)
+
+
+async def test_r7_through_out(env):
+    env["rows"] = [{"reason": 'payload={\\"\\\\u0074oken\\":\\"unicode-key-secret\\"}',
+                    "note": "{'from_user': 123456789012}"}]
+    async with serve() as http:
+        out = text(await call(http, "dispatch_holds"))
+    assert "unicode-key-secret" not in out and "123456789012" not in out
+
+
+def test_r7_structural_key_with_escape_is_withheld():
+    assert tower.scrub({"\\u0074oken": "x-secret"}) == {"\\u0074oken": "<redacted>"}
+
+
+def test_r7_one_key_list():
+    for key in ("from_user", "telegram_chat_id", "session_fingerprint", "passphrase"):
+        assert re.search(tower._KEY_WORDS, key)

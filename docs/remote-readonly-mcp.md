@@ -58,7 +58,10 @@ Boundaries:
   revoke PUBLIC EXECUTE on the large-object writer functions (0 large objects
   and no code using them in either database, measured 2026-11-23; the
   rollback re-grants them).
-- **Redaction:** a value under any key naming a credential or personal id
+- **Redaction:** text is first decoded (`\uXXXX`, `\UXXXXXXXX`, `\xXX` at any
+  backslash depth, `%XX`, numeric HTML entities; up to three layers) so no key
+  can hide behind an encoding, and one shared key list drives every rule. A
+  value under any key naming a credential or personal id
   (token, secret, password, api_key, chat_id, user_id, telegram_*id, nonce,
   ...) is withheld whatever its type; the same keys written inside a string are
   withheld in every quoting form (bare `key: value`, `key=value`, Python repr,
