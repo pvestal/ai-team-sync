@@ -14,6 +14,31 @@ return once Echo search takes a read-only flag (follow-up ticket). Until then
 the remote brief carries ATS context, the ticket envelope and its rulings, but
 no recalled memories.
 
+## OAuth for ChatGPT (#3787)
+
+ChatGPT connects only through OAuth, so `ats-mcp-remote` also serves a minimal
+authorization server (`src/ai_team_sync/mcp/remote_oauth.py`), on only when
+`~/.config/ai-team-sync/oauth-clients.json` (0600) lists a client:
+
+- Discovery: `/.well-known/oauth-protected-resource` (and `/mcp` suffix),
+  `/.well-known/oauth-authorization-server`. Issuer `https://tower.tail5aaf78.ts.net`,
+  resource `https://tower.tail5aaf78.ts.net/mcp`, scope `tower.read`.
+- `/oauth/authorize`: code + PKCE S256 only; redirect only to ChatGPT's
+  `https://chatgpt.com/connector_platform_oauth_redirect` or
+  `https://chatgpt.com/connector/oauth/<id>`; RFC 9207 `iss` on every redirect;
+  `resource` must be the one above. An unknown client or redirect gets 400,
+  never a redirect.
+- `/oauth/token`: confidential clients only (`client_secret_basic` /
+  `client_secret_post`); single-use codes (120 s); access tokens 1 h,
+  refresh tokens 30 d, rotated on use. `/oauth/revoke`: RFC 7009.
+- Tokens are opaque; only their SHA-256 is stored
+  (`$ATS_STATE_DIR/oauth-tokens.json`, 0600). On `/mcp` an OAuth token is just
+  another client (`oauth:<client_id>`): same 19 read tools, rate limits, audit.
+- Revoke everything for a client: remove it from the clients file or change its
+  secret (`secret_sha256`), then restart the unit.
+- Public paths (Tailscale Funnel): `/mcp`, `/.well-known`, `/oauth`. None of the
+  OAuth paths serves MCP data.
+
 ## Tower context tools (#3787 Phase 1)
 
 Thirteen more read tools, all annotated `readOnlyHint: true`,

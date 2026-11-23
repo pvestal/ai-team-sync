@@ -48,6 +48,7 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import TextContent, Tool
 
+from ai_team_sync.mcp import remote_oauth as _oauth
 from ai_team_sync.mcp import remote_tower as tower
 from ai_team_sync.mcp.remote_controls import AuditLog, RateLimiter, describe_args, load_clients
 
@@ -635,6 +636,7 @@ class BearerGate:
             except RuntimeError as exc:
                 raise ValueError(str(exc)) from None
         self.app = app
+        self.oauth = None  # remote_oauth.OAuthServer, set by build_app (#3787)
         self._clients = [(cid, t.encode()) for cid, t in clients.items()]
         # The refusal log reports the expected length of the first (primary) secret.
         self._token = self._clients[0][1]
@@ -647,6 +649,12 @@ class BearerGate:
             if scope["type"] == "websocket":
                 await send({"type": "websocket.close", "code": 1008})
             return
+        # OAuth discovery and the authorization server itself (#3787) take no
+        # bearer: they are how a client obtains one. They serve no MCP data.
+        if scope.get("path", "") in _oauth.PATHS:
+            if self.oauth is None or not self.oauth.enabled:
+                return await _send_status(send, 404, b"not found\n")
+            return await self.oauth(scope, _capped_receive(receive), send)
         headers = scope.get("headers", [])
         auth = [v for k, v in headers if k == b"authorization"]
         scheme, credential = _parse_bearer(auth[0]) if len(auth) == 1 else ("-", b"")
@@ -671,11 +679,18 @@ class BearerGate:
                 matches.append(cid)
         # Exactly one client, or nobody (review r5): attribution never depends on order.
         matched = matches[0] if len(matches) == 1 else None
+        # An OAuth access token (RFC 6750 "Bearer <token>" only), checked after
+        # the static secrets: same tools, limits and audit, never more.
+        if (matched is None and not matches and len(auth) == 1 and scheme == "bearer"
+                and self.oauth is not None):
+            matched = self.oauth.client_for_access_token(credential)
         ok = len(auth) == 1 and matched is not None
         if not ok:
             self._log_refusal(scope, headers, auth, scheme, credential)
+            challenge = (self.oauth.www_authenticate()
+                         if self.oauth is not None and self.oauth.enabled else b'Bearer realm="ats"')
             return await _send_status(send, 401, b"unauthorized\n",
-                                      [(b"www-authenticate", b'Bearer realm="ats"')])
+                                      [(b"www-authenticate", challenge)])
         lengths = [v for k, v in scope.get("headers", []) if k == b"content-length"]
         if lengths:
             try:
@@ -726,7 +741,7 @@ def _capped_receive(receive):
     return wrapped
 
 
-def build_app(token: "str | dict[str, str]"):
+def build_app(token: "str | dict[str, str]", oauth: "_oauth.OAuthServer | None" = None):
     """ASGI app: BearerGate -> /mcp Streamable HTTP (stateless, JSON responses)."""
     server = build_server()
     # DNS-rebinding protection is a browser defence for unauthenticated local
@@ -753,6 +768,7 @@ def build_app(token: "str | dict[str, str]"):
         return await manager.handle_request(scope, receive, send)
 
     gate = BearerGate(mcp_app, token)
+    gate.oauth = oauth
     gate.manager = manager  # tests drive manager.run() themselves
     return gate
 
@@ -822,11 +838,22 @@ def run() -> None:
     global AUDIT
     AUDIT = AuditLog(Path(state_dir) / "audit.jsonl" if state_dir else None)
     configure_logging()
+    # OAuth for ChatGPT (#3787): on only when the operator's clients file lists a client.
+    oauth_clients = _oauth.load_clients(Path(os.environ.get(
+        "ATS_REMOTE_MCP_OAUTH_CLIENTS",
+        str(Path.home() / ".config" / "ai-team-sync" / "oauth-clients.json"))))
+    for cid in oauth_clients:
+        if cid in token or "oauth:" + cid in token:
+            raise SystemExit(f"refusing to start: OAuth client {cid!r} collides with a bearer client")
+    oauth = _oauth.OAuthServer(
+        oauth_clients,
+        _oauth.TokenStore(Path(state_dir) / "oauth-tokens.json" if state_dir else None),
+        audit=AUDIT, limiter=RATE_LIMITER)
     # proxy_headers off: X-Forwarded-* from the Funnel is not trusted for anything.
     # access_log off (#3787): it echoed client-chosen paths and query strings into
     # the journal; tool calls are in the audit log, refusals in the auth log.
     # log_config=None keeps uvicorn from replacing the handlers set above.
-    uvicorn.run(build_app(token), host=host, port=port, proxy_headers=False,
+    uvicorn.run(build_app(token, oauth), host=host, port=port, proxy_headers=False,
                 server_header=False, log_level="info", access_log=False, log_config=None,
                 limit_concurrency=MAX_CONCURRENCY, timeout_keep_alive=5,
                 h11_max_incomplete_event_size=MAX_BODY_BYTES)
