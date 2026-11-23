@@ -122,9 +122,30 @@ def _origin(url: str) -> tuple[str, str, int | None]:
     return (u.scheme, u.host, u.port)
 
 
+# The only origins this process may ever reach, pinned in code (review r4: the
+# configurable ATS_SERVER_URL / ATS_REMOTE_ECHO_URL could otherwise name Anime
+# Studio :8401 as "ats" or "echo"). Environment may only restate them.
+PINNED_ORIGINS = {"ats": ("http", "127.0.0.1", 8400), "echo": ("http", "127.0.0.1", 8309)}
+
+
+class OriginNotPinned(RuntimeError):
+    """ATS_URL or ECHO_URL names an origin other than its pinned one."""
+
+
+def require_pinned_origins() -> None:
+    for base, url in (("ats", ATS_URL), ("echo", ECHO_URL)):
+        if _origin(url) != PINNED_ORIGINS[base]:
+            raise OriginNotPinned(f"{base} upstream must be "
+                                  "%s://%s:%d" % PINNED_ORIGINS[base])
+
+
 def upstream_allowed(method: str, url: httpx.URL) -> bool:
     origin = (url.scheme, url.host, url.port)
     bases = {"ats": _origin(ATS_URL), "echo": _origin(ECHO_URL)}
+    # Both the configured base AND the pinned origin must agree, so a mistaken
+    # environment value refuses everything instead of widening anything.
+    if any(bases[b] != PINNED_ORIGINS[b] for b in bases):
+        return False
     for m, base, pattern in UPSTREAM_ALLOWLIST:
         if m == method.upper() and origin == bases[base] and pattern.fullmatch(url.path):
             return True
@@ -775,6 +796,10 @@ def run() -> None:
     port = int(os.environ.get("ATS_REMOTE_MCP_PORT", str(DEFAULT_PORT)))
     token_file = Path(os.environ.get("ATS_REMOTE_MCP_TOKEN_FILE", str(DEFAULT_TOKEN_FILE)))
     _require_loopback(host)
+    try:
+        require_pinned_origins()
+    except OriginNotPinned as exc:
+        raise SystemExit(f"refusing to start: {exc}") from None
     load_token(token_file)  # same refusals as before (#3760), then per-client (#3787)
     clients_dir = os.environ.get("ATS_REMOTE_MCP_CLIENTS_DIR")
     token = load_clients(token_file,

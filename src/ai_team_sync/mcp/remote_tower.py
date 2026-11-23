@@ -53,6 +53,16 @@ _SECRET_PATTERNS = (
     re.compile(r"\bhvs\.[A-Za-z0-9_-]{20,}"),                  # Vault tokens
     re.compile(r"(?i)\b(password|passwd|secret|token|api[_-]?key)\s*[=:]\s*\S+"),
 )
+# One key/value rule for every quoting form (review r4): bare (`authorization:
+# Basic x`), Python repr (`{'token': 'x'}`), JSON and escaped JSON
+# (`{\"token\":\"x\"}`). The key may be wrapped in quotes and backslashes;
+# the value, optionally led by an auth scheme word, is withheld up to the next
+# quote, backslash, comma, semicolon, brace, bracket or whitespace.
+_SECRET_KV = re.compile(
+    r"(?i)([\"'\\]*\b[a-z0-9_-]*?(?:token|secret|password|passwd|api[_-]?key|credential|"
+    r"cookie|authorization|bearer|nonce|chat_id|user_id|private_key|signature)[a-z0-9_-]*"
+    r"[\"'\\]*\s*[:=]\s*[\"'\\]*)"
+    r"((?:(?:bearer|basic|token|digest)\s+)?[^\s\"'\\,;{}\[\]]+)")
 # A credential written as JSON text inside a string column ("token": "...").
 _SECRET_JSON = re.compile(
     r'(?i)("(?:[a-z0-9_]*?)(?:token|secret|password|passwd|api[_-]?key|credential|cookie|'
@@ -148,6 +158,7 @@ def scrub(value: Any, *, paths: bool = True) -> Any:
         value = _scrub_embedded_json(value, paths)
         value = _SECRET_JSON.sub(lambda m: m.group(1) + '"<redacted>"', value)
         value = _SECRET_JSON_CONTAINER.sub('"<redacted>": "<redacted>"', value)
+        value = _SECRET_KV.sub(lambda m: m.group(1) + "<redacted>", value)
         for pat in _SECRET_PATTERNS:
             value = pat.sub("<redacted>", value)
         return _scrub_paths(value, repos=not paths)

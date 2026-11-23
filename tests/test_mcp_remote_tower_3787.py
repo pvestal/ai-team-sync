@@ -705,3 +705,48 @@ async def test_r3_suppressed_refusals_are_counted_on_the_next_audited_line(env, 
     lines = [json.loads(l) for l in env["audit_path"].read_text().splitlines()]
     assert [l["outcome"] for l in lines] == ["ok", "rate_limited", "rate_limited"]
     assert "suppressed_refusals" not in lines[1] and lines[2]["suppressed_refusals"] == 3
+
+
+# ---- review round 4 regressions ------------------------------------------------------
+
+@pytest.mark.parametrize("value", [
+    "authorization: supersecret123456",
+    "Authorization: Basic supersecret123456",
+    "payload={'token': 'supersecret123456'}",
+    'payload={\\"token\\":\\"supersecret123456\\"}',
+    "access_token=supersecret123456&x=1",
+    "cookie: session=supersecret123456",
+    "{'chat_id': 123456789012}",
+])
+def test_r4_every_quoting_form_of_a_credential_is_withheld(value):
+    leak = "123456789012" if "chat_id" in value else "supersecret123456"
+    for paths in (True, False):
+        assert leak not in json.dumps(tower.scrub(value, paths=paths)), (paths, value)
+
+
+async def test_r4_credential_forms_are_withheld_through_a_tool(env):
+    env["rows"] = [{"reason": "authorization: supersecret123456 / payload={'token': 'supersecret123456'}"}]
+    async with serve() as http:
+        res = await call(http, "dispatch_holds")
+    assert "supersecret123456" not in text(res)
+
+
+@pytest.mark.parametrize("attr,url", [
+    ("ECHO_URL", "http://127.0.0.1:8401"), ("ATS_URL", "http://127.0.0.1:8401"),
+    ("ECHO_URL", "http://192.168.50.135:8309"), ("ATS_URL", "https://127.0.0.1:8400"),
+])
+def test_r4_a_misconfigured_origin_refuses_everything_and_refuses_startup(monkeypatch, attr, url):
+    monkeypatch.setattr(rr, attr, url)
+    for method, target in (("GET", url + "/health"), ("GET", url + "/api/tower-tasks/3787"),
+                           ("POST", url + "/api/brief"), ("GET", url + "/api/version"),
+                           ("GET", "http://127.0.0.1:8309/health"),
+                           ("GET", "http://127.0.0.1:8400/api/version")):
+        assert rr.upstream_allowed(method, httpx.URL(target)) is False
+    with pytest.raises(rr.OriginNotPinned):
+        rr.require_pinned_origins()
+
+
+def test_r4_pinned_origins_pass():
+    rr.require_pinned_origins()  # module defaults
+    assert rr.PINNED_ORIGINS == {"ats": ("http", "127.0.0.1", 8400),
+                                 "echo": ("http", "127.0.0.1", 8309)}

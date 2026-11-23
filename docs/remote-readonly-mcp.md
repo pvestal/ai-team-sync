@@ -34,6 +34,10 @@ Boundaries:
   operator, and several of its GET routes write (QC kicks, lazy `UPDATE shots`,
   the GPU arbiter sweep, filmstrip builds). The upstream allowlist has no
   Anime Studio origin, and a test pins that.
+- **Origins are pinned in code** (ATS `http://127.0.0.1:8400`, Echo
+  `http://127.0.0.1:8309`): the process refuses to start, and the transport
+  refuses every request, if `ATS_SERVER_URL` / `ATS_REMOTE_ECHO_URL` name any
+  other origin.
 - **Echo** is reached for exactly `GET /api/tower-tasks/{int}` and
   `GET /health` (whose `database_user` is dropped). Not Echo's MCP tools: every
   Echo MCP call inserts a telemetry row.
@@ -56,8 +60,9 @@ Boundaries:
   rollback re-grants them).
 - **Redaction:** a value under any key naming a credential or personal id
   (token, secret, password, api_key, chat_id, user_id, telegram_*id, nonce,
-  ...) is withheld whatever its type; the same keys written as JSON text inside
-  a string are withheld; credential-shaped text (bearer/JWT/`sk-`/`ghp_`/Vault
+  ...) is withheld whatever its type; the same keys written inside a string are
+  withheld in every quoting form (bare `key: value`, `key=value`, Python repr,
+  JSON, escaped JSON); credential-shaped text (bearer/JWT/`sk-`/`ghp_`/Vault
   tokens, `password=` pairs) is replaced everywhere. Absolute paths are
   withheld from the leading `/` to the next delimiter, spaces and Unicode
   included (a path that may contain spaces cannot be cut at a space); Echo
