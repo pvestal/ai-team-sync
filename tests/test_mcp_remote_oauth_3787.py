@@ -350,3 +350,48 @@ async def test_r1_a_rotated_secret_sharing_the_old_hash_prefix_still_ends_every_
         assert (await mcp(c, t["access_token"])).status_code == 401
         assert env["store"].rotate_refresh(t["refresh_token"], CID,
                                            env["server"].clients[CID]["secret_sha256"]) is None
+
+
+# ---- per-client redirect URIs (claude.ai OAuth) --------------------------------------
+
+CLAUDE_REDIRECT = "https://claude.ai/api/mcp/auth_callback"
+
+
+async def test_a_client_with_redirect_uris_may_use_only_those_exact_uris(env):
+    env["server"].clients["tower-claude"] = {
+        "secret_sha256": hashlib.sha256(b"c" * 48).hexdigest(), "redirect_uris": [CLAUDE_REDIRECT]}
+    async with serve(env) as c:
+        ok = await authz(c, pkce()[1], client_id="tower-claude", redirect_uri=CLAUDE_REDIRECT)
+        assert ok.status_code == 302 and ok.headers["location"].startswith(CLAUDE_REDIRECT + "?")
+        for bad in (REDIRECT, CLAUDE_REDIRECT + "x", CLAUDE_REDIRECT + "/../evil",
+                    "https://claude.ai.evil.example/api/mcp/auth_callback"):
+            r = await authz(c, pkce()[1], client_id="tower-claude", redirect_uri=bad)
+            assert r.status_code == 400 and "location" not in r.headers, bad
+        # and the ChatGPT client may not use claude's callback
+        r = await authz(c, pkce()[1], redirect_uri=CLAUDE_REDIRECT)
+        assert r.status_code == 400
+
+
+async def test_claude_client_full_flow(env):
+    env["server"].clients["tower-claude"] = {
+        "secret_sha256": hashlib.sha256(b"c" * 48).hexdigest(), "redirect_uris": [CLAUDE_REDIRECT]}
+    async with serve(env) as c:
+        v, ch = pkce()
+        q = qs(await authz(c, ch, client_id="tower-claude", redirect_uri=CLAUDE_REDIRECT))
+        r = await c.post("/oauth/token", data={"client_id": "tower-claude", "client_secret": "c" * 48,
+                                               "grant_type": "authorization_code", "code": q["code"],
+                                               "code_verifier": v, "redirect_uri": CLAUDE_REDIRECT,
+                                               "resource": oa.resource()})
+        assert r.status_code == 200
+        lst = await mcp(c, r.json()["access_token"])
+        assert len(lst.json()["result"]["tools"]) == 19
+
+
+@pytest.mark.parametrize("uris", [[], "https://claude.ai/x", ["http://claude.ai/cb"], ["https://claude.ai/cb?x=1"],
+                                  ["https://claude.ai/cb#f"], ["javascript:alert(1)"]])
+def test_redirect_uris_must_be_exact_https(tmp_path, uris):
+    p = tmp_path / "c.json"
+    p.write_text(json.dumps({"clients": {"x": {"secret_sha256": "a" * 64, "redirect_uris": uris}}}))
+    os.chmod(p, 0o600)
+    with pytest.raises(RuntimeError):
+        oa.load_clients(p)

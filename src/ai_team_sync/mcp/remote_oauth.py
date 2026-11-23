@@ -94,8 +94,15 @@ def authorization_server_metadata() -> dict:
 
 # ---- clients (operator-managed file) ----------------------------------------------
 
+_EXACT_REDIRECT = re.compile(r"https://[a-z0-9.-]+\.[a-z]{2,}(?::[0-9]{2,5})?/[A-Za-z0-9/_.~-]{0,200}")
+
+
 def load_clients(path: Path) -> dict[str, dict]:
-    """{client_id: {"secret_sha256": hex}}; a missing file means OAuth is off."""
+    """{client_id: {"secret_sha256": hex, "redirect_uris": [exact https URIs]}}.
+
+    A client without ``redirect_uris`` may redirect only to ChatGPT's two forms
+    (CHATGPT_REDIRECT). A client with them may redirect only to exactly those
+    URIs -- no pattern, no prefix. A missing file means OAuth is off."""
     try:
         st = path.lstat()
     except FileNotFoundError:
@@ -108,7 +115,14 @@ def load_clients(path: Path) -> dict[str, dict]:
         sha = str(rec.get("secret_sha256", ""))
         if not _CLIENT_ID.fullmatch(cid) or not re.fullmatch(r"[0-9a-f]{64}", sha):
             raise RuntimeError(f"{path}: bad client entry {cid!r}")
-        out[cid] = {"secret_sha256": sha}
+        uris = rec.get("redirect_uris")
+        if uris is not None:
+            if (not isinstance(uris, list) or not uris
+                    or not all(isinstance(u, str) and _EXACT_REDIRECT.fullmatch(u) for u in uris)):
+                raise RuntimeError(f"{path}: client {cid!r} redirect_uris must be exact https URIs")
+            out[cid] = {"secret_sha256": sha, "redirect_uris": list(uris)}
+        else:
+            out[cid] = {"secret_sha256": sha}
     return out
 
 
@@ -254,6 +268,12 @@ class OAuthServer:
             return await self._revoke(body, headers, send)
         return await _respond(send, 405, b"method not allowed\n", "text/plain")
 
+    def _redirect_ok(self, client_id: str, redirect_uri: str) -> bool:
+        allowed = self.clients[client_id].get("redirect_uris")
+        if allowed is not None:
+            return redirect_uri in allowed
+        return bool(CHATGPT_REDIRECT.fullmatch(redirect_uri))
+
     def _record(self, event: str, outcome: str, client: str | None = None) -> None:
         if self.audit is not None:
             self.audit.record({"tool": "<oauth>", "event": event, "outcome": outcome,
@@ -264,7 +284,7 @@ class OAuthServer:
              if len(v) == 1}
         client_id, redirect_uri = q.get("client_id", ""), q.get("redirect_uri", "")
         # Never redirect to an unvalidated client or URI (RFC 6749 4.1.2.1).
-        if client_id not in self.clients or not CHATGPT_REDIRECT.fullmatch(redirect_uri):
+        if client_id not in self.clients or not self._redirect_ok(client_id, redirect_uri):
             self._record("authorize", "refused_client_or_redirect")
             return await _respond(send, 400, b"invalid client or redirect_uri\n", "text/plain")
         state = q.get("state")

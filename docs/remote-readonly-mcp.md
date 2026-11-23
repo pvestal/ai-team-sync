@@ -23,7 +23,10 @@ authorization server (`src/ai_team_sync/mcp/remote_oauth.py`), on only when
 - Discovery: `/.well-known/oauth-protected-resource` (and `/mcp` suffix),
   `/.well-known/oauth-authorization-server`. Issuer `https://tower.tail5aaf78.ts.net`,
   resource `https://tower.tail5aaf78.ts.net/mcp`, scope `tower.read`.
-- `/oauth/authorize`: code + PKCE S256 only; redirect only to ChatGPT's
+- Clients: `tower-chatgpt` (ChatGPT) and `tower-claude` (claude.ai). A client
+  entry may list exact `redirect_uris` (claude.ai: `https://claude.ai/api/mcp/auth_callback`);
+  without them it may use only ChatGPT's redirect forms below.
+- `/oauth/authorize`: code + PKCE S256 only; by default redirect only to ChatGPT's
   `https://chatgpt.com/connector_platform_oauth_redirect` or
   `https://chatgpt.com/connector/oauth/<id>`; RFC 9207 `iss` on every redirect;
   `resource` must be the one above. An unknown client or redirect gets 400,
