@@ -882,3 +882,43 @@ def test_r7_structural_key_with_escape_is_withheld():
 def test_r7_one_key_list():
     for key in ("from_user", "telegram_chat_id", "session_fingerprint", "passphrase"):
         assert re.search(tower._KEY_WORDS, key)
+
+
+# ---- review round 8 regressions ------------------------------------------------------
+
+def _layers(s: str, n: int) -> str:
+    for _ in range(n):
+        s = s.replace("%", "%25")
+    return s
+
+
+@pytest.mark.parametrize("value,leak", [
+    (_layers("%74oken=quadruple-tool-secret", 3), "quadruple-tool-secret"),      # %25252574oken
+    (_layers("%74oken=ten-layer-secret", 9), "ten-layer-secret"),
+    ("&#00000116;oken=long-entity-tool-secret", "long-entity-tool-secret"),
+    ("&#x0000074;oken=hex-entity-secret", "hex-entity-secret"),
+    ("&amp;#116;oken=named-then-numeric-secret", "named-then-numeric-secret"),
+])
+def test_r8_any_depth_and_entity_form(value, leak):
+    for paths in (True, False):
+        assert leak not in json.dumps(tower.scrub(value, paths=paths)), (paths, value)
+
+
+def test_r8_structural_key_at_depth():
+    k = _layers("%74oken", 3)
+    assert tower.scrub({k: "quadruple-structural-secret"}) == {k: "<redacted>"}
+
+
+def test_r8_text_that_never_stabilises_is_withheld():
+    deep = _layers("%74oken=deep", tower.MAX_DECODE_PASSES + 2)
+    assert tower.scrub(deep) == tower.UNDECODABLE
+
+
+async def test_r8_through_tool(env):
+    env["rows"] = [{"reason": _layers("%74oken=quadruple-tool-secret", 3),
+                    _layers("%74oken", 3): "quadruple-structural-secret",
+                    "note": "&#00000116;oken=long-entity-tool-secret"}]
+    async with serve() as http:
+        out = text(await call(http, "dispatch_holds"))
+    for leak in ("quadruple-tool-secret", "quadruple-structural-secret", "long-entity-tool-secret"):
+        assert leak not in out

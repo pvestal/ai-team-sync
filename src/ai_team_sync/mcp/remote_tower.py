@@ -196,32 +196,38 @@ def _scrub_embedded_json(text: str, paths: bool) -> str:
 
 
 _ESCAPE = re.compile(r"\\+u([0-9a-fA-F]{4})|\\+U([0-9a-fA-F]{8})|\\+x([0-9a-fA-F]{2})"
-                     r"|%([0-9a-fA-F]{2})|&#[xX]([0-9a-fA-F]{1,6});|&#([0-9]{1,7});")
+                     r"|%([0-9a-fA-F]{2})")
+MAX_DECODE_PASSES = 32
+UNDECODABLE = "<redacted: undecodable>"
 
 
 def _decode_escapes(text: str) -> str:
-    """Decode \\uXXXX / \\UXXXXXXXX / \\xXX (any backslash depth), %XX and
-    numeric HTML entities before any rule runs, repeated up to three times for
-    layered encodings (review r7: "\\u0074oken" is "token" to every JSON
-    reader). Rules then see the characters a reader would see; the output
-    carries the decoded form."""
+    """Decode until stable, failing closed (review r8: a fixed three passes
+    left a four-layer %25252574oken encoded).
+
+    Each pass decodes \\uXXXX / \\UXXXXXXXX / \\xXX at any backslash depth
+    and %XX, then every HTML entity through the standard library
+    (html.unescape: numeric with any leading zeros, hex, and named). Passes
+    repeat until the text no longer changes; text still changing after
+    MAX_DECODE_PASSES is withheld whole. The output carries the decoded form."""
+    import html
+
     if not any(c in text for c in "\\%&"):
         return text
 
     def one(m: re.Match) -> str:
-        hexval = next((g for g in m.groups()[:5] if g), None)
-        try:
-            cp = int(hexval, 16) if hexval else int(m.group(6))
-            return chr(cp) if 0 < cp <= 0x10FFFF else m.group(0)
-        except (TypeError, ValueError):
-            return m.group(0)
+        hexval = next(g for g in m.groups() if g)
+        cp = int(hexval, 16)
+        return chr(cp) if 0 < cp <= 0x10FFFF else m.group(0)
 
-    for _ in range(3):
+    for _ in range(MAX_DECODE_PASSES):
         decoded = _ESCAPE.sub(one, text)
+        if "&" in decoded:
+            decoded = html.unescape(decoded)
         if decoded == text:
-            break
+            return text
         text = decoded
-    return text
+    return UNDECODABLE
 
 
 def scrub(value: Any, *, paths: bool = True) -> Any:
