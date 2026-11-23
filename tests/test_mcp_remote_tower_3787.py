@@ -922,3 +922,14 @@ async def test_r8_through_tool(env):
         out = text(await call(http, "dispatch_holds"))
     for leak in ("quadruple-tool-secret", "quadruple-structural-secret", "long-entity-tool-secret"):
         assert leak not in out
+
+
+# ---- review round 9 regression -------------------------------------------------------
+
+async def test_r9_undecodable_structural_key_withholds_its_value(env):
+    deep_key = _layers("%74oken", tower.MAX_DECODE_PASSES + 2)
+    assert tower.scrub({deep_key: "deep-key-secret"}) == {deep_key: "<redacted>"}
+    env["rows"] = [{deep_key: "deep-key-secret", "id": 1}]
+    async with serve() as http:
+        out = text(await call(http, "dispatch_holds"))
+    assert "deep-key-secret" not in out

@@ -230,6 +230,13 @@ def _decode_escapes(text: str) -> str:
     return UNDECODABLE
 
 
+def _key_is_sensitive(key: str) -> bool:
+    """A dict key is sensitive if it names a credential once decoded, or if it
+    cannot be decoded at all (review r9: an undecodable key failed open)."""
+    decoded = _decode_escapes(key)
+    return decoded == UNDECODABLE or bool(_SENSITIVE_KEY.search(decoded))
+
+
 def scrub(value: Any, *, paths: bool = True) -> Any:
     """Withhold credentials and personal ids (by key, by JSON text, by shape)
     and absolute filesystem paths, recursively. ``paths=True`` (production
@@ -247,7 +254,7 @@ def scrub(value: Any, *, paths: bool = True) -> Any:
             value = pat.sub("<redacted>", value)
         return _scrub_paths(value, repos=not paths)
     if isinstance(value, dict):
-        return {k: ("<redacted>" if isinstance(k, str) and _SENSITIVE_KEY.search(_decode_escapes(k))
+        return {k: ("<redacted>" if isinstance(k, str) and _key_is_sensitive(k)
                     and v not in (None, "", [], {}) else scrub(v, paths=paths))
                 for k, v in value.items()}
     if isinstance(value, (list, tuple)):
