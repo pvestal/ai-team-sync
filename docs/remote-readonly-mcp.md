@@ -1,9 +1,11 @@
-# Remote read-only ATS MCP (#3760)
+# Remote read-only ATS MCP (#3760, #3787)
 
 Lets a remote MCP client (claude.ai chat, including voice mode) READ ATS
 context: `task_brief`, `get_decision_history`, `team_status`,
-`get_session_details`, `list_all_locks`, `ats_version`. It has no write tools
-and cannot act as any session.
+`get_session_details`, `list_all_locks`, `ats_version`; and, since #3787,
+Echo task / question / outbox records, Anime Studio production ledgers, GPU
+claims, governed executions and service state (see "Tower context tools"). It
+has no write tools and cannot act as any session.
 
 Not on this surface (operator ruling 2026-11-21): `preflight`, and semantic
 memory recall inside `task_brief`. Both run Echo memory search, which refreshes
@@ -11,6 +13,79 @@ Echo's Redis result cache and bumps Qdrant access metadata on every call. They
 return once Echo search takes a read-only flag (follow-up ticket). Until then
 the remote brief carries ATS context, the ticket envelope and its rulings, but
 no recalled memories.
+
+## Tower context tools (#3787 Phase 1)
+
+Thirteen more read tools, all annotated `readOnlyHint: true`,
+`destructiveHint: false`, `openWorldHint: false`
+(`src/ai_team_sync/mcp/remote_tower.py`):
+
+| Tool | Source |
+|---|---|
+| `tower_task` | Echo `GET /api/tower-tasks/{id}` (SELECT-only envelope: description, relations, rulings, latest claim) |
+| `tower_task_runs`, `open_tasks`, `operator_questions`, `notification_outbox` | `echo_brain.remote_read.*` views |
+| `production_assignments`, `dispatch_holds`, `judge_queue`, `accepted_media`, `gpu_claims`, `governed_executions`, `video_submissions` | `anime_production.remote_read.*` views |
+| `service_state` | fixed `systemctl show` / `git rev-parse` argv, Echo `/health`, ATS `/api/version`, allowlisted keys of `/etc/anime-studio/flags.env` and of tower-echo-brain's Environment |
+
+Boundaries:
+
+- **Anime Studio's HTTP API is never called.** Under
+  `ANIME_STUDIO_AUTH_MODE=single_user` every request to :8401 is the configured
+  operator, and several of its GET routes write (QC kicks, lazy `UPDATE shots`,
+  the GPU arbiter sweep, filmstrip builds). The upstream allowlist has no
+  Anime Studio origin, and a test pins that.
+- **Echo** is reached for exactly `GET /api/tower-tasks/{int}` and
+  `GET /health` (whose `database_user` is dropped). Not Echo's MCP tools: every
+  Echo MCP call inserts a telemetry row.
+- **Database:** role `tower_remote_ro` (deploy/sql/remote_read/00_roles.sql)
+  can read only the `remote_read` views; the views are owned by a NOLOGIN
+  role that holds SELECT on exactly the base tables they name, and each view
+  is a column allowlist (no paths, prompts, tokens, Telegram ids or chat
+  bodies; `echo_telegram_messages` and `telegram_inbox` are not exposed). The
+  connector sends only the literal SELECTs in `NAMED_QUERIES`, each in a READ
+  ONLY transaction, and before first use per database refuses a role that is
+  elevated, inherits a role, can touch any relation outside `remote_read`, can
+  write `remote_read`, can CREATE in a schema, or is not read-only by default.
+- **Redaction:** credential-shaped text (bearer/JWT/`sk-`/`ghp_`/Vault tokens,
+  `password=`-style pairs) is replaced everywhere; absolute filesystem paths are
+  replaced in Anime Studio rows (Echo task text keeps its repo-path citations).
+  Hashes are never redacted.
+- **Per-client secrets:** the #3760 secret is client `claude-ai`; each further
+  client has its own `<client>.token` (0600) in
+  `~/.config/ai-team-sync/remote-mcp.clients.d/` (0700). Secrets must differ.
+- **Rate limits:** per client, 60 tool calls/min and 30 database tool
+  calls/min; over the limit is a tool error.
+- **Audit:** one JSON line per call to `$ATS_STATE_DIR/audit.jsonl` (0600,
+  rotated once at 10 MiB) and the journal: time, client, tool, outcome, ms,
+  output size, and arguments (integers/booleans and fixed-shape enum words
+  verbatim; any other string as length + sha256 prefix). An unlisted tool
+  name is logged as `<unlisted>` with its length. Library log messages
+  (mcp, uvicorn) are written as `<message withheld>`, and uvicorn's access log
+  is off, because both echoed client text.
+
+Known differences, stated rather than hidden:
+
+- `judge_queue` is DB-side membership mirroring Anime Studio 776e213d9's
+  queue predicates (cited in the SQL). It omits the keyframe queue's
+  legacy-linked arm (a Python-computed id list) and does not check files on
+  disk or resolve missing video identities, which the Judge page does lazily
+  (and with writes).
+- `production_assignments` returns records, not Anime Studio's derived
+  eligibility (out of Phase 1).
+- Anime Studio exposes no loaded revision without operator authority;
+  `service_state` reports its disk HEAD and unit start time instead.
+- The role can still create a session-local TEMP table if a session turns its
+  own read-only default off (PostgreSQL grants TEMPORARY to PUBLIC); the
+  connector never sends such SQL. Optional hardening at release:
+  `REVOKE TEMPORARY ON DATABASE <db> FROM PUBLIC` (affects every role relying
+  on PUBLIC).
+
+SQL sandbox (no production rows; schema-only dump of the base tables):
+
+```bash
+deploy/sql/remote_read/sandbox.sh /tmp/rr-sandbox      # prints the env line
+REMOTE_READ_SANDBOX_HOST=<socket dir> pytest tests/test_remote_read_sql_3787.py
+```
 
 ## Shape
 
@@ -21,12 +96,13 @@ claude.ai ──HTTPS──▶ Tailscale Funnel (tower.<tailnet>.ts.net:443, pat
              127.0.0.1:8402  ats-mcp-remote (user unit)
                1. BearerGate  — 401 unless `Authorization: Bearer <secret>`
                2. /mcp only   — every other path 404
-               3. tool allowlist (6 read tools)
+               3. tool allowlist (6 ATS + 13 Tower read tools, #3787)
                4. upstream allowlist — only GET reads + POST /api/brief on
-                  ats-server can leave the process; nothing goes to Echo
-                  directly (the brief's own Echo lookups are reads)
+                  ats-server, and GET /api/tower-tasks/{id} + GET /health on
+                  Echo, can leave the process; never Anime Studio
+               5. remote_read views via role tower_remote_ro (#3787)
                          ▼
-             ats-server 127.0.0.1:8400
+             ats-server 127.0.0.1:8400 · Echo 127.0.0.1:8309 · PostgreSQL
 ```
 
 Code: `src/ai_team_sync/mcp/remote_readonly.py`. Guard tests:

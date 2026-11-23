@@ -34,10 +34,19 @@ MUTATING_TOOLS = frozenset({
     "pre_commit_check", "check_git_changes", "whos_editing", "lock_ownership",
     "recent_file_activities", "recent_restarts", "delegation_status",
 })
-READ_TOOLS_REVIEWED = frozenset({
+ATS_READ_TOOLS = frozenset({
     "task_brief", "get_decision_history", "team_status",
     "get_session_details", "list_all_locks", "ats_version",
 })
+# #3787 Phase 1 Tower reads (remote_tower.py). Not stdio ats-mcp tools: they
+# exist only on this surface, so they are pinned here and in the #3787 suite.
+TOWER_READ_TOOLS = frozenset({
+    "tower_task", "tower_task_runs", "open_tasks", "operator_questions",
+    "notification_outbox", "production_assignments", "dispatch_holds",
+    "judge_queue", "accepted_media", "gpu_claims", "governed_executions",
+    "video_submissions", "service_state",
+})
+READ_TOOLS_REVIEWED = ATS_READ_TOOLS | TOWER_READ_TOOLS
 # Reads with side effects downstream: Echo memory search refreshes its Redis
 # cache and Qdrant access metadata. Off the remote surface by operator ruling
 # (2026-11-21) until Echo search takes a read-only flag.
@@ -71,6 +80,7 @@ def upstream(monkeypatch):
     # Pin the upstream bases: the module reads ATS_SERVER_URL at
     # import, and a test must not inherit them from the shell.
     monkeypatch.setattr(rr, "ATS_URL", "http://127.0.0.1:8400")
+    monkeypatch.setattr(rr, "ECHO_URL", "http://127.0.0.1:8309")
     rec = Recorder()
     monkeypatch.setattr(rr, "_inner_transport", rec)
     return rec
@@ -117,7 +127,7 @@ async def test_every_stdio_tool_is_classified():
     """A tool added to ats-mcp must be classified here before this suite passes."""
     from ai_team_sync.mcp.server import list_tools
     stdio = {t.name for t in await list_tools()}
-    unclassified = stdio - MUTATING_TOOLS - READ_TOOLS_REVIEWED - SIDE_EFFECT_READS
+    unclassified = stdio - MUTATING_TOOLS - ATS_READ_TOOLS - SIDE_EFFECT_READS
     assert not unclassified, f"classify these for the remote surface: {unclassified}"
     assert not (MUTATING_TOOLS & READ_TOOLS_REVIEWED)
     assert not (SIDE_EFFECT_READS & READ_TOOLS_REVIEWED)
@@ -308,6 +318,9 @@ PINNED_UPSTREAM = {
     ("GET", "ats", "/api/locks"),
     ("GET", "ats", "/api/restarts"),
     ("GET", "ats", "/api/version"),
+    # #3787: Echo's SELECT-only task envelope and /health; nothing else of Echo.
+    ("GET", "echo", "/api/tower-tasks/[1-9][0-9]{0,9}"),
+    ("GET", "echo", "/health"),
 }
 
 
@@ -319,6 +332,7 @@ def test_upstream_allowlist_is_exactly_the_reviewed_set():
 def test_tool_catalog_is_exactly_the_reviewed_set():
     assert rr.READONLY_TOOL_NAMES == READ_TOOLS_REVIEWED
     assert {t.name for t in rr.READONLY_TOOLS} == READ_TOOLS_REVIEWED
+    assert rr.ATS_TOOL_NAMES == ATS_READ_TOOLS
 
 
 EXPECTED_REQUESTS = {
@@ -348,8 +362,13 @@ async def test_brief_recall_is_forced_off(upstream):
     assert json.loads(upstream.requests[0].content)["recall"] is False
 
 
-def test_nothing_reaches_echo_directly():
-    assert {base for _, base, _ in rr.UPSTREAM_ALLOWLIST} == {"ats"}
+def test_only_ats_and_echo_are_upstreams_never_anime_studio():
+    """#3787 widened this from ATS-only to ATS + two Echo GETs. Anime Studio is
+    never an upstream: in single_user mode every request to it is the operator."""
+    assert {base for _, base, _ in rr.UPSTREAM_ALLOWLIST} == {"ats", "echo"}
+    assert {(m, p.pattern) for m, base, p in rr.UPSTREAM_ALLOWLIST if base == "echo"} == {
+        ("GET", "/api/tower-tasks/[1-9][0-9]{0,9}"), ("GET", "/health")}
+    assert "8401" not in rr.ECHO_URL and "8401" not in rr.ATS_URL
 
 
 # ---- availability bounds -------------------------------------------------------------

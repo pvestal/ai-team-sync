@@ -34,6 +34,7 @@ import logging
 import os
 import re
 import stat
+import time
 from pathlib import Path
 from typing import Any
 
@@ -43,7 +44,14 @@ from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import TextContent, Tool
 
+from ai_team_sync.mcp import remote_tower as tower
+from ai_team_sync.mcp.remote_controls import AuditLog, RateLimiter, describe_args, load_clients
+
 ATS_URL = os.environ.get("ATS_SERVER_URL", "http://127.0.0.1:8400").rstrip("/")
+# Echo is read for exactly two SELECT-only routes (#3787): the task envelope and
+# /health. Anime Studio is never an upstream: in single_user auth mode every
+# request to it is the operator, and several of its GETs write.
+ECHO_URL = os.environ.get("ATS_REMOTE_ECHO_URL", "http://127.0.0.1:8309").rstrip("/")
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8402
@@ -67,7 +75,7 @@ MAX_CONCURRENCY = 16
 # cache and bumps Qdrant access metadata. It returns when Echo's search takes a
 # read-only flag (follow-up ticket). task_brief runs with recall forced off for
 # the same reason.
-READONLY_TOOL_NAMES = frozenset({
+ATS_TOOL_NAMES = frozenset({
     "task_brief",
     "get_decision_history",
     "team_status",
@@ -75,6 +83,8 @@ READONLY_TOOL_NAMES = frozenset({
     "list_all_locks",
     "ats_version",
 })
+# #3787 Phase 1: Echo / Anime Studio / service-state reads (remote_tower.py).
+READONLY_TOOL_NAMES = ATS_TOOL_NAMES | tower.TOWER_TOOL_NAMES
 
 # Every (method, base, path regex) this server may send upstream. GETs are reads
 # by HTTP contract on ATS; the one POST is the read-only brief builder (a brief
@@ -89,6 +99,9 @@ UPSTREAM_ALLOWLIST: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("GET", "ats", re.compile(r"/api/locks")),
     ("GET", "ats", re.compile(r"/api/restarts")),
     ("GET", "ats", re.compile(r"/api/version")),
+    # #3787: Echo's SELECT-only task envelope (tower_task_api.py) and /health.
+    ("GET", "echo", re.compile(r"/api/tower-tasks/[1-9][0-9]{0,9}")),
+    ("GET", "echo", re.compile(r"/health")),
 )
 
 
@@ -110,7 +123,7 @@ def _origin(url: str) -> tuple[str, str, int | None]:
 
 def upstream_allowed(method: str, url: httpx.URL) -> bool:
     origin = (url.scheme, url.host, url.port)
-    bases = {"ats": _origin(ATS_URL)}
+    bases = {"ats": _origin(ATS_URL), "echo": _origin(ECHO_URL)}
     for m, base, pattern in UPSTREAM_ALLOWLIST:
         if m == method.upper() and origin == bases[base] and pattern.fullmatch(url.path):
             return True
@@ -174,7 +187,7 @@ def _text(s: str) -> list[TextContent]:
     return [TextContent(type="text", text=s)]
 
 
-READONLY_TOOLS: list[Tool] = [
+_ATS_TOOLS: list[Tool] = [
     Tool(
         name="task_brief",
         description=(
@@ -235,6 +248,11 @@ READONLY_TOOLS: list[Tool] = [
     ),
 ]
 
+# Every tool is marked read-only for clients that honour annotations (ChatGPT
+# treats a tool without readOnlyHint as a write that needs confirmation).
+for _t in _ATS_TOOLS:
+    _t.annotations = tower.READ_ONLY
+READONLY_TOOLS: list[Tool] = _ATS_TOOLS + tower.TOWER_TOOLS
 assert {t.name for t in READONLY_TOOLS} == READONLY_TOOL_NAMES
 
 
@@ -351,7 +369,30 @@ _HANDLERS = {
     "list_all_locks": _locks,
     "ats_version": _version,
 }
-assert set(_HANDLERS) == READONLY_TOOL_NAMES
+assert set(_HANDLERS) == ATS_TOOL_NAMES
+
+
+async def _dispatch(c: httpx.AsyncClient, name: str, a: dict[str, Any]) -> list[TextContent]:
+    if name in _HANDLERS:
+        return await _HANDLERS[name](c, a)
+    if name == "service_state":
+        return await tower.h_service_state(c, a, ECHO_URL, ATS_URL)
+    return await tower.TOWER_HANDLERS[name](c, a, ECHO_URL)
+
+
+# Process-wide controls; run() points the audit log at the state directory.
+RATE_LIMITER = RateLimiter()
+AUDIT = AuditLog(None)
+SAFE_AUDIT_STRINGS = tower.SAFE_STRING_ARGS
+
+
+def _caller(server: Server) -> str:
+    """The client id BearerGate attached to this HTTP request ("?" if none)."""
+    try:
+        request = server.request_context.request
+        return str(request.scope.get("ats_remote_client") or "?")
+    except (LookupError, AttributeError):
+        return "?"
 
 
 def build_server() -> Server:
@@ -365,16 +406,50 @@ def build_server() -> Server:
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         # Raising makes the MCP layer answer isError=true, so a refusal can never
         # be read as a successful result.
-        if name not in READONLY_TOOL_NAMES:
-            raise PermissionError(f"Refused: {name!r} is not available on the "
-                                  "read-only remote surface.")
-        async with _client() as c:
-            try:
-                return await _HANDLERS[name](c, arguments or {})
-            except UpstreamRefused as exc:
-                raise PermissionError(f"Refused: {exc}") from None
-            except httpx.HTTPError as exc:
-                raise RuntimeError(f"ATS read failed: {type(exc).__name__}") from None
+        client = _caller(server)
+        a = arguments if isinstance(arguments, dict) else {}
+        started = time.monotonic()
+        entry: dict[str, Any] = {"client": client}
+        try:
+            if name not in READONLY_TOOL_NAMES:
+                # The name is client text: never logged as such.
+                entry.update(tool="<unlisted>", name_len=len(str(name)), outcome="refused")
+                raise PermissionError(f"Refused: {name!r} is not available on the "
+                                      "read-only remote surface.")
+            entry.update(tool=name, args=describe_args(a, SAFE_AUDIT_STRINGS))
+            if not RATE_LIMITER.allow(client, "call") or (
+                    name in tower.DB_TOOLS and not RATE_LIMITER.allow(client, "db")):
+                entry["outcome"] = "rate_limited"
+                raise PermissionError("Refused: rate limit for this client reached; "
+                                      "retry in a minute.")
+            async with _client() as c:
+                try:
+                    result = await _dispatch(c, name, a)
+                except UpstreamRefused as exc:
+                    entry["outcome"] = "refused_upstream"
+                    raise PermissionError(f"Refused: {exc}") from None
+                except tower.BadArgument as exc:
+                    entry["outcome"] = "bad_argument"
+                    raise ValueError(str(exc)) from None
+                except tower.NotConfigured as exc:
+                    entry["outcome"] = "not_configured"
+                    raise RuntimeError(f"Unavailable on this server: {exc}") from None
+                except tower.RoleRefused as exc:
+                    entry["outcome"] = "role_refused"
+                    raise PermissionError(f"Refused: the read-only database role "
+                                          f"failed its self-check ({exc})") from None
+                except httpx.HTTPError as exc:
+                    entry["outcome"] = "upstream_error"
+                    raise RuntimeError(f"Upstream read failed: {type(exc).__name__}") from None
+                except Exception as exc:  # database / probe errors: name only
+                    entry["outcome"] = "error"
+                    raise RuntimeError(f"Read failed: {type(exc).__name__}") from None
+            entry["outcome"] = "ok"
+            entry["chars"] = sum(len(t.text) for t in result)
+            return result
+        finally:
+            entry["ms"] = int((time.monotonic() - started) * 1000)
+            AUDIT.record(entry)
 
     return server
 
@@ -492,11 +567,18 @@ class BearerGate:
     the forwarded client address -- and never the credential itself.
     """
 
-    def __init__(self, app, token: str):
-        if len(token) < MIN_TOKEN_LEN:
+    def __init__(self, app, clients: "str | dict[str, str]"):
+        # A bare string is the #3760 single secret; it belongs to client "claude-ai".
+        if isinstance(clients, str):
+            clients = {"claude-ai": clients}
+        if not clients or any(len(t) < MIN_TOKEN_LEN for t in clients.values()):
             raise ValueError("bearer token too short")
+        if len(set(clients.values())) != len(clients):
+            raise ValueError("two clients share one secret")
         self.app = app
-        self._token = token.encode()
+        self._clients = [(cid, t.encode()) for cid, t in clients.items()]
+        # The refusal log reports the expected length of the first (primary) secret.
+        self._token = self._clients[0][1]
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "lifespan":
@@ -519,10 +601,16 @@ class BearerGate:
         # ruling 2026-11-21). The prefix is matched case-insensitively; the
         # secret still has to match exactly.
         joined = bare[6:] if bare[:6].lower() == b"bearer" else b""
-        bearer_ok = hmac.compare_digest(credential, self._token) and scheme == "bearer"
-        bare_ok = hmac.compare_digest(bare, self._token)
-        joined_ok = hmac.compare_digest(joined, self._token)
-        ok = len(auth) == 1 and (bearer_ok or bare_ok or joined_ok)
+        # Every client's secret is compared in all three forms on every request,
+        # so timing does not depend on which client (if any) matched.
+        matched = None
+        for cid, secret in self._clients:
+            bearer_ok = hmac.compare_digest(credential, secret) and scheme == "bearer"
+            bare_ok = hmac.compare_digest(bare, secret)
+            joined_ok = hmac.compare_digest(joined, secret)
+            if (bearer_ok or bare_ok or joined_ok) and matched is None:
+                matched = cid
+        ok = len(auth) == 1 and matched is not None
         if not ok:
             self._log_refusal(scope, headers, auth, scheme, credential)
             return await _send_status(send, 401, b"unauthorized\n",
@@ -534,6 +622,7 @@ class BearerGate:
                     return await _send_status(send, 413, b"request too large\n")
             except ValueError:
                 return await _send_status(send, 400, b"bad content-length\n")
+        scope["ats_remote_client"] = matched
         return await self.app(scope, _capped_receive(receive), send)
 
     def _log_refusal(self, scope, headers, auth, scheme, credential) -> None:
@@ -576,7 +665,7 @@ def _capped_receive(receive):
     return wrapped
 
 
-def build_app(token: str):
+def build_app(token: "str | dict[str, str]"):
     """ASGI app: BearerGate -> /mcp Streamable HTTP (stateless, JSON responses)."""
     server = build_server()
     # DNS-rebinding protection is a browser defence for unauthenticated local
@@ -617,6 +706,41 @@ def _require_loopback(host: str) -> None:
                          "loopback only; public reach is the Tailscale Funnel")
 
 
+class _Withheld(logging.Formatter):
+    """For library loggers (mcp, uvicorn errors): level and logger name only.
+
+    Their messages can carry client-chosen text -- the MCP SDK logs an unlisted
+    tool's name verbatim ("Tool '<name>' not listed") -- which this surface
+    never echoes (#3787; the same rule as the #3760 refusal log).
+    """
+
+    def format(self, record: logging.LogRecord) -> str:
+        return f"{record.levelname}:{record.name}:<message withheld>"
+
+
+def configure_logging(stream=None) -> list[tuple[logging.Logger, logging.Handler]]:
+    """Journal handlers for this process. Returns what it attached (tests detach it)."""
+    from ai_team_sync.mcp.remote_controls import audit_log
+    attached = []
+    for lg in (auth_log, audit_log):
+        if not lg.handlers:
+            h = logging.StreamHandler(stream)
+            h.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+            lg.addHandler(h)
+            lg.setLevel(logging.INFO)
+            lg.propagate = False
+            attached.append((lg, h))
+    for name in ("mcp", "uvicorn.error"):
+        lg = logging.getLogger(name)
+        h = logging.StreamHandler(stream)
+        h.setFormatter(_Withheld())
+        lg.addHandler(h)
+        lg.setLevel(logging.WARNING)
+        lg.propagate = False
+        attached.append((lg, h))
+    return attached
+
+
 def run() -> None:
     import uvicorn
 
@@ -624,18 +748,21 @@ def run() -> None:
     port = int(os.environ.get("ATS_REMOTE_MCP_PORT", str(DEFAULT_PORT)))
     token_file = Path(os.environ.get("ATS_REMOTE_MCP_TOKEN_FILE", str(DEFAULT_TOKEN_FILE)))
     _require_loopback(host)
-    token = load_token(token_file)
-    # The refusal log must reach the journal whatever else configured logging:
-    # its own stderr handler, not dependent on a root handler.
-    if not auth_log.handlers:
-        handler = logging.StreamHandler()
-        handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
-        auth_log.addHandler(handler)
-        auth_log.setLevel(logging.INFO)
-        auth_log.propagate = False
+    load_token(token_file)  # same refusals as before (#3760), then per-client (#3787)
+    clients_dir = os.environ.get("ATS_REMOTE_MCP_CLIENTS_DIR")
+    token = load_clients(token_file,
+                         os.environ.get("ATS_REMOTE_MCP_PRIMARY_CLIENT", "claude-ai"),
+                         Path(clients_dir) if clients_dir else None)
+    state_dir = os.environ.get("ATS_STATE_DIR")
+    global AUDIT
+    AUDIT = AuditLog(Path(state_dir) / "audit.jsonl" if state_dir else None)
+    configure_logging()
     # proxy_headers off: X-Forwarded-* from the Funnel is not trusted for anything.
+    # access_log off (#3787): it echoed client-chosen paths and query strings into
+    # the journal; tool calls are in the audit log, refusals in the auth log.
+    # log_config=None keeps uvicorn from replacing the handlers set above.
     uvicorn.run(build_app(token), host=host, port=port, proxy_headers=False,
-                server_header=False, log_level="info", access_log=True,
+                server_header=False, log_level="info", access_log=False, log_config=None,
                 limit_concurrency=MAX_CONCURRENCY, timeout_keep_alive=5,
                 h11_max_incomplete_event_size=MAX_BODY_BYTES)
 

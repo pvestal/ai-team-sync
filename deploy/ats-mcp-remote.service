@@ -20,6 +20,15 @@ Environment=ATS_SERVER_URL=http://127.0.0.1:8400
 # An empty, private state dir: this process must never find a session pointer
 # or keyring to act as (it never looks, but nothing is there if it did).
 Environment=ATS_STATE_DIR=%h/.local/state/ats-mcp-remote
+# #3787 Phase 1. Each extra remote client gets its own secret file
+# (<client>.token, 0600) in this 0700 directory; absent = only the #3760 secret,
+# attributed to client "claude-ai". The read-only database credential
+# (user tower_remote_ro, 0600 JSON) is read from ATS_REMOTE_MCP_DB_FILE; while it
+# is absent every database-backed tool answers "Unavailable" and nothing else
+# changes. The audit log is $ATS_STATE_DIR/audit.jsonl.
+Environment=ATS_REMOTE_MCP_CLIENTS_DIR=%h/.config/ai-team-sync/remote-mcp.clients.d
+Environment=ATS_REMOTE_MCP_DB_FILE=%h/.config/ai-team-sync/remote-ro-db.json
+Environment=ATS_REMOTE_ECHO_URL=http://127.0.0.1:8309
 ExecStartPre=/usr/bin/mkdir -p -m 0700 %h/.local/state/ats-mcp-remote
 ExecStart=%h/.local/bin/ats-mcp-remote
 Restart=on-failure
