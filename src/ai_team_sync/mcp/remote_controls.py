@@ -82,6 +82,18 @@ class RateLimiter:
     clock: Any = time.monotonic
     _buckets: dict[tuple[str, str], _Bucket] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
+    _refusal_logged: dict[str, float] = field(default_factory=dict)
+
+    def should_record_refusal(self, client: str, every_s: float = 10.0) -> bool:
+        """At most one audited rate-limit refusal per client per ``every_s``:
+        a client over its limit cannot flood the audit log or journal."""
+        now = self.clock()
+        with self._lock:
+            last = self._refusal_logged.get(client)
+            if last is not None and now - last < every_s:
+                return False
+            self._refusal_logged[client] = now
+            return True
 
     def allow(self, client: str, cls: str) -> bool:
         cap = self.per_minute[cls]
@@ -105,17 +117,24 @@ MAX_AUDIT_BYTES = 10 * 1024 * 1024
 
 
 def describe_args(args: dict[str, Any],
-                  enums: dict[str, frozenset[str]] | None = None) -> dict[str, Any]:
+                  enums: dict[str, frozenset[str]] | None = None,
+                  known_keys: frozenset[str] = frozenset()) -> dict[str, Any]:
     """Arguments as they may be logged: never client free text.
 
+    Only keys the tool's schema declares (``known_keys``) are named; any other
+    key is client text (review r2) and is counted, never named. Values:
     ints/bools verbatim; a string verbatim only when it is a member of that
     tool's FIXED enum for that key (``enums``); every other string, and
     anything nested, as its length and a short sha256 prefix.
     """
     enums = enums or {}
     out: dict[str, Any] = {}
-    for k, v in list((args or {}).items())[:16]:
-        key = k if isinstance(k, str) and re.fullmatch(r"[a-z_]{1,32}", k) else "<key>"
+    items = list((args or {}).items())
+    unknown = sum(1 for k, _ in items if k not in known_keys)
+    if unknown:
+        out["<unknown_keys>"] = unknown
+    for k, v in [(k, v) for k, v in items if k in known_keys][:16]:
+        key = k
         if isinstance(v, bool) or (isinstance(v, int) and abs(v) < 2**53):
             out[key] = v
         elif isinstance(v, str) and v in enums.get(key, ()):

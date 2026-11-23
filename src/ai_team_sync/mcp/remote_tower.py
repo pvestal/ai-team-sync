@@ -64,8 +64,16 @@ _SENSITIVE_KEY = re.compile(
     r"(?i)(token|secret|password|passwd|api[_-]?key|credential|cookie|authorization|"
     r"bearer|nonce|chat_id|user_id|from_user|telegram_[a-z_]*id|session_fingerprint|"
     r"private_key|signature)")
-_ABS_PATH = re.compile(r"(?<![\w.:/])/(?:opt|home|mnt|etc|var|tmp|srv|root|usr|run|media|"
-                       r"proc|sys|dev|boot|lib|snap)/[^\s'\",;)\]}]*")
+# ANY slash-rooted path of two or more segments, whatever its root (review r2:
+# a fixed root list let /data/... through). Not preceded by a word character,
+# '.', ':' or '/', so URLs (scheme://host/...) and dates (11/23) are not paths.
+_ABS_PATH = re.compile(r"(?<![\w.:/~])/[A-Za-z0-9._@+-]+/[^\s'\",;)\]}]*")
+_JSON_START = re.compile(r"[\[{]")
+# A sensitive key in text whose value is a container that did not parse as
+# JSON: everything from the key to the end of the string is withheld.
+_SECRET_JSON_CONTAINER = re.compile(
+    r'(?is)"[a-z0-9_]*?(?:token|secret|password|passwd|api[_-]?key|credential|cookie|'
+    r'authorization|chat_id|user_id|telegram_[a-z_]*id|nonce|private_key|signature)"\s*:\s*[\[{].*')
 # Repo citations in Echo task text stay readable as repo-relative labels;
 # every other absolute path is withheld.
 _REPO_ROOTS = (("/opt/tower-echo-brain/", "echo:"), ("/opt/anime-studio/", "anime-studio:"),
@@ -82,6 +90,31 @@ def _label_path(m: re.Match, repos: bool) -> str:
     return "<path>"
 
 
+def _scrub_embedded_json(text: str, paths: bool) -> str:
+    """JSON objects/arrays written inside a text value are scrubbed structurally
+    (review r2: {"token": ["..."]} and {"credential": {...}} survived a scalar
+    regex), then re-serialised in place."""
+    if "{" not in text and "[" not in text:
+        return text
+    dec = json.JSONDecoder()
+    out, i = [], 0
+    while True:
+        m = _JSON_START.search(text, i)
+        if not m:
+            out.append(text[i:])
+            return "".join(out)
+        try:
+            obj, end = dec.raw_decode(text, m.start())
+        except ValueError:
+            out.append(text[i:m.start() + 1])
+            i = m.start() + 1
+            continue
+        out.append(text[i:m.start()])
+        out.append(json.dumps(scrub(obj, paths=paths), sort_keys=True)
+                   if isinstance(obj, (dict, list)) else text[m.start():end])
+        i = end
+
+
 def scrub(value: Any, *, paths: bool = True) -> Any:
     """Withhold credentials and personal ids (by key, by JSON text, by shape)
     and absolute filesystem paths, recursively. ``paths=True`` (production
@@ -89,7 +122,9 @@ def scrub(value: Any, *, paths: bool = True) -> Any:
     ``paths=False`` (Echo task text) keeps repo paths as repo-relative labels
     and withholds all others."""
     if isinstance(value, str):
+        value = _scrub_embedded_json(value, paths)
         value = _SECRET_JSON.sub(lambda m: m.group(1) + '"<redacted>"', value)
+        value = _SECRET_JSON_CONTAINER.sub('"<redacted>": "<redacted>"', value)
         for pat in _SECRET_PATTERNS:
             value = pat.sub("<redacted>", value)
         return _ABS_PATH.sub(lambda m: _label_path(m, repos=not paths), value)
@@ -516,8 +551,11 @@ _SINCE = {"type": "string", "format": "date-time"}
 
 
 def _tool(name: str, description: str, props: dict, required: list[str] | None = None) -> Tool:
+    # additionalProperties false (review r2): an unknown argument is refused by
+    # the SDK's schema validation before any handler or audit sees it.
     return Tool(name=name, description="Read-only. " + description, annotations=READ_ONLY,
                 inputSchema={"type": "object", "properties": props,
+                             "additionalProperties": False,
                              **({"required": required} if required else {})})
 
 

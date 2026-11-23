@@ -595,3 +595,60 @@ async def test_write_tools_remain_refused_and_audited(env):
             res = await call(http, name, {"x": 1})
             assert res["isError"] is True and "Refused" in text(res)
     assert env["up"].requests == [] and not env["conns"]
+
+
+# ---- review round 2 regressions ------------------------------------------------------
+
+@pytest.mark.parametrize("value,leak", [
+    ("trace /data/private/render.log", "/data/private"),
+    ("trace /srv2/x/y.log and /a/b", "/srv2/x"),
+    ('body {"token": ["jsonsecret0001"]}', "jsonsecret0001"),
+    ('body {"credential": {"value": "jsonsecret0002"}}', "jsonsecret0002"),
+    ('[{"x": 1, "api_key": {"k": "jsonsecret0003"}}]', "jsonsecret0003"),
+    ('broken {"token": ["jsonsecret0004", ', "jsonsecret0004"),
+])
+def test_r2_any_absolute_root_and_container_json_secrets_are_withheld(value, leak):
+    for paths in (True, False):
+        assert leak not in json.dumps(tower.scrub(value, paths=paths)), (paths, value)
+
+
+def test_r2_urls_and_dates_are_not_mistaken_for_paths():
+    s = tower.scrub("see https://tower.local/anime/x and 11/23/2026", paths=True)
+    assert "https://tower.local/anime/x" in s and "11/23/2026" in s
+
+
+async def test_r2_unknown_argument_is_refused_and_never_named_in_the_audit(env):
+    async with serve() as http:
+        res = await call(http, "gpu_claims", {"clientsecret": 7})
+        assert res["isError"] is True          # additionalProperties: false
+        await call(http, "task_brief", {"objective": "x", "clientsecret2": 7})
+    raw = env["audit_path"].read_text()
+    assert "clientsecret" not in raw
+    last = json.loads(raw.splitlines()[-1])
+    assert last["tool"] == "task_brief" and last["args"]["<unknown_keys>"] == 1
+
+
+def test_r2_every_tower_tool_schema_forbids_unknown_arguments():
+    for t in tower.TOWER_TOOLS:
+        assert t.inputSchema.get("additionalProperties") is False, t.name
+
+
+async def test_r2_unlisted_calls_spend_the_rate_limit_and_refusals_are_throttled(env, monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(rr, "RATE_LIMITER", rc.RateLimiter(
+        per_minute={"call": 1, "db": 10}, clock=lambda: now[0]))
+    async with serve() as http:
+        first = await call(http, "no_such_tool")
+        later = [await call(http, "no_such_tool") for _ in range(5)]
+    assert "not available" in text(first)
+    assert all("rate limit" in text(r) for r in later)
+    lines = [json.loads(l) for l in env["audit_path"].read_text().splitlines()]
+    assert [l["outcome"] for l in lines] == ["refused", "rate_limited"]  # 4 refusals not logged
+
+
+async def test_r2_tower_output_is_capped_like_every_tool(env):
+    env["rows"] = [{"reason": "x" * 900, "id": i} for i in range(200)]
+    async with serve() as http:
+        res = await call(http, "dispatch_holds", {"limit": 100})
+    out = text(res)
+    assert len(out) <= rr.MAX_OUTPUT_CHARS + 80 and out.endswith("characters]")

@@ -254,6 +254,8 @@ for _t in _ATS_TOOLS:
     _t.annotations = tower.READ_ONLY
 READONLY_TOOLS: list[Tool] = _ATS_TOOLS + tower.TOWER_TOOLS
 assert {t.name for t in READONLY_TOOLS} == READONLY_TOOL_NAMES
+# The argument names each tool declares: the only keys the audit log may name.
+TOOL_ARG_KEYS = {t.name: frozenset(t.inputSchema.get("properties", {})) for t in READONLY_TOOLS}
 
 
 async def _task_brief(c: httpx.AsyncClient, a: dict[str, Any]) -> list[TextContent]:
@@ -410,18 +412,24 @@ def build_server() -> Server:
         a = arguments if isinstance(arguments, dict) else {}
         started = time.monotonic()
         entry: dict[str, Any] = {"client": client}
+        audit = True
         try:
+            # Every call, listed or not, spends the client's budget first
+            # (review r2: unlisted names were refused before the limiter).
+            if not RATE_LIMITER.allow(client, "call") or (
+                    name in tower.DB_TOOLS and not RATE_LIMITER.allow(client, "db")):
+                entry.update(tool=name if name in READONLY_TOOL_NAMES else "<unlisted>",
+                             outcome="rate_limited")
+                audit = RATE_LIMITER.should_record_refusal(client)
+                raise PermissionError("Refused: rate limit for this client reached; "
+                                      "retry in a minute.")
             if name not in READONLY_TOOL_NAMES:
                 # The name is client text: never logged as such.
                 entry.update(tool="<unlisted>", name_len=len(str(name)), outcome="refused")
                 raise PermissionError(f"Refused: {name!r} is not available on the "
                                       "read-only remote surface.")
-            entry.update(tool=name, args=describe_args(a, tower.AUDIT_ENUMS.get(name)))
-            if not RATE_LIMITER.allow(client, "call") or (
-                    name in tower.DB_TOOLS and not RATE_LIMITER.allow(client, "db")):
-                entry["outcome"] = "rate_limited"
-                raise PermissionError("Refused: rate limit for this client reached; "
-                                      "retry in a minute.")
+            entry.update(tool=name, args=describe_args(
+                a, tower.AUDIT_ENUMS.get(name), TOOL_ARG_KEYS[name]))
             async with _client() as c:
                 try:
                     result = await _dispatch(c, name, a)
@@ -444,12 +452,17 @@ def build_server() -> Server:
                 except Exception as exc:  # database / probe errors: name only
                     entry["outcome"] = "error"
                     raise RuntimeError(f"Read failed: {type(exc).__name__}") from None
+            # One output bound for every tool (review r2: Tower handlers built
+            # TextContent directly and bypassed the 60,000-character cap).
+            result = [TextContent(type="text", text=_text(t.text)[0].text)
+                      if isinstance(t, TextContent) else t for t in result]
             entry["outcome"] = "ok"
-            entry["chars"] = sum(len(t.text) for t in result)
+            entry["chars"] = sum(len(t.text) for t in result if isinstance(t, TextContent))
             return result
         finally:
             entry["ms"] = int((time.monotonic() - started) * 1000)
-            AUDIT.record(entry)
+            if audit:
+                AUDIT.record(entry)
 
     return server
 
