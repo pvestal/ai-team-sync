@@ -811,13 +811,10 @@ async def test_r5_a_credential_matching_two_clients_is_refused_not_first_wins(en
         assert r2.status_code == 401
 
 
-@pytest.mark.parametrize("prose", [
-    "Next requires operator authorization: Codex review of the branch first",
-    "the token: was refreshed by the service",
-    "Header: Authorization: header name only",
-])
-def test_r5_prose_after_a_weak_key_is_kept(prose):
-    assert tower.scrub(prose, paths=False) == prose
+def test_r6_prose_after_a_credential_key_is_withheld_to_end_of_line_by_design():
+    # Accepted cost (review r6): no prose exception for any credential key.
+    out = tower.scrub("Next requires operator authorization: Codex review\nnext line", paths=False)
+    assert out == "Next requires operator authorization: <redacted>\nnext line"
 
 
 @pytest.mark.parametrize("value,leak", [
@@ -831,3 +828,23 @@ def test_r5_prose_after_a_weak_key_is_kept(prose):
 def test_r5_credential_shaped_values_after_any_key_are_withheld(value, leak):
     for paths in (True, False):
         assert leak not in tower.scrub(value, paths=paths), value
+
+
+@pytest.mark.parametrize("value,leak", [
+    ('{\\"password\\":\\"a\\\\\\" b staple\\"}', "staple"),   # r6 probe
+    ('{"password":"a\\" b staple"}', "staple"),
+    ("{'secret': 'x \\' y staple'}", "staple"),
+    ("access_token: abcdefghijkl", "abcdefghijkl"),
+    ("refresh_token: deadbeef", "deadbeef"),
+    ("user_id: patrick", "patrick"),
+    ("chat_id: opsroom", "opsroom"),
+    ("nonce: abcdefghijk", "abcdefghijk"),
+])
+def test_r6_escaped_closes_and_every_credential_key_withheld(value, leak):
+    for paths in (True, False):
+        assert leak not in tower.scrub(value, paths=paths), (paths, value)
+
+
+def test_r6_text_after_a_properly_closed_value_survives():
+    out = tower.scrub('{"password": "s3cr et", "shot": "abc"}', paths=True)
+    assert "s3cr" not in out and '"shot": "abc"' in out
