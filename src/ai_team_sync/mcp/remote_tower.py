@@ -676,8 +676,10 @@ _SINCE = {"type": "string", "format": "date-time"}
 
 
 def _tool(name: str, description: str, props: dict, required: list[str] | None = None) -> Tool:
-    # additionalProperties false (review r2): an unknown argument is refused by
-    # the SDK's schema validation before any handler or audit sees it.
+    # additionalProperties false (review r2): an unknown argument fails the
+    # schema. The CONNECTOR validates (remote_readonly.call_tool, SDK validation
+    # off): after the rate limit and inside the audited call, so a malformed
+    # call is limited and audited like any other.
     return Tool(name=name, description="Read-only. " + description, annotations=READ_ONLY,
                 inputSchema={"type": "object", "properties": props,
                              "additionalProperties": False,

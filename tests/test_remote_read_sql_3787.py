@@ -48,6 +48,8 @@ FORBIDDEN_COLUMNS = {
     "credential_hash", "binding_id", "bound_principal_id", "state_fingerprint", "rules",
     "proof", "generation_prompt", "motion_prompt", "source_image_path", "first_frame_path",
     "output_video_path", "sfx_audio_path", "execution_ref", "user_message", "bot_response",
+    # Option A: redundant free text (a code column carries it)
+    "refusal_text", "error", "reconcile_note",
 }
 
 

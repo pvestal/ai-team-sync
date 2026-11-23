@@ -17,6 +17,9 @@
 -- dispatch_holds provenance jsonb; gpu_claims holder_host/pid/boot_id/
 -- start_ticks/cmd; render_admission_executions credential_hash, binding_id,
 -- bound_principal_id, state_fingerprint, rules, evidence; refusals proof.
+-- Option A (operator 2026-11-23): free text whose content a code column already
+-- carries is not exposed -- refusals.refusal_text (reason_code), video
+-- submissions error / reconcile_note (error_code, outcome).
 
 BEGIN;
 
@@ -177,14 +180,14 @@ FROM public.render_admission_executions e;
 
 CREATE OR REPLACE VIEW remote_read.render_admission_refusals WITH (security_barrier) AS
 SELECT r.execution_id, r.shot_id, r.backend_id, r.comfyui_prompt_id, r.reason_code,
-       left(r.refusal_text, 500) AS refusal_text, r.recorded_by, r.recorded_at
+       r.recorded_by, r.recorded_at
 FROM public.render_admission_execution_refusals r;
 
 CREATE OR REPLACE VIEW remote_read.video_submissions WITH (security_barrier) AS
 SELECT v.submission_id, v.shot_id, v.keyframe_sha, v.requested_by, v.outcome,
-       v.engine, v.error_code, left(v.error, 500) AS error, v.comfyui_prompt_id,
+       v.engine, v.error_code, v.comfyui_prompt_id,
        v.backend_id, v.backend_kind, v.created_at, v.finished_at, v.resolved_at,
-       v.last_reconciled_at, left(v.reconcile_note, 300) AS reconcile_note
+       v.last_reconciled_at
 FROM public.video_submissions v;
 
 RESET ROLE;

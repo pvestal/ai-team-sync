@@ -6,7 +6,8 @@
 -- Each view is a COLUMN ALLOWLIST: a column not named here cannot reach a
 -- remote client. Excluded on purpose (and pinned by tests/test_remote_read_sql_3787.py):
 --   tower_tasks.description            (served by Echo's own envelope route instead)
---   tower_task_runs: session_id, repo_root, worktree_path, target_file,
+--   tower_task_runs: error text (Option A: state/disposition/has_error carry it),
+--                    session_id, repo_root, worktree_path, target_file,
 --                    research/implementation/tests/review/landing/verification jsonb
 --   operator_questions: nonce, delivery_token_hash, chat_id, telegram_message_id,
 --                    answer_user_id, ats_session_id, evidence, delivery, decision_id
@@ -61,7 +62,7 @@ LEFT JOIN public.tower_projects p ON p.id = t.project_id;
 
 CREATE OR REPLACE VIEW remote_read.tower_task_runs WITH (security_barrier) AS
 SELECT r.id, r.task_id, r.state, r.executor, r.level, r.branch, r.base_sha,
-       r.final_sha, r.disposition, left(r.error, 1000) AS error,
+       r.final_sha, r.disposition, (r.error IS NOT NULL) AS has_error,
        r.claimed_at, r.heartbeat_at, r.lease_expires_at, r.card_sent_at,
        r.created_at, r.updated_at, r.finished_at
 FROM public.tower_task_runs r;

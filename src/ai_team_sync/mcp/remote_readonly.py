@@ -1,7 +1,10 @@
-"""Read-only ATS MCP over Streamable HTTP, for remote clients (#3760).
+"""Read-only MCP over Streamable HTTP, for remote clients (#3760, #3787).
 
-A remote client (claude.ai chat, including voice mode) may READ ATS context --
-task briefs, decisions, active work -- and nothing else. This is a
+A remote client (claude.ai chat, including voice mode) may READ: ATS context
+(task briefs, decisions, active work) and, since #3787, Tower context -- Echo
+task envelopes and /health over two pinned GET routes, remote_read SQL views
+through the tower_remote_ro role, and fixed service-state probes
+(remote_tower.py). It may write nothing. This is a
 separate server from the stdio ``ats-mcp``, deliberately sharing none of its
 dispatch, because that dispatch carries session identity: it resolves the
 caller from pointer files and keyrings, heartbeats sessions it holds, and
@@ -89,8 +92,10 @@ READONLY_TOOL_NAMES = ATS_TOOL_NAMES | tower.TOWER_TOOL_NAMES
 
 # Every (method, base, path regex) this server may send upstream. GETs are reads
 # by HTTP contract on ATS; the one POST is the read-only brief builder (a brief
-# never binds a ticket or claims anything, routers/briefs.py). Nothing here
-# reaches Echo directly.
+# never binds a ticket or claims anything, routers/briefs.py). Echo is reached
+# directly for exactly two SELECT-only GETs (the task envelope and /health,
+# #3787); the brief's own Echo lookups are ATS-side reads. Anime Studio is never
+# an upstream.
 _SID = r"[A-Za-z0-9-]{1,64}"
 UPSTREAM_ALLOWLIST: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("POST", "ats", re.compile(r"/api/brief")),
