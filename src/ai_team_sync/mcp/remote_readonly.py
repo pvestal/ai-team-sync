@@ -39,6 +39,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import jsonschema
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
@@ -256,6 +257,7 @@ READONLY_TOOLS: list[Tool] = _ATS_TOOLS + tower.TOWER_TOOLS
 assert {t.name for t in READONLY_TOOLS} == READONLY_TOOL_NAMES
 # The argument names each tool declares: the only keys the audit log may name.
 TOOL_ARG_KEYS = {t.name: frozenset(t.inputSchema.get("properties", {})) for t in READONLY_TOOLS}
+TOOL_SCHEMAS = {t.name: t.inputSchema for t in READONLY_TOOLS}
 
 
 async def _task_brief(c: httpx.AsyncClient, a: dict[str, Any]) -> list[TextContent]:
@@ -404,7 +406,10 @@ def build_server() -> Server:
     async def list_tools() -> list[Tool]:
         return list(READONLY_TOOLS)
 
-    @server.call_tool()
+    # validate_input=False (review r3): the SDK validated arguments BEFORE this
+    # callback, so a malformed call skipped the rate limit and the audit. The
+    # same jsonschema validation runs below, after both.
+    @server.call_tool(validate_input=False)
     async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         # Raising makes the MCP layer answer isError=true, so a refusal can never
         # be read as a successful result.
@@ -420,7 +425,9 @@ def build_server() -> Server:
                     name in tower.DB_TOOLS and not RATE_LIMITER.allow(client, "db")):
                 entry.update(tool=name if name in READONLY_TOOL_NAMES else "<unlisted>",
                              outcome="rate_limited")
-                audit = RATE_LIMITER.should_record_refusal(client)
+                audit, suppressed = RATE_LIMITER.should_record_refusal(client)
+                if suppressed:
+                    entry["suppressed_refusals"] = suppressed
                 raise PermissionError("Refused: rate limit for this client reached; "
                                       "retry in a minute.")
             if name not in READONLY_TOOL_NAMES:
@@ -430,6 +437,13 @@ def build_server() -> Server:
                                       "read-only remote surface.")
             entry.update(tool=name, args=describe_args(
                 a, tower.AUDIT_ENUMS.get(name), TOOL_ARG_KEYS[name]))
+            try:
+                jsonschema.validate(instance=a, schema=TOOL_SCHEMAS[name])
+            except jsonschema.ValidationError:
+                entry["outcome"] = "bad_argument"
+                # The validator's message can quote client text; say only what failed.
+                raise ValueError("Input validation error: the arguments do not match "
+                                 f"{name}'s input schema") from None
             async with _client() as c:
                 try:
                     result = await _dispatch(c, name, a)

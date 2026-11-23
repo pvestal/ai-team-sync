@@ -83,17 +83,23 @@ class RateLimiter:
     _buckets: dict[tuple[str, str], _Bucket] = field(default_factory=dict)
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _refusal_logged: dict[str, float] = field(default_factory=dict)
+    _suppressed: dict[str, int] = field(default_factory=dict)
 
-    def should_record_refusal(self, client: str, every_s: float = 10.0) -> bool:
-        """At most one audited rate-limit refusal per client per ``every_s``:
-        a client over its limit cannot flood the audit log or journal."""
+    def should_record_refusal(self, client: str, every_s: float = 10.0) -> tuple[bool, int]:
+        """(record this refusal?, refusals suppressed since the last recorded one).
+
+        At most one rate-limit refusal per client per ``every_s`` becomes an
+        audit line, so a client over its limit cannot flood the audit log or
+        journal; the next recorded line carries the count of the ones it
+        stood for, so every refused call is still accounted for (review r3)."""
         now = self.clock()
         with self._lock:
             last = self._refusal_logged.get(client)
             if last is not None and now - last < every_s:
-                return False
+                self._suppressed[client] = self._suppressed.get(client, 0) + 1
+                return False, 0
             self._refusal_logged[client] = now
-            return True
+            return True, self._suppressed.pop(client, 0)
 
     def allow(self, client: str, cls: str) -> bool:
         cap = self.per_minute[cls]

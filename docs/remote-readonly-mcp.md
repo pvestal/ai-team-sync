@@ -59,21 +59,30 @@ Boundaries:
   ...) is withheld whatever its type; the same keys written as JSON text inside
   a string are withheld; credential-shaped text (bearer/JWT/`sk-`/`ghp_`/Vault
   tokens, `password=` pairs) is replaced everywhere. Absolute paths are
-  withheld; Echo task text keeps repo citations as repo-relative labels
-  (`echo:src/...`, `anime-studio:packages/...`). Hashes are never redacted.
+  withheld from the leading `/` to the next delimiter, spaces and Unicode
+  included (a path that may contain spaces cannot be cut at a space); Echo
+  task text keeps repo citations as repo-relative labels (`echo:src/...`,
+  `anime-studio:packages/...`) and HTTP routes (`/api/...`) as written.
+  Hashes are never redacted.
 - **Per-client secrets:** the #3760 secret is client `claude-ai`; each further
   client has its own `<client>.token` (0600) in
   `~/.config/ai-team-sync/remote-mcp.clients.d/` (0700). Secrets must differ.
 - **Rate limits:** per client, 60 tool calls/min and 30 database tool
   calls/min; over the limit is a tool error.
-- **Audit:** one JSON line per call to `$ATS_STATE_DIR/audit.jsonl` (0600,
+- **Audit:** one JSON line per call (exception: a client over its rate limit
+  gets at most one `rate_limited` line per 10 s, and the next such line carries
+  `suppressed_refusals`, the number of refused calls it stands for) to
+  `$ATS_STATE_DIR/audit.jsonl` (0600,
   rotated once at 10 MiB) and the journal: time, client, tool, outcome, ms,
   output size, and arguments (integers/booleans and fixed-shape enum words
   verbatim only when the value is in that tool's fixed schema enum; any other
   string as length + sha256 prefix). An unlisted tool
   name is logged as `<unlisted>` with its length. Library log messages
   (mcp, uvicorn) are written as `<message withheld>`, and uvicorn's access log
-  is off, because both echoed client text.
+  is off, because both echoed client text. Arguments are validated against
+  each tool's schema by the connector itself, after the rate limit and inside
+  the audited call (the SDK's own pre-callback validation is off), so a
+  malformed call is limited and audited like any other.
 
 Known differences, stated rather than hidden:
 

@@ -652,3 +652,56 @@ async def test_r2_tower_output_is_capped_like_every_tool(env):
         res = await call(http, "dispatch_holds", {"limit": 100})
     out = text(res)
     assert len(out) <= rr.MAX_OUTPUT_CHARS + 80 and out.endswith("characters]")
+
+
+# ---- review round 3 regressions ------------------------------------------------------
+
+@pytest.mark.parametrize("value,leak", [
+    ("trace /dataé/private/render.log", "private/render"),
+    ("trace /data private/render.log", "private/render"),
+    ("clip at /mnt/10TB2/My Videos/scene 3.mp4 failed", "scene 3"),
+    ("x /опт/секрет/файл", "секрет"),
+    ("\x000\x00 then /home/a/b", "/home/a"),
+])
+def test_r3_unicode_and_space_paths_are_withheld(value, leak):
+    for paths in (True, False):
+        out = tower.scrub(value, paths=paths)
+        assert leak not in out and "<path>" in out, (paths, out)
+
+
+def test_r3_echo_text_keeps_routes_and_repo_labels_but_not_paths_after_them():
+    s = tower.scrub("GET /api/tower-tasks/3787 then read /opt/tower-echo-brain/src/x.py "
+                    "near /home/patrick/secret dir/a.txt", paths=False)
+    assert "/api/tower-tasks/3787" in s and "echo:src/x.py" in s
+    assert "secret dir" not in s and "/home/patrick" not in s
+
+
+async def test_r3_malformed_calls_spend_the_limit_and_are_audited(env, monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(rr, "RATE_LIMITER", rc.RateLimiter(
+        per_minute={"call": 2, "db": 10}, clock=lambda: now[0]))
+    async with serve() as http:
+        a = await call(http, "gpu_claims", {"clientsecret": 7})
+        b = await call(http, "judge_queue", {"lane": "not-a-lane"})
+        c = await call(http, "gpu_claims")
+    assert a["isError"] and b["isError"] and "input schema" in text(a)
+    assert "clientsecret" not in text(a) and "not-a-lane" not in text(b)
+    assert "rate limit" in text(c)  # the two malformed calls spent the budget
+    lines = [json.loads(l) for l in env["audit_path"].read_text().splitlines()]
+    assert [l["outcome"] for l in lines] == ["bad_argument", "bad_argument", "rate_limited"]
+    assert "clientsecret" not in env["audit_path"].read_text()
+
+
+async def test_r3_suppressed_refusals_are_counted_on_the_next_audited_line(env, monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(rr, "RATE_LIMITER", rc.RateLimiter(
+        per_minute={"call": 1, "db": 10}, clock=lambda: now[0]))
+    async with serve() as http:
+        await call(http, "gpu_claims")                       # ok
+        for _ in range(4):
+            await call(http, "gpu_claims")                   # 1 logged + 3 suppressed
+        now[0] += 11
+        await call(http, "gpu_claims")                       # still limited (1/min): logged
+    lines = [json.loads(l) for l in env["audit_path"].read_text().splitlines()]
+    assert [l["outcome"] for l in lines] == ["ok", "rate_limited", "rate_limited"]
+    assert "suppressed_refusals" not in lines[1] and lines[2]["suppressed_refusals"] == 3

@@ -64,10 +64,15 @@ _SENSITIVE_KEY = re.compile(
     r"(?i)(token|secret|password|passwd|api[_-]?key|credential|cookie|authorization|"
     r"bearer|nonce|chat_id|user_id|from_user|telegram_[a-z_]*id|session_fingerprint|"
     r"private_key|signature)")
-# ANY slash-rooted path of two or more segments, whatever its root (review r2:
-# a fixed root list let /data/... through). Not preceded by a word character,
-# '.', ':' or '/', so URLs (scheme://host/...) and dates (11/23) are not paths.
-_ABS_PATH = re.compile(r"(?<![\w.:/~])/[A-Za-z0-9._@+-]+/[^\s'\",;)\]}]*")
+# An absolute path starts at a '/' not preceded by a word character, '.', ':',
+# '/' or '~' (so URLs and dates are not paths) and RUNS TO THE NEXT DELIMITER,
+# spaces and any Unicode included (review r3: "/data private/x", "/dataé/x"; a
+# real file name may contain spaces). A run containing a further '/' is
+# withheld whole. Over-withholding trailing words is the accepted cost.
+_PATH_DELIMS = "'\"\n\r,;)\\]}<>"  # regex character-class body: \] is a literal ]
+_ABS_RUN = re.compile(r"(?<![\w.:/~])/[^\s/" + _PATH_DELIMS + r"][^" + _PATH_DELIMS + r"]*")
+# Echo task text cites HTTP routes (/api/..., /health, /mcp); they are not files.
+_ROUTE_TOKEN = re.compile(r"(?<![\w.:/~])/(?:api/|mcp\b|mcp-|health\b)[^\s" + _PATH_DELIMS + r"]*")
 _JSON_START = re.compile(r"[\[{]")
 # A sensitive key in text whose value is a container that did not parse as
 # JSON: everything from the key to the end of the string is withheld.
@@ -80,14 +85,32 @@ _REPO_ROOTS = (("/opt/tower-echo-brain/", "echo:"), ("/opt/anime-studio/", "anim
                ("/home/patrick/code/ai-team-sync/", "ai-team-sync:"))
 
 
-def _label_path(m: re.Match, repos: bool) -> str:
-    path = m.group(0)
+_REPO_TOKEN = re.compile(
+    r"(?<![\w.:/~])(" + "|".join(re.escape(r) for r, _ in _REPO_ROOTS) + r")([^\s" + _PATH_DELIMS + r"]*)")
+
+
+def _scrub_paths(text: str, repos: bool) -> str:
+    """Withhold absolute paths. ``repos``: keep repo citations as labels and
+    HTTP routes as written (Echo task text); every other path is withheld."""
+    if "/" not in text:
+        return text
+    text = text.replace("\x00", "")  # the placeholder below can never come from input
+    keep: list[str] = []
+
+    def stash(value: str) -> str:
+        keep.append(value)
+        return f"\x00{len(keep) - 1}\x00"
+
     if repos:
-        for root, label in _REPO_ROOTS:
-            rest = path[len(root):]
-            if path.startswith(root) and ".." not in rest and not rest.startswith("."):
-                return label + rest
-    return "<path>"
+        def repo(m: re.Match) -> str:
+            rest = m.group(2)
+            if ".." in rest.split("/") or rest.startswith("."):
+                return m.group(0)  # left for the general rule below
+            return stash(dict(_REPO_ROOTS)[m.group(1)] + rest)
+        text = _REPO_TOKEN.sub(repo, text)
+        text = _ROUTE_TOKEN.sub(lambda m: stash(m.group(0)), text)
+    text = _ABS_RUN.sub(lambda m: "<path>" if "/" in m.group(0)[1:] else m.group(0), text)
+    return re.sub(r"\x00(\d+)\x00", lambda m: keep[int(m.group(1))], text)
 
 
 def _scrub_embedded_json(text: str, paths: bool) -> str:
@@ -127,7 +150,7 @@ def scrub(value: Any, *, paths: bool = True) -> Any:
         value = _SECRET_JSON_CONTAINER.sub('"<redacted>": "<redacted>"', value)
         for pat in _SECRET_PATTERNS:
             value = pat.sub("<redacted>", value)
-        return _ABS_PATH.sub(lambda m: _label_path(m, repos=not paths), value)
+        return _scrub_paths(value, repos=not paths)
     if isinstance(value, dict):
         return {k: ("<redacted>" if isinstance(k, str) and _SENSITIVE_KEY.search(k)
                     and v not in (None, "", [], {}) else scrub(v, paths=paths))
