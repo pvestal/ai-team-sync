@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
-from sqlalchemy import select, update
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_team_sync import peer_identity, verdicts
@@ -248,11 +248,14 @@ _SCAN_BATCH = 1000
 async def list_delegations(parent_session_id: str = "", state: str = "",
                            mode: str = "", effective_verdict: str = "", repository: str = "",
                            limit: int = 100, before: datetime | None = None,
-                           db: AsyncSession = Depends(get_db)):
-    """Newest first. `repository` (#3591) matches the reviewed repository with
-    its linked worktrees, wherever they live; `limit` caps a page at 1000;
-    `before` (a created_at from the previous page) returns the next page, so
-    a reader can take the whole history instead of a silently cut window."""
+                           before_id: str = "", db: AsyncSession = Depends(get_db)):
+    """Newest first, ties broken by id. `repository` (#3591) matches the
+    reviewed repository with its linked worktrees, wherever they live; `limit`
+    caps a page at 1000; `before` + `before_id` (created_at and id of the last
+    row of the previous page) return the next page, so a reader takes the
+    whole history -- rows sharing a timestamp across a page boundary included
+    -- instead of a silently cut window. `before` alone keeps strict-time
+    semantics."""
     from ai_team_sync.git_utils import repository_of
 
     limit = max(1, min(int(limit or 100), 1000))
@@ -261,7 +264,12 @@ async def list_delegations(parent_session_id: str = "", state: str = "",
         # Stored naive UTC; the cursor arrives as the ISO string _as_dict emitted.
         if before.tzinfo is not None:
             before = before.astimezone(timezone.utc).replace(tzinfo=None)
-        stmt = stmt.where(Delegation.created_at < before)
+        if before_id:
+            stmt = stmt.where(or_(Delegation.created_at < before,
+                                  and_(Delegation.created_at == before,
+                                       Delegation.id < before_id)))
+        else:
+            stmt = stmt.where(Delegation.created_at < before)
     if parent_session_id:
         stmt = stmt.where(Delegation.parent_session_id == parent_session_id)
     if state:
@@ -270,7 +278,7 @@ async def list_delegations(parent_session_id: str = "", state: str = "",
         stmt = stmt.where(Delegation.mode == mode)
     if effective_verdict:
         stmt = stmt.where(Delegation.effective_verdict == effective_verdict)
-    stmt = stmt.order_by(Delegation.created_at.desc())
+    stmt = stmt.order_by(Delegation.created_at.desc(), Delegation.id.desc())
     if not repository:
         rows = await db.execute(stmt.limit(limit))
         return [_as_dict(d) for d in rows.scalars().all()]

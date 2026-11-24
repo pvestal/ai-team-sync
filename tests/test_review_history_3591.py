@@ -145,3 +145,26 @@ async def test_delegations_without_new_parameters_are_unchanged(client, db_sessi
     await db_session.commit()
     rows = (await client.get("/api/delegations")).json()
     assert len(rows) == 100 and rows[0]["id"] == "d104"
+
+
+@pytest.mark.asyncio
+async def test_codex_53a2ceeb_rows_sharing_a_timestamp_across_pages_are_all_read(
+        client, db_session, repo):
+    """Five reviews with ONE created_at, pages of two: every row exactly once."""
+    root, wt = repo
+    ts = datetime(2026, 11, 1, 12, 0, 0)
+    db_session.add(_session("p-root", root, ts))
+    for i in range(5):
+        db_session.add(_delegation(f"t{i}", "p-root", wt, ts))
+    await db_session.commit()
+    for repository in ("", root):   # plain list and repository-filtered list
+        seen, cursor = [], {}
+        while True:
+            page = (await client.get("/api/delegations", params={
+                "mode": "VERIFY", "limit": 2, **({"repository": repository} if repository else {}),
+                **cursor})).json()
+            seen += [d["id"] for d in page]
+            if len(page) < 2:
+                break
+            cursor = {"before": page[-1]["created_at"], "before_id": page[-1]["id"]}
+        assert seen == ["t4", "t3", "t2", "t1", "t0"], repository
