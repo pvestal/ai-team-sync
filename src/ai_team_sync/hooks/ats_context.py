@@ -237,10 +237,10 @@ async def _brief(
         "objective": prompt,
         "repo_root": target.repo_root,
         "scope": [],
-        # The chained Echo prompt hook is the supplemental-memory stage. Exact
-        # task context may still be fetched through ATS because ATS owns
-        # the authority packet and validates its identity.
-        "recall": False,
+        # #3591: the brief's own Echo recall. The chained Echo prompt hook
+        # writes its recall to the status line only (operator 2026-06-07), so
+        # without this nothing recalled from prior work reached the agent.
+        "recall": True,
         "limit": 6,
         "session_id": session_id,
         # Identity is never guessed for an unnumbered request; it gets advisory
@@ -484,6 +484,7 @@ _RULINGS_SHOWN = 6
 _NAMED_FULL = 12
 _BRANCHES_SHOWN = 3
 _DIGEST_ITEMS = 5
+_RECALL_SHOWN = 3
 
 # The only retrieval paths the note may advertise. Both take ONE ticket:
 # task_brief has no ticket list and no overlap flag, so it cannot reproduce a
@@ -660,6 +661,12 @@ def _priority_digest(packet: dict, repo_root: str = "", *, prompt: str = "") -> 
             add(6, "omitted", f"    advisory overlap #{c['id']} [{c.get('status')}{closed}]{_owner(c)} → "
                 f"{_GET_TICKET.replace('task_id=N', 'task_id=' + str(c['id']))}", ("overlap", c["id"]))
 
+    # #3591: what prior work said, as text with its citation -- the full brief
+    # below is cut at the budget, so recall placed only there never arrived.
+    for item in (packet.get("recall") or [])[:_RECALL_SHOWN]:
+        add(8, "recall", f"    [{item.get('provenance')}] {_one_line(item.get('text'), 240)}\n"
+            f"      ↳ {_one_line(item.get('citation'), 160)}", ("recall", None))
+
     omitted_total = sum(1 for e in entries if e[2] == "omitted")
     headers = {
         "rulings": f"  operator rulings and prohibitions (binding where they apply; {len(rulings)} current):",
@@ -670,11 +677,13 @@ def _priority_digest(packet: dict, repo_root: str = "", *, prompt: str = "") -> 
                     f"{len(relevant)} relevant):",
         "overlaps": f"  existing work that may overlap (advisory; similarity is not proof; "
                     f"{len(overlaps)} returned):",
+        "recall": "  prior work recalled for this request (semantic match, not authority; "
+                  "check the citation before relying on it):",
         "omitted": f"  NOT SHOWN IN FULL ABOVE — {omitted_total} item(s); each identified, "
                    "with how to retrieve it:",
     }
     order = ["rulings", "unchecked", "references", "named", "ticket", "branch_status", "branches",
-             "overlap_status", "overlaps", "omitted"]
+             "overlap_status", "overlaps", "recall", "omitted"]
     retrieve = ["  retrieve (verified tools; each takes ONE ticket):",
                 f"    a ticket's record: {_GET_TICKET}  [Echo Brain MCP]",
                 f"    a ticket's current operator rulings: {_GET_RULINGS}  "
