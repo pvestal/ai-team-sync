@@ -34,6 +34,7 @@ def _decision_to_response(d: Decision) -> DecisionResponse:
         reasoning=d.reasoning,
         files=json.loads(d.files) if d.files else [],
         created_at=d.created_at,
+        record_kind=d.record_kind or "decision",
     )
 
 
@@ -139,9 +140,20 @@ async def list_decisions(
     ticket_id: int | None = None,
     since: datetime | None = None,
     limit: int | None = Query(None, ge=1, le=200),
+    repository: str | None = None,
+    record_kind: str | None = None,
     db: AsyncSession = Depends(get_db),
 ):
+    """`repo_root` matches a session's recorded root exactly. `repository`
+    (#3591) matches every session of that repository, its linked worktrees
+    included wherever they live; `record_kind` keeps one kind of record."""
     query = select(Decision).order_by(Decision.created_at.desc())
+    if record_kind:
+        query = query.where(Decision.record_kind == record_kind)
+    if repository:
+        return await _decisions_of_repository(db, query, repository, session_id=session_id,
+                                              ticket_id=ticket_id, since=since,
+                                              limit=limit or 200)
     if session_id:
         query = query.where(Decision.session_id == session_id)
     if repo_root:
@@ -155,6 +167,39 @@ async def list_decisions(
         query = query.limit(limit)
     result = await db.execute(query)
     return [_decision_to_response(d) for d in result.scalars().all()]
+
+
+async def _decisions_of_repository(db, query, repository, *, session_id, ticket_id, since,
+                                   limit: int) -> list[DecisionResponse]:
+    from ai_team_sync.git_utils import repository_of
+
+    want = repository_of(repository)
+    query = query.add_columns(Session.repo_root).join(Session, Decision.session_id == Session.id)
+    if session_id:
+        query = query.where(Decision.session_id == session_id)
+    if ticket_id is not None:
+        query = query.where(Decision.ticket_id == ticket_id)
+    if since is not None:
+        query = query.where(Decision.created_at >= since)
+    out: list[DecisionResponse] = []
+    # Newest first, matched in Python (a worktree's repository is a path fact,
+    # not a column), read in batches until the page is full or the table ends:
+    # a short page always means "no more", never "stopped looking".
+    offset = 0
+    while len(out) < limit:
+        batch = (await db.execute(query.offset(offset).limit(_SCAN_BATCH))).all()
+        for decision, root in batch:
+            if repository_of(root) == want:
+                out.append(_decision_to_response(decision))
+                if len(out) >= limit:
+                    break
+        if len(batch) < _SCAN_BATCH:
+            break
+        offset += _SCAN_BATCH
+    return out
+
+
+_SCAN_BATCH = 1000
 
 
 @router.get("/{decision_id}", response_model=DecisionResponse)

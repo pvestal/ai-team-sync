@@ -276,6 +276,8 @@ class DecisionResponse(BaseModel):
     reasoning: str
     files: list[str]
     created_at: datetime
+    # 'decision' | 'work_admission' (#3591): lets readers skip admission records.
+    record_kind: str = "decision"
 
     model_config = {"from_attributes": True}
 

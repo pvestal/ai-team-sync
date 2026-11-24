@@ -241,16 +241,60 @@ async def create_delegation(body: DelegationCreate, request: Request,
     return _as_dict(d)
 
 
+_SCAN_BATCH = 1000
+
+
 @router.get("")
 async def list_delegations(parent_session_id: str = "", state: str = "",
+                           mode: str = "", effective_verdict: str = "", repository: str = "",
+                           limit: int = 100, before: datetime | None = None,
                            db: AsyncSession = Depends(get_db)):
+    """Newest first. `repository` (#3591) matches the reviewed repository with
+    its linked worktrees, wherever they live; `limit` caps a page at 1000;
+    `before` (a created_at from the previous page) returns the next page, so
+    a reader can take the whole history instead of a silently cut window."""
+    from ai_team_sync.git_utils import repository_of
+
+    limit = max(1, min(int(limit or 100), 1000))
     stmt = select(Delegation)
+    if before is not None:
+        # Stored naive UTC; the cursor arrives as the ISO string _as_dict emitted.
+        if before.tzinfo is not None:
+            before = before.astimezone(timezone.utc).replace(tzinfo=None)
+        stmt = stmt.where(Delegation.created_at < before)
     if parent_session_id:
         stmt = stmt.where(Delegation.parent_session_id == parent_session_id)
     if state:
         stmt = stmt.where(Delegation.state == state)
-    rows = await db.execute(stmt.order_by(Delegation.created_at.desc()).limit(100))
-    return [_as_dict(d) for d in rows.scalars().all()]
+    if mode:
+        stmt = stmt.where(Delegation.mode == mode)
+    if effective_verdict:
+        stmt = stmt.where(Delegation.effective_verdict == effective_verdict)
+    stmt = stmt.order_by(Delegation.created_at.desc())
+    if not repository:
+        rows = await db.execute(stmt.limit(limit))
+        return [_as_dict(d) for d in rows.scalars().all()]
+    want = repository_of(repository)
+    out = []
+    stmt = stmt.add_columns(Session.repo_root).outerjoin(
+        Session, Session.id == Delegation.parent_session_id)
+    # Read in batches until the page is full or the table ends, so a short
+    # page always means the history is exhausted (the `before` cursor relies
+    # on that), never that the scan stopped early.
+    offset, batch_size = 0, _SCAN_BATCH
+    while len(out) < limit:
+        batch = (await db.execute(stmt.offset(offset).limit(batch_size))).all()
+        for d, parent_root in batch:
+            # A reviewed worktree that was removed since no longer resolves; the
+            # parent session recorded which repository the work belonged to.
+            if want in (repository_of(d.repo_root), repository_of(parent_root)):
+                out.append(_as_dict(d))
+                if len(out) >= limit:
+                    break
+        if len(batch) < batch_size:
+            break
+        offset += batch_size
+    return out
 
 
 @router.get("/{delegation_id}")

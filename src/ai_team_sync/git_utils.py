@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import subprocess
 from pathlib import Path
@@ -244,3 +245,20 @@ def resolve_repo_roots(path: str | Path) -> tuple[str | None, str | None]:
         if parent == d:
             return None, None
         d = parent
+
+
+def repository_of(path: str | None) -> str:
+    """The repository a recorded path belongs to (#3591): a linked worktree,
+    wherever it lives, maps to its shared checkout. A path that no longer
+    exists falls back to stripping a '/.worktrees/<name>' suffix; '' when
+    unknown. Pure path work, cached."""
+    return _repository_of(os.path.abspath(path).rstrip("/")) if path else ""
+
+
+@functools.lru_cache(maxsize=4096)
+def _repository_of(path: str) -> str:
+    if os.path.isdir(path):
+        _worktree, shared = resolve_repo_roots(os.path.join(path, ".ats-repository"))
+        if shared:
+            return os.path.realpath(shared).rstrip("/")
+    return path.split("/.worktrees/", 1)[0]
