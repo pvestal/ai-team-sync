@@ -48,12 +48,13 @@ import jsonschema
 from mcp.server import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.server.transport_security import TransportSecuritySettings
-from mcp.types import TextContent, Tool
+from mcp.types import ImageContent, TextContent, Tool
 
 from ai_team_sync.mcp import remote_oauth as _oauth
 from ai_team_sync.mcp import remote_comfy
 from ai_team_sync.mcp import remote_coordination
 from ai_team_sync.mcp import remote_diagnostics
+from ai_team_sync.mcp import remote_media_probe
 from ai_team_sync.mcp import remote_tower as tower
 from ai_team_sync import external_reviewer
 from ai_team_sync.mcp.remote_controls import AuditLog, RateLimiter, describe_args, load_clients
@@ -306,7 +307,8 @@ TOOL_ARG_KEYS = {t.name: frozenset(t.inputSchema.get("properties", {})) for t in
 TOOL_SCHEMAS = {t.name: t.inputSchema for t in READONLY_TOOLS}
 TOOL_ARG_KEYS[remote_comfy.TOOL.name] = frozenset({"backend"})
 TOOL_SCHEMAS[remote_comfy.TOOL.name] = remote_comfy.TOOL.inputSchema
-for _tool in (remote_coordination.TOOL, remote_coordination.INBOX_TOOL, remote_diagnostics.TOOL):
+for _tool in (remote_coordination.TOOL, remote_coordination.INBOX_TOOL, remote_diagnostics.TOOL,
+              remote_media_probe.TOOL):
     TOOL_ARG_KEYS[_tool.name] = frozenset(_tool.inputSchema["properties"])
     TOOL_SCHEMAS[_tool.name] = _tool.inputSchema
 
@@ -457,7 +459,7 @@ def build_server() -> Server:
     @server.list_tools()
     async def list_tools() -> list[Tool]:
         extra = ([remote_coordination.TOOL, remote_coordination.INBOX_TOOL, remote_comfy.TOOL,
-                  remote_diagnostics.TOOL]
+                  remote_diagnostics.TOOL, remote_media_probe.TOOL]
                  if _caller(server) in external_reviewer.REVIEWERS else [])
         return [*READONLY_TOOLS, *extra]
 
@@ -465,7 +467,7 @@ def build_server() -> Server:
     # callback, so a malformed call skipped the rate limit and the audit. The
     # same jsonschema validation runs below, after both.
     @server.call_tool(validate_input=False)
-    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | ImageContent]:
         # Raising makes the MCP layer answer isError=true, so a refusal can never
         # be read as a successful result.
         client = _caller(server)
@@ -474,7 +476,8 @@ def build_server() -> Server:
         note = reviewer and name == remote_coordination.TOOL.name
         inbox = reviewer and name == remote_coordination.INBOX_TOOL.name
         logs = reviewer and name == remote_diagnostics.TOOL.name
-        listed = name in READONLY_TOOL_NAMES or comfy or note or inbox or logs
+        media_probe = reviewer and name == remote_media_probe.TOOL.name
+        listed = name in READONLY_TOOL_NAMES or comfy or note or inbox or logs or media_probe
         a = arguments if isinstance(arguments, dict) else {}
         started = time.monotonic()
         entry: dict[str, Any] = {"client": client}
@@ -526,6 +529,8 @@ def build_server() -> Server:
                         result = await remote_comfy.execution_metadata(c, a)
                     elif logs:
                         result = await remote_diagnostics.service_log_summary(a)
+                    elif media_probe:
+                        result = remote_media_probe.probe()
                     else:
                         result = await _dispatch(c, name, a)
                 except UpstreamRefused as exc:
@@ -553,6 +558,8 @@ def build_server() -> Server:
                       if isinstance(t, TextContent) else t for t in result]
             entry["outcome"] = "ok"
             entry["chars"] = sum(len(t.text) for t in result if isinstance(t, TextContent))
+            if media_probe:
+                entry["image_base64_chars"] = sum(len(t.data) for t in result if isinstance(t, ImageContent))
             return result
         finally:
             entry["ms"] = int((time.monotonic() - started) * 1000)

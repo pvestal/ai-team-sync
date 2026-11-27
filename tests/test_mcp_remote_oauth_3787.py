@@ -207,7 +207,9 @@ async def test_full_flow_then_mcp_call_as_the_oauth_client(env, basic):
         assert t["token_type"] == "Bearer" and t["scope"] == oa.SCOPE and t["refresh_token"]
         lst = await mcp(c, t["access_token"])
         names = {tool["name"] for tool in lst.json()["result"]["tools"]}
-        assert lst.status_code == 200 and len(names) == 23
+        assert lst.status_code == 200 and len(names) == 24
+        assert "media_probe" in names
+        await check_synthetic_image(c, t["access_token"])
         assert "engineering_messages" in names
         assert "comfy_execution_metadata" in names
         assert "send_engineering_note" in names
@@ -425,6 +427,20 @@ async def test_a_client_with_redirect_uris_may_use_only_those_exact_uris(env):
         assert r.status_code == 400
 
 
+async def check_synthetic_image(c, token):
+    response = await mcp(c, token, "tools/call", {"name": "media_probe", "arguments": {}})
+    result = response.json()["result"]
+    assert result["isError"] is False
+    image, = result["content"]
+    assert image["type"] == "image" and image["mimeType"] == "image/png"
+    data = base64.b64decode(image["data"], validate=True)
+    assert data.startswith(b"\x89PNG\r\n\x1a\n") and len(data) < 4096
+    refused = await mcp(c, token, "tools/call", {
+        "name": "media_probe", "arguments": {"path": "/should-not-be-read"},
+    })
+    assert refused.json()["result"]["isError"] is True
+
+
 async def test_claude_client_full_flow(env):
     env["server"].clients["tower-claude"] = {
         "secret_sha256": hashlib.sha256(b"c" * 48).hexdigest(), "redirect_uris": [CLAUDE_REDIRECT]}
@@ -437,7 +453,8 @@ async def test_claude_client_full_flow(env):
                                                "resource": oa.resource()})
         assert r.status_code == 200
         lst = await mcp(c, r.json()["access_token"])
-        assert len(lst.json()["result"]["tools"]) == 23
+        assert len(lst.json()["result"]["tools"]) == 24
+        await check_synthetic_image(c, r.json()["access_token"])
         inbox = await mcp(c, r.json()["access_token"], "tools/call", {
             "name": "engineering_messages", "arguments": {"limit": 3},
         })
