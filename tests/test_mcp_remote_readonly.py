@@ -317,6 +317,7 @@ PINNED_UPSTREAM = {
     ("GET", "ats", "/api/decisions"),
     ("GET", "ats", "/api/locks"),
     ("GET", "ats", "/api/restarts"),
+    ("GET", "ats", r"/api/delegations/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}"),
     ("GET", "ats", "/api/version"),
     # #3787: Echo's SELECT-only task envelope and /health; nothing else of Echo.
     ("GET", "echo", "/api/tower-tasks/[1-9][0-9]{0,9}"),

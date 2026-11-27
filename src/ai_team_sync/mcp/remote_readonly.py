@@ -112,6 +112,7 @@ UPSTREAM_ALLOWLIST: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("GET", "ats", re.compile(r"/api/decisions")),
     ("GET", "ats", re.compile(r"/api/locks")),
     ("GET", "ats", re.compile(r"/api/restarts")),
+    ("GET", "ats", re.compile(r"/api/delegations/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}")),
     ("GET", "ats", re.compile(r"/api/version")),
     # #3787: Echo's SELECT-only task envelope (tower_task_api.py) and /health.
     ("GET", "echo", re.compile(r"/api/tower-tasks/[1-9][0-9]{0,9}")),
@@ -308,7 +309,7 @@ TOOL_SCHEMAS = {t.name: t.inputSchema for t in READONLY_TOOLS}
 TOOL_ARG_KEYS[remote_comfy.TOOL.name] = frozenset({"backend"})
 TOOL_SCHEMAS[remote_comfy.TOOL.name] = remote_comfy.TOOL.inputSchema
 for _tool in (remote_coordination.TOOL, remote_coordination.INBOX_TOOL, remote_diagnostics.TOOL,
-              remote_media_probe.TOOL):
+              remote_diagnostics.RELEASE_TOOL, remote_media_probe.TOOL):
     TOOL_ARG_KEYS[_tool.name] = frozenset(_tool.inputSchema["properties"])
     TOOL_SCHEMAS[_tool.name] = _tool.inputSchema
 
@@ -459,7 +460,7 @@ def build_server() -> Server:
     @server.list_tools()
     async def list_tools() -> list[Tool]:
         extra = ([remote_coordination.TOOL, remote_coordination.INBOX_TOOL, remote_comfy.TOOL,
-                  remote_diagnostics.TOOL, remote_media_probe.TOOL]
+                  remote_diagnostics.TOOL, remote_diagnostics.RELEASE_TOOL, remote_media_probe.TOOL]
                  if _caller(server) in external_reviewer.REVIEWERS else [])
         return [*READONLY_TOOLS, *extra]
 
@@ -476,8 +477,9 @@ def build_server() -> Server:
         note = reviewer and name == remote_coordination.TOOL.name
         inbox = reviewer and name == remote_coordination.INBOX_TOOL.name
         logs = reviewer and name == remote_diagnostics.TOOL.name
+        release = reviewer and name == remote_diagnostics.RELEASE_TOOL.name
         media_probe = reviewer and name == remote_media_probe.TOOL.name
-        listed = name in READONLY_TOOL_NAMES or comfy or note or inbox or logs or media_probe
+        listed = name in READONLY_TOOL_NAMES or comfy or note or inbox or logs or release or media_probe
         a = arguments if isinstance(arguments, dict) else {}
         started = time.monotonic()
         entry: dict[str, Any] = {"client": client}
@@ -504,7 +506,7 @@ def build_server() -> Server:
                 a, tower.AUDIT_ENUMS.get(name), TOOL_ARG_KEYS[name]))
             try:
                 jsonschema.validate(instance=a, schema=TOOL_SCHEMAS[name],
-                                    format_checker=jsonschema.FormatChecker() if note or inbox else None)
+                                    format_checker=jsonschema.FormatChecker() if note or inbox or release else None)
             except jsonschema.ValidationError:
                 entry["outcome"] = "bad_argument"
                 # The validator's message can quote client text; say only what failed.
@@ -529,6 +531,8 @@ def build_server() -> Server:
                         result = await remote_comfy.execution_metadata(c, a)
                     elif logs:
                         result = await remote_diagnostics.service_log_summary(a)
+                    elif release:
+                        result = await remote_diagnostics.release_evidence(c, ATS_URL, a)
                     elif media_probe:
                         result = remote_media_probe.probe()
                     else:

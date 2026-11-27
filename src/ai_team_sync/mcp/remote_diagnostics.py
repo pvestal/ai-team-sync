@@ -2,6 +2,7 @@
 
 import json
 import re
+import uuid
 
 from . import remote_tower
 
@@ -21,6 +22,47 @@ TOOL = remote_tower._tool(
      "minutes": {"type": "integer", "minimum": 1, "maximum": 60},
      "limit": {"type": "integer", "minimum": 1, "maximum": 20}}, ["unit"],
 )
+RELEASE_UNITS = (*UNITS, "ats-server.service", "ats-mcp-remote.service")
+RELEASE_TOOL = remote_tower._tool(
+    "release_evidence",
+    "Read the structured ATS verdict for a review ID, or recent recorded restarts for one service.",
+    {"review_id": {"type": "string", "format": "uuid"},
+     "unit": {"type": "string", "enum": list(RELEASE_UNITS)},
+     "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, [],
+)
+_SHA = re.compile(r"[a-f0-9]{7,64}")
+
+
+def _revision(value):
+    return value if isinstance(value, str) and _SHA.fullmatch(value) else None
+
+
+async def release_evidence(client, ats_url: str, arguments: dict):
+    review_id, unit = arguments.get("review_id"), arguments.get("unit")
+    if bool(review_id) == bool(unit) or (review_id and "limit" in arguments):
+        raise remote_tower.BadArgument("Supply either review_id or unit (optionally with limit).")
+    if review_id:
+        response = await client.get(f"{ats_url}/api/delegations/{uuid.UUID(review_id)}")
+        response.raise_for_status()
+        row = response.json()
+        verdict = row.get("structured_verdict") or {}
+        reviewed = verdict.get("reviewed") or {}
+        return remote_tower._out("ATS review", {
+            **{key: row.get(key) for key in ("id", "state", "mode", "effective_verdict", "closed_at")},
+            "base_sha": _revision(reviewed.get("base_sha")),
+            "head_sha": _revision(reviewed.get("head_sha")),
+            "items": [{key: item.get(key) for key in ("status", "severity", "claim_category")}
+                      for item in (verdict.get("items") or [])[:30] if isinstance(item, dict)],
+        })
+    response = await client.get(f"{ats_url}/api/restarts",
+                                params={"unit": unit, "limit": arguments.get("limit", 5)})
+    response.raise_for_status()
+    rows = response.json()
+    return remote_tower._out("ATS restarts", [
+        {**{key: row.get(key) for key in ("id", "unit", "outcome", "old_pid", "new_pid", "created_at")},
+         "loaded_revision": _revision((row.get("after") or {}).get("loaded_commit"))}
+        for row in rows[:10]
+    ])
 
 
 def log_projection(raw: str) -> list[dict]:

@@ -28,6 +28,17 @@ TARGET = "6bf35b97-c984-49ad-80b1-60b8eaaff270"
 
 class Up(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request):
+        if request.url.path == f"/api/delegations/{TARGET}":
+            return httpx.Response(200, json={
+                "id": TARGET, "state": "closed", "effective_verdict": "PASS",
+                "result_summary": "PRIVATE reviewer prose",
+                "structured_verdict": {"reviewed": {"head_sha": "1234abc", "repo": "/private/tree"},
+                                        "items": [{"status": "PASS", "citation": "PRIVATE citation"}]},
+            })
+        if request.url.path == "/api/restarts":
+            assert request.url.params["unit"] == "anime-studio.service"
+            return httpx.Response(200, json=[{"outcome": "completed", "reason": "PRIVATE",
+                                              "after": {"loaded_commit": "1234abc", "raw": "PRIVATE"}}])
         if request.url.path == f"/api/sessions/{SENDER}":
             return httpx.Response(200, json={"agent": "chatgpt-connector",
                                              "developer": "oauth:tower-chatgpt", "status": "active"})
@@ -207,7 +218,13 @@ async def test_full_flow_then_mcp_call_as_the_oauth_client(env, basic):
         assert t["token_type"] == "Bearer" and t["scope"] == oa.SCOPE and t["refresh_token"]
         lst = await mcp(c, t["access_token"])
         names = {tool["name"] for tool in lst.json()["result"]["tools"]}
-        assert lst.status_code == 200 and len(names) == 24
+        assert lst.status_code == 200 and len(names) == 25
+        assert "release_evidence" in names
+        reviewed = await mcp(c, t["access_token"], "tools/call", {
+            "name": "release_evidence", "arguments": {"review_id": TARGET},
+        })
+        assert reviewed.json()["result"]["isError"] is False
+        assert "1234abc" in reviewed.text and "PRIVATE" not in reviewed.text
         assert "media_probe" in names
         await check_synthetic_image(c, t["access_token"])
         assert "engineering_messages" in names
@@ -453,7 +470,12 @@ async def test_claude_client_full_flow(env):
                                                "resource": oa.resource()})
         assert r.status_code == 200
         lst = await mcp(c, r.json()["access_token"])
-        assert len(lst.json()["result"]["tools"]) == 24
+        assert len(lst.json()["result"]["tools"]) == 25
+        released = await mcp(c, r.json()["access_token"], "tools/call", {
+            "name": "release_evidence", "arguments": {"unit": "anime-studio.service", "limit": 2},
+        })
+        assert released.json()["result"]["isError"] is False
+        assert "1234abc" in released.text and "PRIVATE" not in released.text
         await check_synthetic_image(c, r.json()["access_token"])
         inbox = await mcp(c, r.json()["access_token"], "tools/call", {
             "name": "engineering_messages", "arguments": {"limit": 3},
