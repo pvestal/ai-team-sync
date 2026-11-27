@@ -81,10 +81,11 @@ def format_message_inbox(rows: list[dict]) -> str | None:
     """One copy per prompt; no message disappears before explicit acknowledgement."""
     if not rows:
         return None
+    from ai_team_sync.external_reviewer import inbox_body
     lines = [f"ATS: {len(rows)} message(s) addressed to this session:"]
     for row in rows[:10]:
         lines.append(f"- Message {row['id']} from {row['sender_agent']} "
-                     f"(session {row['sender_session_id']}): {row['body']}")
+                     f"(session {row['sender_session_id']}): {inbox_body(row)}")
     lines.append("Acknowledge each after reading with ATS acknowledge_message; "
                  "the sender otherwise sees delivery as unconfirmed.")
     return "\n".join(lines)

@@ -11,6 +11,8 @@ import contextlib
 import hashlib
 import hmac
 import json
+from typing import Literal
+from uuid import UUID
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -21,6 +23,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_team_sync import peer_identity, ticket_roles
 from ai_team_sync.database import get_db
 from ai_team_sync.events import broadcast_event
+from ai_team_sync import external_reviewer
 from ai_team_sync.models import AgentMessage, Handoff, Session
 from ai_team_sync.message_lifecycle import append_delivery_event
 from ai_team_sync.routers.locks import acquisition_guard, cross_account
@@ -37,6 +40,15 @@ class MessageCreate(BaseModel):
 
 class MessageAck(BaseModel):
     recipient_session_id: str
+
+
+class ExternalNote(BaseModel):
+    model_config = {"extra": "forbid"}
+    sender_session_id: UUID
+    recipient_session_id: UUID
+    request_id: UUID
+    kind: Literal["coordination", "review_finding"]
+    body: str = Field(min_length=1, max_length=3000)
 
 
 class MessageSurface(BaseModel):
@@ -81,17 +93,57 @@ class MessageResponse(BaseModel):
 
 
 async def _actor(session_id: str, request: Request, db: AsyncSession,
-                 *, require_active: bool = True) -> Session:
+                 *, require_active: bool = True, external: bool = False) -> Session:
     session = await db.get(Session, session_id)
     if (session is None or (require_active and session.status != "active")
             or cross_account(peer_identity.peer_uid_for_request(request), session)):
         raise HTTPException(403, "Active actor session owned by caller is required")
-    token = request.headers.get("X-ATS-Approval-Token", "")
+    if external_reviewer.external_session(session) != external:
+        raise HTTPException(403, "Sender capability is scoped to a different operation")
+    header = external_reviewer.CAPABILITY_HEADER if external else "X-ATS-Approval-Token"
+    token = request.headers.get(header, "")
     expected = session.approval_token_hash or ""
     if not token or not expected or not hmac.compare_digest(
             hashlib.sha256(token.encode()).hexdigest(), expected):
         raise HTTPException(403, "Actor session capability is required")
     return session
+
+
+@router.post("/external-review/messages", response_model=MessageResponse, status_code=201)
+async def send_external_note(body: ExternalNote, request: Request, db: AsyncSession = Depends(get_db)):
+    sender = await _actor(str(body.sender_session_id), request, db, external=True)
+    if (sender.agent, sender.developer) != (external_reviewer.AGENT, external_reviewer.ACTOR):
+        raise HTTPException(403, "External reviewer identity required")
+    try:
+        text = external_reviewer.clean_body(body.body)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    target = str(body.recipient_session_id)
+    if target == sender.id:
+        raise HTTPException(422, "Recipient must be another session")
+    request_id = str(body.request_id)
+    async with acquisition_guard(db):
+        existing = await db.get(AgentMessage, request_id)
+        if existing:
+            if (existing.sender_session_id, existing.original_recipient_session_id,
+                    existing.kind, existing.body) != (sender.id, target, body.kind, text):
+                raise HTTPException(409, "Request ID already used for different content")
+            return existing
+        recipient = await db.get(Session, target)
+        if recipient is None or recipient.status != "active":
+            raise HTTPException(409, "Recipient session is not active")
+        row = AgentMessage(
+            id=request_id, sender_session_id=sender.id, recipient_session_id=target,
+            original_recipient_session_id=target, addressing_mode="session",
+            ticket_id=recipient.ticket_id, kind=body.kind, sender_agent=sender.agent,
+            sender_developer=sender.developer, recipient_agent=recipient.agent, body=text,
+        )
+        append_delivery_event(row, "assigned", target, "external_review_note")
+        db.add(row)
+        await db.commit()
+    await db.refresh(row)
+    await broadcast_event(target, "message.received", {"message_id": row.id})
+    return row
 
 
 @router.post("/messages", response_model=MessageResponse, status_code=201)

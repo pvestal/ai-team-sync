@@ -339,9 +339,11 @@ async def respond_to_override_request(
     # who asks. An unidentified caller is refused rather than assumed to be the
     # owner.
     from ai_team_sync.routers.locks import cross_account
+    from ai_team_sync.external_reviewer import external_session
     if (not body.actor_session_id
             or body.actor_session_id != request.owner_session_id
             or request.owner_session is None
+            or external_session(request.owner_session)
             or request.owner_session.status not in ("active", "paused")
             or cross_account(peer_identity.peer_uid_for_request(http_request), request.owner_session)):
         raise HTTPException(

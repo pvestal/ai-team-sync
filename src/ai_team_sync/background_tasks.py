@@ -177,9 +177,13 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
         return last_activity < cutoff, last_activity
 
     # Pass 1, unserialized reads only: who LOOKS idle, kept as plain values.
+    from ai_team_sync import external_reviewer
     candidates = []
     for sess in (await db.execute(
             select(Session).where(Session.status == "active"))).scalars().all():
+        if (sess.agent, sess.developer) == (external_reviewer.AGENT, external_reviewer.ACTOR):
+            # This provisioned sender has no engineering scope or process heartbeat.
+            continue
         if (await judge(sess))[0]:
             candidates.append((sess.id, getattr(sess, "repo_root", "") or "", sess.scope))
 

@@ -1,4 +1,25 @@
-# Remote read-only ATS MCP (#3760, #3787)
+# Remote ATS MCP (#3760, #3787)
+
+The existing clients keep the 19-tool read catalog. The authenticated
+`oauth:tower-chatgpt` client also receives `comfy_execution_metadata` and
+`send_engineering_note`. The public MCP URL and OAuth discovery endpoints stay
+the same.
+
+The note tool accepts a recipient session, a caller-provided UUID request ID,
+plain text, and either `coordination` or `review_finding`. The recipient sees
+the authenticated sender outside the quoted text. Repeating the same request
+ID with the same payload returns the original message. Changing the payload
+with that ID is refused. The audit records actor, target, request ID, and outcome.
+
+The connector uses a dedicated, unscoped ATS sender provisioned with agent
+`chatgpt-connector` and developer `oauth:tower-chatgpt`. Its private
+`$ATS_STATE_DIR/chatgpt-ats-sender.json` stores the session ID and capability.
+The capability is accepted only on the dedicated local message endpoint.
+Removing the file disables note submission. The read tools remain available.
+
+The ComfyUI tool reads queue counts, up to five history entries, and the
+availability of `WanImageToVideo` on a chosen pinned backend. It returns graph
+digests and selected class names without graph inputs, prompts, or artifacts.
 
 Lets a remote MCP client (claude.ai chat, including voice mode) READ ATS
 context: `task_brief`, `get_decision_history`, `team_status`,
@@ -162,7 +183,7 @@ claude.ai ──HTTPS──▶ Tailscale Funnel (tower.<tailnet>.ts.net:443, pat
                1. BearerGate  — 401 unless `Authorization: Bearer <secret>`
                2. /mcp only   — every other path 404
                3. tool allowlist (6 ATS + 13 Tower read tools, #3787)
-               4. upstream allowlist — only GET reads + POST /api/brief on
+               4. baseline upstream allowlist — GET reads + POST /api/brief on
                   ats-server, and GET /api/tower-tasks/{id} + GET /health on
                   Echo, can leave the process; never Anime Studio
                5. remote_read views via role tower_remote_ro (#3787)

@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
 
 from fastapi import Depends
@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_team_sync.database import get_db, init_db
 from ai_team_sync.config import settings
+from ai_team_sync import external_reviewer
 from ai_team_sync.liveness import liveness_from_request
 from ai_team_sync.routers import restart_leases  # registers restart_leases on Base (#3580)
 from ai_team_sync.routers import sessions, locks, decisions, override_requests, git_status, websocket, dashboard, presence_ws, presence_http, restarts, workers, briefs, delegations, version, authority, file_activities, messages, observability
@@ -34,6 +35,15 @@ async def lifespan(app: FastAPI):
     yield
 
 
+def bound_external_capability(request: Request) -> None:
+    approval = request.headers.get("X-ATS-Approval-Token", "")
+    external = request.headers.get(external_reviewer.CAPABILITY_HEADER)
+    if approval.startswith(external_reviewer.TOKEN_PREFIX) or (
+            external is not None and
+            (request.method != "POST" or request.url.path != external_reviewer.MESSAGE_PATH)):
+        raise HTTPException(403, "External reviewer capability only authorizes addressed engineering notes")
+
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="ai-team-sync",
@@ -43,7 +53,7 @@ def create_app() -> FastAPI:
         # Any request carrying a session header proves that session is alive, so
         # read-heavy work (Read/Bash/queries) is no longer invisible to the
         # reaper. See liveness.py for the incident this closes.
-        dependencies=[Depends(liveness_from_request)],
+        dependencies=[Depends(bound_external_capability), Depends(liveness_from_request)],
     )
     app.include_router(sessions.router, prefix="/api")
     app.include_router(locks.router, prefix="/api")

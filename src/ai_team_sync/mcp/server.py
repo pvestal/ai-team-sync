@@ -1354,10 +1354,11 @@ def format_message_nudge(messages: list) -> str | None:
     """Pending messages are repeated until the recipient explicitly acknowledges."""
     if not messages:
         return None
+    from ai_team_sync.external_reviewer import inbox_body
     lines = [f"📨 {len(messages)} ATS message(s) awaiting YOUR acknowledgement:"]
     for row in messages[:5]:
         lines.append(f"  • {row['id']} from {row['sender_agent']} "
-                     f"(session {row['sender_session_id']}): {row['body'][:500]}")
+                     f"(session {row['sender_session_id']}): {inbox_body(row, 500)}")
     lines.append("Use acknowledge_message after reading. Until then the sender sees it as unconfirmed.")
     return "\n".join(lines)
 

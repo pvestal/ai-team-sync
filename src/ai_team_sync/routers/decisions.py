@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ai_team_sync.database import get_db
 from ai_team_sync.models import AgentMessage, Decision, Session
 from ai_team_sync.message_lifecycle import append_delivery_event
-from ai_team_sync import peer_identity
+from ai_team_sync import external_reviewer, peer_identity
 from ai_team_sync.routers.locks import acquisition_guard, cross_account
 from ai_team_sync.notifications.dispatcher import dispatch
 from ai_team_sync.schemas import DecisionCreate, DecisionResponse
@@ -68,6 +68,8 @@ async def create_decision(body: DecisionCreate, request: Request,
     session = result.scalar_one_or_none()
     if not session:
         raise HTTPException(404, "Session not found")
+    if external_reviewer.external_session(session):
+        raise HTTPException(403, "External reviewer sessions cannot record decisions")
     recipient = None
     if body.recipient_session_id:
         if session.status != "active" or cross_account(

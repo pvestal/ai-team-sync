@@ -21,10 +21,28 @@ from ai_team_sync.mcp import remote_readonly as rr
 BEARER = "b" * 48
 CID, SECRET = "tower-chatgpt", "s" * 48
 REDIRECT = "https://chatgpt.com/connector_platform_oauth_redirect"
+SENDER = "14daf630-1f69-4608-8616-5adc83777dfc"
+TARGET = "6bf35b97-c984-49ad-80b1-60b8eaaff270"
 
 
 class Up(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request):
+        if request.url.path == f"/api/sessions/{SENDER}":
+            return httpx.Response(200, json={"agent": "chatgpt-connector",
+                                             "developer": "oauth:tower-chatgpt", "status": "active"})
+        if request.url.path == "/api/external-review/messages":
+            assert request.headers["X-ATS-External-Message-Capability"] == "test-sender-capability"
+            body = json.loads(request.content)
+            assert body["sender_session_id"] == SENDER and body["recipient_session_id"] == TARGET
+            assert body["kind"] == "review_finding" and body["body"] == "test finding"
+            return httpx.Response(201, json={"id": body["request_id"]})
+        if request.url.port == 8189:
+            fixtures = {
+                "/queue": {"queue_running": [], "queue_pending": []},
+                "/history": {},
+                "/object_info/WanImageToVideo": {"WanImageToVideo": {"input": "PRIVATE"}},
+            }
+            return httpx.Response(200, json=fixtures[request.url.path])
         return httpx.Response(200, json={"component": "ats-rest", "commit": "x"})
 
 
@@ -33,6 +51,8 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(rr, "ATS_URL", "http://127.0.0.1:8400")
     monkeypatch.setattr(rr, "ECHO_URL", "http://127.0.0.1:8309")
     monkeypatch.setattr(rr, "_inner_transport", Up())
+    monkeypatch.setattr(rr.remote_coordination, "_sender", lambda: (SENDER, "test-sender-capability"))
+    monkeypatch.setattr(rr, "WRITE_RATE_LIMITER", rc.RateLimiter(per_minute={"write": 6}))
     monkeypatch.setattr(rr, "RATE_LIMITER", rc.RateLimiter(per_minute={"call": 1000, "db": 1000}))
     audit = rc.AuditLog(tmp_path / "audit.jsonl")
     monkeypatch.setattr(rr, "AUDIT", audit)
@@ -174,13 +194,33 @@ async def test_full_flow_then_mcp_call_as_the_oauth_client(env, basic):
         t = r.json()
         assert t["token_type"] == "Bearer" and t["scope"] == oa.SCOPE and t["refresh_token"]
         lst = await mcp(c, t["access_token"])
-        assert lst.status_code == 200 and len(lst.json()["result"]["tools"]) == 19
+        names = {tool["name"] for tool in lst.json()["result"]["tools"]}
+        assert lst.status_code == 200 and len(names) == 21
+        assert "comfy_execution_metadata" in names
+        assert "send_engineering_note" in names
+        metadata = await mcp(c, t["access_token"], "tools/call", {
+            "name": "comfy_execution_metadata", "arguments": {"backend": "amd"},
+        })
+        assert metadata.json()["result"]["isError"] is False
+        assert "WanImageToVideo" in metadata.text and "PRIVATE" not in metadata.text
+        note = await mcp(c, t["access_token"], "tools/call", {
+            "name": "send_engineering_note", "arguments": {
+                "recipient_session_id": TARGET, "kind": "review_finding", "body": "test finding",
+                "request_id": "70ab9fd5-a6b0-44df-805f-63cb21955170",
+            },
+        })
+        assert note.json()["result"]["isError"] is False
+        receipt = json.loads(note.json()["result"]["content"][0]["text"])
+        assert receipt["actor"] == f"oauth:{CID}" and receipt["target"] == TARGET
+        assert receipt["outcome"] == "recorded"
         call = await mcp(c, t["access_token"], "tools/call", {"name": "ats_version", "arguments": {}})
         assert call.json()["result"]["isError"] is False
         refused = await mcp(c, t["access_token"], "tools/call",
                             {"name": "start_session", "arguments": {}})
         assert refused.json()["result"]["isError"] is True
     lines = [json.loads(l) for l in env["audit"].read_text().splitlines()]
+    assert any(row.get("request_id") == receipt["request_id"] and row.get("target") == TARGET
+               and row.get("client") == f"oauth:{CID}" and row.get("outcome") == "ok" for row in lines)
     assert any(l.get("client") == "oauth:" + CID and l.get("tool") == "ats_version" for l in lines)
     # tokens are stored only as hashes
     raw = env["tokens"].read_text()
@@ -385,6 +425,10 @@ async def test_claude_client_full_flow(env):
         assert r.status_code == 200
         lst = await mcp(c, r.json()["access_token"])
         assert len(lst.json()["result"]["tools"]) == 19
+        refused = await mcp(c, r.json()["access_token"], "tools/call", {
+            "name": "comfy_execution_metadata", "arguments": {"backend": "amd"},
+        })
+        assert refused.json()["result"]["isError"] is True
 
 
 @pytest.mark.parametrize("uris", [[], "https://claude.ai/x", ["http://claude.ai/cb"], ["https://claude.ai/cb?x=1"],

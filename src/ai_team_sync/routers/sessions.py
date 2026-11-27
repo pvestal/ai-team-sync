@@ -22,7 +22,7 @@ from sqlalchemy.orm.attributes import set_committed_value
 
 from ai_team_sync.database import get_db
 from ai_team_sync.background_tasks import replace_lifecycle_marker
-from ai_team_sync import completion_events
+from ai_team_sync import completion_events, external_reviewer
 from ai_team_sync.models import AgentMessage, CommitRecord, Handoff, ScopeLock, Session
 from ai_team_sync.message_lifecycle import append_delivery_event, release_unread_ticket_messages
 from ai_team_sync.git_utils import uncommitted_for_scope
@@ -1222,6 +1222,11 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
     # the connection belongs to one of its accounts; anyone else naming it is
     # restricted. What was established is written to the row, so no later
     # request re-derives identity from the label.
+    external = external_reviewer.external_session(body)
+    if external and ((body.agent, body.developer) != (external_reviewer.AGENT, external_reviewer.ACTOR)
+                     or body.scope or body.ticket_id is not None or body.task_id is not None
+                     or body.delegation_id or body.adopt_session_id or body.lifecycle_key or body.repo_root):
+        raise HTTPException(403, "External reviewer sessions are limited to addressed engineering notes")
     peer_uid = peer_identity.peer_uid_for_request(request)
     worker, bound_uid, binding_refusal = registry().resolve_at_create(body.agent, peer_uid)
     lifecycle_candidate = None
@@ -1441,6 +1446,8 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
         import secrets
         approval_token = (request.headers.get("X-ATS-Approval-Token", "")
                           if adopted is not None else secrets.token_urlsafe(32))
+        if external:
+            approval_token = external_reviewer.TOKEN_PREFIX + approval_token
         if adopted is None:
             session = Session(
                 developer=body.developer,

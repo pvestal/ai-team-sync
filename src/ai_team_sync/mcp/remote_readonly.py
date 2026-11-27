@@ -30,6 +30,7 @@ Tailscale Funnel in front of it. See docs/remote-readonly-mcp.md.
 from __future__ import annotations
 
 import contextlib
+from contextvars import ContextVar
 import hmac
 import ipaddress
 import json
@@ -38,6 +39,7 @@ import os
 import re
 import stat
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +51,8 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import TextContent, Tool
 
 from ai_team_sync.mcp import remote_oauth as _oauth
+from ai_team_sync.mcp import remote_comfy
+from ai_team_sync.mcp import remote_coordination
 from ai_team_sync.mcp import remote_tower as tower
 from ai_team_sync.mcp.remote_controls import AuditLog, RateLimiter, describe_args, load_clients
 
@@ -110,6 +114,7 @@ UPSTREAM_ALLOWLIST: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("GET", "echo", re.compile(r"/api/tower-tasks/[1-9][0-9]{0,9}")),
     ("GET", "echo", re.compile(r"/health")),
 )
+_EXTERNAL_NOTE_REQUEST: ContextVar[bool] = ContextVar("external_note_request", default=False)
 
 
 class UpstreamRefused(RuntimeError):
@@ -152,6 +157,11 @@ def upstream_allowed(method: str, url: httpx.URL) -> bool:
     # environment value refuses everything instead of widening anything.
     if any(bases[b] != PINNED_ORIGINS[b] for b in bases):
         return False
+    if origin in {("http", "127.0.0.1", port) for port in remote_comfy.BACKENDS.values()}:
+        return method.upper() == "GET" and (
+            (url.path in {"/queue", "/object_info/WanImageToVideo"} and not url.query)
+            or (url.path == "/history" and url.query == b"max_items=5")
+        )
     for m, base, pattern in UPSTREAM_ALLOWLIST:
         if m == method.upper() and origin == bases[base] and pattern.fullmatch(url.path):
             return True
@@ -163,7 +173,14 @@ class _GuardedTransport(httpx.AsyncBaseTransport):
         self._inner = inner or httpx.AsyncHTTPTransport()
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        if not upstream_allowed(request.method, request.url):
+        external_note = (
+            _EXTERNAL_NOTE_REQUEST.get() and request.method == "POST"
+            and _origin(ATS_URL) == _origin(str(request.url)) == PINNED_ORIGINS["ats"]
+            and request.url.path == "/api/external-review/messages" and not request.url.query
+        )
+        if remote_coordination.CAPABILITY_HEADER in request.headers and not external_note:
+            raise UpstreamRefused("External message capability is scoped to addressed notes")
+        if not external_note and not upstream_allowed(request.method, request.url):
             raise UpstreamRefused(f"{request.method} {request.url} is not a read-only upstream")
         # The size cap counts wire bytes, so the wire must BE the body: ask for
         # no compression and refuse any encoded answer (#3760 review r2 -- a
@@ -285,6 +302,10 @@ assert {t.name for t in READONLY_TOOLS} == READONLY_TOOL_NAMES
 # The argument names each tool declares: the only keys the audit log may name.
 TOOL_ARG_KEYS = {t.name: frozenset(t.inputSchema.get("properties", {})) for t in READONLY_TOOLS}
 TOOL_SCHEMAS = {t.name: t.inputSchema for t in READONLY_TOOLS}
+TOOL_ARG_KEYS[remote_comfy.TOOL.name] = frozenset({"backend"})
+TOOL_SCHEMAS[remote_comfy.TOOL.name] = remote_comfy.TOOL.inputSchema
+TOOL_ARG_KEYS[remote_coordination.TOOL.name] = frozenset(remote_coordination.TOOL.inputSchema["properties"])
+TOOL_SCHEMAS[remote_coordination.TOOL.name] = remote_coordination.TOOL.inputSchema
 
 
 async def _task_brief(c: httpx.AsyncClient, a: dict[str, Any]) -> list[TextContent]:
@@ -413,6 +434,7 @@ async def _dispatch(c: httpx.AsyncClient, name: str, a: dict[str, Any]) -> list[
 
 # Process-wide controls; run() points the audit log at the state directory.
 RATE_LIMITER = RateLimiter()
+WRITE_RATE_LIMITER = RateLimiter(per_minute={"write": 6})
 AUDIT = AuditLog(None)
 
 
@@ -431,7 +453,9 @@ def build_server() -> Server:
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
-        return list(READONLY_TOOLS)
+        extra = ([remote_coordination.TOOL, remote_comfy.TOOL]
+                 if _caller(server) == remote_coordination.ACTOR else [])
+        return [*READONLY_TOOLS, *extra]
 
     # validate_input=False (review r3): the SDK validated arguments BEFORE this
     # callback, so a malformed call skipped the rate limit and the audit. The
@@ -441,6 +465,9 @@ def build_server() -> Server:
         # Raising makes the MCP layer answer isError=true, so a refusal can never
         # be read as a successful result.
         client = _caller(server)
+        comfy = name == remote_comfy.TOOL.name and client == remote_comfy.PRINCIPAL
+        note = name == remote_coordination.TOOL.name and client == remote_coordination.ACTOR
+        listed = name in READONLY_TOOL_NAMES or comfy or note
         a = arguments if isinstance(arguments, dict) else {}
         started = time.monotonic()
         entry: dict[str, Any] = {"client": client}
@@ -449,15 +476,16 @@ def build_server() -> Server:
             # Every call, listed or not, spends the client's budget first
             # (review r2: unlisted names were refused before the limiter).
             if not RATE_LIMITER.allow(client, "call") or (
-                    name in tower.DB_TOOLS and not RATE_LIMITER.allow(client, "db")):
-                entry.update(tool=name if name in READONLY_TOOL_NAMES else "<unlisted>",
+                    name in tower.DB_TOOLS and not RATE_LIMITER.allow(client, "db")) or (
+                    note and not WRITE_RATE_LIMITER.allow(client, "write")):
+                entry.update(tool=name if listed else "<unlisted>",
                              outcome="rate_limited")
                 audit, suppressed = RATE_LIMITER.should_record_refusal(client)
                 if suppressed:
                     entry["suppressed_refusals"] = suppressed
                 raise PermissionError("Refused: rate limit for this client reached; "
                                       "retry in a minute.")
-            if name not in READONLY_TOOL_NAMES:
+            if not listed:
                 # The name is client text: never logged as such.
                 entry.update(tool="<unlisted>", name_len=len(str(name)), outcome="refused")
                 raise PermissionError(f"Refused: {name!r} is not available on the "
@@ -465,15 +493,28 @@ def build_server() -> Server:
             entry.update(tool=name, args=describe_args(
                 a, tower.AUDIT_ENUMS.get(name), TOOL_ARG_KEYS[name]))
             try:
-                jsonschema.validate(instance=a, schema=TOOL_SCHEMAS[name])
+                jsonschema.validate(instance=a, schema=TOOL_SCHEMAS[name],
+                                    format_checker=jsonschema.FormatChecker() if note else None)
             except jsonschema.ValidationError:
                 entry["outcome"] = "bad_argument"
                 # The validator's message can quote client text; say only what failed.
                 raise ValueError("Input validation error: the arguments do not match "
                                  f"{name}'s input schema") from None
+            if note:
+                entry.update(request_id=str(uuid.UUID(a["request_id"])), target=str(uuid.UUID(a["recipient_session_id"])),
+                             kind=a["kind"])
             async with _client() as c:
                 try:
-                    result = await _dispatch(c, name, a)
+                    if note:
+                        marker = _EXTERNAL_NOTE_REQUEST.set(True)
+                        try:
+                            result = await remote_coordination.send_note(c, ATS_URL, a, entry["request_id"])
+                        finally:
+                            _EXTERNAL_NOTE_REQUEST.reset(marker)
+                    elif comfy:
+                        result = await remote_comfy.execution_metadata(c, a)
+                    else:
+                        result = await _dispatch(c, name, a)
                 except UpstreamRefused as exc:
                     entry["outcome"] = "refused_upstream"
                     raise PermissionError(f"Refused: {exc}") from None
@@ -489,7 +530,7 @@ def build_server() -> Server:
                                           f"failed its self-check ({exc})") from None
                 except httpx.HTTPError as exc:
                     entry["outcome"] = "upstream_error"
-                    raise RuntimeError(f"Upstream read failed: {type(exc).__name__}") from None
+                    raise RuntimeError(f"Upstream request failed: {type(exc).__name__}") from None
                 except Exception as exc:  # database / probe errors: name only
                     entry["outcome"] = "error"
                     raise RuntimeError(f"Read failed: {type(exc).__name__}") from None
