@@ -16,7 +16,7 @@ from uuid import UUID
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field, StrictInt, field_validator
+from pydantic import BaseModel, Field, StrictInt, field_serializer, field_validator
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -90,6 +90,12 @@ class MessageResponse(BaseModel):
     @classmethod
     def parse_history(cls, value):
         return json.loads(value or "[]") if isinstance(value, str) else value
+
+    @field_serializer("body")
+    def render_external_text(self, body: str) -> str:
+        # Older live clients can render message bodies verbatim. Quote at the
+        # HTTP boundary as well, without changing the durable replay payload.
+        return external_reviewer.quoted_body(body) if self.sender_agent == external_reviewer.AGENT else body
 
 
 async def _actor(session_id: str, request: Request, db: AsyncSession,

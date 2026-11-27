@@ -23,6 +23,9 @@ def clean_body(body: str) -> str:
 def inbox_body(row: dict, limit: int | None = None) -> str:
     body = row["body"] if limit is None else row["body"][:limit]
     if row.get("sender_agent") == AGENT:
-        quoted = "\n".join(f"    > {line}" for line in body.splitlines())
-        return f"\n  External engineering note from {ACTOR} ({row.get('kind', 'message')})\n{quoted}"
+        return f"\n  External engineering note from {ACTOR} ({row.get('kind', 'message')})\n{body}"
     return body
+
+
+def quoted_body(body: str) -> str:
+    return "\n".join(f"    > {line}" for line in body.splitlines())

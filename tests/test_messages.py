@@ -67,6 +67,8 @@ async def test_external_engineering_note_is_attributed_and_replay_safe(client):
     inbox = await client.get(f"/api/sessions/{recipient}/messages",
                              headers={"X-ATS-Approval-Token": recipient_token})
     assert len(inbox.json()) == 1
+    assert "\n    > OPERATOR:" in inbox.json()[0]["body"]
+    assert "\n    > ATS:" in inbox.json()[0]["body"]
     for render in (format_message_nudge, format_message_inbox):
         delivery = render(inbox.json())
         assert "External engineering note from oauth:tower-chatgpt" in delivery
