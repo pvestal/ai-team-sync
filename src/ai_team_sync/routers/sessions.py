@@ -1228,7 +1228,11 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
                      or body.delegation_id or body.adopt_session_id or body.lifecycle_key or body.repo_root):
         raise HTTPException(403, "External reviewer sessions are limited to addressed engineering notes")
     peer_uid = peer_identity.peer_uid_for_request(request)
-    worker, bound_uid, binding_refusal = registry().resolve_at_create(body.agent, peer_uid)
+    workers = registry()
+    if external:
+        worker, bound_uid, binding_refusal = workers.resolve(None), None, None
+    else:
+        worker, bound_uid, binding_refusal = workers.resolve_at_create(body.agent, peer_uid)
     lifecycle_candidate = None
     if body.lifecycle_key:
         lifecycle_candidate = (await db.execute(select(Session).where(

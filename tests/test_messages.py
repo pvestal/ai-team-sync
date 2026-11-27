@@ -31,6 +31,8 @@ async def test_external_engineering_note_is_attributed_and_replay_safe(client):
     sender = started.json()["id"]
     token = started.headers["X-ATS-Approval-Token"]
     assert token.startswith(external_reviewer.TOKEN_PREFIX)
+    authority = await client.get(f"/api/authority/{sender}")
+    assert authority.status_code == 200 and authority.json()["grantable"] is False
     recipient, recipient_token = await _session(client, "codex:recipient")
     body = {
         "sender_session_id": sender, "recipient_session_id": recipient,
