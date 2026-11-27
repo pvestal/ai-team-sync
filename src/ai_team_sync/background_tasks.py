@@ -181,7 +181,7 @@ async def auto_complete_stale_sessions(db: AsyncSession) -> int:
     candidates = []
     for sess in (await db.execute(
             select(Session).where(Session.status == "active"))).scalars().all():
-        if (sess.agent, sess.developer) == (external_reviewer.AGENT, external_reviewer.ACTOR):
+        if external_reviewer.reviewer_identity(sess.agent, sess.developer):
             # This provisioned sender has no engineering scope or process heartbeat.
             continue
         if (await judge(sess))[0]:

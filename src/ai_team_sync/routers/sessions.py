@@ -1223,7 +1223,7 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
     # restricted. What was established is written to the row, so no later
     # request re-derives identity from the label.
     external = external_reviewer.external_session(body)
-    if external and ((body.agent, body.developer) != (external_reviewer.AGENT, external_reviewer.ACTOR)
+    if external and (not external_reviewer.reviewer_identity(body.agent, body.developer)
                      or body.scope or body.ticket_id is not None or body.task_id is not None
                      or body.delegation_id or body.adopt_session_id or body.lifecycle_key or body.repo_root):
         raise HTTPException(403, "External reviewer sessions are limited to addressed engineering notes")
@@ -1240,13 +1240,14 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
             Session.lifecycle_key == body.lifecycle_key,
             Session.status.in_(("active", "paused")),
         ))).scalar_one_or_none()
-    active_for_worker = (
-        await _active_sessions_for_worker(db, worker.name)
-        if worker.concurrency is not None else 0
-    )
-    if lifecycle_candidate is not None and worker.concurrency is not None:
-        active_for_worker = max(0, active_for_worker - 1)
-    _authority_gate(body, active_for_worker, worker, binding_refusal)
+    if not external:
+        active_for_worker = (
+            await _active_sessions_for_worker(db, worker.name)
+            if worker.concurrency is not None else 0
+        )
+        if lifecycle_candidate is not None and worker.concurrency is not None:
+            active_for_worker = max(0, active_for_worker - 1)
+        _authority_gate(body, active_for_worker, worker, binding_refusal)
 
     # A bound session's claims are what a later grant is measured against, so
     # each must have exactly one meaning: an absolute root plus exact files or
@@ -1362,9 +1363,12 @@ async def create_session(body: SessionCreate, request: Request, response: Respon
     # The ticket-role decision reads who owns the ticket, so it shares the
     # acquisition guard with the insert: two sessions asking to own one ticket
     # get one owner and one 409 (#3585). The partial unique index is the backstop.
-    guarded = locking or ticket_id is not None or body.lifecycle_key is not None
+    guarded = external or locking or ticket_id is not None or body.lifecycle_key is not None
     async with (acquisition_guard(db) if guarded else contextlib.nullcontext()):
         adopted = None
+        if external and await db.scalar(select(Session.id).where(
+                Session.developer == body.developer, Session.status == "active").limit(1)):
+            raise HTTPException(409, "This external reviewer already has a provisioned mailbox")
         if body.lifecycle_key:
             # Re-read while registration/claim insertion is serialized. The
             # partial unique index is the cross-process backstop.

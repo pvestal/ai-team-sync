@@ -6,7 +6,6 @@ import uuid
 
 from . import remote_tower
 
-PRINCIPAL = "oauth:tower-chatgpt"
 BACKENDS = {"nvidia": 8188, "amd": 8189}
 NODE_CLASSES = frozenset({
     "CLIPTextEncode", "CLIPVisionEncode", "ControlNetApplyAdvanced", "ControlNetLoader",
@@ -36,13 +35,34 @@ def _history_projection(history: dict) -> list:
         graph = prompt[2]
         classes = {node.get("class_type") for node in graph.values()
                    if isinstance(node, dict) and isinstance(node.get("class_type"), str)}
-        status = (row.get("status") or {}).get("status_str")
+        status_data = row.get("status") or {}
+        status = status_data.get("status_str")
+        started = finished = None
+        failure = None
+        for event in (status_data.get("messages") or [])[:100]:
+            if not isinstance(event, list) or len(event) != 2 or not isinstance(event[1], dict):
+                continue
+            kind, payload = event
+            timestamp = payload.get("timestamp")
+            if type(timestamp) is not int or not 0 < timestamp < 10**14:
+                continue
+            if kind == "execution_start":
+                started = timestamp
+            if kind in ("execution_success", "execution_error", "execution_interrupted"):
+                finished = timestamp
+                if kind != "execution_success":
+                    node = payload.get("node_type")
+                    failure = {"event": kind, "node_class": node if isinstance(node, str)
+                               and node in NODE_CLASSES else None}
         graph_bytes = json.dumps(graph, ensure_ascii=False, sort_keys=True,
                                  separators=(",", ":")).encode()
         result.append({
             "prompt_id": prompt_id, "status": status if status in ("success", "error") else "unknown",
             "graph_digest": hashlib.sha256(graph_bytes).hexdigest(),
             "node_count": len(graph), "known_node_classes": sorted(classes & NODE_CLASSES),
+            "duration_ms": (finished - started
+                            if started is not None and finished is not None and started <= finished else None),
+            "failure": failure,
         })
     return result
 

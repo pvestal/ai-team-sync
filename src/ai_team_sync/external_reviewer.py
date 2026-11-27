@@ -2,15 +2,23 @@
 
 import unicodedata
 
-AGENT = "chatgpt-connector"
-ACTOR = "oauth:tower-chatgpt"
+REVIEWERS = {
+    "oauth:tower-chatgpt": "chatgpt-connector",
+    "oauth:tower-claude": "claude-ai-connector",
+}
 CAPABILITY_HEADER = "X-ATS-External-Message-Capability"
 TOKEN_PREFIX = "ats-external-note-"
 MESSAGE_PATH = "/api/external-review/messages"
+INBOX_PATH = "/api/external-review/inbox"
+CAPABILITY_PATHS = frozenset({MESSAGE_PATH, INBOX_PATH})
 
 
 def external_session(session) -> bool:
-    return session.agent == AGENT or session.developer == ACTOR
+    return session.agent in REVIEWERS.values() or session.developer in REVIEWERS
+
+
+def reviewer_identity(agent: str, developer: str) -> bool:
+    return developer in REVIEWERS and REVIEWERS[developer] == agent
 
 
 def clean_body(body: str) -> str:
@@ -22,8 +30,9 @@ def clean_body(body: str) -> str:
 
 def inbox_body(row: dict, limit: int | None = None) -> str:
     body = row["body"] if limit is None else row["body"][:limit]
-    if row.get("sender_agent") == AGENT:
-        return f"\n  External engineering note from {ACTOR} ({row.get('kind', 'message')})\n{body}"
+    actor = row.get("sender_developer")
+    if reviewer_identity(row.get("sender_agent"), actor):
+        return f"\n  External engineering note from {actor} ({row.get('kind', 'message')})\n{body}"
     return body
 
 

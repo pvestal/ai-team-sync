@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field, StrictInt, field_serializer, field_validator
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ai_team_sync import peer_identity, ticket_roles
@@ -49,6 +49,15 @@ class ExternalNote(BaseModel):
     request_id: UUID
     kind: Literal["coordination", "review_finding"]
     body: str = Field(min_length=1, max_length=3000)
+
+
+class ExternalInbox(BaseModel):
+    model_config = {"extra": "forbid"}
+    session_id: UUID
+    with_session_id: UUID | None = None
+    box: Literal["incoming", "sent", "conversation"] = "incoming"
+    pending_only: bool = False
+    limit: StrictInt = Field(default=10, ge=1, le=20)
 
 
 class MessageSurface(BaseModel):
@@ -95,7 +104,9 @@ class MessageResponse(BaseModel):
     def render_external_text(self, body: str) -> str:
         # Older live clients can render message bodies verbatim. Quote at the
         # HTTP boundary as well, without changing the durable replay payload.
-        return external_reviewer.quoted_body(body) if self.sender_agent == external_reviewer.AGENT else body
+        if external_reviewer.reviewer_identity(self.sender_agent, self.sender_developer):
+            return external_reviewer.quoted_body(body)
+        return body
 
 
 async def _actor(session_id: str, request: Request, db: AsyncSession,
@@ -118,7 +129,7 @@ async def _actor(session_id: str, request: Request, db: AsyncSession,
 @router.post("/external-review/messages", response_model=MessageResponse, status_code=201)
 async def send_external_note(body: ExternalNote, request: Request, db: AsyncSession = Depends(get_db)):
     sender = await _actor(str(body.sender_session_id), request, db, external=True)
-    if (sender.agent, sender.developer) != (external_reviewer.AGENT, external_reviewer.ACTOR):
+    if not external_reviewer.reviewer_identity(sender.agent, sender.developer):
         raise HTTPException(403, "External reviewer identity required")
     try:
         text = external_reviewer.clean_body(body.body)
@@ -150,6 +161,25 @@ async def send_external_note(body: ExternalNote, request: Request, db: AsyncSess
     await db.refresh(row)
     await broadcast_event(target, "message.received", {"message_id": row.id})
     return row
+
+
+@router.post("/external-review/inbox", response_model=list[MessageResponse])
+async def read_external_inbox(body: ExternalInbox, request: Request, db: AsyncSession = Depends(get_db)):
+    reviewer = await _actor(str(body.session_id), request, db, external=True)
+    if not external_reviewer.reviewer_identity(reviewer.agent, reviewer.developer):
+        raise HTTPException(403, "External reviewer identity required")
+    incoming = AgentMessage.recipient_session_id == reviewer.id
+    sent = AgentMessage.sender_session_id == reviewer.id
+    if body.with_session_id:
+        peer = str(body.with_session_id)
+        incoming = and_(incoming, AgentMessage.sender_session_id == peer)
+        sent = and_(sent, AgentMessage.recipient_session_id == peer)
+    filters = {"incoming": incoming, "sent": sent, "conversation": or_(incoming, sent)}
+    query = select(AgentMessage).where(filters[body.box])
+    if body.pending_only:
+        query = query.where(AgentMessage.acknowledged_at.is_(None))
+    rows = await db.execute(query.order_by(AgentMessage.created_at.desc(), AgentMessage.id.desc()).limit(body.limit))
+    return rows.scalars().all()
 
 
 @router.post("/messages", response_model=MessageResponse, status_code=201)

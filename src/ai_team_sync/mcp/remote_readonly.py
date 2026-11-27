@@ -53,7 +53,9 @@ from mcp.types import TextContent, Tool
 from ai_team_sync.mcp import remote_oauth as _oauth
 from ai_team_sync.mcp import remote_comfy
 from ai_team_sync.mcp import remote_coordination
+from ai_team_sync.mcp import remote_diagnostics
 from ai_team_sync.mcp import remote_tower as tower
+from ai_team_sync import external_reviewer
 from ai_team_sync.mcp.remote_controls import AuditLog, RateLimiter, describe_args, load_clients
 
 ATS_URL = os.environ.get("ATS_SERVER_URL", "http://127.0.0.1:8400").rstrip("/")
@@ -114,7 +116,7 @@ UPSTREAM_ALLOWLIST: tuple[tuple[str, str, re.Pattern[str]], ...] = (
     ("GET", "echo", re.compile(r"/api/tower-tasks/[1-9][0-9]{0,9}")),
     ("GET", "echo", re.compile(r"/health")),
 )
-_EXTERNAL_NOTE_REQUEST: ContextVar[bool] = ContextVar("external_note_request", default=False)
+_EXTERNAL_MESSAGE_PATH: ContextVar[str | None] = ContextVar("external_message_path", default=None)
 
 
 class UpstreamRefused(RuntimeError):
@@ -173,14 +175,14 @@ class _GuardedTransport(httpx.AsyncBaseTransport):
         self._inner = inner or httpx.AsyncHTTPTransport()
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
-        external_note = (
-            _EXTERNAL_NOTE_REQUEST.get() and request.method == "POST"
+        external_message = (
+            request.url.path in external_reviewer.CAPABILITY_PATHS and request.method == "POST"
             and _origin(ATS_URL) == _origin(str(request.url)) == PINNED_ORIGINS["ats"]
-            and request.url.path == "/api/external-review/messages" and not request.url.query
+            and request.url.path == _EXTERNAL_MESSAGE_PATH.get() and not request.url.query
         )
-        if remote_coordination.CAPABILITY_HEADER in request.headers and not external_note:
-            raise UpstreamRefused("External message capability is scoped to addressed notes")
-        if not external_note and not upstream_allowed(request.method, request.url):
+        if remote_coordination.CAPABILITY_HEADER in request.headers and not external_message:
+            raise UpstreamRefused("External message capability is scoped to engineering messages")
+        if not external_message and not upstream_allowed(request.method, request.url):
             raise UpstreamRefused(f"{request.method} {request.url} is not a read-only upstream")
         # The size cap counts wire bytes, so the wire must BE the body: ask for
         # no compression and refuse any encoded answer (#3760 review r2 -- a
@@ -304,8 +306,9 @@ TOOL_ARG_KEYS = {t.name: frozenset(t.inputSchema.get("properties", {})) for t in
 TOOL_SCHEMAS = {t.name: t.inputSchema for t in READONLY_TOOLS}
 TOOL_ARG_KEYS[remote_comfy.TOOL.name] = frozenset({"backend"})
 TOOL_SCHEMAS[remote_comfy.TOOL.name] = remote_comfy.TOOL.inputSchema
-TOOL_ARG_KEYS[remote_coordination.TOOL.name] = frozenset(remote_coordination.TOOL.inputSchema["properties"])
-TOOL_SCHEMAS[remote_coordination.TOOL.name] = remote_coordination.TOOL.inputSchema
+for _tool in (remote_coordination.TOOL, remote_coordination.INBOX_TOOL, remote_diagnostics.TOOL):
+    TOOL_ARG_KEYS[_tool.name] = frozenset(_tool.inputSchema["properties"])
+    TOOL_SCHEMAS[_tool.name] = _tool.inputSchema
 
 
 async def _task_brief(c: httpx.AsyncClient, a: dict[str, Any]) -> list[TextContent]:
@@ -453,8 +456,9 @@ def build_server() -> Server:
 
     @server.list_tools()
     async def list_tools() -> list[Tool]:
-        extra = ([remote_coordination.TOOL, remote_comfy.TOOL]
-                 if _caller(server) == remote_coordination.ACTOR else [])
+        extra = ([remote_coordination.TOOL, remote_coordination.INBOX_TOOL, remote_comfy.TOOL,
+                  remote_diagnostics.TOOL]
+                 if _caller(server) in external_reviewer.REVIEWERS else [])
         return [*READONLY_TOOLS, *extra]
 
     # validate_input=False (review r3): the SDK validated arguments BEFORE this
@@ -465,9 +469,12 @@ def build_server() -> Server:
         # Raising makes the MCP layer answer isError=true, so a refusal can never
         # be read as a successful result.
         client = _caller(server)
-        comfy = name == remote_comfy.TOOL.name and client == remote_comfy.PRINCIPAL
-        note = name == remote_coordination.TOOL.name and client == remote_coordination.ACTOR
-        listed = name in READONLY_TOOL_NAMES or comfy or note
+        reviewer = client in external_reviewer.REVIEWERS
+        comfy = reviewer and name == remote_comfy.TOOL.name
+        note = reviewer and name == remote_coordination.TOOL.name
+        inbox = reviewer and name == remote_coordination.INBOX_TOOL.name
+        logs = reviewer and name == remote_diagnostics.TOOL.name
+        listed = name in READONLY_TOOL_NAMES or comfy or note or inbox or logs
         a = arguments if isinstance(arguments, dict) else {}
         started = time.monotonic()
         entry: dict[str, Any] = {"client": client}
@@ -494,7 +501,7 @@ def build_server() -> Server:
                 a, tower.AUDIT_ENUMS.get(name), TOOL_ARG_KEYS[name]))
             try:
                 jsonschema.validate(instance=a, schema=TOOL_SCHEMAS[name],
-                                    format_checker=jsonschema.FormatChecker() if note else None)
+                                    format_checker=jsonschema.FormatChecker() if note or inbox else None)
             except jsonschema.ValidationError:
                 entry["outcome"] = "bad_argument"
                 # The validator's message can quote client text; say only what failed.
@@ -505,14 +512,20 @@ def build_server() -> Server:
                              kind=a["kind"])
             async with _client() as c:
                 try:
-                    if note:
-                        marker = _EXTERNAL_NOTE_REQUEST.set(True)
+                    if note or inbox:
+                        path = external_reviewer.MESSAGE_PATH if note else external_reviewer.INBOX_PATH
+                        marker = _EXTERNAL_MESSAGE_PATH.set(path)
                         try:
-                            result = await remote_coordination.send_note(c, ATS_URL, a, entry["request_id"])
+                            if note:
+                                result = await remote_coordination.send_note(c, ATS_URL, client, a, entry["request_id"])
+                            else:
+                                result = await remote_coordination.read_inbox(c, ATS_URL, client, a)
                         finally:
-                            _EXTERNAL_NOTE_REQUEST.reset(marker)
+                            _EXTERNAL_MESSAGE_PATH.reset(marker)
                     elif comfy:
                         result = await remote_comfy.execution_metadata(c, a)
+                    elif logs:
+                        result = await remote_diagnostics.service_log_summary(a)
                     else:
                         result = await _dispatch(c, name, a)
                 except UpstreamRefused as exc:

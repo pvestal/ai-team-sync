@@ -40,8 +40,8 @@ def bound_external_capability(request: Request) -> None:
     external = request.headers.get(external_reviewer.CAPABILITY_HEADER)
     if approval.startswith(external_reviewer.TOKEN_PREFIX) or (
             external is not None and
-            (request.method != "POST" or request.url.path != external_reviewer.MESSAGE_PATH)):
-        raise HTTPException(403, "External reviewer capability only authorizes addressed engineering notes")
+            (request.method != "POST" or request.url.path not in external_reviewer.CAPABILITY_PATHS)):
+        raise HTTPException(403, "External reviewer capability only authorizes scoped engineering messaging")
 
 
 def create_app() -> FastAPI:

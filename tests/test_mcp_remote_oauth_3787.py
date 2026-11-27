@@ -22,6 +22,7 @@ BEARER = "b" * 48
 CID, SECRET = "tower-chatgpt", "s" * 48
 REDIRECT = "https://chatgpt.com/connector_platform_oauth_redirect"
 SENDER = "14daf630-1f69-4608-8616-5adc83777dfc"
+CLAUDE_SENDER = "43448c10-2e96-43c2-810c-e4651bed8f58"
 TARGET = "6bf35b97-c984-49ad-80b1-60b8eaaff270"
 
 
@@ -30,6 +31,14 @@ class Up(httpx.AsyncBaseTransport):
         if request.url.path == f"/api/sessions/{SENDER}":
             return httpx.Response(200, json={"agent": "chatgpt-connector",
                                              "developer": "oauth:tower-chatgpt", "status": "active"})
+        if request.url.path == f"/api/sessions/{CLAUDE_SENDER}":
+            return httpx.Response(200, json={"agent": "claude-ai-connector",
+                                             "developer": "oauth:tower-claude", "status": "active"})
+        if request.url.path == "/api/external-review/inbox":
+            body = json.loads(request.content)
+            expected_token = "claude-sender-capability" if body["session_id"] == CLAUDE_SENDER else "test-sender-capability"
+            assert request.headers["X-ATS-External-Message-Capability"] == expected_token
+            return httpx.Response(200, json=[])
         if request.url.path == "/api/external-review/messages":
             assert request.headers["X-ATS-External-Message-Capability"] == "test-sender-capability"
             body = json.loads(request.content)
@@ -51,7 +60,10 @@ def env(monkeypatch, tmp_path):
     monkeypatch.setattr(rr, "ATS_URL", "http://127.0.0.1:8400")
     monkeypatch.setattr(rr, "ECHO_URL", "http://127.0.0.1:8309")
     monkeypatch.setattr(rr, "_inner_transport", Up())
-    monkeypatch.setattr(rr.remote_coordination, "_sender", lambda: (SENDER, "test-sender-capability"))
+    monkeypatch.setattr(rr.remote_coordination, "_sender", lambda actor: {
+        "oauth:tower-chatgpt": (SENDER, "test-sender-capability"),
+        "oauth:tower-claude": (CLAUDE_SENDER, "claude-sender-capability"),
+    }[actor])
     monkeypatch.setattr(rr, "WRITE_RATE_LIMITER", rc.RateLimiter(per_minute={"write": 6}))
     monkeypatch.setattr(rr, "RATE_LIMITER", rc.RateLimiter(per_minute={"call": 1000, "db": 1000}))
     audit = rc.AuditLog(tmp_path / "audit.jsonl")
@@ -195,7 +207,8 @@ async def test_full_flow_then_mcp_call_as_the_oauth_client(env, basic):
         assert t["token_type"] == "Bearer" and t["scope"] == oa.SCOPE and t["refresh_token"]
         lst = await mcp(c, t["access_token"])
         names = {tool["name"] for tool in lst.json()["result"]["tools"]}
-        assert lst.status_code == 200 and len(names) == 21
+        assert lst.status_code == 200 and len(names) == 23
+        assert "engineering_messages" in names
         assert "comfy_execution_metadata" in names
         assert "send_engineering_note" in names
         metadata = await mcp(c, t["access_token"], "tools/call", {
@@ -424,9 +437,15 @@ async def test_claude_client_full_flow(env):
                                                "resource": oa.resource()})
         assert r.status_code == 200
         lst = await mcp(c, r.json()["access_token"])
-        assert len(lst.json()["result"]["tools"]) == 19
+        assert len(lst.json()["result"]["tools"]) == 23
+        inbox = await mcp(c, r.json()["access_token"], "tools/call", {
+            "name": "engineering_messages", "arguments": {"limit": 3},
+        })
+        assert inbox.json()["result"]["isError"] is False
+        payload = json.loads(inbox.json()["result"]["content"][0]["text"])
+        assert payload["session_id"] == CLAUDE_SENDER
         refused = await mcp(c, r.json()["access_token"], "tools/call", {
-            "name": "comfy_execution_metadata", "arguments": {"backend": "amd"},
+            "name": "engineering_messages", "arguments": {"session_id": SENDER},
         })
         assert refused.json()["result"]["isError"] is True
 

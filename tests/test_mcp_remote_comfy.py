@@ -31,3 +31,12 @@ def test_history_projection_excludes_inputs_and_outputs():
     assert projected["status"] == "error"
     assert len(projected["graph_digest"]) == 64
     assert "PRIVATE" not in repr(projected)
+
+
+def test_journal_projection_exposes_reason_codes_not_message_text():
+    from ai_team_sync.mcp.remote_diagnostics import log_projection
+
+    raw = '{"__REALTIME_TIMESTAMP":"1234","PRIORITY":"3","MESSAGE":"private SECRET QC_UNAVAILABLE"}'
+    assert log_projection(raw) == [{
+        "timestamp_us": 1234, "priority": 3, "reason_codes": ["QC_UNAVAILABLE"],
+    }]

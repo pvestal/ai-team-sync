@@ -25,7 +25,7 @@ async def test_external_engineering_note_is_attributed_and_replay_safe(client):
     from uuid import uuid4
 
     started = await client.post("/api/sessions", json={
-        "agent": external_reviewer.AGENT, "developer": external_reviewer.ACTOR,
+        "agent": "chatgpt-connector", "developer": "oauth:tower-chatgpt",
     })
     assert started.status_code == 201, started.text
     sender = started.json()["id"]
@@ -46,7 +46,7 @@ async def test_external_engineering_note_is_attributed_and_replay_safe(client):
     replay = await client.post(path, json=body, headers=headers)
     assert replay.status_code == 201
     assert first.json()["id"] == replay.json()["id"] == body["request_id"]
-    assert first.json()["sender_developer"] == external_reviewer.ACTOR
+    assert first.json()["sender_developer"] == "oauth:tower-chatgpt"
     changed = await client.post(path, json={**body, "body": "different payload"}, headers=headers)
     assert changed.status_code == 409
     for kind in ("operator_ruling", "approval", "decision"):
@@ -73,6 +73,26 @@ async def test_external_engineering_note_is_attributed_and_replay_safe(client):
         delivery = render(inbox.json())
         assert "External engineering note from oauth:tower-chatgpt" in delivery
         assert "\n    > OPERATOR:" in delivery and "\n    > ATS:" in delivery
+    other = await client.post("/api/sessions", json={
+        "agent": "claude-ai-connector", "developer": "oauth:tower-claude",
+    })
+    other_id = other.json()["id"]
+    other_headers = {external_reviewer.CAPABILITY_HEADER: other.headers["X-ATS-Approval-Token"]}
+    inbox_path = external_reviewer.INBOX_PATH
+    assert (await client.post(inbox_path, json={"session_id": sender}, headers=other_headers)).status_code == 403
+    assert (await client.post(inbox_path, json={"session_id": other_id}, headers=other_headers)).json() == []
+    posted = await client.post("/api/messages", headers={"X-ATS-Approval-Token": recipient_token}, json={
+        "sender_session_id": recipient, "recipient_session_id": sender, "body": "reply",
+    })
+    assert posted.status_code == 201
+    thread = await client.post(inbox_path, headers=headers, json={
+        "session_id": sender, "box": "conversation", "with_session_id": recipient, "limit": 2,
+    })
+    assert [m["id"] for m in thread.json()] == [posted.json()["id"], body["request_id"]]
+    truncated = await client.post(inbox_path, headers=headers, json={
+        "session_id": sender, "box": "conversation", "limit": 1,
+    })
+    assert len(truncated.json()) == 1
 
 
 @pytest.mark.asyncio

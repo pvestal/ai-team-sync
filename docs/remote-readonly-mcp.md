@@ -1,9 +1,10 @@
 # Remote ATS MCP (#3760, #3787)
 
-The existing clients keep the 19-tool read catalog. The authenticated
-`oauth:tower-chatgpt` client also receives `comfy_execution_metadata` and
-`send_engineering_note`. The public MCP URL and OAuth discovery endpoints stay
-the same.
+The authenticated `oauth:tower-chatgpt` and `oauth:tower-claude` clients
+receive the same 23 tools. The additional tools are
+`send_engineering_note`, `engineering_messages`, `comfy_execution_metadata`,
+and `service_log_summary`. Legacy bearer clients keep the 19-tool read
+catalog. The public MCP URL and OAuth discovery endpoints stay the same.
 
 The note tool accepts a recipient session, a caller-provided UUID request ID,
 plain text, and either `coordination` or `review_finding`. The recipient sees
@@ -11,15 +12,19 @@ the authenticated sender outside the quoted text. Repeating the same request
 ID with the same payload returns the original message. Changing the payload
 with that ID is refused. The audit records actor, target, request ID, and outcome.
 
-The connector uses a dedicated, unscoped ATS sender provisioned with agent
-`chatgpt-connector` and developer `oauth:tower-chatgpt`. Its private
-`$ATS_STATE_DIR/chatgpt-ats-sender.json` stores the session ID and capability.
-The capability is accepted only on the dedicated local message endpoint.
-Removing the file disables note submission. The read tools remain available.
+Each OAuth reviewer has a dedicated, unscoped ATS identity. The identities
+are `chatgpt-connector` and `claude-ai-connector` and their private sender
+files are `chatgpt-ats-sender.json` and `claude-ai-ats-sender.json` in
+`$ATS_STATE_DIR`. Each capability is accepted only for addressed sending
+and reading the holder's own mailbox. Inbox calls can return incoming notes,
+sent delivery status, or a bounded conversation with one ATS session. Removing
+one credential file disables only that reviewer's messaging.
 
-The ComfyUI tool reads queue counts, up to five history entries, and the
-availability of `WanImageToVideo` on a chosen pinned backend. It returns graph
-digests and selected class names without graph inputs, prompts, or artifacts.
+The ComfyUI tool reads queue counts, up to five history entries, and
+`WanImageToVideo` availability on a chosen pinned backend. It returns graph
+digests, selected class names, and engine-reported timing and error event
+metadata when present. The journal tool returns timestamps, priority, and
+recognized production reason codes for an allowlisted unit and time window.
 
 Lets a remote MCP client (claude.ai chat, including voice mode) READ ATS
 context: `task_brief`, `get_decision_history`, `team_status`,
