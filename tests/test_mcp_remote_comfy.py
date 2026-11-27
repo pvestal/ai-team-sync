@@ -40,3 +40,23 @@ def test_journal_projection_exposes_reason_codes_not_message_text():
     assert log_projection(raw) == [{
         "timestamp_us": 1234, "priority": 3, "reason_codes": ["QC_UNAVAILABLE"],
     }]
+
+
+async def test_journal_cap_keeps_newest_events(monkeypatch):
+    import json
+    from ai_team_sync.mcp import remote_diagnostics, remote_tower
+
+    async def journal(argv):
+        assert "--reverse" in argv
+        raw = "\n".join(json.dumps({
+            "__REALTIME_TIMESTAMP": str(index), "PRIORITY": "3",
+            "MESSAGE": "x" * 1500 + (" QC_UNAVAILABLE" if index == 20 else ""),
+        }) for index in range(20, 0, -1))
+        return raw[:remote_tower.FIXED_OUTPUT_LIMIT]
+
+    monkeypatch.setattr(remote_tower, "run_fixed", journal)
+    result, = await remote_diagnostics.service_log_summary({"unit": "anime-studio.service", "limit": 20})
+    payload = json.loads(result.text.split("\n", 1)[1])
+    assert payload["possibly_truncated"]
+    assert payload["events"][0]["timestamp_us"] == 20
+    assert payload["events"][0]["reason_codes"] == ["QC_UNAVAILABLE"]

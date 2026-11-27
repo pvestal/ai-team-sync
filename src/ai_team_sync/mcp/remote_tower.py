@@ -613,6 +613,7 @@ def _fixed_commands() -> list[tuple[str, list[str]]]:
 
 
 FIXED_COMMANDS = tuple((label, tuple(argv)) for label, argv in _fixed_commands())
+FIXED_OUTPUT_LIMIT = 20_000
 
 
 async def _run_fixed(argv: tuple[str, ...]) -> str:
@@ -628,7 +629,7 @@ async def _run_fixed(argv: tuple[str, ...]) -> str:
     except asyncio.TimeoutError:
         proc.kill()
         return ""
-    return out.decode("utf-8", "replace")[:20000]
+    return out.decode("utf-8", "replace")[:FIXED_OUTPUT_LIMIT]
 
 
 # Tests replace this; production never does.

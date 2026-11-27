@@ -49,11 +49,12 @@ async def service_log_summary(arguments: dict):
     unit = arguments["unit"]
     minutes, limit = arguments.get("minutes", 15), arguments.get("limit", 10)
     raw = await remote_tower.run_fixed((
-        "journalctl", "--no-pager", "--unit", unit, "--since", f"-{minutes} minutes",
+        "journalctl", "--no-pager", "--reverse", "--unit", unit, "--since", f"-{minutes} minutes",
         "--lines", str(limit), "--output", "json",
         "--output-fields", "__REALTIME_TIMESTAMP,PRIORITY,MESSAGE",
     ))
     return remote_tower._out("Service journal metadata", {
         "unit": unit, "minutes": minutes, "limit": limit,
-        "events": log_projection(raw)[-limit:],
+        "possibly_truncated": len(raw) >= remote_tower.FIXED_OUTPUT_LIMIT,
+        "events": log_projection(raw)[:limit],
     })
